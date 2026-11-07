@@ -151,6 +151,8 @@ export global ShellGeometry {
     out property <length> settings-heading-height: 26px;
     out property <length> settings-section-gap: 22px;
     out property <length> settings-field-width: 136px;
+    // A number and its unit: 112 px number, 4 px gap, 60 px unit menu.
+    out property <length> settings-size-field-width: 176px;
     out property <length> settings-action-button-width: 112px;
     // The status line under an action row: the gap above it, then one line.
     out property <length> settings-status-gap: 6px;
@@ -211,4 +213,36 @@ export global ShellGeometry {
     out property <length> editor-toolbar-icon-width: 27px;
     out property <length> editor-toolbar-save-checkpoint-right-inset: 13px;
     out property <length> editor-toolbar-save-checkpoint-width: 163px;
+    // The step calculator's summary band and its columns.
+    out property <length> summary-band-height: 84px;
+    out property <length> summary-cell-width: 102px;
+    // A violation line under a calculator field: its height and its gap to the box
+    // and to the caption below. A caption below moves down by their sum.
+    out property <length> violation-line-height: 16px;
+    out property <length> violation-line-gap: 2px;
+    out property <length> summary-cells-x: 199px;
+    out property <length> summary-title-x: 111px;
+    // The calculator's inset card.
+    out property <length> calculator-inset-width: 415px;
+    out property <length> calculator-inset-height: 159px;
+    // The calculator's drawing board (the overlay body at the smallest window), the
+    // box of it that is centred, and the largest scale.
+    out property <length> calculator-board-width: 892px;
+    out property <length> calculator-board-height: 543px;
+    out property <length> calculator-drawing-x: 62px;
+    out property <length> calculator-drawing-y: 11.5px;
+    out property <length> calculator-drawing-width: 809.5px;
+    out property <length> calculator-drawing-height: 435px;
+    out property <float> calculator-max-scale: 1.3;
+    // The icon bar's top group: one button slot's height.
+    out property <length> icon-bar-slot-height: 40px;
+    // The Analytics rows: pitch, the inset from the overlay's edges, the
+    // name column (chip and gap before it excluded), the optional rail
+    // column, the right-aligned count column, and the bar's thickness.
+    out property <length> analytics-row-height: 32px;
+    out property <length> analytics-row-inset: 24px;
+    out property <length> analytics-name-width: 120px;
+    out property <length> analytics-mm-width: 100px;
+    out property <length> analytics-count-width: 56px;
+    out property <length> analytics-bar-height: 10px;
 }

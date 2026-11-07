@@ -7,28 +7,22 @@
 //! No display server and no GPU: `i_slint_backend_testing::init_no_event_loop()`
 //! simulates a windowing system without one and renders no pixels. The
 //! backend is per-thread and a second `init` on the same thread is an error,
-//! so every test reaches the probe through [`probe`], which guards the
-//! `init` call behind a `thread_local!`.
+//! so every test reaches the probe through [`probe`], which installs the
+//! backend with the shared per-thread guard.
 
 mod common;
 
 use std::fs;
+use std::time::Duration;
 
-use focusforge_gui::{Theme, ThemeProbe};
-use slint::{Color, Global};
+use focusforge_gui::{Theme, ThemeProbe, ThemeSheet};
+use i_slint_backend_testing::{ElementQuery, mock_elapsed_time};
+use slint::{Color, ComponentHandle, Global};
 
-/// A headless `ThemeProbe` instance; the `thread_local!` guard makes a
-/// repeat call on the same thread safe.
+/// A headless `ThemeProbe` instance; the shared per-thread backend guard
+/// makes a repeat call on the same thread safe.
 fn probe() -> ThemeProbe {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     ThemeProbe::new().unwrap()
 }
 
@@ -129,6 +123,7 @@ fn tokens_match_the_recorded_values() {
     assert_eq!(theme.get_space_12(), 48.0, "space-12");
 
     // Radii.
+    assert_eq!(theme.get_radius_xs(), 2.0, "radius-xs");
     assert_eq!(theme.get_radius_sm(), 3.0, "radius-sm");
     assert_eq!(theme.get_radius_md(), 5.0, "radius-md");
     assert_eq!(theme.get_radius_lg(), 8.0, "radius-lg");
@@ -398,4 +393,80 @@ fn every_component_is_on_the_component_sheet() {
         missing.is_empty(),
         "not on the component sheet: {missing:?}"
     );
+}
+
+/// `(motion-fast, motion-slow, flash-hold)` in milliseconds.
+fn motion_tokens(theme: &Theme<'_>) -> (i64, i64, i64) {
+    (
+        theme.get_motion_fast(),
+        theme.get_motion_slow(),
+        theme.get_flash_hold(),
+    )
+}
+
+#[test]
+fn motion_tokens_are_zero_with_reduced_motion() {
+    let probe = probe();
+    let theme = Theme::get(&probe);
+    assert!(!theme.get_reduce_motion());
+    assert_eq!(motion_tokens(&theme), (150, 400, 150));
+
+    theme.set_reduce_motion(true);
+    assert_eq!(
+        motion_tokens(&theme),
+        (0, 0, 150),
+        "reduced motion zeroes the fades and keeps the flash hold"
+    );
+
+    theme.set_reduce_motion(false);
+    assert_eq!(motion_tokens(&theme), (150, 400, 150));
+}
+
+/// `(spinner angle, sweep at the right)` at the current mock time.
+fn motion_sample(theme: &Theme<'_>) -> (f32, bool) {
+    slint::platform::update_timers_and_animations();
+    (theme.get_spinner_angle(), theme.get_sweep_right())
+}
+
+/// The sample at 0 ms and at `at` ms later.
+fn motion_samples(theme: &Theme<'_>, at: u64) -> ((f32, bool), (f32, bool)) {
+    let start = motion_sample(theme);
+    mock_elapsed_time(Duration::from_millis(at));
+    (start, motion_sample(theme))
+}
+
+#[test]
+fn spinner_and_sweep_stand_still_with_reduced_motion() {
+    common::init_window_backend();
+    let sheet = ThemeSheet::new().unwrap();
+    // The element query skips what the window clips away, and the sheet is
+    // a long column.
+    sheet
+        .window()
+        .set_size(slint::PhysicalSize::new(1300, 20_000));
+    sheet.show().unwrap();
+    let theme = Theme::get(&sheet);
+    let spinners = || {
+        ElementQuery::from_root(&sheet)
+            .match_descendants()
+            .match_type_name("FFSpinner")
+            .find_all()
+            .len()
+    };
+
+    assert!(!theme.get_reduce_motion());
+    let drawn = spinners();
+    assert!(drawn > 0, "the sheet draws no FFSpinner");
+    // 450 ms is no whole spinner turn; the sweep flips sides every 900 ms.
+    let (start, later) = motion_samples(&theme, 450);
+    assert_ne!(start.0, later.0, "the spinner turns with motion on");
+    let (start, later) = motion_samples(&theme, 900);
+    assert_ne!(start.1, later.1, "the sweep changes sides with motion on");
+
+    theme.set_reduce_motion(true);
+    let (start, later) = motion_samples(&theme, 450);
+    assert_eq!(start, later, "the spinner stands still");
+    let (start, later) = motion_samples(&theme, 900);
+    assert_eq!(start, later, "the sweep is a fixed segment");
+    assert_eq!(spinners(), drawn, "the spinner stays drawn");
 }

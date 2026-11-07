@@ -280,7 +280,8 @@ pub fn init(options: &Options) -> Diagnostics {
         }
         Err(NoFileSink::NoDataDir) => (None, None),
         Err(err) => {
-            eprintln!("{err}");
+            // A closed stderr must not end the run.
+            let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("{err}\n"));
             (None, None)
         }
     };
@@ -402,35 +403,33 @@ mod tests {
     use tracing::Level;
 
     #[test]
-    fn stderr_filter_excludes_third_party_targets_at_default_verbosity() {
-        let filter = stderr_targets(0);
-        assert!(!filter.would_enable("some_third_party_crate", &Level::ERROR));
-        assert!(filter.would_enable("focusforge_core", &Level::WARN));
-        assert!(!filter.would_enable("focusforge_core", &Level::INFO));
-    }
+    fn stderr_filter_by_verbosity_target_and_level() {
+        const THIRD_PARTY: &str = "some_third_party_crate";
+        // (verbosity, target, level, reaches stderr)
+        let table = [
+            (0, THIRD_PARTY, Level::ERROR, false),
+            (0, "focusforge_core", Level::WARN, true),
+            (0, "focusforge_core", Level::INFO, false),
+            (-1, "focusforge_cli", Level::ERROR, true),
+            (-1, "focusforge_cli", Level::WARN, false),
+            (1, "focusforge_cli", Level::INFO, true),
+            (2, "focusforge_cli", Level::DEBUG, true),
+            (3, "focusforge_cli", Level::TRACE, true),
+            (1, THIRD_PARTY, Level::DEBUG, false),
+            (2, THIRD_PARTY, Level::DEBUG, true),
+        ];
+        for (verbosity, target, level, expected) in table {
+            assert_eq!(
+                stderr_targets(verbosity).would_enable(target, &level),
+                expected,
+                "{level} on {target} at verbosity {verbosity}"
+            );
+        }
 
-    #[test]
-    fn stderr_filter_verbosity_mapping() {
-        assert!(stderr_targets(-1).would_enable("focusforge_cli", &Level::ERROR));
-        assert!(!stderr_targets(-1).would_enable("focusforge_cli", &Level::WARN));
-        assert!(stderr_targets(1).would_enable("focusforge_cli", &Level::INFO));
-        assert!(stderr_targets(2).would_enable("focusforge_cli", &Level::DEBUG));
-        assert!(stderr_targets(3).would_enable("focusforge_cli", &Level::TRACE));
-    }
-
-    #[test]
-    fn stderr_filter_lifts_third_party_default_from_verbosity_two() {
-        assert!(!stderr_targets(1).would_enable("some_third_party_crate", &Level::DEBUG));
-        assert!(stderr_targets(2).would_enable("some_third_party_crate", &Level::DEBUG));
-    }
-
-    #[test]
-    fn stderr_filter_never_accepts_the_mirrored_output_target() {
         for verbosity in [-1, 0, 1, 2, 3] {
-            let filter = stderr_targets(verbosity);
             for level in [Level::ERROR, Level::WARN, Level::INFO, Level::DEBUG] {
                 assert!(
-                    !filter.would_enable(MIRRORED_OUTPUT_TARGET, &level),
+                    !stderr_targets(verbosity).would_enable(MIRRORED_OUTPUT_TARGET, &level),
                     "{level} on the mirrored-output target reached stderr at verbosity {verbosity}"
                 );
             }

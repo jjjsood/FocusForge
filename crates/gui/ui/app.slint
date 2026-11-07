@@ -10,6 +10,8 @@ export { Theme, TypeRole, ThemeProbe }
 
 import { ThemeSheet } from "theme_sheet.slint";
 export { ThemeSheet }
+import { StageTile } from "components/ff_stage_view.slint";
+export { StageTile }
 
 import { ShellGeometry } from "geometry.slint";
 import { FFTabStrip, ProjectTabView } from "shell/tab_strip.slint";
@@ -24,18 +26,20 @@ export { SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
 import { FFIconBar } from "shell/icon_bar.slint";
 import { FFNotificationCenter, NotificationRowView } from "shell/notification_center.slint";
-import { AboutState, FFSettingsModal, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState } from "shell/settings_modal.slint";
-export { AboutState, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
+import { AboutState, FFSettingsModal, UpdateControlsState, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState } from "shell/settings_modal.slint";
+export { AboutState, UpdateControlsState, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
 import { FFCheckpointDelete, FFCloseGuard, FFDivergenceWarning, ExportRowView, FFExportDialog, FFFingerprintMismatch, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSourcesMissing } from "shell/dialogs.slint";
 import { FFToast } from "components/ff_toast.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
+import { FFCalculatorOverlay, CalculatorFieldView, SummaryCell } from "shell/calculator_overlay.slint";
+import { FFAnalyticsOverlay, AnalyticsRowView } from "shell/analytics_overlay.slint";
 import { FFLoadingIndicator } from "shell/loading.slint";
-export { ProjectCardView, RecentRowView, ExportRowView, NotificationRowView }
+export { ProjectCardView, RecentRowView, ExportRowView, NotificationRowView, CalculatorFieldView, SummaryCell }
 
 export component AppWindow inherits Window {
     // Every callback forwards one-for-one into `AppController` via
     // `src/bridge.rs`.
-    callback window-drag-requested();
+    callback window-drag-pointer(PointerEventButton, bool);
     callback window-minimize-requested();
     callback window-maximize-toggled();
     callback window-close-requested();
@@ -151,7 +155,7 @@ export component AppWindow inherits Window {
         can-scroll-right: root.can-scroll-right;
         projects-overlay-open: root.projects-overlay-open;
 
-        window-drag-requested => { root.window-drag-requested(); }
+        window-drag-pointer(button, down) => { root.window-drag-pointer(button, down); }
         window-minimize-requested => { root.window-minimize-requested(); }
         window-maximize-toggled => { root.window-maximize-toggled(); }
         window-close-requested => { root.window-close-requested(); }
@@ -242,6 +246,23 @@ export component AppWindow inherits Window {
     // pane's not-yet-fused placeholder. Set from Rust alongside
     // `project-loaded` in `src/bridge.rs::push_projects`.
     in property <bool> composite-ready: false;
+    // The Composite pane's label and live stage view, set from
+    // `src/bridge.rs::push_stage_view`.
+    in property <string> composite-label: "Composite";
+    in property <bool> stage-visible: false;
+    in property <image> stage-source;
+    in property <length> stage-image-x;
+    in property <length> stage-image-y;
+    in property <length> stage-image-w;
+    in property <length> stage-image-h;
+    in property <[StageTile]> stage-tiles: [];
+    in property <bool> stage-inset-visible: false;
+    in property <bool> stage-inset-only: false;
+    in property <bool> stage-mosaic-fading: false;
+    in property <bool> stage-inset-fading: false;
+    in property <image> stage-heat;
+    in property <string> stage-card-title: "";
+    in property <string> stage-card-body: "";
     // The checkpoints panel's own line -- the active tab's checkpoint
     // count, or the empty-state wording. Set from Rust alongside
     // `composite-ready` in `src/bridge.rs::push_projects`.
@@ -332,22 +353,8 @@ export component AppWindow inherits Window {
         height: root.height - ShellGeometry.strip-height - ShellGeometry.toolbar-height
             - ShellGeometry.bottom-bar-height;
 
-        // `reject` so the chrome accelerators still reach the parent;
-        // `key-pressed` auto-repeats while a key is held, which
-        // `AppController::set_space_held`'s idempotence absorbs.
-        key-pressed(event) => {
-            if event.text == Key.Escape && root.dismiss-front-dialog() {
-                return accept;
-            }
-            root.canvas-key-pressed(event.text, event.modifiers.control, event.modifiers.shift,
-                event.modifiers.alt);
-            reject
-        }
-        key-released(event) => {
-            root.canvas-key-released(event.text, event.modifiers.control, event.modifiers.shift,
-                event.modifiers.alt);
-            reject
-        }
+        key-pressed(event) => { return root.window-key-pressed(event); }
+        key-released(event) => { return root.window-key-released(event); }
         focus-changed-event(reason) => { root.canvas-focus-changed(); }
 
         canvas := FFCanvas {
@@ -362,6 +369,21 @@ export component AppWindow inherits Window {
             detached-pane: root.detached-pane;
             project-loaded: root.project-loaded;
             composite-ready: root.composite-ready;
+            composite-label: root.composite-label;
+            stage-visible: root.stage-visible;
+            stage-source: root.stage-source;
+            stage-image-x: root.stage-image-x;
+            stage-image-y: root.stage-image-y;
+            stage-image-w: root.stage-image-w;
+            stage-image-h: root.stage-image-h;
+            stage-tiles: root.stage-tiles;
+            stage-inset-visible: root.stage-inset-visible;
+            stage-inset-only: root.stage-inset-only;
+            stage-mosaic-fading: root.stage-mosaic-fading;
+            stage-inset-fading: root.stage-inset-fading;
+            stage-heat: root.stage-heat;
+            stage-card-title: root.stage-card-title;
+            stage-card-body: root.stage-card-body;
             image-x: root.image-x;
             image-y: root.image-y;
             image-w: root.image-w;
@@ -535,6 +557,8 @@ export component AppWindow inherits Window {
         images-sort-selected(picked) => { root.images-sort-selected(picked); }
         images-frame-selected(i) => { root.images-frame-selected(i); }
         images-frame-keyboard-moved(delta) => { root.images-frame-keyboard-moved(delta); }
+        images-other-key-pressed(event) => { return root.window-key-pressed(event); }
+        images-other-key-released(event) => { return root.window-key-released(event); }
         images-frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
         images-frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
         images-frame-drag-pointer(i, kind, y) => { root.images-frame-drag-pointer(i, kind, y); }
@@ -550,6 +574,8 @@ export component AppWindow inherits Window {
     // `AppController::open_settings`/`close_settings`.
     in property <bool> settings-open: false;
     in property <[InputRow]> input-rows: [];
+    in property <string> input-source: "";
+    in property <[string]> input-problems: [];
     in property <string> settings-section: "performance";
     callback settings-open-requested();
     // The unread count on the bell, and whether the notification center is
@@ -572,21 +598,36 @@ export component AppWindow inherits Window {
     callback performance-gpu-toggled(bool);
     callback performance-host-cap-edited(string);
     callback performance-vram-cap-edited(string);
+    callback performance-cap-committed();
     callback performance-host-cap-cursor-moved(length, length);
     callback performance-vram-cap-cursor-moved(length, length);
+    callback performance-host-unit-toggled();
+    callback performance-vram-unit-toggled();
+    callback performance-host-unit-selected(string);
+    callback performance-vram-unit-selected(string);
+    callback performance-unit-dismissed();
 
     in property <string> appearance-presentation: "image-list";
     in property <bool> appearance-menu-open: false;
     in property <bool> appearance-menu-focused: false;
     in property <bool> appearance-menu-disabled: false;
     in property <string> appearance-save-error: "";
+    in property <bool> appearance-sharpness-heatmap: true;
+    in property <bool> appearance-reduce-motion: false;
     callback appearance-presentation-selected(string);
+    callback appearance-sharpness-heatmap-toggled(bool);
+    callback appearance-reduce-motion-toggled(bool);
     callback appearance-menu-toggled();
 
     in property <StorageState> storage;
     callback storage-clear-requested();
 
     in property <AboutState> about;
+    in property <UpdateControlsState> update-controls;
+    callback update-check-on-start-toggled(bool);
+    callback update-check-now-requested();
+    callback update-skip-requested();
+    callback update-page-requested();
 
     in property <[FFManifestRow]> diagnostics-rows: [];
     in property <string> diagnostics-note: "";
@@ -649,6 +690,8 @@ export component AppWindow inherits Window {
         height: root.height - ShellGeometry.strip-height;
         unread: root.notifications-unread;
         center-open: root.notification-center-open;
+        calculator-open: root.calculator-open;
+        analytics-open: root.analytics-open;
 
         bell-activated => {
             root.bell-activated();
@@ -657,6 +700,8 @@ export component AppWindow inherits Window {
             }
         }
         settings-requested => { root.settings-open-requested(); }
+        calculator-activated => { root.calculator-toggled(); }
+        analytics-activated => { root.analytics-toggled(); }
     }
 
     bottom-bar := FFBottomBar {
@@ -736,6 +781,69 @@ export component AppWindow inherits Window {
         recent-clicked(i) => { root.projects-recent-clicked(i); }
     }
 
+    in property <bool> calculator-open: false;
+    in property <bool> calculator-objective: false;
+    in property <[string]> calculator-optics-labels: [];
+    in property <string> calculator-optics-selected: "";
+    in property <[CalculatorFieldView]> calculator-fields: [];
+    in property <[SummaryCell]> calculator-entered: [];
+    in property <[SummaryCell]> calculator-calculated: [];
+    in property <string> calculator-step: "";
+    in property <string> calculator-depth-of-field: "";
+    in property <string> calculator-frames: "";
+    in property <string> calculator-duration: "";
+    in property <int> calculator-planes: 13;
+    in property <float> calculator-overlap: 0.25;
+    out property <float> calculator-drawing-scale: calculator-overlay.drawing-scale;
+    callback calculator-toggled();
+    callback calculator-optics-chosen(string);
+    callback calculator-field-edited(int, string);
+
+    calculator-overlay := FFCalculatorOverlay {
+        x: ShellGeometry.icon-bar-width;
+        y: ShellGeometry.strip-height + ShellGeometry.toolbar-height;
+        width: root.width - ShellGeometry.dock-width - ShellGeometry.icon-bar-width;
+        height: root.height - ShellGeometry.strip-height - ShellGeometry.toolbar-height
+            - ShellGeometry.bottom-bar-height;
+        open: root.calculator-open;
+        objective: root.calculator-objective;
+        optics-labels: root.calculator-optics-labels;
+        optics-selected: root.calculator-optics-selected;
+        fields: root.calculator-fields;
+        entered: root.calculator-entered;
+        calculated: root.calculator-calculated;
+        step-text: root.calculator-step;
+        depth-of-field-text: root.calculator-depth-of-field;
+        frames-text: root.calculator-frames;
+        duration-text: root.calculator-duration;
+        planes: root.calculator-planes;
+        overlap: root.calculator-overlap;
+
+        close-requested => { root.calculator-toggled(); }
+        optics-chosen(label) => { root.calculator-optics-chosen(label); }
+        field-edited(slot, text) => { root.calculator-field-edited(slot, text); }
+    }
+
+    in property <bool> analytics-open: false;
+    in property <string> analytics-state: "waiting";
+    in property <[AnalyticsRowView]> analytics-rows: [];
+    in property <string> analytics-error: "";
+    callback analytics-toggled();
+
+    analytics-overlay := FFAnalyticsOverlay {
+        x: ShellGeometry.icon-bar-width;
+        y: ShellGeometry.strip-height + ShellGeometry.toolbar-height;
+        width: root.width - ShellGeometry.dock-width - ShellGeometry.icon-bar-width;
+        height: root.height - ShellGeometry.strip-height - ShellGeometry.toolbar-height
+            - ShellGeometry.bottom-bar-height;
+        open: root.analytics-open;
+        state: root.analytics-state;
+        rows: root.analytics-rows;
+        error: root.analytics-error;
+
+        close-requested => { root.analytics-toggled(); }
+    }
+
     notification-center := FFNotificationCenter {
         x: ShellGeometry.icon-bar-width;
         y: ShellGeometry.strip-height;
@@ -749,10 +857,7 @@ export component AppWindow inherits Window {
         diagnostics-requested(id) => { root.notification-diagnostics-requested(id); }
         selection-moved(delta) => { root.notification-selection-moved(delta); }
         expansion-toggled => { root.notification-expansion-toggled(); }
-        close-requested => {
-            root.notification-center-close-requested();
-            icon-bar.focus-bell();
-        }
+        close-requested => { root.notification-center-close-requested(); }
     }
 
     settings-modal := FFSettingsModal {
@@ -762,6 +867,8 @@ export component AppWindow inherits Window {
         height: root.height;
         settings-open: root.settings-open;
         input-rows: root.input-rows;
+        input-source: root.input-source;
+        input-problems: root.input-problems;
         settings-section: root.settings-section;
         performance: root.performance;
         appearance-presentation: root.appearance-presentation;
@@ -769,10 +876,19 @@ export component AppWindow inherits Window {
         appearance-menu-focused: root.appearance-menu-focused;
         appearance-menu-disabled: root.appearance-menu-disabled;
         appearance-save-error: root.appearance-save-error;
+        appearance-sharpness-heatmap: root.appearance-sharpness-heatmap;
+        appearance-reduce-motion: root.appearance-reduce-motion;
         appearance-presentation-selected(choice) => { root.appearance-presentation-selected(choice); }
+        appearance-sharpness-heatmap-toggled(on) => { root.appearance-sharpness-heatmap-toggled(on); }
+        appearance-reduce-motion-toggled(on) => { root.appearance-reduce-motion-toggled(on); }
         appearance-menu-toggled => { root.appearance-menu-toggled(); }
         storage: root.storage;
         about: root.about;
+        update-controls: root.update-controls;
+        update-check-on-start-toggled(on) => { root.update-check-on-start-toggled(on); }
+        update-check-now-requested => { root.update-check-now-requested(); }
+        update-skip-requested => { root.update-skip-requested(); }
+        update-page-requested => { root.update-page-requested(); }
         diagnostics-rows: root.diagnostics-rows;
         diagnostics-note: root.diagnostics-note;
         diagnostics-include-minidumps: root.diagnostics-include-minidumps;
@@ -794,8 +910,14 @@ export component AppWindow inherits Window {
         performance-gpu-toggled(on) => { root.performance-gpu-toggled(on); }
         performance-host-cap-edited(t) => { root.performance-host-cap-edited(t); }
         performance-vram-cap-edited(t) => { root.performance-vram-cap-edited(t); }
+        performance-cap-committed => { root.performance-cap-committed(); }
         performance-host-cap-cursor-moved(x, w) => { root.performance-host-cap-cursor-moved(x, w); }
         performance-vram-cap-cursor-moved(x, w) => { root.performance-vram-cap-cursor-moved(x, w); }
+        performance-host-unit-toggled => { root.performance-host-unit-toggled(); }
+        performance-vram-unit-toggled => { root.performance-vram-unit-toggled(); }
+        performance-host-unit-selected(u) => { root.performance-host-unit-selected(u); }
+        performance-vram-unit-selected(u) => { root.performance-vram-unit-selected(u); }
+        performance-unit-dismissed => { root.performance-unit-dismissed(); }
         storage-clear-requested => { root.storage-clear-requested(); }
         diagnostics-minidumps-toggled(v) => { root.diagnostics-minidumps-toggled(v); }
         diagnostics-destination-edited(t) => { root.diagnostics-destination-edited(t); }
@@ -810,16 +932,19 @@ export component AppWindow inherits Window {
     // The one grouping question and the two refusals the entry path can
     // produce.
     in property <bool> question-open: false;
-    in property <int> question-frame-count: 0;
+    in property <string> question-body;
     in property <int> question-project-count: 0;
     callback question-open-as-one();
     callback question-open-as-many();
     callback question-cancelled();
     in property <bool> refusal-open: false;
-    in property <string> refusal-title: "No frames here";
+    in property <string> refusal-title: "";
     in property <string> refusal-body: "";
-    in property <string> refusal-button-label: "Pick another folder…";
-    callback refusal-pick-another-folder();
+    in property <string> refusal-dismiss-label: "Close";
+    // Empty for a refusal that offers nothing beyond closing.
+    in property <string> refusal-confirm-label: "";
+    callback refusal-dismissed();
+    callback refusal-confirmed();
 
     // A saved project's source content disagrees with its recorded
     // fingerprint; the project stays unopened until a choice is made.
@@ -847,6 +972,7 @@ export component AppWindow inherits Window {
     in property <[string]> export-format-segments: [];
     in property <string> export-format-selected: "";
     in property <string> export-settings-heading: "";
+    in property <string> export-settings-note: "";
     in property <[ExportRowView]> export-rows: [];
     in property <bool> export-slider-group: false;
     in property <bool> export-metadata-on: true;
@@ -868,6 +994,7 @@ export component AppWindow inherits Window {
     // "info" | "warning" | "failure" | "crash".
     in property <string> toast-kind: "info";
     in property <string> toast-title: "";
+    in property <string> toast-link-label: "Open notification";
     callback toast-dismissed();
     callback toast-activated(int);
     // The pointer or the keyboard is on the toast.
@@ -881,8 +1008,10 @@ export component AppWindow inherits Window {
     in property <string> frame-warning-info: "";
     in property <string> frame-warning-confirm-label: "Confirm";
     in property <string> frame-warning-secondary-label: "";
+    in property <string> frame-warning-tertiary-label: "";
     callback frame-warning-cancelled();
     callback frame-warning-secondary-pressed();
+    callback frame-warning-tertiary-pressed();
     callback frame-warning-confirmed();
 
     // Keep or discard a run whose alignment left some frames unregistered.
@@ -921,6 +1050,53 @@ export component AppWindow inherits Window {
         } else {
             canvas-ground.focus();
         }
+    }
+
+    // A closing notification center, calculator or Settings may hold keyboard
+    // focus (the center's key scope, an entry box, the Settings content,
+    // which stays drawn while it fades out); the canvas takes it back so
+    // Escape reaches `chrome_key`, unless a dialog or Settings owns it.
+    function return-focus-to-canvas() {
+        if !root.dialog-open && !root.settings-open {
+            canvas-ground.focus();
+        }
+    }
+
+    changed settings-open => {
+        if !root.settings-open {
+            root.return-focus-to-canvas();
+        }
+    }
+
+    changed notification-center-open => {
+        if !root.notification-center-open {
+            root.return-focus-to-canvas();
+        }
+    }
+
+    changed calculator-open => {
+        if !root.calculator-open {
+            root.return-focus-to-canvas();
+        }
+    }
+
+    // The window's key handling for the canvas and for every focus holder
+    // that rejects a key. `reject` so the chrome accelerators still reach the
+    // parent; `key-pressed` auto-repeats while a key is held, which
+    // `AppController::set_space_held`'s idempotence absorbs.
+    function window-key-pressed(event: KeyEvent) -> EventResult {
+        if event.text == Key.Escape && root.dismiss-front-dialog() {
+            return accept;
+        }
+        root.canvas-key-pressed(event.text, event.modifiers.control, event.modifiers.shift,
+            event.modifiers.alt);
+        return reject;
+    }
+
+    function window-key-released(event: KeyEvent) -> EventResult {
+        root.canvas-key-released(event.text, event.modifiers.control, event.modifiers.shift,
+            event.modifiers.alt);
+        return reject;
     }
 
     // Raises the cancel of the front-most dialog, in paint order, and
@@ -974,7 +1150,7 @@ export component AppWindow inherits Window {
         width: root.width;
         height: root.height;
         question-open: root.question-open;
-        frame-count: root.question-frame-count;
+        body: root.question-body;
         project-count: root.question-project-count;
         open-as-one => { root.question-open-as-one(); }
         open-as-many => { root.question-open-as-many(); }
@@ -1020,6 +1196,7 @@ export component AppWindow inherits Window {
         format-segments: root.export-format-segments;
         format-selected: root.export-format-selected;
         settings-heading: root.export-settings-heading;
+        settings-note: root.export-settings-note;
         rows: root.export-rows;
         slider-group: root.export-slider-group;
         metadata-on: root.export-metadata-on;
@@ -1043,11 +1220,13 @@ export component AppWindow inherits Window {
         y: 0px;
         width: root.width;
         height: root.height;
-        refusal-open: root.refusal-open;
+        open: root.refusal-open;
         title: root.refusal-title;
         body: root.refusal-body;
-        button-label: root.refusal-button-label;
-        pick-another-folder => { root.refusal-pick-another-folder(); }
+        cancel-label: root.refusal-dismiss-label;
+        confirm-label: root.refusal-confirm-label;
+        cancelled => { root.refusal-dismissed(); }
+        confirmed => { root.refusal-confirmed(); }
     }
 
     toast := FFToast {
@@ -1056,6 +1235,7 @@ export component AppWindow inherits Window {
         toast-open: root.toast-open;
         title: root.toast-title;
         kind: root.toast-kind;
+        link-label: root.toast-link-label;
         dismissed => { root.toast-dismissed(); }
         link-activated => {
             root.toast-activated(root.toast-id);
@@ -1077,8 +1257,10 @@ export component AppWindow inherits Window {
         info: root.frame-warning-info;
         confirm-label: root.frame-warning-confirm-label;
         secondary-label: root.frame-warning-secondary-label;
+        tertiary-label: root.frame-warning-tertiary-label;
         cancelled => { root.frame-warning-cancelled(); }
         secondary-pressed => { root.frame-warning-secondary-pressed(); }
+        tertiary-pressed => { root.frame-warning-tertiary-pressed(); }
         confirmed => { root.frame-warning-confirmed(); }
     }
 

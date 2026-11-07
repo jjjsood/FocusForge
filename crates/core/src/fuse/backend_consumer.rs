@@ -15,7 +15,7 @@ use crate::algorithm::{AlgorithmError, TileCtx, TileReader};
 use crate::align::{Transform, WarpingReader};
 use crate::fuse::FusionConsumer;
 use crate::gpu::TileBackend;
-use crate::tile::{NoopPreprocess, TileConsumer, TileJob};
+use crate::tile::{NoopPreprocess, SampleFormat, TileConsumer, TileJob};
 
 /// Joins a [`TileBackend`] to a [`FusionConsumer`] sink: `consume` calls
 /// [`TileBackend::warp_fuse_tile`] over the **raw** `reader` (never a
@@ -95,33 +95,49 @@ impl<'a> BackendFusionConsumer<'a> {
     }
 }
 
+impl BackendFusionConsumer<'_> {
+    /// The device is re-checked on every error, whatever its shape: the first
+    /// call after a loss can fail anywhere between allocating a buffer and
+    /// reading the result back. An error raised while the device is still
+    /// healthy is a genuine failure and propagates.
+    fn backend_failed(&self, job: &TileJob<'_>, err: AlgorithmError) -> Result<(), AlgorithmError> {
+        if self.backend.device_lost() {
+            self.consume_on_host(job)
+        } else {
+            Err(err)
+        }
+    }
+}
+
 impl TileConsumer for BackendFusionConsumer<'_> {
     fn consume(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
         if self.backend.device_lost() {
             return self.consume_on_host(job);
         }
-        let output = match self.backend.warp_fuse_tile(
-            self.reader,
-            self.frame,
-            &self.transforms,
-            job.read_rect(),
-            self.samples_per_pixel,
-            self.levels,
-        ) {
-            Ok(output) => output,
-            // The device is re-checked on every error, whatever its shape:
-            // the first call after a loss can fail anywhere between
-            // allocating a buffer and reading the result back. An error
-            // raised while the device is still healthy is a genuine failure
-            // and propagates.
-            Err(err) => {
-                if self.backend.device_lost() {
-                    return self.consume_on_host(job);
-                }
-                return Err(err);
-            }
-        };
-        self.sink.write_output(job, &output)
+        match self.sink.format() {
+            SampleFormat::U16 => match self.backend.warp_fuse_tile(
+                self.reader,
+                self.frame,
+                &self.transforms,
+                job.read_rect(),
+                self.samples_per_pixel,
+                self.levels,
+            ) {
+                Ok(output) => self.sink.write_output(job, &output),
+                Err(err) => self.backend_failed(job, err),
+            },
+            SampleFormat::F32 => match self.backend.warp_fuse_tile_f32(
+                self.reader,
+                self.frame,
+                &self.transforms,
+                job.read_rect(),
+                self.samples_per_pixel,
+                self.levels,
+            ) {
+                Ok(output) => self.sink.write_output_f32(job, &output),
+                Err(err) => self.backend_failed(job, err),
+            },
+        }
     }
 
     fn supplies_own_pixels(&self) -> bool {

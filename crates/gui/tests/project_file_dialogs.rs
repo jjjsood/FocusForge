@@ -8,6 +8,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
@@ -16,7 +17,7 @@ use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{self, Metrics, SealRequest};
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use focusforge_gui::entry::LocateTarget;
-use focusforge_gui::{AppController, OpenOutcome};
+use focusforge_gui::{AppController, OpenOutcome, RefusalAction};
 
 const SPP: u32 = 3;
 const W: u32 = 8;
@@ -490,4 +491,325 @@ fn refusals_report_their_cause_and_open_nothing() {
         seen["tampered_zmap"], seen["missing_entry"],
         "hash, missing-entry and structural damage share one sentence"
     );
+}
+
+/// The refusal a controller is showing: its own title and what it offers.
+fn refusal(controller: &AppController) -> (String, RefusalAction) {
+    (
+        controller
+            .refusal_title()
+            .expect("a refusal is raised")
+            .to_string(),
+        controller.refusal_action().expect("a refusal is raised"),
+    )
+}
+
+/// Copies every `.tif` of a sealed project's directory into a fresh
+/// directory, so the frames can be deleted and then located again.
+fn copy_frames(from: &Path, to_name: &str) -> PathBuf {
+    let to = common::tree(to_name);
+    for entry in std::fs::read_dir(from).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "tif") {
+            std::fs::copy(&path, to.join(path.file_name().unwrap())).unwrap();
+        }
+    }
+    to
+}
+
+#[test]
+fn refusal_titles_name_their_own_cause() {
+    use RefusalAction::{Close, PickFolder};
+    let check = |name: &str, controller: &AppController, title: &str, action: RefusalAction| {
+        assert_eq!(
+            refusal(controller),
+            (title.to_string(), action),
+            "{name}: the refusal's own title and offer"
+        );
+    };
+
+    let mut controller = AppController::new();
+    let empty = common::tree("refusal_titles_empty");
+    common::open_and_settle(&mut controller, &[empty]);
+    check("empty folder", &controller, "No frames here", PickFolder);
+
+    let set = common::tree("refusal_titles_sets");
+    write_frame(&set.join("00.tif"), 1);
+    let note = set.join("notes.txt");
+    std::fs::write(&note, b"not a frame").unwrap();
+    let mut controller = AppController::new();
+    assert!(controller.open_paths(&[set.join("00.tif"), note]).is_none());
+    check("text file", &controller, "No frames here", PickFolder);
+
+    #[cfg(unix)]
+    if let Some(root) = common::readonly_dir("refusal_titles_unreadable", 0o000, |_| {}) {
+        let mut controller = AppController::new();
+        common::open_and_settle(&mut controller, &[root.to_path_buf()]);
+        check(
+            "unreadable folder",
+            &controller,
+            "This folder cannot be read",
+            PickFolder,
+        );
+    }
+
+    let raw = set.join("raw.dng");
+    std::fs::copy(
+        common::workspace_root().join("fixtures/blackmagic-micro-dng/frame.dng"),
+        &raw,
+    )
+    .unwrap();
+    let mut controller = AppController::new();
+    assert!(controller.open_paths(&[set.join("00.tif"), raw]).is_none());
+    check(
+        "mixed kinds",
+        &controller,
+        "These images are not one stack",
+        Close,
+    );
+
+    let other = common::tree("refusal_titles_other_folder");
+    write_frame(&other.join("00.tif"), 2);
+    let mut controller = AppController::new();
+    assert!(
+        controller
+            .open_paths(&[set.join("00.tif"), other.join("00.tif")])
+            .is_none()
+    );
+    check(
+        "several folders",
+        &controller,
+        "These images are not one stack",
+        Close,
+    );
+
+    let bigtiff = common::tree("refusal_titles_bigtiff");
+    std::fs::write(bigtiff.join("00.tif"), b"II+\0\x08\0\0\0").unwrap();
+    std::fs::write(bigtiff.join("01.tif"), b"MM\0+\0\x08\0\0").unwrap();
+    let mut controller = AppController::new();
+    common::open_and_settle(&mut controller, &[bigtiff]);
+    check(
+        "BigTIFF header",
+        &controller,
+        "These frames cannot be read",
+        Close,
+    );
+
+    let bad = common::tree("refusal_titles_corrupt").join("bad.ffp");
+    std::fs::write(&bad, b"not a zip container").unwrap();
+    let mut controller = AppController::new();
+    common::open_and_settle(&mut controller, &[bad]);
+    check(
+        "corrupt project",
+        &controller,
+        "This project cannot be opened",
+        Close,
+    );
+
+    let (dir, project_path) = sealed("refusal_titles_saved", 2);
+    let mut controller = AppController::new();
+    common::open_and_settle(&mut controller, &[project_path]);
+    let id = controller.tab_id_at(0).unwrap();
+    let wrong = common::tree("refusal_titles_wrong_folder");
+    for name in ["frame-00.tif", "frame-01.tif"] {
+        std::fs::write(wrong.join(name), b"not the right bytes at all").unwrap();
+    }
+    common::locate_and_settle(&mut controller, LocateTarget::Tab(id), wrong);
+    check(
+        "wrong locate folder",
+        &controller,
+        "These are not the project's frames",
+        Close,
+    );
+
+    std::fs::remove_file(dir.join("frame-00.tif")).unwrap();
+    assert!(!controller.start_fuse());
+    check(
+        "deleted frame",
+        &controller,
+        "A frame is no longer there",
+        RefusalAction::LocateTab(id),
+    );
+
+    // The right frames are located, then the project file goes before it is
+    // reopened.
+    let (dir, project_path) = sealed("refusal_titles_relocated", 2);
+    let good = copy_frames(&dir, "refusal_titles_relocated_good");
+    common::rewrite_changed(&dir.join("frame-00.tif"));
+    let mut controller = AppController::new();
+    let outcome = common::open_and_settle(&mut controller, std::slice::from_ref(&project_path));
+    assert!(matches!(outcome, OpenOutcome::Mismatch(_)));
+    controller
+        .locate_frames(LocateTarget::Mismatch, good)
+        .expect("a mismatch is pending to locate against")
+        .join()
+        .expect("the locate worker did not panic");
+    std::fs::remove_file(&project_path).unwrap();
+    controller.settle_locate();
+    check(
+        "relocated project that cannot reopen",
+        &controller,
+        "This project cannot be opened",
+        Close,
+    );
+    assert_eq!(
+        controller.last_refusal(),
+        Some("demo.ffp could not be reopened after its frames were located."),
+        "relocated project that cannot reopen: the body names the project file"
+    );
+
+    let mut controller = common::controller_with_frames("refusal_titles_algorithm", 2);
+    controller.set_fuse_algorithm("no-such-method");
+    assert!(!controller.start_fuse());
+    check(
+        "unresolved algorithm",
+        &controller,
+        "This run cannot start",
+        Close,
+    );
+
+    let mut controller = common::controller_with_frames("refusal_titles_memory", 2);
+    controller.set_host_memory_cap("1");
+    controller.set_published_preview_bytes(1);
+    assert!(!controller.start_fuse());
+    check(
+        "source-preview memory",
+        &controller,
+        "This run cannot start",
+        Close,
+    );
+}
+
+/// Starts the active tab's run, slowed so it can be paused part-way, and
+/// pauses it: a live run for a later tab to queue behind.
+fn hold_run_paused(controller: &mut AppController) {
+    controller.set_slow_run(1, Duration::from_secs(2));
+    assert!(controller.start_fuse());
+    let start = Instant::now();
+    while controller.job_view().fraction <= 0.0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "the run never ticked progress"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    controller.pause_or_resume();
+}
+
+#[test]
+fn missing_frame_refusal_offers_locate() {
+    let (dir, project_path) = sealed("missing_frame_locate", 3);
+    let copies = copy_frames(&dir, "missing_frame_locate_copies");
+    let mut controller = AppController::new();
+    common::open_and_settle(&mut controller, &[project_path]);
+    let id = controller.tab_id_at(0).unwrap();
+    std::fs::remove_file(dir.join("frame-01.tif")).unwrap();
+
+    assert!(!controller.start_fuse());
+    assert_eq!(
+        refusal(&controller),
+        (
+            "A frame is no longer there".to_string(),
+            RefusalAction::LocateTab(id)
+        )
+    );
+    let body = controller.last_refusal().unwrap();
+    assert!(body.contains("frame-01.tif"), "the file is named: {body}");
+    assert!(controller.images_panel().rows.iter().any(|r| r.unresolved));
+
+    // A folder without the project's frames relocates nothing.
+    let wrong = common::tree("missing_frame_locate_wrong");
+    for name in ["frame-00.tif", "frame-01.tif", "frame-02.tif"] {
+        std::fs::write(wrong.join(name), b"not the right bytes at all").unwrap();
+    }
+    common::locate_and_settle(&mut controller, LocateTarget::Tab(id), wrong);
+    assert_eq!(
+        controller.refusal_title(),
+        Some("These are not the project's frames")
+    );
+    assert!(controller.images_panel().rows.iter().any(|r| r.unresolved));
+
+    // A folder holding them relocates this tab and opens no other.
+    common::locate_and_settle(&mut controller, LocateTarget::Tab(id), copies);
+    assert_eq!(controller.project_tabs().len(), 1, "no new tab opens");
+    assert!(controller.images_panel().rows.iter().all(|r| !r.unresolved));
+    assert_eq!(controller.gallery_failure_kind(0), None);
+
+    // Never saved: nothing to check a folder against, so only Close.
+    let mut unsaved = common::controller_with_frames("missing_frame_unsaved", 2);
+    let frames = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("missing_frame_unsaved_frames");
+    std::fs::remove_file(frames.join("00.tif")).unwrap();
+    assert!(!unsaved.start_fuse());
+    assert_eq!(
+        refusal(&unsaved),
+        (
+            "A frame is no longer there".to_string(),
+            RefusalAction::Close
+        )
+    );
+}
+
+#[test]
+fn queued_missing_frame_refusal_locates_the_queued_tab() {
+    let mut controller = common::controller_with_frames("queued_missing_frame", 2);
+    let running = controller.tab_id_at(0).unwrap();
+    hold_run_paused(&mut controller);
+
+    let (dir, project_path) = sealed("queued_missing_frame_saved", 2);
+    common::open_and_settle(&mut controller, &[project_path]);
+    let queued = controller.tab_id_at(1).unwrap();
+    assert_ne!(queued, running);
+    assert!(
+        controller.start_fuse(),
+        "the saved tab queues behind the run"
+    );
+    std::fs::remove_file(dir.join("frame-00.tif")).unwrap();
+
+    controller.select_project(0);
+    controller.pause_or_resume();
+    common::wait_for_settle(&mut controller, Duration::from_secs(120));
+
+    assert_eq!(
+        refusal(&controller),
+        (
+            "A frame is no longer there".to_string(),
+            RefusalAction::LocateTab(queued)
+        ),
+        "the locate targets the queued tab, not the active one"
+    );
+}
+
+#[test]
+fn both_source_dialogs_name_the_project_file_alike() {
+    let fixtures = common::workspace_root().join("fixtures/projects");
+    // The fixtures' frames sit beside the projects, as they do in place.
+    let dir = common::tree("source_dialogs_alike");
+    std::fs::create_dir_all(dir.join("frames")).unwrap();
+    for frame in std::fs::read_dir(fixtures.join("frames")).unwrap() {
+        let frame = frame.unwrap().path();
+        std::fs::copy(&frame, dir.join("frames").join(frame.file_name().unwrap())).unwrap();
+    }
+    for (fixture, copy) in [
+        ("missing.ffp", "missing.ffp"),
+        ("missing.ffp", "other name.ffp"),
+        ("mismatch.ffp", "mismatch.ffp"),
+        ("mismatch.ffp", "other name.ffp"),
+    ] {
+        let path = dir.join(copy);
+        std::fs::copy(fixtures.join(fixture), &path).unwrap();
+        let mut controller = AppController::new();
+        let outcome = common::open_and_settle(&mut controller, &[path]);
+        let file_name = if fixture == "missing.ffp" {
+            assert!(matches!(outcome, OpenOutcome::Opened(_)), "{copy}");
+            assert_eq!(
+                controller.project_tabs()[0].title,
+                copy.trim_end_matches(".ffp")
+            );
+            controller.sources_notice().expect("sources are missing").2
+        } else {
+            assert!(matches!(outcome, OpenOutcome::Mismatch(_)), "{copy}");
+            controller.mismatch_copy().expect("a mismatch is pending").2
+        };
+        assert_eq!(file_name, copy, "{fixture} opened as {copy}");
+    }
 }

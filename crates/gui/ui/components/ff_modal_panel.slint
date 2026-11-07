@@ -4,9 +4,10 @@
 // its content placed as this component's children.
 
 import { Theme } from "../theme.slint";
+import { FFAppear } from "ff_appear.slint";
 import { FFIconButton } from "ff_icon_button.slint";
 
-export component FFModalPanel inherits Rectangle {
+export component FFModalPanel inherits FFAppear {
     in property <bool> modal-open: false;
     in property <length> panel-width: 480px;
     in property <length> panel-height: 300px;
@@ -21,7 +22,8 @@ export component FFModalPanel inherits Rectangle {
     out property <length> close-reserve: root.show-close ? Theme.icon-md + 2 * Theme.space-2 : 0px;
     callback close-requested();
 
-    visible: root.modal-open;
+    shown: root.modal-open;
+    fade-out: true;
     width: 100%;
     height: 100%;
 

@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The accent pill that slides under the active half of the mode switch.
+
+import { Theme } from "../theme.slint";
+
+export component FFModePill inherits Rectangle {
+    background: Theme.accent-default;
+    border-radius: min(Theme.radius-full, self.height / 2);
+}

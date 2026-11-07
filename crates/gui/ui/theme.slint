@@ -114,6 +114,7 @@ export global Theme {
     out property <length> space-12: 48px;
 
     // Radii -- a flat scale, deliberately not the brand's 22% corner.
+    out property <length> radius-xs: 2px;
     out property <length> radius-sm: 3px;
     out property <length> radius-md: 5px;
     out property <length> radius-lg: 8px;
@@ -125,12 +126,28 @@ export global Theme {
     out property <length> icon-md: 16px;
     out property <length> icon-sm: 14px;
 
-    // Motion animates the tab strip's scroll. An easing cannot be a
-    // property, so every `animate` using motion-fast pairs it with ease-out.
-    out property <duration> motion-fast: 150ms;
+    // Reduced motion: the two motion tokens read 0 ms and every animation
+    // using them finishes at once.
+    in-out property <bool> reduce-motion: false;
+    // An easing cannot be a property, so every `animate` using motion-fast
+    // pairs it with ease-out.
+    out property <duration> motion-fast: reduce-motion ? 0ms : 150ms;
     // A slower fade for a notice that must be readable while it moves, not
-    // just acknowledged -- the failure toast's own appear/disappear.
-    out property <duration> motion-slow: 400ms;
+    // just acknowledged -- the toast's own appear/disappear.
+    out property <duration> motion-slow: reduce-motion ? 0ms : 400ms;
+    // How long a checkpoint row's tint holds before it falls; reduced motion
+    // leaves it, so the cue stays when the fall is a cut.
+    out property <duration> flash-hold: 150ms;
+    // The loading clocks, read from `animation-tick()`. The spinner ring
+    // turns once per second; the indeterminate sweep switches sides every
+    // 900 ms. With Reduce motion on, the angle is 0deg and the sweep stays
+    // left.
+    out property <angle> spinner-angle: reduce-motion
+        ? 0deg
+        : mod(animation-tick() / 1ms, 1000.0) / 1000.0 * 360deg;
+    out property <bool> sweep-right: reduce-motion
+        ? false
+        : mod(animation-tick() / 1ms, 1800.0) >= 900.0;
 }
 
 // Empty on purpose: a handle so a test can reach a global.

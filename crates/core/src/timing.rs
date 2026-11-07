@@ -9,7 +9,7 @@
 //!
 //! Every figure is **wall clock, in seconds**, from one process's own
 //! [`std::time::Instant`] -- never CPU time; CPU-time attribution stays in
-//! `/usr/bin/time -v` output outside this schema. The five [`Stage`]s a
+//! `/usr/bin/time -v` output outside this schema. The six [`Stage`]s a
 //! [`StageTimer`] tracks are **contiguous and disjoint by construction**:
 //! each `mark` closes the span since the previous `mark` (or since `new()`)
 //! and opens the next, so the non-`None` figures a finished
@@ -24,9 +24,12 @@
 //! a claim about how much work happened. A per-tile read/fuse/write split
 //! does not exist as a clean seam -- those three
 //! interleave inside one parallel tile loop by design
-//! (`crate::tile::scheduler::TileScheduler::run`) -- so the five true
-//! sequential seams (setup / align / prepare / fuse / finalize, with
-//! `prepare` folded into `fuse`) are what this module measures, no finer.
+//! (`crate::tile::scheduler::TileScheduler::run`) -- so the true sequential
+//! seams (`setup` / `develop` / `align` / `fuse` / `warp_write` /
+//! `finalize`) are what this module measures, no finer. Brightness
+//! preparation has no key of its own: it is counted inside `setup`, as is
+//! everything else before alignment except the RAW develop pass, which
+//! `develop` carries.
 //!
 //! # `None` versus `Some(0.0)`
 //!
@@ -758,6 +761,9 @@ pub enum Stage {
     /// parameters, the fingerprint, brightness preparation and stage-cache
     /// lookups.
     Setup,
+    /// Developing every RAW frame into scratch before anything reads them.
+    /// Never entered by a stack that has nothing to develop up front.
+    Develop,
     /// Producing this run's [`crate::align::StackAlignment`] -- computed,
     /// reused from `--resume`'s ledger peek, reused from the stage cache,
     /// or never entered at all under `--no-align`.
@@ -781,6 +787,7 @@ impl Stage {
     fn name(self) -> &'static str {
         match self {
             Stage::Setup => "setup",
+            Stage::Develop => "develop",
             Stage::Align => "align",
             Stage::Fuse => "fuse",
             Stage::WarpWrite => "warp_write",
@@ -805,11 +812,13 @@ pub struct StageTimer {
     last: Instant,
     clock_reads: u32,
     setup: f64,
+    develop: f64,
     align: f64,
     fuse: f64,
     warp_write: f64,
     finalize: f64,
     setup_entered: bool,
+    develop_entered: bool,
     align_entered: bool,
     fuse_entered: bool,
     warp_write_entered: bool,
@@ -835,11 +844,13 @@ impl StageTimer {
             last: started,
             clock_reads: 1,
             setup: 0.0,
+            develop: 0.0,
             align: 0.0,
             fuse: 0.0,
             warp_write: 0.0,
             finalize: 0.0,
             setup_entered: false,
+            develop_entered: false,
             align_entered: false,
             fuse_entered: false,
             warp_write_entered: false,
@@ -872,6 +883,10 @@ impl StageTimer {
             Stage::Setup => {
                 self.setup += elapsed;
                 self.setup_entered = true;
+            }
+            Stage::Develop => {
+                self.develop += elapsed;
+                self.develop_entered = true;
             }
             Stage::Align => {
                 self.align += elapsed;
@@ -917,6 +932,7 @@ impl StageTimer {
     pub fn finish(self) -> StageTimings {
         StageTimings {
             setup: self.setup_entered.then_some(self.setup),
+            develop: self.develop_entered.then_some(self.develop),
             align: self.align_entered.then_some(self.align),
             fuse: self.fuse_entered.then_some(self.fuse),
             warp_write: self.warp_write_entered.then_some(self.warp_write),
@@ -1180,6 +1196,7 @@ mod accounting_tests {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct StageTimings {
     pub setup: Option<f64>,
+    pub develop: Option<f64>,
     pub align: Option<f64>,
     pub fuse: Option<f64>,
     pub warp_write: Option<f64>,

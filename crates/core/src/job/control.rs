@@ -10,7 +10,7 @@
 //! impl` anywhere in this module.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::tile::TileControl;
@@ -94,8 +94,19 @@ pub struct JobControl {
     /// running clock does not tick before fuse, so the prepare ETA needs its
     /// own origin.
     prepare_start_nanos: AtomicU64,
+    /// How many RAW frames are developed into scratch during the develop
+    /// stage -- shared through [`Self::begin_develop`].
+    develop_done: Arc<AtomicUsize>,
+    /// The frame count the develop stage started with; `0` until
+    /// [`Self::begin_develop`] is called.
+    develop_total: AtomicUsize,
+    /// Offset from [`Self::epoch`] at which the develop stage began; like
+    /// prepare, it runs before the running clock ticks.
+    develop_start_nanos: AtomicU64,
     /// The live admission cap; [`NO_CAP`] when none is set.
     admission_cap: AtomicUsize,
+    /// Whether every admission check waits until released.
+    held: AtomicBool,
     /// Nanoseconds of running time every fuse-stage admission check waits
     /// for; `0` means none.
     min_running_nanos: AtomicU64,
@@ -125,7 +136,11 @@ impl JobControl {
             prepare_done: Arc::new(AtomicUsize::new(0)),
             prepare_total: AtomicUsize::new(0),
             prepare_start_nanos: AtomicU64::new(0),
+            develop_done: Arc::new(AtomicUsize::new(0)),
+            develop_total: AtomicUsize::new(0),
+            develop_start_nanos: AtomicU64::new(0),
             admission_cap: AtomicUsize::new(NO_CAP),
+            held: AtomicBool::new(false),
             min_running_nanos: AtomicU64::new(0),
         })
     }
@@ -137,6 +152,18 @@ impl JobControl {
     pub fn set_admission_cap(&self, cap: Option<usize>) {
         self.admission_cap
             .store(cap.map_or(NO_CAP, |c| c.max(1)), Ordering::SeqCst);
+    }
+
+    /// While held, [`TileControl::should_stop`] waits in short slices before
+    /// letting any further unit start, and returns at once on a pause or
+    /// cancel; work already begun finishes. Releasing resumes where it stood.
+    pub fn set_held(&self, held: bool) {
+        self.held.store(held, Ordering::SeqCst);
+    }
+
+    /// Whether the control is held, see [`Self::set_held`].
+    pub fn held(&self) -> bool {
+        self.held.load(Ordering::SeqCst)
     }
 
     /// Holds the fuse stage until this job's running time (pauses excluded)
@@ -239,6 +266,17 @@ impl JobControl {
         Arc::clone(&self.prepare_done)
     }
 
+    /// Starts the develop stage: stores `frames` as its total, zeroes the
+    /// counter, stamps the stage's start and hands back the shared counter
+    /// the develop pass credits as each frame lands in scratch.
+    pub(crate) fn begin_develop(&self, frames: usize) -> Arc<AtomicUsize> {
+        self.develop_done.store(0, Ordering::SeqCst);
+        self.develop_total.store(frames, Ordering::SeqCst);
+        self.develop_start_nanos
+            .store(self.epoch.elapsed().as_nanos() as u64, Ordering::SeqCst);
+        Arc::clone(&self.develop_done)
+    }
+
     /// A plain snapshot, returned by value -- polled, never pushed.
     ///
     /// Every field is **live**: `units_done`/`pixels_done` are credited by
@@ -248,7 +286,7 @@ impl JobControl {
     /// during the run rather than seeing them jump at the end of it.
     ///
     /// `eta` follows the stage: the per-frame rate (pauses excluded) during
-    /// Prepare and a computed Align, `None` once every align frame is done,
+    /// Develop, Prepare and a computed Align, `None` once every align frame is done,
     /// and the pixel rate otherwise.
     pub fn progress(&self) -> JobProgress {
         let units_done = self.units_done.load(Ordering::SeqCst);
@@ -259,6 +297,8 @@ impl JobControl {
         let stage = JobStage::from_u8(self.stage.load(Ordering::SeqCst));
         let prepare_done = self.prepare_done.load(Ordering::SeqCst);
         let prepare_total = self.prepare_total.load(Ordering::SeqCst);
+        let develop_done = self.develop_done.load(Ordering::SeqCst);
+        let develop_total = self.develop_total.load(Ordering::SeqCst);
         let align_done = self.align_done.load(Ordering::SeqCst);
         let align_total = self.align_total.load(Ordering::SeqCst);
         let eta = if stage == JobStage::Align {
@@ -284,6 +324,14 @@ impl JobControl {
                 prepare_total as u64,
                 Duration::from_nanos(elapsed.saturating_sub(started)),
             )
+        } else if stage == JobStage::Develop {
+            let started = self.develop_start_nanos.load(Ordering::SeqCst);
+            let elapsed = self.epoch.elapsed().as_nanos() as u64;
+            eta(
+                develop_done as u64,
+                develop_total as u64,
+                Duration::from_nanos(elapsed.saturating_sub(started)),
+            )
         } else {
             eta(pixels_done, pixel_total, running)
         };
@@ -299,6 +347,8 @@ impl JobControl {
             align_total,
             prepare_done,
             prepare_total,
+            develop_done,
+            develop_total,
         }
     }
 
@@ -363,6 +413,10 @@ impl TileControl for JobControl {
         loop {
             if self.state() != ControlState::Running {
                 return true;
+            }
+            if self.held() {
+                std::thread::sleep(SLICE);
+                continue;
             }
             let short = floor.saturating_sub(self.running_now());
             if short.is_zero() {
@@ -533,6 +587,41 @@ mod tests {
             control.progress().eta,
             None,
             "outside Prepare the ETA is the pixel one"
+        );
+    }
+
+    #[test]
+    fn develop_eta_follows_the_frame_rate() {
+        let control = JobControl::new();
+        assert_eq!(control.progress().develop_total, 0);
+
+        let counter = control.begin_develop(5);
+        control.set_stage(JobStage::Develop);
+        let p = control.progress();
+        assert_eq!(
+            (p.stage, p.develop_done, p.develop_total),
+            (JobStage::Develop, 0, 5)
+        );
+        assert_eq!(p.eta, None, "no frame has completed");
+
+        std::thread::sleep(Duration::from_millis(5));
+        counter.fetch_add(1, Ordering::SeqCst);
+        let p = control.progress();
+        assert_eq!(p.develop_done, 1);
+        assert!(p.eta.is_some_and(|d| d > Duration::ZERO), "{:?}", p.eta);
+
+        counter.fetch_add(4, Ordering::SeqCst);
+        assert_eq!(control.progress().eta, Some(Duration::ZERO));
+
+        let restarted = control.begin_develop(2);
+        assert_eq!(restarted.load(Ordering::SeqCst), 0);
+        assert_eq!(control.progress().develop_total, 2);
+
+        control.set_stage(JobStage::Fuse);
+        assert_eq!(
+            control.progress().eta,
+            None,
+            "outside Develop the ETA is the pixel one"
         );
     }
 

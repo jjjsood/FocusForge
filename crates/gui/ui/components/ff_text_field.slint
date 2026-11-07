@@ -5,6 +5,9 @@
 // grows the control by 2 px on every edge, like every focusable control.
 // Only height follows state; width is the caller's. `placeholder` is muted
 // text drawn only while the input itself is empty; typing replaces it.
+// `input-type` restricts the accepted characters (`InputType.number`: digits
+// only). `takes-pushed-text-on-commit` re-applies `text` after each commit, so
+// a value the caller pushes back replaces what the user typed.
 
 import { Theme } from "../theme.slint";
 
@@ -12,6 +15,8 @@ export component FFTextField inherits Rectangle {
     in property <string> text: "";
     in property <string> placeholder: "";
     in property <bool> enabled: true;
+    in property <InputType> input-type: InputType.text;
+    in property <bool> takes-pushed-text-on-commit: false;
     in property <string> tone: "neutral"; // "neutral" | "warning" | "failure"
     in property <length> field-width: 110px;
     // Pushed back by the caller in response to `cursor-moved`, so text
@@ -19,6 +24,8 @@ export component FFTextField inherits Rectangle {
     // spilling past the border.
     in property <length> scroll-offset: 0px;
     callback edited(string);
+    // Enter, or the field losing focus.
+    callback committed();
     // The cursor's new x position and the field's visible text width, both
     // measured from the field's own unscrolled left edge.
     callback cursor-moved(length, length);
@@ -30,6 +37,11 @@ export component FFTextField inherits Rectangle {
             ? Theme.status-failure
             : Theme.border-strong;
     property <length> viewport-width: max(0px, root.width - 2 * Theme.space-2);
+
+    // Shows `text` as the caller pushed it, over whatever was typed.
+    public function take-pushed-text() {
+        input.text = root.text;
+    }
 
     width: root.field-width + (root.emphasised ? 4px : 0px);
     height: root.emphasised ? 32px : 28px;
@@ -62,8 +74,19 @@ export component FFTextField inherits Rectangle {
         font-size: Theme.text-body.size;
         vertical-alignment: center;
         single-line: true;
+        input-type: root.input-type;
 
         edited => { root.edited(self.text); }
+        accepted => {
+            root.committed();
+            if root.takes-pushed-text-on-commit { root.take-pushed-text(); }
+        }
+        changed has-focus => {
+            if !self.has-focus {
+                root.committed();
+                if root.takes-pushed-text-on-commit { root.take-pushed-text(); }
+            }
+        }
         cursor-position-changed(position) => { root.cursor-moved(position.x, root.viewport-width); }
     }
 }

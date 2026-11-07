@@ -7,11 +7,12 @@
 //! export band, gives compression and 8-bit rounding something to do.
 
 mod common;
+
+use common::{bin, partial_of};
 #[path = "../../core/tests/common/raw_dng.rs"]
 mod raw_dng;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use focusforge_core::align::{Registration, Transform};
 use focusforge_core::io::test_frames::{
@@ -25,10 +26,6 @@ use focusforge_core::project::export::to_8bit;
 use focusforge_core::project::{self, AlignRecord, Metrics, Op, Point, SealRequest};
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use raw_dng::{DngSpec, write_dng};
-
-fn bin() -> Command {
-    common::cli_bin("export_formats")
-}
 
 struct CliOutput {
     success: bool,
@@ -47,12 +44,6 @@ fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
-}
-
-fn partial_of(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap().to_os_string();
-    name.push(".partial");
-    path.with_file_name(name)
 }
 
 fn assert_refused(dir: &Path, args: &[&str], out: &Path) {
@@ -1114,15 +1105,24 @@ fn build_raw_metadata_synth(name: &str, make: &str, model: &str) -> (common::Tmp
     let frame_path = dir.join("00.dng");
     std::fs::copy(dng.path(), &frame_path).expect("copy RAW frame");
 
+    // A RAW result is a float composite.
     let composite_path = staging.join("composite.tif");
-    write_tiff(
+    let mut composite = TiffWriter::create_f32(
         &composite_path,
-        8,
-        8,
-        3,
-        &gradient_samples(8, 8, 3),
-        Some("staged composite"),
-    );
+        TiffSpec {
+            width: 8,
+            height: 8,
+            samples_per_pixel: 3,
+            description: Some("staged composite".to_string()),
+        },
+    )
+    .unwrap();
+    let wide: Vec<f32> = gradient_samples(8, 8, 3)
+        .into_iter()
+        .map(|v| f32::from(v) * 1.25)
+        .collect();
+    composite.write_tile_f32(full(8, 8), &wide).unwrap();
+    composite.finish().unwrap();
     let zmap_path = staging.join("zmap.tif");
     let mut map = ZMapWriter::create(&zmap_path, ZMapInfo::new(8, 8, 1).unwrap()).unwrap();
     map.write_tile(full(8, 8), &[0u16; 64]).unwrap();

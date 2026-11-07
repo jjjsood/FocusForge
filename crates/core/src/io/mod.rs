@@ -16,9 +16,12 @@
 
 mod error;
 mod frame;
+mod frame_cache;
 mod frame_set;
 mod grouping;
+mod jpeg;
 mod metadata;
+mod orientation;
 mod paths;
 pub mod raw;
 #[cfg(feature = "test-algorithms")]
@@ -33,14 +36,15 @@ pub use grouping::{
     CaptureTime, GROUP_GAP, Group, GroupSignal, Proposal, capture_time, one_group, propose,
     propose_with_progress,
 };
+pub use jpeg::{JpegError, JpegStack};
 pub(crate) use metadata::{
-    IccOrigin, MetadataPlan, XMP_APP1_HEADER, exif_blob, icc_tag_entry, iptc_tag_entry,
-    photoshop_iptc_segment, resolve_plan, xmp_tag_entry,
+    IccOrigin, MetadataPlan, XMP_APP1_HEADER, dng_entries, exif_blob, icc_tag_entry,
+    iptc_tag_entry, photoshop_iptc_segment, resolve_plan, set_entry, xmp_tag_entry,
 };
 pub use metadata::{MetadataTags, SourceKind, SourceMetadata, TagEntry, read_source_metadata};
 pub use paths::{
-    JPEG_EXTENSIONS, PNG_EXTENSIONS, RAW_EXTENSIONS, TIFF_EXTENSIONS, all_frame_paths,
-    frame_paths_for_extensions, has_extension,
+    DNG_EXTENSIONS, JPEG_EXTENSIONS, PNG_EXTENSIONS, RAW_EXTENSIONS, TIFF_EXTENSIONS,
+    all_frame_paths, frame_paths_for_extensions, has_extension,
 };
 pub use raw::{DEFAULT_RAW_CACHE_BYTES, RawError, RawMetadata, RawStack};
 pub use tiff::decoded::{CacheStats, DecodedTiffStack};
@@ -48,3 +52,17 @@ pub use tiff::header::{ByteOrder, TiffHeader};
 pub use tiff::segment::{DecodedSegment, SegmentOrigin, TiffSegmentDecoder, TiffSegmentReader};
 pub use tiff::stack::{COMPOSITE_FILENAME, TiffStack, ZMAP_FILENAME, frame_paths, is_frame_path};
 pub use tiff::writer::{StripCompression, StripSpec, StripWriter, TiffSpec, TiffWriter};
+
+/// Map `path` read-only for the lifetime of the returned [`memmap2::Mmap`].
+///
+/// The crate's one `unsafe` site: mapping a file that changes while mapped is
+/// undefined behavior (memmap2 0.9.11, <https://docs.rs/memmap2/0.9.11/memmap2/struct.Mmap.html>).
+/// Callers map only files nothing writes again: a TIFF frame, or a
+/// developed-frame file this process wrote once and closed.
+#[allow(unsafe_code)]
+pub(crate) fn map_read_only(path: &std::path::Path) -> std::io::Result<memmap2::Mmap> {
+    let file = std::fs::File::open(path)?;
+    // SAFETY: every caller maps a file that nothing writes while a mapping
+    // of it is alive, as the doc comment above requires.
+    unsafe { memmap2::Mmap::map(&file) }
+}

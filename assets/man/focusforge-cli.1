@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH focusforge-cli 1  "focusforge-cli 0.1.0" 
+.TH focusforge-cli 1  "focusforge-cli 0.2.0-rc.1" 
 .SH NAME
 focusforge\-cli \- FocusForge command\-line interface
 .SH SYNOPSIS
@@ -23,13 +23,19 @@ Print version
 .SH SUBCOMMANDS
 .TP
 focusforge\-cli\-info(1)
-Print project, TIFF or RAW metadata for a file, or for every frame in a directory
+Print project, TIFF, JPEG or RAW metadata for a file, or for every frame in a directory
 .TP
 focusforge\-cli\-algorithms(1)
 List every registered algorithm, or print one named algorithm\*(Aqs full parameter schema
 .TP
+focusforge\-cli\-step\-plan(1)
+Compute the focus step, frame count, duration and disk need of a focus stack
+.TP
+focusforge\-cli\-sharp\-areas(1)
+Count the areas of the image that are sharpest in each frame of a stack
+.TP
 focusforge\-cli\-stack(1)
-Fuse supported TIFF or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images \-\- run `focusforge\-cli export` for that
+Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images \-\- run `focusforge\-cli export` for that
 .TP
 focusforge\-cli\-export(1)
 Turn a project into an image file: the image with `\-o`, the Z\-Map with `\-\-zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image
@@ -52,7 +58,10 @@ Remove every entry from the stage cache under `.scratch/stage\-cache/`. Never to
 focusforge\-cli\-diagnostics(1)
 Package this installation\*(Aqs logs, crash reports, system summary, graphics adapter record, effective configuration and version into one ZIP, listing every file before writing it. The home directory and the user name are redacted out of every text entry, image data is never included, and nothing is sent anywhere
 .TP
+focusforge\-cli\-check\-update(1)
+Ask the release server whether a newer FocusForge release exists
+.TP
 focusforge\-cli\-help(1)
 Print this message or the help of the given subcommand(s)
 .SH VERSION
-v0.1.0
+v0.2.0\-rc.1

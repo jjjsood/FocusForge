@@ -1,0 +1,94 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A size entry: a digits-only number beside a MiB / GiB unit menu, in one
+// `settings-size-field-width` slot. `unavailable` replaces both with one
+// disabled box. With `external-list` the caller draws the open unit list as an
+// `FFMenuList` at `unit-x` / `unit-width`, so a row below cannot paint over it.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFTextField } from "ff_text_field.slint";
+import { FFMenu } from "ff_menu.slint";
+
+export component FFSizeField inherits Rectangle {
+    in property <string> text: "";
+    in property <string> placeholder: "";
+    in property <string> unit: "GiB"; // "MiB" | "GiB"
+    in property <string> tone: "neutral"; // "neutral" | "failure"
+    in property <bool> unavailable: false;
+    in property <length> scroll-offset: 0px;
+    // The unit menu's accessible name.
+    in property <string> unit-name: "";
+    in property <bool> unit-open: false;
+    in property <bool> unit-focused: false;
+    in property <int> unit-focused-index: -1;
+    in property <bool> external-list: false;
+    out property <length> unit-width: 60px;
+    out property <length> unit-x: root.width - root.unit-width;
+    callback edited(string);
+    // Enter, or the number losing focus.
+    callback committed();
+    callback cursor-moved(length, length);
+    callback unit-toggled();
+    callback unit-selected(string);
+    callback unit-previous-requested();
+    callback unit-next-requested();
+    callback unit-accepted();
+    callback unit-dismissed();
+
+    width: ShellGeometry.settings-size-field-width;
+    height: ShellGeometry.field-height;
+    forward-focus: number;
+
+    // The number grows by 2 px on every edge when emphasised; its slot keeps
+    // the unemphasised size.
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.unavailable ? root.width : root.unit-x - Theme.space-1;
+        height: parent.height;
+
+        number := FFTextField {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            text: root.unavailable ? "" : root.text;
+            placeholder: root.unavailable ? "Unavailable" : root.placeholder;
+            tone: root.tone;
+            enabled: !root.unavailable;
+            input-type: InputType.number;
+            takes-pushed-text-on-commit: true;
+            field-width: parent.width;
+            scroll-offset: root.scroll-offset;
+            edited(text) => { root.edited(text); }
+            committed => { root.committed(); }
+            cursor-moved(x, w) => { root.cursor-moved(x, w); }
+        }
+    }
+
+    public function take-pushed-text() { number.take-pushed-text(); }
+
+    if !root.unavailable: FFMenu {
+        x: root.unit-x;
+        width: root.unit-width;
+        chevron-inset: Theme.space-1;
+        name: root.unit-name;
+        label: root.unit;
+        choices: ["MiB", "GiB"];
+        choice-ids: ["MiB", "GiB"];
+        show-choice-ids: false;
+        selected: root.unit;
+        open: root.unit-open;
+        focused: root.unit-focused;
+        focused-index: root.unit-focused-index;
+        external-list: root.external-list;
+        toggled => { root.unit-toggled(); }
+        option-selected(picked) => {
+            root.unit-selected(picked);
+            number.take-pushed-text();
+        }
+        previous-requested => { root.unit-previous-requested(); }
+        next-requested => { root.unit-next-requested(); }
+        accepted => { root.unit-accepted(); }
+        dismissed => { root.unit-dismissed(); }
+    }
+}

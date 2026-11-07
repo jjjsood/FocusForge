@@ -11,13 +11,13 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use focusforge_gui::entry::ImportRefused;
+use focusforge_gui::entry::{GuiProject, ImportRefused};
 use focusforge_gui::job::{JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 use focusforge_gui::viewport::PaneRect;
 use focusforge_gui::{AppController, EntryError, OpenAs, OpenOutcome, ShellMode};
 use slint::ComponentHandle;
 
-use common::{copy_frame, tree};
+use common::{copy_frame, copy_frame_from, tree};
 
 fn base_pane() -> (PaneRect, PaneRect) {
     (
@@ -45,8 +45,8 @@ fn base_pane() -> (PaneRect, PaneRect) {
 #[test]
 fn unambiguous_folder_opens_one_project() {
     let root = tree("entry_unambiguous");
-    copy_frame(&root, "00.tif", 0);
-    copy_frame(&root, "01.tif", 1);
+    copy_frame_from("mantis-512", &root, "00.tif", 0);
+    copy_frame_from("mantis-512", &root, "01.tif", 1);
 
     let mut controller = AppController::new();
     let outcome = common::open_and_settle(&mut controller, &[root]);
@@ -62,14 +62,14 @@ fn unambiguous_folder_opens_one_project() {
 #[test]
 fn ambiguous_folder_asks_once() {
     let root = tree("entry_ambiguous");
-    copy_frame(&root.join("subject-a"), "00.tif", 0);
-    copy_frame(&root.join("subject-b"), "00.tif", 1);
+    copy_frame_from("mantis-512", &root.join("subject-a"), "00.tif", 0);
+    copy_frame_from("mantis-512", &root.join("subject-b"), "00.tif", 1);
 
     let mut controller = AppController::new();
     match common::open_and_settle(&mut controller, &[root]) {
         OpenOutcome::Question(question, _proposal) => {
             assert_eq!(question.project_count, 2);
-            assert_eq!(question.frame_count, 2);
+            assert_eq!(question.stack_sizes, vec![1, 1]);
         }
         OpenOutcome::Opened(_) => panic!("two directories must ask, not open straight through"),
         OpenOutcome::Mismatch(_) => panic!("opening a folder must never raise a mismatch"),
@@ -90,10 +90,51 @@ fn ambiguous_folder_asks_once() {
 }
 
 #[test]
+fn grouping_question_counts_frames_per_stack() {
+    for (label, sizes, body) in [
+        (
+            "equal",
+            [3, 3],
+            "This folder holds 2 stacks of 3 frames each.",
+        ),
+        (
+            "unequal",
+            [3, 4],
+            "This folder holds 2 stacks (3 and 4 frames).",
+        ),
+    ] {
+        let root = tree(&format!("entry_per_stack_{label}"));
+        for (stack, count) in ["subject-a", "subject-b"].into_iter().zip(sizes) {
+            for i in 0..count {
+                // mantis-64 holds three frames; a stack longer than that reuses them.
+                copy_frame_from(
+                    "mantis-64",
+                    &root.join(stack),
+                    &format!("{i:02}.tif"),
+                    i % 3,
+                );
+            }
+        }
+        let mut controller = AppController::new();
+        match common::open_and_settle(&mut controller, &[root]) {
+            OpenOutcome::Question(question, _) => {
+                assert_eq!(question.stack_sizes, sizes, "{label}");
+                assert_eq!(
+                    focusforge_gui::overlay::grouping_body(&question.stack_sizes),
+                    body,
+                    "{label}"
+                );
+            }
+            _ => panic!("{label}: two stacks must raise the question"),
+        }
+    }
+}
+
+#[test]
 fn both_answers_open_what_they_say() {
     let one_root = tree("entry_both_answers_one");
-    copy_frame(&one_root.join("subject-a"), "00.tif", 0);
-    copy_frame(&one_root.join("subject-b"), "00.tif", 1);
+    copy_frame_from("mantis-512", &one_root.join("subject-a"), "00.tif", 0);
+    copy_frame_from("mantis-512", &one_root.join("subject-b"), "00.tif", 1);
 
     let mut one = AppController::new();
     assert!(matches!(
@@ -109,8 +150,8 @@ fn both_answers_open_what_they_say() {
     assert!(one.pending_question().is_none());
 
     let many_root = tree("entry_both_answers_many");
-    copy_frame(&many_root.join("subject-a"), "00.tif", 0);
-    copy_frame(&many_root.join("subject-b"), "00.tif", 1);
+    copy_frame_from("mantis-512", &many_root.join("subject-a"), "00.tif", 0);
+    copy_frame_from("mantis-512", &many_root.join("subject-b"), "00.tif", 1);
 
     let mut many = AppController::new();
     assert!(matches!(
@@ -132,8 +173,8 @@ fn both_answers_open_what_they_say() {
 #[test]
 fn drop_of_a_folder_matches_the_picker() {
     let root = tree("entry_drop_folder");
-    copy_frame(&root, "00.tif", 0);
-    copy_frame(&root, "01.tif", 1);
+    copy_frame_from("mantis-512", &root, "00.tif", 0);
+    copy_frame_from("mantis-512", &root, "01.tif", 1);
 
     let mut picked = AppController::new();
     common::open_and_settle(&mut picked, std::slice::from_ref(&root));
@@ -153,9 +194,9 @@ fn drop_of_a_folder_matches_the_picker() {
 #[test]
 fn drop_of_several_files_is_one_open() {
     let root = tree("entry_drop_files");
-    copy_frame(&root, "00.tif", 0);
-    copy_frame(&root, "01.tif", 1);
-    copy_frame(&root, "02.tif", 2);
+    copy_frame_from("mantis-512", &root, "00.tif", 0);
+    copy_frame_from("mantis-512", &root, "01.tif", 1);
+    copy_frame_from("mantis-512", &root, "02.tif", 2);
 
     let mut controller = AppController::new();
     let paths = vec![
@@ -186,7 +227,7 @@ fn active_frame_paths(controller: &AppController) -> Vec<PathBuf> {
 fn tree_of_frames(label: &str, names: &[&str]) -> PathBuf {
     let root = tree(label);
     for (index, name) in names.iter().enumerate() {
-        copy_frame(&root, name, index);
+        copy_frame_from("mantis-512", &root, name, index);
     }
     root
 }
@@ -284,6 +325,147 @@ fn a_picked_raw_set_opens_as_one_tab() {
     );
 }
 
+/// A small RGB JPEG at `dir/name`; `level` makes every frame's bytes (and so
+/// its content hash) differ.
+fn write_jpeg(dir: &Path, name: &str, level: u8) -> PathBuf {
+    write_jpeg_sized(
+        dir,
+        name,
+        level,
+        (16, 16),
+        jpeg_encoder::ColorType::Rgb,
+        None,
+    )
+}
+
+/// A flat JPEG of `width` x `height` pixels in `color`, carrying the EXIF
+/// blob `exif` when given.
+fn write_jpeg_sized(
+    dir: &Path,
+    name: &str,
+    level: u8,
+    (width, height): (u16, u16),
+    color: jpeg_encoder::ColorType,
+    exif: Option<&[u8]>,
+) -> PathBuf {
+    let components = match color {
+        jpeg_encoder::ColorType::Luma => 1,
+        _ => 3,
+    };
+    let data = vec![level; usize::from(width) * usize::from(height) * components];
+    let mut bytes = Vec::new();
+    let mut encoder = jpeg_encoder::Encoder::new(&mut bytes, 90);
+    if let Some(exif) = exif {
+        encoder.add_exif_metadata(exif).expect("EXIF segment fits");
+    }
+    encoder
+        .encode(&data, width, height, color)
+        .expect("frame encodes");
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("frame file");
+    path
+}
+
+/// An EXIF TIFF blob whose IFD0 holds one SHORT entry, Orientation = `value`.
+fn orientation_exif(big_endian: bool, value: u16) -> Vec<u8> {
+    let short = |v: u16| {
+        if big_endian {
+            v.to_be_bytes()
+        } else {
+            v.to_le_bytes()
+        }
+    };
+    let long = |v: u32| {
+        if big_endian {
+            v.to_be_bytes()
+        } else {
+            v.to_le_bytes()
+        }
+    };
+    let mut blob = Vec::from(if big_endian { *b"MM" } else { *b"II" });
+    blob.extend(short(42));
+    blob.extend(long(8));
+    blob.extend(short(1));
+    blob.extend(short(0x0112));
+    blob.extend(short(3));
+    blob.extend(long(1));
+    blob.extend(short(value));
+    blob.extend([0, 0]);
+    blob.extend(long(0));
+    blob
+}
+
+/// A distinct camera RAW file: the fixture DNG with `extra` appended
+/// (import hashes files, it never decodes them).
+fn write_raw(dir: &Path, name: &str, extra: u8) -> PathBuf {
+    let mut bytes =
+        std::fs::read(common::workspace_root().join("fixtures/blackmagic-micro-dng/frame.dng"))
+            .unwrap();
+    bytes.push(extra);
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn picked_jpeg_frames_open_as_one_project() {
+    let root = tree("entry_picked_jpeg");
+    let b = write_jpeg(&root, "b.jpg", 10);
+    let a = write_jpeg(&root, "A.JPG", 20);
+    let c = write_jpeg(&root, "c.Jpeg", 30);
+
+    let mut controller = AppController::new();
+    let outcome = common::open_and_settle(&mut controller, &[c.clone(), b.clone(), a.clone()]);
+    assert!(
+        matches!(outcome, OpenOutcome::Opened(_)),
+        "a JPEG-only set must open"
+    );
+    assert_eq!(controller.project_tabs().len(), 1);
+    assert_eq!(active_frame_paths(&controller), vec![a, b, c]);
+
+    let single = write_jpeg(&root, "only.jpeg", 40);
+    let mut controller = AppController::new();
+    let outcome = common::open_and_settle(&mut controller, std::slice::from_ref(&single));
+    assert!(matches!(outcome, OpenOutcome::Opened(_)));
+    assert_eq!(active_frame_paths(&controller), vec![single]);
+}
+
+#[test]
+fn mixed_kinds_name_the_kinds_present() {
+    let root = tree("entry_mixed_kinds");
+    copy_frame_from("mantis-512", &root, "t.tif", 0);
+    let tiff = root.join("t.tif");
+    let jpeg = write_jpeg(&root, "j.jpg", 10);
+    let raw = write_raw(&root, "r.dng", 1);
+
+    let cases = [
+        (vec![raw.clone(), tiff.clone()], "camera RAW and TIFF"),
+        (vec![tiff.clone(), raw.clone()], "camera RAW and TIFF"),
+        (vec![jpeg.clone(), tiff.clone()], "JPEG and TIFF"),
+        (vec![tiff.clone(), jpeg.clone()], "JPEG and TIFF"),
+        (vec![jpeg.clone(), raw.clone()], "camera RAW and JPEG"),
+        (vec![raw.clone(), jpeg.clone()], "camera RAW and JPEG"),
+        (
+            vec![tiff.clone(), jpeg.clone(), raw.clone()],
+            "camera RAW, JPEG and TIFF",
+        ),
+        (
+            vec![raw.clone(), tiff.clone(), jpeg.clone()],
+            "camera RAW, JPEG and TIFF",
+        ),
+    ];
+    for (set, kinds) in cases {
+        match focusforge_gui::entry::classify(&set) {
+            Err(error @ EntryError::MixedKinds { .. }) => assert_eq!(
+                error.to_string(),
+                format!("These files mix {kinds}. A stack is one kind of file."),
+                "{set:?}"
+            ),
+            other => panic!("{set:?} must be MixedKinds, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn an_upper_case_tif_extension_is_a_frame() {
     let root = tree_of_frames("entry_picked_upper", &["00.TIF", "01.TIF"]);
@@ -307,14 +489,26 @@ fn picked_images_refusals_change_nothing() {
     )
     .unwrap();
 
+    let jpeg_a = write_jpeg(&root, "a.jpg", 10);
+    let jpeg_b = write_jpeg(&other, "b.jpg", 20);
+    let png = root.join("c.png");
+    std::fs::write(&png, b"not decoded").unwrap();
+
     let mut controller = with_one_project("entry_picked_refused_open");
     let tabs = controller.project_tabs();
 
+    let not_one_stack = Some("These images are not one stack");
+    let no_frames = Some("No frames here");
     let mut refusals = Vec::new();
-    for set in [
-        vec![root.join("00.tif"), note.clone()],
-        vec![root.join("00.tif"), other.join("00.tif")],
-        vec![root.join("00.tif"), raw.clone()],
+    for (set, title) in [
+        (vec![root.join("00.tif"), note.clone()], no_frames),
+        (
+            vec![root.join("00.tif"), other.join("00.tif")],
+            not_one_stack,
+        ),
+        (vec![root.join("00.tif"), raw.clone()], not_one_stack),
+        (vec![jpeg_a.clone(), png], no_frames),
+        (vec![jpeg_a, jpeg_b], not_one_stack),
     ] {
         assert!(
             controller.open_paths(&set).is_none(),
@@ -323,8 +517,8 @@ fn picked_images_refusals_change_nothing() {
         assert_eq!(controller.project_tabs(), tabs, "{set:?} changes nothing");
         assert_eq!(
             controller.refusal_title(),
-            None,
-            "the dialog keeps its own title"
+            title,
+            "{set:?}: a set that is not one stack says so; an unreadable file says no frames are here"
         );
         refusals.push(
             controller
@@ -341,6 +535,11 @@ fn picked_images_refusals_change_nothing() {
     assert_eq!(
         refusals[2],
         "These files mix camera RAW and TIFF. A stack is one kind of file."
+    );
+    assert!(refusals[3].ends_with("not a folder of frames or a FocusForge project"));
+    assert_eq!(
+        refusals[4],
+        "These files are in different folders. A stack's frames share one folder."
     );
 
     // An answer that arrives while a load is in flight opens nothing.
@@ -360,7 +559,7 @@ fn picked_images_refusals_change_nothing() {
 
 /// The refusal body for a folder holding nothing the open path reads: it
 /// names every accepted source family (checked against the extension
-/// constants the open path scans with), names no PNG/JPEG, and leaves the
+/// constants the open path scans with), names no PNG, and leaves the
 /// way out to the dialog's button.
 fn assert_no_readable_frames_body(controller: &AppController, outcome: OpenOutcome) {
     match outcome {
@@ -371,7 +570,7 @@ fn assert_no_readable_frames_body(controller: &AppController, outcome: OpenOutco
     let body = controller
         .last_refusal()
         .expect("a refusal message must be recorded");
-    for extension in TIFF_EXTENSIONS {
+    for extension in TIFF_EXTENSIONS.iter().chain(JPEG_EXTENSIONS) {
         assert!(
             body.contains(&format!(".{extension}")),
             "the body must name .{extension}: {body}"
@@ -381,13 +580,14 @@ fn assert_no_readable_frames_body(controller: &AppController, outcome: OpenOutco
         body.contains("RAW"),
         "the body must name camera RAW: {body}"
     );
-    for extension in PNG_EXTENSIONS.iter().chain(JPEG_EXTENSIONS) {
+    for extension in PNG_EXTENSIONS {
         assert!(
             !body.to_lowercase().contains(&format!(".{extension}")),
             "the body must not name .{extension}: {body}"
         );
     }
-    assert!(!body.contains("PNG") && !body.contains("JPEG"), "{body}");
+    assert!(!body.contains("PNG"), "{body}");
+    assert!(!body.contains("16-bit"), "{body}");
     assert!(
         !body.contains("Pick another folder"),
         "the button carries the offer, not the body: {body}"
@@ -403,10 +603,9 @@ fn empty_folder_is_refused_with_a_fix() {
 }
 
 #[test]
-fn png_and_jpeg_only_folder_is_refused() {
-    let root = tree("entry_png_jpeg_folder");
+fn png_only_folder_is_refused() {
+    let root = tree("entry_png_folder");
     std::fs::write(root.join("a.png"), b"not decoded").unwrap();
-    std::fs::write(root.join("b.jpg"), b"not decoded").unwrap();
     let mut controller = AppController::new();
     let outcome = common::open_and_settle(&mut controller, &[root]);
     assert_no_readable_frames_body(&controller, outcome);
@@ -454,6 +653,251 @@ fn unreadable_folder_is_refused_with_its_read_error() {
     assert_eq!(refusal, expected);
 }
 
+// ---------------------------------------------------------------------
+// TIFF frames no reader here can open are refused when the folder or the
+// file set is opened, not when the fuse starts.
+// ---------------------------------------------------------------------
+
+/// Eight bytes: a TIFF byte-order mark and magic 43, which is BigTIFF.
+fn write_bigtiff(path: &Path, big_endian: bool) {
+    let bytes: &[u8; 8] = if big_endian {
+        b"MM\0+\0\x08\0\0"
+    } else {
+        b"II+\0\x08\0\0\0"
+    };
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Sets every SHORT of `tag` in the first IFD of the little-endian TIFF at
+/// `path` to `value`.
+fn patch_short_tag(path: &Path, tag: u16, value: u16) {
+    let mut bytes = std::fs::read(path).unwrap();
+    assert_eq!(&bytes[..2], b"II", "the fixture frames are little-endian");
+    let u16_at = |bytes: &[u8], at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+    let u32_at =
+        |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let ifd = u32_at(&bytes, 4) as usize;
+    for index in 0..usize::from(u16_at(&bytes, ifd)) {
+        let entry = ifd + 2 + index * 12;
+        if u16_at(&bytes, entry) != tag {
+            continue;
+        }
+        let count = u32_at(&bytes, entry + 4) as usize;
+        let values = if count * 2 <= 4 {
+            entry + 8
+        } else {
+            u32_at(&bytes, entry + 8) as usize
+        };
+        for slot in 0..count {
+            bytes[values + slot * 2..values + slot * 2 + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(path, bytes).unwrap();
+        return;
+    }
+    panic!("no tag {tag} in {}", path.display());
+}
+
+/// The refusal an unreadable TIFF frame raises: no tab, the dialog titled
+/// and offering Close, a "Not a project" card for `card`, and a body that
+/// names `file` and says `cause` without the open root's path or any
+/// format jargon. Returns the body.
+fn assert_unreadable_frame(
+    label: &str,
+    controller: &AppController,
+    outcome: OpenOutcome,
+    root: &Path,
+    card: &Path,
+    file: &str,
+    cause: &str,
+) -> String {
+    match outcome {
+        OpenOutcome::Refused(EntryError::UnreadableFrame { path, .. }) => {
+            assert_eq!(path, card, "{label}: the path the card is made for");
+        }
+        OpenOutcome::Refused(other) => panic!("{label}: expected UnreadableFrame, got {other}"),
+        _ => panic!("{label}: the frames must be refused before any tab opens"),
+    }
+    assert!(controller.project_tabs().is_empty(), "{label}: no tab");
+    assert_eq!(
+        controller.refusal_title(),
+        Some("These frames cannot be read"),
+        "{label}"
+    );
+    let cards = controller.project_cards();
+    let card_view = cards
+        .iter()
+        .find(|view| view.kind == "not-a-project")
+        .unwrap_or_else(|| panic!("{label}: a Not a project card must be recorded"));
+    assert_eq!(
+        card_view.project_name,
+        card.file_name().unwrap().to_string_lossy(),
+        "{label}: the card's name"
+    );
+    let body = controller
+        .last_refusal()
+        .unwrap_or_else(|| panic!("{label}: a refusal message must be recorded"))
+        .to_string();
+    assert!(
+        body.contains(file),
+        "{label}: the body names {file}: {body}"
+    );
+    assert!(
+        body.contains(cause),
+        "{label}: the body says {cause}: {body}"
+    );
+    assert!(
+        !body.contains(&*root.to_string_lossy()),
+        "{label}: the body leaves out the path: {body}"
+    );
+    for jargon in [
+        "magic",
+        "43",
+        "Compression",
+        "BitsPerSample",
+        "PhotometricInterpretation",
+    ] {
+        assert!(!body.contains(jargon), "{label}: no {jargon:?}: {body}");
+    }
+    body
+}
+
+#[test]
+fn open_refuses_bigtiff_folder() {
+    for (label, big_endian) in [("II first", false), ("MM first", true)] {
+        let root = tree(&format!("entry_bigtiff_{}", label.replace(' ', "_")));
+        copy_frame(&root, "00.tif", 0);
+        write_bigtiff(&root.join("01.tif"), big_endian);
+        write_bigtiff(&root.join("02.tif"), !big_endian);
+        let mut controller = AppController::new();
+        let outcome = common::open_and_settle(&mut controller, std::slice::from_ref(&root));
+        let body = assert_unreadable_frame(
+            label,
+            &controller,
+            outcome,
+            &root,
+            &root,
+            "01.tif",
+            "BigTIFF",
+        );
+        assert!(
+            body.contains("standard TIFF"),
+            "{label}: the way out: {body}"
+        );
+        assert!(
+            !body.contains("02.tif"),
+            "{label}: the first file only: {body}"
+        );
+    }
+
+    let root = tree("entry_bigtiff_two_stacks");
+    copy_frame(&root.join("subject-a"), "00.tif", 0);
+    std::fs::create_dir_all(root.join("subject-b")).unwrap();
+    write_bigtiff(&root.join("subject-b").join("00.tif"), false);
+    let mut controller = AppController::new();
+    let outcome = common::open_and_settle(&mut controller, std::slice::from_ref(&root));
+    assert_unreadable_frame(
+        "two stacks",
+        &controller,
+        outcome,
+        &root,
+        &root,
+        "00.tif",
+        "BigTIFF",
+    );
+    assert!(
+        controller.pending_question().is_none(),
+        "two stacks: the grouping question is not raised"
+    );
+
+    for set in ["mantis-64", "mantis8-64", "mantis-64-deflate-p1-strip-ii"] {
+        let root = tree(&format!("entry_readable_{set}"));
+        copy_frame_from(set, &root, "00.tif", 0);
+        copy_frame_from(set, &root, "01.tif", 1);
+        let mut controller = AppController::new();
+        let outcome = common::open_and_settle(&mut controller, &[root]);
+        assert!(
+            matches!(outcome, OpenOutcome::Opened(_)),
+            "{set}: a readable folder opens"
+        );
+        assert_eq!(controller.last_refusal(), None, "{set}");
+        assert_eq!(controller.project_tabs().len(), 1, "{set}");
+    }
+}
+
+#[test]
+fn open_refuses_unreadable_tiff_layout() {
+    // A file set: two classic frames and one BigTIFF.
+    let root = tree("entry_layout_file_set");
+    copy_frame(&root, "00.tif", 0);
+    copy_frame(&root, "01.tif", 1);
+    write_bigtiff(&root.join("02.tif"), false);
+    let picked: Vec<PathBuf> = ["00.tif", "01.tif", "02.tif"]
+        .iter()
+        .map(|name| root.join(name))
+        .collect();
+    let mut controller = AppController::new();
+    let outcome = common::open_and_settle(&mut controller, &picked);
+    assert_unreadable_frame(
+        "file set",
+        &controller,
+        outcome,
+        &root,
+        &root.join("02.tif"),
+        "02.tif",
+        "BigTIFF",
+    );
+
+    // A folder whose second frame the decoded reader refuses by header; the
+    // palette case is compressed, because an uncompressed 16-bit frame is
+    // read by the memory-mapped reader, which does not look at the photometric.
+    for (label, set, tag, value) in [
+        ("palette photometric", "mantis-64-lzw-p1-strip-ii", 262, 3),
+        ("32-bit samples", "mantis-64", 258, 32),
+    ] {
+        let root = tree(&format!("entry_layout_{}", label.replace([' ', '-'], "_")));
+        copy_frame_from(set, &root, "00.tif", 0);
+        copy_frame_from(set, &root, "01.tif", 1);
+        patch_short_tag(&root.join("01.tif"), tag, value);
+        let mut controller = AppController::new();
+        let outcome = common::open_and_settle(&mut controller, std::slice::from_ref(&root));
+        let body = assert_unreadable_frame(
+            label,
+            &controller,
+            outcome,
+            &root,
+            &root,
+            "01.tif",
+            "TIFF layout",
+        );
+        assert!(
+            body.contains("standard 8- or 16-bit TIFF"),
+            "{label}: the way out: {body}"
+        );
+    }
+
+    // A frame deleted after the picked set classified, while the load waits.
+    let root = tree("entry_layout_deleted_in_hold");
+    copy_frame(&root, "00.tif", 0);
+    copy_frame(&root, "01.tif", 1);
+    let mut controller = AppController::new();
+    controller.set_open_hold(Duration::from_millis(300));
+    let load = controller
+        .open_paths(&[root.join("00.tif"), root.join("01.tif")])
+        .expect("the pick classifies and starts a load");
+    std::fs::remove_file(root.join("01.tif")).unwrap();
+    load.join().unwrap();
+    let outcome = controller.settle_open().expect("the load settles");
+    assert_unreadable_frame(
+        "deleted during the open",
+        &controller,
+        outcome,
+        &root,
+        &root.join("01.tif"),
+        "01.tif",
+        "could not be read",
+    );
+}
+
 #[test]
 fn a_path_that_is_neither_a_folder_nor_a_project_is_refused_by_name() {
     let dir = tree("entry_unreadable_path");
@@ -479,7 +923,7 @@ fn a_path_that_is_neither_a_folder_nor_a_project_is_refused_by_name() {
 #[test]
 fn skipped_subfolders_are_reported_not_failed() {
     let root = tree("entry_skipped");
-    copy_frame(&root.join("subject"), "00.tif", 0);
+    copy_frame_from("mantis-512", &root.join("subject"), "00.tif", 0);
     std::fs::create_dir_all(root.join("thumbs")).unwrap();
     std::fs::write(root.join("thumbs").join("readme.txt"), b"not a frame").unwrap();
 
@@ -503,7 +947,7 @@ fn skipped_subfolders_are_reported_not_failed() {
 #[test]
 fn two_skipped_subfolders_make_one_record_naming_both_paths() {
     let root = tree("entry_two_skipped");
-    copy_frame(&root.join("subject"), "00.tif", 0);
+    copy_frame_from("mantis-512", &root.join("subject"), "00.tif", 0);
     for name in ["thumbs", "notes"] {
         std::fs::create_dir_all(root.join(name)).unwrap();
         std::fs::write(root.join(name).join("readme.txt"), b"not a frame").unwrap();
@@ -569,14 +1013,15 @@ fn no_grouping_vocabulary_after_the_answer() {
     }
 
     let ambiguous_root = tree("entry_no_group_ambiguous");
-    copy_frame(&ambiguous_root.join("subject-a"), "00.tif", 0);
-    copy_frame(&ambiguous_root.join("subject-b"), "00.tif", 1);
+    copy_frame_from("mantis-512", &ambiguous_root.join("subject-a"), "00.tif", 0);
+    copy_frame_from("mantis-512", &ambiguous_root.join("subject-b"), "00.tif", 1);
     let mut controller = AppController::new();
     match common::open_and_settle(&mut controller, &[ambiguous_root]) {
         OpenOutcome::Question(question, _) => {
             let rendered = format!(
-                "This folder reads as {} stacks of {} frames. Open as one project. Open as {} projects. Cancel",
-                question.project_count, question.frame_count, question.project_count,
+                "{} Open as one project. Open as {} projects. Cancel",
+                focusforge_gui::overlay::grouping_body(&question.stack_sizes),
+                question.project_count,
             );
             assert!(!rendered.to_lowercase().contains("group"));
         }
@@ -606,18 +1051,6 @@ fn drop_caption_names_the_drop_and_the_wayland_line() {
 // The tab strip scrolls to every tab (nine projects at the 1200 minimum).
 // ---------------------------------------------------------------------
 
-fn init_backend() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
-}
-
 fn push_tabs(app: &focusforge_gui::AppWindow, controller: &AppController) {
     let tabs: Vec<focusforge_gui::ProjectTabView> = controller
         .project_tabs()
@@ -641,14 +1074,19 @@ fn push_tabs(app: &focusforge_gui::AppWindow, controller: &AppController) {
 
 #[test]
 fn tab_strip_scrolls_to_every_tab() {
-    init_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1200, 760));
 
     let mut controller = AppController::new();
     let root = tree("entry_nine_tabs");
     for i in 0..9 {
-        copy_frame(&root.join(format!("subject-{i}")), "00.tif", i % 8);
+        copy_frame_from(
+            "mantis-512",
+            &root.join(format!("subject-{i}")),
+            "00.tif",
+            i % 8,
+        );
     }
     match common::open_and_settle(&mut controller, &[root]) {
         OpenOutcome::Question(..) => {
@@ -725,7 +1163,7 @@ fn tab_strip_scrolls_to_every_tab() {
 #[test]
 fn a_single_tab_does_not_read_as_overflowing_before_any_resize() {
     let root = tree("entry_single_tab_no_resize");
-    copy_frame(&root, "00.tif", 0);
+    copy_frame_from("mantis-512", &root, "00.tif", 0);
 
     let mut controller = AppController::new();
     let outcome = common::open_and_settle(&mut controller, &[root]);
@@ -750,7 +1188,12 @@ fn tab_scroll_changes_reach_the_sink_and_opening_scrolls_into_view() {
 
     let root = tree("entry_tab_scroll_events");
     for i in 0..10 {
-        copy_frame(&root.join(format!("subject-{i}")), "00.tif", i % 8);
+        copy_frame_from(
+            "mantis-512",
+            &root.join(format!("subject-{i}")),
+            "00.tif",
+            i % 8,
+        );
     }
     let mut controller = AppController::new();
     controller.set_tab_region_width(1254.0);
@@ -827,8 +1270,9 @@ fn tab_scroll_changes_reach_the_sink_and_opening_scrolls_into_view() {
 // Reopening a saved project through the same picker.
 // ---------------------------------------------------------------------
 
-/// Seals a minimal project into `dir`, returning its `.ffp` path.
-fn seal_test_project(dir: &Path) -> PathBuf {
+/// Seals a minimal project over `sources` into `dir`, returning its `.ffp`
+/// path.
+fn seal_test_project(dir: &Path, sources: &[PathBuf]) -> PathBuf {
     use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
     use focusforge_core::params::ParamValues;
     use focusforge_core::project::{Metrics, SealRequest, seal};
@@ -866,7 +1310,7 @@ fn seal_test_project(dir: &Path) -> PathBuf {
         project_path: &project_path,
         staged_composite: &composite,
         staged_zmap: &zmap,
-        sources: &[],
+        sources,
         algorithm: "laplacian",
         params: &ParamValues::new(),
         align: None,
@@ -882,7 +1326,7 @@ fn seal_test_project(dir: &Path) -> PathBuf {
 #[test]
 fn a_saved_project_reopens_through_the_same_picker() {
     let dir = tree("entry_reopen_project");
-    let project_path = seal_test_project(&dir);
+    let project_path = seal_test_project(&dir, &[]);
 
     let mut controller = AppController::new();
     let outcome = common::open_and_settle(&mut controller, &[project_path]);
@@ -892,6 +1336,23 @@ fn a_saved_project_reopens_through_the_same_picker() {
     assert!(
         !tabs[0].unsaved,
         "a reopened project carries no unsaved chip"
+    );
+}
+
+#[test]
+fn a_reopened_project_plans_for_its_frames_not_its_cropped_composite() {
+    use focusforge_gui::entry::tab_stack_context;
+
+    let dir = tree("entry_reopen_context");
+    copy_frame_from("mantis-64", &dir, "00.tif", 0);
+    let project_path = seal_test_project(&dir, &[dir.join("00.tif")]);
+    let project = focusforge_core::project::Project::open(&project_path).expect("project opens");
+
+    let context = tab_stack_context(&GuiProject::Opened(Box::new(project))).expect("a context");
+    assert_eq!(
+        (context.width, context.height, context.samples_per_pixel),
+        (64, 64, 3),
+        "the 4x4 composite is smaller than the 64x64 frame the run read"
     );
 }
 
@@ -919,9 +1380,9 @@ fn a_file_that_is_not_a_project_is_refused_by_name() {
 #[test]
 fn each_tab_keeps_its_own_viewport() {
     let root_a = tree("entry_viewport_a");
-    copy_frame(&root_a, "00.tif", 0);
+    copy_frame_from("mantis-512", &root_a, "00.tif", 0);
     let root_b = tree("entry_viewport_b");
-    copy_frame(&root_b, "00.tif", 1);
+    copy_frame_from("mantis-512", &root_b, "00.tif", 1);
 
     let mut controller = AppController::new();
     let (left, right) = base_pane();
@@ -955,7 +1416,7 @@ fn each_tab_keeps_its_own_viewport() {
 /// A controller with one project already open from `name`'s one-frame tree.
 fn with_one_project(name: &str) -> AppController {
     let root = tree(name);
-    copy_frame(&root, "00.tif", 0);
+    copy_frame_from("mantis-512", &root, "00.tif", 0);
     let mut controller = AppController::new();
     assert!(matches!(
         common::open_and_settle(&mut controller, &[root]),
@@ -1002,7 +1463,7 @@ fn opening_a_folder_from_plus_appends_and_activates_the_first() {
     controller.select_plus();
 
     let root = tree("entry_plus_open");
-    copy_frame(&root, "00.tif", 1);
+    copy_frame_from("mantis-512", &root, "00.tif", 1);
     assert!(matches!(
         common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Opened(_)
@@ -1032,9 +1493,9 @@ fn a_multi_stack_open_from_plus_appends_all_in_order() {
     controller.select_plus();
 
     let root = tree("entry_plus_multi");
-    copy_frame(&root.join("subject-a"), "00.tif", 0);
-    copy_frame(&root.join("subject-b"), "00.tif", 1);
-    copy_frame(&root.join("subject-c"), "00.tif", 2);
+    copy_frame_from("mantis-512", &root.join("subject-a"), "00.tif", 0);
+    copy_frame_from("mantis-512", &root.join("subject-b"), "00.tif", 1);
+    copy_frame_from("mantis-512", &root.join("subject-c"), "00.tif", 2);
     assert!(matches!(
         common::open_and_settle(&mut controller, &[root]),
         OpenOutcome::Question(..)
@@ -1092,9 +1553,9 @@ fn closing_the_last_tab_selects_plus() {
 fn with_four_projects(name: &str) -> focusforge_gui::AppController {
     let mut controller = with_one_project(&format!("{name}_first"));
     let root = tree(name);
-    copy_frame(&root.join("subject-a"), "00.tif", 0);
-    copy_frame(&root.join("subject-b"), "00.tif", 1);
-    copy_frame(&root.join("subject-c"), "00.tif", 2);
+    copy_frame_from("mantis-512", &root.join("subject-a"), "00.tif", 0);
+    copy_frame_from("mantis-512", &root.join("subject-b"), "00.tif", 1);
+    copy_frame_from("mantis-512", &root.join("subject-c"), "00.tif", 2);
     common::open_and_settle(&mut controller, &[root]);
     common::answer_and_settle(&mut controller, OpenAs::NProjects);
     assert_eq!(controller.project_tabs().len(), 4);
@@ -1163,7 +1624,7 @@ fn a_close_after_the_debounce_window_closes() {
 /// selected, and the canvas shows the empty state with it.
 #[test]
 fn plus_shows_the_selected_marker_only_when_selected() {
-    init_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -1216,7 +1677,7 @@ fn plus_shows_the_selected_marker_only_when_selected() {
 fn selecting_plus_and_back_flips_project_loaded_without_a_canvas_gesture() {
     use std::sync::{Arc, Mutex};
 
-    init_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -1249,13 +1710,13 @@ fn selecting_plus_and_back_flips_project_loaded_without_a_canvas_gesture() {
 fn answering_the_question_closes_its_dialog() {
     use std::sync::{Arc, Mutex};
 
-    init_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
     let root = tree("entry_question_dialog_closes");
-    copy_frame(&root.join("subject-a"), "00.tif", 0);
-    copy_frame(&root.join("subject-b"), "00.tif", 1);
+    copy_frame_from("mantis-512", &root.join("subject-a"), "00.tif", 0);
+    copy_frame_from("mantis-512", &root.join("subject-b"), "00.tif", 1);
 
     let controller = Arc::new(Mutex::new(AppController::new()));
     let outcome = common::open_and_settle(&mut controller.lock().unwrap(), &[root]);
@@ -1290,7 +1751,12 @@ fn opening_a_folder_onto_a_loaded_tab_appends_new_tabs() {
 
     let root = tree("entry_drop_loaded");
     for i in 0..3 {
-        copy_frame(&root.join(format!("subject-{i}")), "00.tif", i);
+        copy_frame_from(
+            "mantis-512",
+            &root.join(format!("subject-{i}")),
+            "00.tif",
+            i,
+        );
     }
     assert!(matches!(
         common::open_and_settle(&mut controller, &[root]),
@@ -1322,8 +1788,8 @@ fn a_drop_while_plus_is_selected_appends() {
     controller.select_plus();
 
     let root = tree("entry_drop_plus");
-    copy_frame(&root, "00.tif", 1);
-    copy_frame(&root, "01.tif", 2);
+    copy_frame_from("mantis-512", &root, "00.tif", 1);
+    copy_frame_from("mantis-512", &root, "01.tif", 2);
     let dropped = vec![root.join("00.tif"), root.join("01.tif")];
     assert!(matches!(
         common::open_and_settle(&mut controller, &dropped),
@@ -1349,8 +1815,8 @@ fn a_drop_while_plus_is_selected_appends() {
 /// mid-run or outside-Stacking drop test needs to reach that state.
 fn with_fused_project(name: &str) -> AppController {
     let root = tree(name);
-    copy_frame(&root, "00.tif", 0);
-    copy_frame(&root, "01.tif", 1);
+    copy_frame_from("mantis-512", &root, "00.tif", 0);
+    copy_frame_from("mantis-512", &root, "01.tif", 1);
     let mut controller = AppController::new();
     assert!(matches!(
         common::open_and_settle(&mut controller, &[root]),
@@ -1368,8 +1834,8 @@ fn a_drop_of_a_folder_with_a_frames_subfolder_adds_to_the_active_tab() {
     let before_frames = controller.images_panel().rows.len();
 
     let root = tree("entry_drop_frames_subfolder");
-    copy_frame(&root.join("frames"), "00.tif", 2);
-    copy_frame(&root.join("frames"), "01.tif", 3);
+    copy_frame_from("mantis-512", &root.join("frames"), "00.tif", 2);
+    copy_frame_from("mantis-512", &root.join("frames"), "01.tif", 3);
 
     common::add_and_settle(&mut controller, &[root]).expect("an add onto an active tab");
 
@@ -1388,8 +1854,8 @@ fn a_multi_file_drop_spanning_two_parent_directories_adds_to_the_active_tab() {
 
     let dir_a = tree("entry_drop_multi_parent_a");
     let dir_b = tree("entry_drop_multi_parent_b");
-    copy_frame(&dir_a, "00.tif", 4);
-    copy_frame(&dir_b, "00.tif", 5);
+    copy_frame_from("mantis-512", &dir_a, "00.tif", 4);
+    copy_frame_from("mantis-512", &dir_b, "00.tif", 5);
     let dropped = vec![dir_a.join("00.tif"), dir_b.join("00.tif")];
 
     common::add_and_settle(&mut controller, &dropped).expect("an add onto an active tab");
@@ -1401,7 +1867,7 @@ fn a_multi_file_drop_spanning_two_parent_directories_adds_to_the_active_tab() {
 #[test]
 fn a_drop_of_a_lone_ffp_onto_an_active_tab_still_opens_its_own_tab() {
     let mut controller = with_one_project("entry_drop_ffp_first");
-    let project_path = seal_test_project(&tree("entry_drop_ffp"));
+    let project_path = seal_test_project(&tree("entry_drop_ffp"), &[]);
 
     let handle = controller
         .drop_paths(&[project_path])
@@ -1426,8 +1892,8 @@ fn a_drop_with_the_plus_tab_selected_still_opens_through_drop_paths() {
     controller.select_plus();
 
     let root = tree("entry_drop_plus_route");
-    copy_frame(&root, "00.tif", 6);
-    copy_frame(&root, "01.tif", 7);
+    copy_frame_from("mantis-512", &root, "00.tif", 6);
+    copy_frame_from("mantis-512", &root, "01.tif", 7);
     let dropped = vec![root.join("00.tif"), root.join("01.tif")];
 
     let handle = controller
@@ -1458,7 +1924,7 @@ fn a_drop_outside_stacking_mode_is_refused_and_changes_nothing() {
     let before_frames = controller.frame_count();
 
     let root = tree("entry_drop_outside_stacking_extra");
-    copy_frame(&root, "00.tif", 0);
+    copy_frame_from("mantis-512", &root, "00.tif", 0);
     let result = controller.drop_paths(&[root.join("00.tif")]);
     assert!(matches!(result, Err(ImportRefused::NotStacking)));
     assert_eq!(controller.project_tabs().len(), 1);
@@ -1473,7 +1939,7 @@ fn a_drop_while_this_tabs_job_is_running_is_refused_and_changes_nothing() {
     let before_frames = controller.frame_count();
 
     let root = tree("entry_drop_mid_run_extra");
-    copy_frame(&root, "00.tif", 1);
+    copy_frame_from("mantis-512", &root, "00.tif", 1);
     let result = controller.drop_paths(&[root.join("00.tif")]);
     assert!(matches!(result, Err(ImportRefused::JobRunning)));
     assert_eq!(controller.frame_count(), before_frames);
@@ -1487,14 +1953,14 @@ fn a_second_drop_while_the_first_scan_is_still_being_checked_is_refused() {
     let before_frames = controller.frame_count();
 
     let root_a = tree("entry_drop_still_checking_a");
-    copy_frame(&root_a, "00.tif", 2);
+    copy_frame_from("mantis-512", &root_a, "00.tif", 2);
     let handle = controller
         .drop_paths(&[root_a.join("00.tif")])
         .expect("the first drop must not refuse");
     let handle = handle.expect("adding a real frame spawns a worker");
 
     let root_b = tree("entry_drop_still_checking_b");
-    copy_frame(&root_b, "00.tif", 3);
+    copy_frame_from("mantis-512", &root_b, "00.tif", 3);
     let second = controller.drop_paths(&[root_b.join("00.tif")]);
     assert!(matches!(second, Err(ImportRefused::StillChecking)));
     assert_eq!(controller.frame_count(), before_frames);
@@ -1514,6 +1980,194 @@ fn a_drop_of_neither_a_folder_nor_a_frame_is_refused_and_changes_nothing() {
     let result = controller.drop_paths(&[bad]);
     assert!(matches!(result, Err(ImportRefused::NoFrames { .. })));
     assert_eq!(controller.frame_count(), before_frames);
+}
+
+#[test]
+fn import_no_frames_text_names_every_kind() {
+    let mut controller = with_one_project("entry_import_no_frames_text");
+    let dir = tree("entry_import_no_frames_text_extra");
+    let png = dir.join("a.png");
+    std::fs::write(&png, b"not decoded").unwrap();
+    let before = active_frame_paths(&controller);
+
+    let Err(refused) = controller.drop_paths(&[png]) else {
+        panic!("a dropped .png must be refused");
+    };
+    assert!(matches!(refused, ImportRefused::NoFrames { .. }));
+    let text = refused.to_string();
+    for extension in TIFF_EXTENSIONS.iter().chain(JPEG_EXTENSIONS) {
+        assert!(text.contains(&format!(".{extension}")), "{text}");
+    }
+    assert!(text.contains("RAW"), "{text}");
+    assert!(!text.contains("TIFF images"), "{text}");
+    for extension in PNG_EXTENSIONS {
+        assert!(!text.to_lowercase().contains(extension), "{text}");
+    }
+    assert_eq!(active_frame_paths(&controller), before);
+}
+
+/// A controller with a project open over `frames`.
+fn open_set(frames: &[PathBuf]) -> AppController {
+    let mut controller = AppController::new();
+    assert!(matches!(
+        common::open_and_settle(&mut controller, frames),
+        OpenOutcome::Opened(_)
+    ));
+    controller
+}
+
+#[test]
+fn import_adds_jpeg_to_a_jpeg_tab() {
+    let root = tree("entry_import_jpeg");
+    let mut controller = open_set(&[write_jpeg(&root, "a.jpg", 10)]);
+
+    let extra = tree("entry_import_jpeg_extra");
+    let lower = write_jpeg(&extra, "b.jpg", 20);
+    let upper = write_jpeg(&extra, "C.JPEG", 30);
+    common::add_and_settle(&mut controller, &[lower, upper])
+        .expect("JPEG onto a JPEG tab is accepted");
+    assert_eq!(
+        active_frame_paths(&controller).len(),
+        3,
+        "both new frames join the tab"
+    );
+
+    let raw_root = tree("entry_import_raw");
+    let mut raws = open_set(&[write_raw(&raw_root, "a.dng", 1)]);
+    let raw_extra = tree("entry_import_raw_extra");
+    common::add_and_settle(
+        &mut raws,
+        &[
+            write_raw(&raw_extra, "b.dng", 2),
+            write_raw(&raw_extra, "c.DNG", 3),
+        ],
+    )
+    .expect("RAW onto a RAW tab is accepted");
+    assert_eq!(active_frame_paths(&raws).len(), 3);
+
+    let tiff_root = tree_of_frames("entry_import_tiff", &["00.tif"]);
+    let mut tiffs = open_set(&[tiff_root.join("00.tif")]);
+    let tiff_extra = tree("entry_import_tiff_extra");
+    copy_frame_from("mantis-512", &tiff_extra, "01.tif", 1);
+    common::add_and_settle(&mut tiffs, &[tiff_extra.join("01.tif")])
+        .expect("TIFF onto a TIFF tab is accepted");
+    assert_eq!(active_frame_paths(&tiffs).len(), 2);
+
+    let mut emptied = open_set(&[write_jpeg(&root, "e.jpg", 50)]);
+    emptied.remove_frame(0);
+    assert!(active_frame_paths(&emptied).is_empty());
+    common::add_and_settle(&mut emptied, &[write_jpeg(&extra, "f.jpg", 60)])
+        .expect("an emptied tab takes any one kind");
+    assert_eq!(active_frame_paths(&emptied).len(), 1);
+}
+
+#[test]
+fn import_refuses_a_kind_the_tab_does_not_hold() {
+    let root = tree("entry_import_cross");
+    copy_frame_from("mantis-512", &root, "t.tif", 0);
+    let tiff = root.join("t.tif");
+    let jpeg = write_jpeg(&root, "j.jpg", 10);
+    let raw = write_raw(&root, "r.dng", 1);
+
+    let extra = tree("entry_import_cross_extra");
+    copy_frame_from("mantis-512", &extra, "t2.tif", 1);
+    let tiff_in = extra.join("t2.tif");
+    let jpeg_in = write_jpeg(&extra, "j2.jpg", 20);
+    let raw_in = write_raw(&extra, "r2.dng", 2);
+
+    let cases = [
+        (
+            &tiff,
+            vec![jpeg_in.clone()],
+            "Cannot mix JPEG and TIFF in one stack",
+        ),
+        (
+            &raw,
+            vec![jpeg_in.clone()],
+            "Cannot mix camera RAW and JPEG in one stack",
+        ),
+        (
+            &tiff,
+            vec![raw_in.clone()],
+            "Cannot mix camera RAW and TIFF in one stack",
+        ),
+        (
+            &jpeg,
+            vec![tiff_in.clone()],
+            "Cannot mix JPEG and TIFF in one stack",
+        ),
+        (
+            &tiff,
+            vec![tiff_in.clone(), jpeg_in.clone(), raw_in.clone()],
+            "Cannot mix camera RAW, JPEG and TIFF in one stack",
+        ),
+        (
+            &tiff,
+            vec![jpeg_in.clone(), raw_in.clone()],
+            "Cannot mix camera RAW, JPEG and TIFF in one stack",
+        ),
+    ];
+    for (tab_frame, incoming, text) in cases {
+        let mut controller = open_set(std::slice::from_ref(tab_frame));
+        let before = active_frame_paths(&controller);
+        let Err(refused) = controller.add_frames(&incoming) else {
+            panic!("{incoming:?} onto {tab_frame:?} must be refused");
+        };
+        assert!(matches!(refused, ImportRefused::MixedKinds { .. }));
+        assert_eq!(refused.to_string(), text);
+        assert_eq!(active_frame_paths(&controller), before, "{text}");
+    }
+}
+
+#[test]
+fn import_expands_a_folder_with_the_open_scan() {
+    let root = tree("entry_import_folder");
+    let mut jpegs = open_set(&[write_jpeg(&root, "a.jpg", 10)]);
+    let folder = tree("entry_import_folder_jpeg");
+    let frames = folder.join("frames");
+    std::fs::create_dir_all(&frames).unwrap();
+    write_jpeg(&frames, "b.jpg", 20);
+    write_jpeg(&frames, "c.JPG", 30);
+    common::add_and_settle(&mut jpegs, &[folder]).expect("a JPEG folder onto a JPEG tab");
+    assert_eq!(active_frame_paths(&jpegs).len(), 3);
+
+    let raw_root = tree("entry_import_folder_raw_tab");
+    let mut raws = open_set(&[write_raw(&raw_root, "a.dng", 1)]);
+    let raw_folder = tree("entry_import_folder_raw");
+    write_raw(&raw_folder, "b.dng", 2);
+    common::add_and_settle(&mut raws, &[raw_folder]).expect("a RAW folder onto a RAW tab");
+    assert_eq!(active_frame_paths(&raws).len(), 2);
+
+    let tiff_root = tree_of_frames("entry_import_folder_tiff_tab", &["00.tif"]);
+    let mut tiffs = open_set(&[tiff_root.join("00.tif")]);
+    let tiff_folder = tree("entry_import_folder_tiff");
+    copy_frame_from("mantis-512", &tiff_folder, "01.tif", 1);
+    copy_frame_from("mantis-512", &tiff_folder, "composite.tif", 2);
+    copy_frame_from("mantis-512", &tiff_folder, "zmap.tif", 3);
+    common::add_and_settle(&mut tiffs, &[tiff_folder]).expect("a TIFF folder onto a TIFF tab");
+    let names: Vec<_> = active_frame_paths(&tiffs)
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["00.tif", "01.tif"], "output files are not frames");
+
+    let foreign = tree("entry_import_folder_foreign");
+    write_raw(&foreign, "x.dng", 3);
+    let both = tree("entry_import_folder_both");
+    write_jpeg(&both, "y.jpg", 70);
+    copy_frame_from("mantis-512", &both, "y.tif", 4);
+    for (folder, text) in [
+        (foreign, "Cannot mix camera RAW and JPEG in one stack"),
+        (both, "Cannot mix JPEG and TIFF in one stack"),
+    ] {
+        let mut tab = open_set(&[write_jpeg(&root, "z.jpg", 80)]);
+        let before = active_frame_paths(&tab);
+        let Err(refused) = tab.add_frames(&[folder]) else {
+            panic!("{text} must be refused");
+        };
+        assert_eq!(refused.to_string(), text);
+        assert_eq!(active_frame_paths(&tab), before);
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1536,7 +2190,7 @@ fn a_double_click_on_a_close_glyph_closes_one_tab() {
     use std::sync::{Arc, Mutex};
 
     for (case, close, active) in [(0, 1, 0), (1, 0, 0), (2, 1, 1), (3, 3, 3)] {
-        init_backend();
+        common::init_window_backend();
         let app = focusforge_gui::AppWindow::new().unwrap();
         app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -1626,6 +2280,179 @@ fn a_double_click_on_a_close_glyph_closes_one_tab() {
             3,
             "case {case}: closing tab {close} with tab {active} active -- one \
              double-click must close exactly one tab"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// A tab's image size and stack context, for every frame kind.
+// ---------------------------------------------------------------------
+
+type TabGeometry = (Option<(u32, u32)>, Option<(usize, u32, u32, u32)>);
+
+fn unsaved(dir: &Path, frames: Vec<PathBuf>) -> GuiProject {
+    GuiProject::Unsaved(focusforge_core::io::one_group(dir, frames))
+}
+
+/// What both tab helpers report for `project`: the size, and the context as
+/// (frame count, width, height, samples per pixel).
+fn tab_geometry(project: &GuiProject) -> TabGeometry {
+    use focusforge_gui::entry::{tab_image_size, tab_stack_context};
+    let context =
+        tab_stack_context(project).map(|c| (c.frame_count, c.width, c.height, c.samples_per_pixel));
+    (tab_image_size(project), context)
+}
+
+#[test]
+fn jpeg_tab_reports_size_and_context() {
+    use jpeg_encoder::ColorType;
+    let dir = tree("entry_tab_jpeg");
+    for (color, spp) in [(ColorType::Rgb, 3), (ColorType::Luma, 1)] {
+        for count in [1usize, 3] {
+            let frames: Vec<PathBuf> = ["a.jpg", "b.JPEG", "c.Jpg"][..count]
+                .iter()
+                .map(|name| write_jpeg_sized(&dir, name, 40, (24, 16), color, None))
+                .collect();
+            assert_eq!(
+                tab_geometry(&unsaved(&dir, frames)),
+                (Some((24, 16)), Some((count, 24, 16, spp))),
+                "{count} frames of {spp} samples"
+            );
+        }
+    }
+}
+
+#[test]
+fn oriented_jpeg_tab_reports_upright_size() {
+    use jpeg_encoder::ColorType;
+    let dir = tree("entry_tab_jpeg_oriented");
+    let cases = [
+        (None, (24, 16)),
+        (Some((false, 1)), (24, 16)),
+        (Some((false, 3)), (24, 16)),
+        (Some((false, 6)), (16, 24)),
+        (Some((true, 6)), (16, 24)),
+        (Some((false, 8)), (16, 24)),
+        (Some((true, 8)), (16, 24)),
+        (Some((true, 1)), (24, 16)),
+        (Some((true, 3)), (24, 16)),
+    ];
+    for (index, (orientation, (width, height))) in cases.into_iter().enumerate() {
+        let exif = orientation.map(|(big, value)| orientation_exif(big, value));
+        let frame = write_jpeg_sized(
+            &dir,
+            &format!("{index}.jpg"),
+            40,
+            (24, 16),
+            ColorType::Rgb,
+            exif.as_deref(),
+        );
+        assert_eq!(
+            tab_geometry(&unsaved(&dir, vec![frame])),
+            (Some((width, height)), Some((1, width, height, 3))),
+            "orientation {orientation:?}"
+        );
+    }
+}
+
+#[test]
+fn raw_tab_reports_size_and_context() {
+    let dir = tree("entry_tab_raw");
+    let frames = vec![write_raw(&dir, "a.dng", 1), write_raw(&dir, "b.dng", 2)];
+    let set = focusforge_core::io::open_frame_set(
+        &frames[..1],
+        focusforge_core::tile::HostBudget::explicit(u64::MAX),
+    )
+    .expect("the fixture DNG opens");
+    let expected = set.reader.frame(0);
+    let (width, height, spp) = (expected.width, expected.height, expected.samples_per_pixel);
+    assert_eq!(
+        tab_geometry(&unsaved(&dir, frames)),
+        (Some((width, height)), Some((2, width, height, spp)))
+    );
+}
+
+#[test]
+fn tiff_tab_size_matches_its_header() {
+    use focusforge_core::io::test_frames::{
+        ByteOrderSpec, FrameMetadata, shorts_bo, write_frame_with_metadata,
+    };
+    use focusforge_core::io::{ByteOrder, TiffHeader};
+
+    let dir = tree("entry_tab_tiff");
+    let oriented = dir.join("oriented.tif");
+    write_frame_with_metadata(
+        &oriented,
+        24,
+        16,
+        &FrameMetadata {
+            byte_order: ByteOrderSpec(ByteOrder::Little),
+            ifd0: vec![(274, 3, shorts_bo(ByteOrder::Little, &[6]))],
+            ..Default::default()
+        },
+    )
+    .expect("oriented TIFF writes");
+    assert_eq!(
+        TiffHeader::open(&oriented).unwrap().upright_dimensions(),
+        (16, 24)
+    );
+    let fixtures = common::workspace_root().join("fixtures");
+    let mut firsts = vec![oriented];
+    for name in ["mantis-64", "mantis8-64", "mantis-64-deflate-p1-strip-ii"] {
+        firsts.push(fixtures.join(name).join("frames/00.tif"));
+    }
+    for first in firsts {
+        let header = TiffHeader::open(&first).expect("fixture header");
+        let (width, height) = header.upright_dimensions();
+        let spp = header.samples_per_pixel;
+        assert_eq!(
+            tab_geometry(&unsaved(&dir, vec![first.clone(), first.clone()])),
+            (Some((width, height)), Some((2, width, height, spp))),
+            "{}",
+            first.display()
+        );
+    }
+}
+
+#[test]
+fn reopened_jpeg_project_reports_source_size() {
+    use jpeg_encoder::ColorType;
+    let dir = tree("entry_tab_reopened_jpeg");
+    let sources: Vec<PathBuf> = ["a.jpg", "b.jpg"]
+        .iter()
+        .map(|name| write_jpeg_sized(&dir, name, 40, (24, 16), ColorType::Rgb, None))
+        .collect();
+    let project_path = seal_test_project(&dir, &sources);
+    let project = focusforge_core::project::Project::open(&project_path).expect("project opens");
+    let project = GuiProject::Opened(Box::new(project));
+    assert_eq!(
+        focusforge_gui::entry::tab_image_size(&project),
+        Some((24, 16))
+    );
+}
+
+#[test]
+fn unreadable_first_frame_reports_no_size() {
+    let dir = tree("entry_tab_unreadable");
+    let good = write_jpeg(&dir, "good.jpg", 40);
+    let truncated = dir.join("truncated.jpg");
+    std::fs::write(&truncated, &std::fs::read(good).unwrap()[..20]).unwrap();
+    let mislabelled = dir.join("tiff-bytes.jpg");
+    std::fs::copy(
+        common::workspace_root().join("fixtures/mantis-64/frames/00.tif"),
+        &mislabelled,
+    )
+    .unwrap();
+    for (label, frames) in [
+        ("missing", vec![dir.join("missing.jpg")]),
+        ("truncated", vec![truncated]),
+        ("mislabelled", vec![mislabelled]),
+        ("empty", Vec::new()),
+    ] {
+        assert_eq!(
+            tab_geometry(&unsaved(&dir, frames)),
+            (None, None),
+            "{label}"
         );
     }
 }

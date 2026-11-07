@@ -1,0 +1,150 @@
+# Stacking settings (docs/guide/stacking.md) and Alignment (docs/guide/alignment.md).
+# The Settings panel has no scroll wheel under MCP, so shots that need the whole
+# panel use a taller window instead of scrolling.
+
+[[shot]]
+name  = "stacking-tab-launch"
+args  = ["--open", "fixtures/mantis-512/frames", "--dock-tab", "settings"]
+size  = "1280x880"
+steps = [["wait-text", "DEFAULT", "120"], ["wait-id", "FFResetAll::area"], ["pause", "800"]]
+out   = "assets/manual/stacking/stacking-tab-launch.png"
+crop  = "AppWindow::dock"
+
+[[shot]]
+name  = "stacking-fuse-picker"
+args  = ["--open", "fixtures/mantis-512/frames", "--dock-tab", "settings"]
+steps = [
+  ["wait-text", "DEFAULT", "120"],
+  ["click-id", "FFMenu::root", "0"],
+  ["wait-id", "FFMenuList::option-area"],
+  ["pause", "500"],
+]
+out   = "assets/manual/stacking/stacking-fuse-picker.png"
+crop  = "FFDock::settings-panel"
+pad   = 8
+
+[[shot]]
+name  = "stacking-soft-transitions"
+args  = ["--open", "fixtures/mantis-512/frames", "--dock-tab", "settings"]
+steps = [
+  ["wait-text", "DEFAULT", "120"],
+  ["click-id", "FFMenu::root", "0"],
+  ["click-id", "FFMenuList::option-area", "1"],
+  ["wait-text", "Sharp-source preference"],
+  ["click-id", "FFMoreToggle::header-area", "1"],
+  ["wait-text", "Radius"],
+  ["pause", "500"],
+]
+out   = "assets/manual/stacking/stacking-soft-transitions.png"
+crop  = "FFDock::settings-panel"
+pad   = 8
+
+[[shot]]
+name  = "stacking-focus-map"
+args  = ["--open", "fixtures/mantis-512/frames", "--dock-tab", "settings"]
+steps = [
+  ["wait-text", "DEFAULT", "120"],
+  ["click-id", "FFMenu::root", "0"],
+  ["click-id", "FFMenuList::option-area", "2"],
+  ["click-id", "FFMoreToggle::header-area", "1"],
+  ["wait-text", "Smoothing Radius"],
+  ["pause", "500"],
+]
+out   = "assets/manual/stacking/stacking-focus-map.png"
+crop  = "FFDock::settings-panel"
+pad   = 8
+
+[[shot]]
+name  = "stacking-details-levels"
+args  = ["--open", "fixtures/mantis-512/frames", "--dock-tab", "settings"]
+steps = [
+  ["wait-text", "DEFAULT", "120"],
+  ["click-id", "FFMoreToggle::header-area", "1"],
+  ["wait-text", "Levels"],
+  ["pause", "500"],
+]
+out   = "assets/manual/stacking/stacking-details-levels.png"
+crop  = "FFDock::settings-panel"
+pad   = 8
+
+[[shot]]
+name  = "stacking-prepare"
+args  = ["--open", "fixtures/mantis-512/frames", "--dock-tab", "settings"]
+steps = [
+  ["wait-text", "DEFAULT", "120"],
+  ["click-id", "FFMoreToggle::header-area", "0"],
+  ["wait-text", "Target brightness (stops)"],
+  ["pause", "500"],
+]
+out   = "assets/manual/stacking/stacking-prepare.png"
+crop  = "FFDock::settings-panel"
+pad   = 8
+
+[[shot]]
+name  = "stacking-prepare-off"
+args  = ["--open", "fixtures/mantis-512/frames", "--dock-tab", "settings"]
+steps = [
+  ["wait-text", "DEFAULT", "120"],
+  ["click-id", "FFMoreToggle::header-area", "0"],
+  ["wait-text", "Target brightness (stops)"],
+  ["click-id", "FFSlider::drag-area", "1"],
+  ["key", "Left"],
+  ["key", "Left"],
+  ["wait-text", "−" ],
+  ["click-id", "FFToggle::area", "0"],
+  ["pause", "500"],
+]
+out   = "assets/manual/stacking/stacking-prepare-off.png"
+crop  = "FFDock::settings-panel"
+pad   = 8
+
+[[shot]]
+name  = "stacking-align-more"
+args  = ["--open", "fixtures/mantis-512/frames", "--dock-tab", "settings"]
+size  = "1280x1300"
+steps = [
+  ["wait-text", "DEFAULT", "120"],
+  ["click-id", "FFMoreToggle::header-area", "2"],
+  ["wait-text", "Reference Frame"],
+  ["pause", "500"],
+]
+out   = "assets/manual/alignment/align-more.png"
+crop  = "FFDock::settings-panel"
+pad   = 8
+
+[[shot]]
+name  = "stacking-align-off"
+args  = ["--open", "fixtures/mantis-512/frames", "--dock-tab", "settings"]
+size  = "1280x880"
+steps = [
+  ["wait-text", "DEFAULT", "120"],
+  ["click-id", "FFToggle::area", "0"],
+  ["pause", "800"],
+]
+out   = "assets/manual/alignment/align-off.png"
+crop  = "FFDock::settings-panel"
+pad   = 8
+
+[[shot]]
+name  = "stacking-locked-during-run"
+args  = ["--open", "fixtures/mantis-512/frames", "--dock-tab", "settings", "--slow-run", "1"]
+steps = [
+  ["wait-text", "DEFAULT", "120"],
+  ["click-id", "FFToolbar::fuse-button"],
+  ["wait-id", "FFToolbar::pause-button", "120"],
+  ["pause", "2000"],
+]
+out   = "assets/manual/stacking/stacking-locked-during-run.png"
+
+[[shot]]
+name  = "stacking-keep-dialog"
+args  = ["--open", "fixtures/mantis-512/frames", "--dock-tab", "settings"]
+steps = [
+  ["wait-text", "DEFAULT", "120"],
+  ["click-id", "FFToolbar::fuse-button"],
+  ["wait-id", "AppWindow::divergence-warning", "900"],
+  ["pause", "800"],
+]
+out   = "assets/manual/alignment/keep-dialog.png"
+crop  = "FFModalPanel::panel"
+pad   = 12

@@ -5,6 +5,7 @@
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
+import { FFAppear } from "../components/ff_appear.slint";
 import { FFModeSwitch } from "dock/mode_switch.slint";
 import { FFCheckpointPanel, CheckpointEntryView } from "dock/checkpoint_panel.slint";
 export { CheckpointEntryView }
@@ -80,6 +81,8 @@ export component FFDock inherits Rectangle {
     callback images-sort-selected(string);
     callback images-frame-selected(int);
     callback images-frame-keyboard-moved(int);
+    callback images-other-key-pressed(KeyEvent) -> EventResult;
+    callback images-other-key-released(KeyEvent) -> EventResult;
     callback images-frame-excluded-toggled(int);
     callback images-frame-remove-requested(int);
     callback images-frame-drag-pointer(int, int, length);
@@ -129,16 +132,16 @@ export component FFDock inherits Rectangle {
 
         dock-tabs := FFDockTabs {
             // Hidden in editor mode: the legend shows in their place.
-            visible: root.project-loaded && root.mode == "stacking";
+            shown: root.project-loaded && root.mode == "stacking";
             active: root.dock-tab;
             tab-selected(t) => { root.dock-tab-selected(t); }
         }
     }
 
-    settings-panel := FFSettingsPanel {
+    settings-appear := FFAppear {
         x: ShellGeometry.dock-content-inset;
         y: root.content-top;
-        // The scrollbar sits flush on this panel's own right edge (see
+        // The scrollbar sits flush on the panel's own right edge (see
         // `ff_scrollbar.slint`'s `x: parent.width - self.width`), so this
         // width is what puts that edge `dock-scrollbar-inset` from the
         // dock's own right edge: the panel starts `dock-content-inset` in,
@@ -147,60 +150,72 @@ export component FFDock inherits Rectangle {
         height: parent.height - self.y - ShellGeometry.dock-content-inset;
         // The tabs are gone in editor mode, and with them the Settings
         // panel -- the legend takes the whole dock body there instead.
-        visible: root.project-loaded && root.mode == "stacking" && root.dock-tab == "settings";
-        rows: root.settings-rows;
-        sticky: root.settings-sticky;
-        scroll-y: root.settings-scroll-y;
-        content-height: root.settings-content-height;
-        enabled: root.settings-enabled;
-        param-changed(section, id, f) => { root.settings-param-changed(section, id, f); }
-        param-stepped(section, id, direction) => { root.settings-param-stepped(section, id, direction); }
-        param-text-edited(section, id, text) => { root.settings-param-text-edited(section, id, text); }
-        algorithm-selected(section, id) => { root.settings-algorithm-selected(section, id); }
-        reset-all => { root.settings-reset-all(); }
-        menu-toggled(section, id) => { root.settings-menu-toggled(section, id); }
-        more-toggled(section) => { root.settings-more-toggled(section); }
-        scrolled(delta) => { root.settings-scrolled(delta); }
-        scrollbar-pointer(kind, y) => { root.settings-scrollbar-pointer(kind, y); }
-        scrollbar-dragged(y) => { root.settings-scrollbar-dragged(y); }
-        viewport-height-changed(h) => { root.settings-viewport-height-changed(h); }
+        shown: root.project-loaded && root.mode == "stacking" && root.dock-tab == "settings";
+
+        settings-panel := FFSettingsPanel {
+            width: 100%;
+            height: 100%;
+            rows: root.settings-rows;
+            sticky: root.settings-sticky;
+            scroll-y: root.settings-scroll-y;
+            content-height: root.settings-content-height;
+            enabled: root.settings-enabled;
+            param-changed(section, id, f) => { root.settings-param-changed(section, id, f); }
+            param-stepped(section, id, direction) => { root.settings-param-stepped(section, id, direction); }
+            param-text-edited(section, id, text) => { root.settings-param-text-edited(section, id, text); }
+            algorithm-selected(section, id) => { root.settings-algorithm-selected(section, id); }
+            reset-all => { root.settings-reset-all(); }
+            menu-toggled(section, id) => { root.settings-menu-toggled(section, id); }
+            more-toggled(section) => { root.settings-more-toggled(section); }
+            scrolled(delta) => { root.settings-scrolled(delta); }
+            scrollbar-pointer(kind, y) => { root.settings-scrollbar-pointer(kind, y); }
+            scrollbar-dragged(y) => { root.settings-scrollbar-dragged(y); }
+            viewport-height-changed(h) => { root.settings-viewport-height-changed(h); }
+        }
     }
 
-    images-panel := FFImagesPanel {
+    images-appear := FFAppear {
         x: ShellGeometry.dock-content-inset;
         y: root.content-top;
         width: ShellGeometry.dock-width - ShellGeometry.dock-content-inset - ShellGeometry.dock-scrollbar-inset;
         height: parent.height - self.y - ShellGeometry.dock-content-inset;
         // The legend always shows in editor mode, tabs or none.
-        visible: root.project-loaded && (root.mode == "editor" || root.dock-tab == "images");
-        rows: root.images-rows;
-        header-text: root.images-header-text;
-        presentation: root.images-presentation;
-        tooltip-max-width: root.tooltip-max-width;
-        list-viewport-y <=> root.images-list-viewport-y;
-        mutable: root.mode == "stacking";
-        enabled: root.images-enabled;
-        job-disabled: !root.images-enabled;
-        legend: root.mode == "editor";
-        sort: root.images-sort;
-        sort-menu-open: root.images-sort-menu-open;
-        dragging-row: root.images-dragging-row;
-        drag-offset: root.images-drag-offset;
-        drag-capture-active: root.images-drag-capture-active;
-        drag-target-row: root.images-drag-target-row;
-        add-frames-requested => { root.images-add-frames-requested(); }
-        sort-menu-toggled => { root.images-sort-menu-toggled(); }
-        sort-selected(picked) => { root.images-sort-selected(picked); }
-        frame-selected(i) => { root.images-frame-selected(i); }
-        frame-keyboard-moved(delta) => { root.images-frame-keyboard-moved(delta); }
-        frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
-        frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
-        frame-drag-pointer(i, kind, y) => { root.images-frame-drag-pointer(i, kind, y); }
-        viewport-scrolled(offset) => { root.images-viewport-scrolled(offset); }
-        frame-wheel(delta) => { root.images-frame-wheel(delta); }
-        scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }
-        scrollbar-dragged(y) => { root.images-scrollbar-dragged(y); }
-        viewport-height-changed(h) => { root.images-viewport-height-changed(h); }
+        shown: root.project-loaded && (root.mode == "editor" || root.dock-tab == "images");
+
+        images-panel := FFImagesPanel {
+            width: 100%;
+            height: 100%;
+            rows: root.images-rows;
+            header-text: root.images-header-text;
+            presentation: root.images-presentation;
+            tooltip-max-width: root.tooltip-max-width;
+            list-viewport-y <=> root.images-list-viewport-y;
+            mutable: root.mode == "stacking";
+            enabled: root.images-enabled;
+            job-disabled: !root.images-enabled;
+            legend: root.mode == "editor";
+            sort: root.images-sort;
+            sort-menu-open: root.images-sort-menu-open;
+            dragging-row: root.images-dragging-row;
+            drag-offset: root.images-drag-offset;
+            drag-capture-active: root.images-drag-capture-active;
+            drag-target-row: root.images-drag-target-row;
+            add-frames-requested => { root.images-add-frames-requested(); }
+            sort-menu-toggled => { root.images-sort-menu-toggled(); }
+            sort-selected(picked) => { root.images-sort-selected(picked); }
+            frame-selected(i) => { root.images-frame-selected(i); }
+            frame-keyboard-moved(delta) => { root.images-frame-keyboard-moved(delta); }
+            other-key-pressed(event) => { return root.images-other-key-pressed(event); }
+            other-key-released(event) => { return root.images-other-key-released(event); }
+            frame-excluded-toggled(i) => { root.images-frame-excluded-toggled(i); }
+            frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
+            frame-drag-pointer(i, kind, y) => { root.images-frame-drag-pointer(i, kind, y); }
+            viewport-scrolled(offset) => { root.images-viewport-scrolled(offset); }
+            frame-wheel(delta) => { root.images-frame-wheel(delta); }
+            scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }
+            scrollbar-dragged(y) => { root.images-scrollbar-dragged(y); }
+            viewport-height-changed(h) => { root.images-viewport-height-changed(h); }
+        }
     }
 
     no-project-note := Text {

@@ -52,6 +52,10 @@ export component FFDiagnosticsPanel inherits Rectangle {
         ? "warning"
         : "neutral";
 
+    // A user edit replaces the field's text binding; this puts the
+    // controller's destination back after every change.
+    changed destination => { dest-field.take-pushed-text(); }
+
     VerticalLayout {
         VerticalLayout {
             padding-left: ShellGeometry.settings-content-inset-left;

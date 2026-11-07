@@ -113,6 +113,99 @@ pub fn cli_bin(test_name: &str) -> Command {
     cmd
 }
 
+/// [`cli_bin`] named after the calling test binary.
+///
+/// `#[allow(dead_code)]`: not every test binary in this crate calls this
+/// helper.
+#[allow(dead_code)]
+pub fn bin() -> Command {
+    cli_bin(env!("CARGO_CRATE_NAME"))
+}
+
+/// The composite of `project`, exported to `<project>.exported.tif`. Two
+/// containers of the same stack differ in `created_at`, so a byte comparison
+/// goes through `export`.
+///
+/// `#[allow(dead_code)]`: not every test binary calls this helper.
+#[allow(dead_code)]
+pub fn export_composite(cwd: &Path, project: &Path) -> PathBuf {
+    let exported = project.with_extension("exported.tif");
+    let out = run_in(
+        &mut bin(),
+        cwd,
+        &[
+            "export",
+            project.to_str().unwrap(),
+            "-o",
+            exported.to_str().unwrap(),
+        ],
+    );
+    assert!(out.success, "export stderr: {}", out.stderr);
+    exported
+}
+
+/// Both payloads of `project`, exported beside it in one invocation as
+/// `<stem>.composite.tif` and `<stem>.zmap.tif`.
+///
+/// `#[allow(dead_code)]`: not every test binary in this crate calls this
+/// helper.
+#[allow(dead_code)]
+pub fn export_both(cwd: &Path, project: &Path) -> (PathBuf, PathBuf) {
+    let composite = project.with_extension("composite.tif");
+    let zmap = project.with_extension("zmap.tif");
+    let out = run_in(
+        &mut bin(),
+        cwd,
+        &[
+            "export",
+            project.to_str().unwrap(),
+            "-o",
+            composite.to_str().unwrap(),
+            "--zmap",
+            zmap.to_str().unwrap(),
+        ],
+    );
+    assert!(out.success, "export stderr: {}", out.stderr);
+    (composite, zmap)
+}
+
+/// The one `.ffp` project in `dir`; fails the test when there are none or
+/// several.
+///
+/// `#[allow(dead_code)]`: not every test binary in this crate calls this
+/// helper.
+#[allow(dead_code)]
+pub fn only_project(dir: &Path) -> PathBuf {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "ffp"))
+        .collect();
+    assert_eq!(found.len(), 1, "exactly one project expected in {dir:?}");
+    found.pop().unwrap()
+}
+
+/// `<path>.partial`, the sibling an export writes before renaming into place.
+///
+/// `#[allow(dead_code)]`: not every test binary in this crate calls this
+/// helper.
+#[allow(dead_code)]
+pub fn partial_of(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap().to_os_string();
+    name.push(".partial");
+    path.with_file_name(name)
+}
+
+/// The raw bytes of `path`.
+///
+/// `#[allow(dead_code)]`: not every test binary in this crate calls this
+/// helper.
+#[allow(dead_code)]
+pub fn read_pixels(path: &Path) -> Vec<u8> {
+    std::fs::read(path).expect("output file must be readable")
+}
+
 /// The `FOCUSFORGE_DATA_DIR` [`cli_bin`] set on `cmd`.
 ///
 /// `#[allow(dead_code)]`: not every test binary in this crate calls this
@@ -368,4 +461,13 @@ pub fn write_synthetic_stack(dir: &Path, width: u32, height: u32, shifts: &[(f64
             .expect("synthetic frame writer must accept the full tile");
         writer.finish().expect("synthetic frame writer must finish");
     }
+}
+
+/// A temp directory `name` holding three 16x16 synthetic frames, the second
+/// shifted one pixel right and the third one pixel down.
+#[allow(dead_code)]
+pub fn synthetic_frames(name: &str) -> TmpDir {
+    let frames = tmp_dir(name);
+    write_synthetic_stack(&frames, 16, 16, &[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]);
+    frames
 }

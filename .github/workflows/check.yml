@@ -53,7 +53,7 @@ jobs:
             ~/.cargo/git
             target/*
             !target/tmp
-          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
       - name: Select native Python
         run: |
           if ! command -v python3 >/dev/null 2>&1; then

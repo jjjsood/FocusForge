@@ -10,6 +10,7 @@ import { ShellGeometry } from "geometry.slint";
 import { FFIconButton } from "components/ff_icon_button.slint";
 import { FFSlider } from "components/ff_slider.slint";
 import { FFField } from "components/ff_field.slint";
+import { FFAppear } from "components/ff_appear.slint";
 import { FFToggle } from "components/ff_toggle.slint";
 import { FFMenu } from "components/ff_menu.slint";
 import { FFMenuList } from "components/ff_menu_list.slint";
@@ -20,9 +21,13 @@ import { FFResetAll } from "components/ff_reset_all.slint";
 import { FFMoreToggle } from "components/ff_more_toggle.slint";
 import { FFRowLabel } from "components/ff_row_label.slint";
 import { FFRowText } from "components/ff_row_text.slint";
+import { FFLinkText } from "components/ff_link_text.slint";
 import { FFButton } from "components/ff_button.slint";
 import { FFProgressBar } from "components/ff_progress_bar.slint";
 import { FFPanePlaceholder } from "components/ff_pane_placeholder.slint";
+import { FFStageView, StageTile } from "components/ff_stage_view.slint";
+import { FFStageInset } from "components/ff_stage_inset.slint";
+import { FFHeatLegend } from "components/ff_heat_legend.slint";
 import { FFSpinner } from "components/ff_spinner.slint";
 import { FFLoadingPanel } from "components/ff_loading_panel.slint";
 import { FFImageRow } from "components/ff_image_row.slint";
@@ -39,6 +44,8 @@ import { FFStatusGlyph } from "components/ff_status_glyph.slint";
 import { FFHeading } from "components/ff_heading.slint";
 import { FFDivider } from "components/ff_divider.slint";
 import { FFSegmented } from "components/ff_segmented.slint";
+import { FFModeLabel } from "components/ff_mode_label.slint";
+import { FFModePill } from "components/ff_mode_pill.slint";
 import { FFPane } from "components/ff_pane.slint";
 import { FFPaneLabel } from "components/ff_pane_label.slint";
 import { FFUndockControl } from "components/ff_undock_control.slint";
@@ -49,6 +56,7 @@ import { FFToast } from "components/ff_toast.slint";
 import { FFNotificationRow } from "components/ff_notification_row.slint";
 import { FFModalPanel } from "components/ff_modal_panel.slint";
 import { FFTextField } from "components/ff_text_field.slint";
+import { FFSizeField } from "components/ff_size_field.slint";
 import { FFNavRail } from "components/ff_nav_rail.slint";
 import { FFNavRailEntry } from "components/ff_nav_rail_entry.slint";
 import { FFSettingsSection } from "components/ff_settings_section.slint";
@@ -57,6 +65,15 @@ import { FFSettingsPathRow } from "components/ff_settings_path_row.slint";
 import { FFSettingsActionRow } from "components/ff_settings_action_row.slint";
 import { FFStatusText } from "components/ff_status_text.slint";
 import { FFInputTableRow } from "components/ff_input_table_row.slint";
+import { FFOverlayFrame } from "components/ff_overlay_frame.slint";
+import { FFCalculatorIllustration } from "components/ff_calculator_illustration.slint";
+import { FFLeaderLine } from "components/ff_leader_line.slint";
+import { FFDimensionMark } from "components/ff_dimension_mark.slint";
+import { FFCalculatorInset } from "components/ff_calculator_inset.slint";
+import { FFSummaryBand } from "components/ff_summary_band.slint";
+import { FFCalculatorLegend } from "components/ff_calculator_legend.slint";
+import { FFAnalyticsRow } from "components/ff_analytics_row.slint";
+import { FFStatusText } from "components/ff_status_text.slint";
 
 // The settings modal's own ground, content width plus its padding.
 component SettingsGround inherits Rectangle {
@@ -83,27 +100,6 @@ component CenterGround inherits Rectangle {
         padding-right: Theme.space-4;
         alignment: start;
         @children
-    }
-}
-
-// A text field in a settings row's value slot. The slot keeps the field's
-// unemphasised size, so its focus growth stays centred.
-component CapFieldSlot inherits Rectangle {
-    in property <string> text: "";
-    in property <string> placeholder: "";
-    in property <string> tone: "neutral";
-    in property <bool> enabled: true;
-    width: ShellGeometry.settings-field-width;
-    height: ShellGeometry.field-height;
-
-    FFTextField {
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-        text: root.text;
-        placeholder: root.placeholder;
-        tone: root.tone;
-        enabled: root.enabled;
-        field-width: parent.width;
     }
 }
 
@@ -199,12 +195,66 @@ component IconSizeSample inherits Rectangle {
     }
 }
 
+component StagePane inherits Rectangle {
+    in property <string> label;
+    in property <image> source;
+    in property <[StageTile]> tiles;
+    in property <bool> inset-visible;
+    in property <image> heat;
+
+    width: 400px;
+    height: 280px;
+
+    FFStageView {
+        width: parent.width;
+        height: parent.height;
+        image-w: parent.width;
+        image-h: parent.height;
+        source: root.source;
+        tiles: root.tiles;
+        inset-visible: root.inset-visible;
+        heat: root.heat;
+    }
+    FFPaneLabel {
+        x: ShellGeometry.pane-chrome-inset;
+        y: ShellGeometry.pane-chrome-inset;
+        label: root.label;
+    }
+}
+
 export component ThemeSheet inherits Window {
+    in property <image> stage-fusing;
+    in property <image> stage-fusing-bare;
+    in property <image> stage-complete;
+    in property <image> stage-heat;
+    in property <[StageTile]> stage-tiles;
+    // The motion demos below show and hide together.
+    in-out property <bool> demo-shown: true;
+    in-out property <bool> demo-loop: true;
+    in-out property <int> guard-clicks: 0;
+
     title: "FocusForge -- token sheet";
     preferred-width: 1100px;
     preferred-height: 1000px;
     background: Theme.surface-base;
     default-font-family: Theme.font-family;
+
+    // The typed size field's focus state needs the window to be shown first.
+    in-out property <bool> size-field-unfocused: true;
+    Timer {
+        interval: 400ms;
+        running: root.size-field-unfocused;
+        triggered => {
+            typed-size-field.focus();
+            root.size-field-unfocused = false;
+        }
+    }
+
+    Timer {
+        interval: 2s;
+        running: root.demo-loop;
+        triggered => { root.demo-shown = !root.demo-shown; }
+    }
 
     Flickable {
         width: root.width;
@@ -215,7 +265,299 @@ export component ThemeSheet inherits Window {
         spacing: Theme.space-3;
         alignment: start;
 
-        GroupHeading { text: "FFToast: info, warning, failure / crash, hover, focus"; }
+        GroupHeading { text: "Icon button: current (icon bar), at rest, hover-free"; }
+        FFNavRail {
+            width: ShellGeometry.icon-bar-width;
+            height: 240px;
+            raised: true;
+            FFIconButton { icon: @image-url("../../../assets/icons/calculator.svg"); focusable: true; current: true; }
+            FFIconButton { icon: @image-url("../../../assets/icons/chart-bar.svg"); focusable: true; }
+            FFIconButton { icon: @image-url("../../../assets/icons/chart-bar.svg"); focusable: true; current: true; }
+            FFIconButton { icon: @image-url("../../../assets/icons/chart-bar.svg"); focusable: true; enabled: false; }
+            FFIconButton { icon: @image-url("../../../assets/icons/settings.svg"); focusable: true; }
+        }
+
+        GroupHeading { text: "Segmented: section variant"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            alignment: start;
+            FFSegmented { width: 240px; section: true; segments: ["Lens (f-stop)", "Objective (NA)"]; selected: "Lens (f-stop)"; }
+            FFSegmented { width: 240px; section: true; segments: ["Lens (f-stop)", "Objective (NA)"]; selected: "Objective (NA)"; }
+        }
+
+        GroupHeading { text: "Field: editable at rest, focused, invalid with its violation line"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            alignment: start;
+            FFField { width: 56px; text: "1"; editable: true; text-alignment: right; }
+            FFField { width: 56px; text: "1"; editable: true; focused: true; text-alignment: right; }
+            VerticalLayout {
+                spacing: Theme.space-1;
+                FFField { width: 56px; text: "0.95"; editable: true; invalid: true; text-alignment: right; }
+                Text { text: "value 0.95 is outside the allowed range [0, 0.9]"; color: Theme.status-failure; font-size: Theme.text-body.size; }
+            }
+        }
+
+        GroupHeading { text: "Leader line (dot at end, at start, horizontal, dotted), dimension mark, bracket"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            alignment: start;
+            FFLeaderLine { width: 5px; height: 60px; }
+            FFLeaderLine { width: 5px; height: 60px; dot-at-end: false; }
+            FFLeaderLine { width: 60px; height: 5px; horizontal: true; }
+            FFLeaderLine { width: 1px; height: 60px; dotted: true; show-dot: false; }
+            FFDimensionMark { width: 52px; height: 5px; bracket: true; }
+            FFDimensionMark { width: 200px; label: "Frames"; value: "13"; }
+            FFDimensionMark { width: 240px; label: "Depth of field"; value: "563.2 \u{00B5}m"; }
+        }
+
+        GroupHeading { text: "Overlay frame; calculator illustration, lens 13 planes, objective 17 planes, then 1, 2, 7, 30 planes"; }
+        FFOverlayFrame {
+            width: 520px;
+            height: 160px;
+            title: "Step calculator";
+        }
+        FFOverlayFrame {
+            width: 520px;
+            height: 160px;
+            title: "Analytics";
+            footer-height: 0px;
+        }
+
+        GroupHeading { text: "Analytics rows: heading, subtitle, final rows without and with a rail position (2 of 58, count 0, largest 58), then a partial and a pending row"; }
+        Rectangle {
+            width: 892px;
+            height: 7 * ShellGeometry.analytics-row-height + 2 * ShellGeometry.analytics-row-height + 3 * Theme.space-6;
+            background: Theme.surface-canvas;
+            FFSectionHeading { x: Theme.space-4; y: Theme.space-3; width: 400px; flat: true; strong: true; label: "SHARP AREAS PER IMAGE"; }
+            FFStatusText { x: Theme.space-4; y: Theme.space-6; width: 400px; height: 16px; text: "Image areas that are sharpest in this image"; }
+            VerticalLayout {
+                y: Theme.space-8 + Theme.space-6;
+                alignment: start;
+                FFAnalyticsRow { chip: Theme.status-failure; name: "00.tif"; fraction: 2.0 / 58.0; count: 2; }
+                FFAnalyticsRow { chip: Theme.status-warning; name: "01.tif"; fraction: 1.0; count: 58; }
+                FFAnalyticsRow { chip: Theme.status-success; name: "frame-with-a-long-file-name-0003.tif"; fraction: 0.0; count: 0; }
+                FFAnalyticsRow { chip: Theme.accent-default; name: "03.tif"; mm-text: "1.250 mm"; fraction: 14.0 / 72.0; count: 14; }
+                FFAnalyticsRow { chip: Theme.status-failure; name: "04.tif"; mm-text: "-10.000 mm"; fraction: 1.0; count: 72; }
+                FFAnalyticsRow { chip: Theme.status-warning; name: "05.tif"; fraction: 0.6; value-state: "partial"; }
+                FFAnalyticsRow { chip: Theme.status-success; name: "06.tif"; value-state: "pending"; }
+            }
+        }
+
+        GroupHeading { text: "Analytics messages, unframed: waiting (no stack), counting failed"; }
+        Rectangle {
+            width: 892px;
+            height: 160px;
+            background: Theme.surface-canvas;
+            FFLoadingPanel {
+                x: 0.25 * parent.width - self.width / 2;
+                y: (parent.height - self.height) / 2;
+                framed: false;
+                show-spinner: false;
+                title: "No stack loaded";
+                caption: "Load a stack to count its sharp areas.";
+            }
+            FFLoadingPanel {
+                x: 0.75 * parent.width - self.width / 2;
+                y: (parent.height - self.height) / 2;
+                framed: false;
+                show-spinner: false;
+                tone: "failed";
+                title: "Counting failed";
+                caption: "could not read frame_003.tif";
+            }
+        }
+        FFCalculatorIllustration { plane-count: 13; }
+        FFCalculatorIllustration { objective: true; plane-count: 17; }
+        FFCalculatorIllustration { plane-count: 1; }
+        FFCalculatorIllustration { objective: true; plane-count: 2; }
+        FFCalculatorIllustration { plane-count: 7; }
+        FFCalculatorIllustration { objective: true; plane-count: 30; }
+
+        GroupHeading { text: "Calculator illustration art-scale: 1.0 as drawn, and 1.3 under a 1.3 scale"; }
+        Rectangle {
+            width: 770px + Theme.space-6 + 770px * 1.3;
+            height: 240px * 1.3;
+            FFCalculatorIllustration { x: 0px; y: 0px; art-scale: 1.0; }
+            FFCalculatorIllustration {
+                x: 770px + Theme.space-6;
+                y: 0px;
+                art-scale: 1.3;
+                transform-scale: 1.3;
+                transform-origin: { x: 0px, y: 0px };
+            }
+        }
+
+        GroupHeading { text: "Calculator inset (overlap 0.25, 0.9 with a violation line room), summary band, legend"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            alignment: start;
+            FFCalculatorInset { step-text: "422.4 \u{00B5}m"; depth-of-field-text: "563.2 \u{00B5}m"; }
+            FFCalculatorInset { step-text: "56.3 \u{00B5}m"; depth-of-field-text: "563.2 \u{00B5}m"; overlap: 0.9; extra-height: Theme.space-4 + Theme.space-1; }
+        }
+        FFSummaryBand {
+            width: 960px;
+            entered: [
+                { caption: "Optics", value: "f-stop" },
+                { caption: "Magnification", value: "1\u{00D7}" },
+                { caption: "Overlap", value: "0.25" },
+                { caption: "Depth range", value: "5 mm" },
+            ];
+            calculated: [
+                { caption: "Depth of field", value: "563.2 \u{00B5}m" },
+                { caption: "Step", value: "422.4 \u{00B5}m" },
+                { caption: "Frames", value: "13" },
+            ];
+        }
+        FFCalculatorLegend { }
+
+        GroupHeading { text: "Motion: FFAppear enter-only, fade-out, slow fade-out; modal panel; toast"; }
+        HorizontalLayout {
+            spacing: Theme.space-3;
+            alignment: start;
+            FFToggle {
+                on: Theme.reduce-motion;
+                name: "Reduce motion";
+                toggled => { Theme.reduce-motion = !Theme.reduce-motion; }
+            }
+            Text { text: "Reduce motion"; color: Theme.text-primary; vertical-alignment: center; }
+            FFToggle {
+                on: root.demo-loop;
+                name: "Loop";
+                toggled => { root.demo-loop = !root.demo-loop; }
+            }
+            Text { text: "Loop every 2 s"; color: Theme.text-primary; vertical-alignment: center; }
+            FFButton {
+                width: 120px;
+                compact: true;
+                text: root.demo-shown ? "Hide" : "Show";
+                clicked => { root.demo-shown = !root.demo-shown; }
+            }
+            Text {
+                text: "motion-fast " + Theme.motion-fast / 1ms + " ms, motion-slow " + Theme.motion-slow / 1ms + " ms, flash-hold " + Theme.flash-hold / 1ms + " ms";
+                color: Theme.text-secondary;
+                vertical-alignment: center;
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            alignment: start;
+            Rectangle {
+                width: 220px;
+                height: 96px;
+                border-width: 1px;
+                border-color: Theme.border-default;
+                FFAppear {
+                    shown: root.demo-shown;
+                    background: Theme.surface-raised;
+                    Text {
+                        text: "Enter-only: fades in, cuts out";
+                        color: Theme.text-primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            Rectangle {
+                width: 220px;
+                height: 96px;
+                border-width: 1px;
+                border-color: Theme.border-default;
+                FFAppear {
+                    shown: root.demo-shown;
+                    fade-out: true;
+                    background: Theme.surface-raised;
+                    VerticalLayout {
+                        padding: Theme.space-3;
+                        spacing: Theme.space-2;
+                        alignment: center;
+                        Text { text: "Fade-out, 150 ms"; color: Theme.text-primary; }
+                        HorizontalLayout {
+                            spacing: Theme.space-2;
+                            alignment: start;
+                            FFButton {
+                                width: 88px;
+                                compact: true;
+                                text: "Click me";
+                                clicked => { root.guard-clicks += 1; }
+                            }
+                            Text { text: "clicks: " + root.guard-clicks; color: Theme.text-secondary; vertical-alignment: center; }
+                        }
+                    }
+                }
+            }
+            Rectangle {
+                width: 220px;
+                height: 96px;
+                border-width: 1px;
+                border-color: Theme.border-default;
+                FFAppear {
+                    shown: root.demo-shown;
+                    fade-out: true;
+                    slow: true;
+                    background: Theme.surface-raised;
+                    Text {
+                        text: "Slow fade-out, 400 ms";
+                        color: Theme.text-primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            alignment: start;
+            Rectangle {
+                width: 500px;
+                height: 220px;
+                clip: true;
+                FFModalPanel {
+                    modal-open: root.demo-shown;
+                    show-close: true;
+                    panel-width: 440px;
+                    panel-height: 180px;
+                    FFHeading {
+                        x: Theme.space-4;
+                        y: Theme.space-4;
+                        text: "Panel and scrim fade together";
+                    }
+                }
+            }
+            Rectangle {
+                width: 300px;
+                height: 84px;
+                FFToast { toast-open: root.demo-shown; kind: "warning"; title: "Brightness target limited"; }
+            }
+        }
+
+        GroupHeading { text: "Stage view: fusing with heat, fusing heat off, aligning, writing"; }
+        VerticalLayout {
+            spacing: Theme.space-4;
+            HorizontalLayout {
+                spacing: Theme.space-6;
+                alignment: start;
+                StagePane { label: "Composite"; source: root.stage-fusing; tiles: root.stage-tiles; inset-visible: true; heat: root.stage-heat; }
+                StagePane { label: "Composite"; source: root.stage-fusing-bare; tiles: root.stage-tiles; }
+            }
+            HorizontalLayout {
+                spacing: Theme.space-6;
+                alignment: start;
+                StagePane { label: "Aligned · IMG_0042.tif"; source: root.stage-complete; }
+                StagePane { label: "Composite"; source: root.stage-complete; }
+            }
+        }
+
+        GroupHeading { text: "Stage inset: empty, filled; heat legend"; }
+        HorizontalLayout {
+            spacing: Theme.space-6;
+            alignment: start;
+            FFStageInset { }
+            FFStageInset { heat: root.stage-heat; }
+            FFHeatLegend { }
+        }
+
+        GroupHeading { text: "FFToast: info, warning, failure / crash, hover, focus, custom link label"; }
         VerticalLayout {
             spacing: Theme.space-4;
             HorizontalLayout {
@@ -231,6 +573,11 @@ export component ThemeSheet inherits Window {
                 FFToast { toast-open: true; kind: "crash"; title: "Previous session stopped"; }
                 FFToast { toast-open: true; kind: "warning"; title: "Brightness target limited"; hovered: true; }
                 FFToast { toast-open: true; kind: "warning"; title: "Brightness target limited"; focused: true; }
+            }
+            HorizontalLayout {
+                spacing: Theme.space-6;
+                alignment: start;
+                FFToast { toast-open: true; kind: "info"; title: "FocusForge 1.2.3 is available"; link-label: "Open download page"; }
             }
             HorizontalLayout {
                 spacing: Theme.space-6;
@@ -497,7 +844,87 @@ export component ThemeSheet inherits Window {
             }
         }
 
-        GroupHeading { text: "Settings: Performance rows, default (toggle on, backend, empty caps showing the placeholder, budgets, note)"; }
+        GroupHeading { text: "Settings: size field rows, default / typed (focused) / failure"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "LIMITS";
+                FFSettingsRow {
+                    label: "Host memory";
+                    align-end: true;
+                    FFSizeField { text: "48"; unit: "GiB"; }
+                }
+                FFSettingsRow {
+                    label: "Host memory";
+                    align-end: true;
+                    typed-size-field := FFSizeField { text: "512"; unit: "MiB"; }
+                }
+                FFSettingsRow {
+                    label: "Host memory";
+                    align-end: true;
+                    divider: false;
+                    FFSizeField { text: "0"; unit: "GiB"; tone: "failure"; }
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: size field rows, unavailable (one disabled box) / not probed (placeholder, unit enabled)"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "LIMITS";
+                FFSettingsRow {
+                    label: "VRAM";
+                    align-end: true;
+                    FFSizeField { unavailable: true; }
+                }
+                FFSettingsRow {
+                    label: "VRAM";
+                    align-end: true;
+                    divider: false;
+                    FFSizeField { placeholder: "Not probed yet"; unit: "GiB"; }
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: size field row with its limit line (12 px error row, right-aligned), then the unit list open"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "LIMITS";
+                FFSettingsRow {
+                    label: "Host memory";
+                    align-end: true;
+                    divider: false;
+                    FFSizeField { text: "48"; unit: "GiB"; }
+                }
+                FFErrorRow { horizontal-alignment: right; message: "Max 48.0 GiB possible."; }
+                FFDivider { }
+            }
+        }
+        size-list-ground := Rectangle {
+            width: ShellGeometry.settings-content-width + 2 * Theme.space-4;
+            height: 140px;
+
+            SettingsGround {
+                FFSettingsSection {
+                    heading: "LIMITS";
+                    FFSettingsRow {
+                        label: "Host memory";
+                        align-end: true;
+                        open-size-field := FFSizeField { text: "48"; unit: "GiB"; external-list: true; unit-open: true; }
+                    }
+                }
+            }
+            FFMenuList {
+                x: open-size-field.absolute-position.x - size-list-ground.absolute-position.x + open-size-field.unit-x;
+                y: open-size-field.absolute-position.y - size-list-ground.absolute-position.y + open-size-field.height;
+                width: open-size-field.unit-width;
+                choices: ["MiB", "GiB"];
+                choice-ids: ["MiB", "GiB"];
+                show-choice-ids: false;
+                selected: "GiB";
+            }
+        }
+
+        GroupHeading { text: "Settings: Performance rows, default (toggle on, backend, Host memory and VRAM at their default numbers)"; }
         SettingsGround {
             VerticalLayout {
                 spacing: ShellGeometry.settings-section-gap;
@@ -514,39 +941,23 @@ export component ThemeSheet inherits Window {
                         FFRowText { text: "gpu — NVIDIA GeForce RTX 5070 Ti"; overflow: elide; }
                     }
                 }
-                VerticalLayout {
-                    spacing: Theme.space-4;
-
-                    FFSettingsSection {
-                        heading: "LIMITS";
-                        FFSettingsRow {
-                            label: "Host memory cap";
-                            align-end: true;
-                            CapFieldSlot { placeholder: "No cap"; }
-                        }
-                        FFSettingsRow {
-                            label: "VRAM cap";
-                            align-end: true;
-                            CapFieldSlot { placeholder: "No cap"; }
-                        }
-                        FFSettingsRow {
-                            label: "Host budget";
-                            FFRowText { text: "48.0 GiB"; }
-                        }
-                        FFSettingsRow {
-                            label: "VRAM budget";
-                            FFRowText { text: "15.4 GiB"; }
-                        }
+                FFSettingsSection {
+                    heading: "LIMITS";
+                    FFSettingsRow {
+                        label: "Host memory";
+                        align-end: true;
+                        FFSizeField { text: "48"; unit: "GiB"; }
                     }
-                    FFStatusText {
-                        height: ShellGeometry.settings-status-height;
-                        text: "Caps only lower the probed budgets. Changes apply from the next start.";
+                    FFSettingsRow {
+                        label: "VRAM";
+                        align-end: true;
+                        FFSizeField { text: "15"; unit: "GiB"; }
                     }
                 }
             }
         }
 
-        GroupHeading { text: "Settings: Performance rows, states (toggle off, long backend elided, cap typed, cap failure tone, budget not probed yet)"; }
+        GroupHeading { text: "Settings: Performance rows, states (toggle off, wide label, long backend elided, Host memory over its maximum with the limit line, VRAM not probed yet, note)"; }
         SettingsGround {
             VerticalLayout {
                 spacing: ShellGeometry.settings-section-gap;
@@ -559,38 +970,47 @@ export component ThemeSheet inherits Window {
                         FFToggle { }
                     }
                     FFSettingsRow {
+                        label: "A label longer than its column";
+                        align-end: true;
+                        wide-label: true;
+                        FFToggle { on: true; }
+                    }
+                    FFSettingsRow {
                         label: "Backend";
                         FFRowText {
-                            text: "cpu — no usable GPU adapter: no suitable adapter was found; continuing on the CPU path";
+                            text: "cpu — no usable GPU adapter; continuing on the CPU path";
                             overflow: elide;
                         }
                     }
                 }
-                FFSettingsSection {
-                    heading: "LIMITS";
-                    FFSettingsRow {
-                        label: "Host memory cap";
-                        align-end: true;
-                        CapFieldSlot { placeholder: "No cap"; text: "2GiB"; }
+                VerticalLayout {
+                    spacing: Theme.space-4;
+
+                    FFSettingsSection {
+                        heading: "LIMITS";
+                        FFSettingsRow {
+                            label: "Host memory";
+                            align-end: true;
+                            divider: false;
+                            FFSizeField { text: "48"; unit: "GiB"; }
+                        }
+                        FFErrorRow { horizontal-alignment: right; message: "Max 48.0 GiB possible."; }
+                        FFDivider { }
+                        FFSettingsRow {
+                            label: "VRAM";
+                            align-end: true;
+                            FFSizeField { placeholder: "Not probed yet"; unit: "GiB"; }
+                        }
                     }
-                    FFSettingsRow {
-                        label: "VRAM cap";
-                        align-end: true;
-                        CapFieldSlot { placeholder: "No cap"; text: "8G"; tone: "failure"; }
-                    }
-                    FFSettingsRow {
-                        label: "Host budget";
-                        FFRowText { text: "48.0 GiB"; }
-                    }
-                    FFSettingsRow {
-                        label: "VRAM budget";
-                        FFRowText { text: "Not probed yet"; muted: true; }
+                    FFStatusText {
+                        height: ShellGeometry.settings-status-height;
+                        text: "Caps only lower the probed budgets. Changes apply from the next start.";
                     }
                 }
             }
         }
 
-        GroupHeading { text: "Settings: Performance rows, no adapter (toggle on and disabled, cpu backend, VRAM cap disabled with Unavailable, budget Unavailable, note)"; }
+        GroupHeading { text: "Settings: Performance rows, no adapter (toggle on and disabled, cpu backend, VRAM unavailable)"; }
         SettingsGround {
             VerticalLayout {
                 spacing: ShellGeometry.settings-section-gap;
@@ -607,33 +1027,17 @@ export component ThemeSheet inherits Window {
                         FFRowText { text: "cpu — no GPU adapter found"; }
                     }
                 }
-                VerticalLayout {
-                    spacing: Theme.space-4;
-
-                    FFSettingsSection {
-                        heading: "LIMITS";
-                        FFSettingsRow {
-                            label: "Host memory cap";
-                            align-end: true;
-                            CapFieldSlot { placeholder: "No cap"; }
-                        }
-                        FFSettingsRow {
-                            label: "VRAM cap";
-                            align-end: true;
-                            CapFieldSlot { placeholder: "Unavailable"; enabled: false; }
-                        }
-                        FFSettingsRow {
-                            label: "Host budget";
-                            FFRowText { text: "48.0 GiB"; }
-                        }
-                        FFSettingsRow {
-                            label: "VRAM budget";
-                            FFRowText { text: "Unavailable"; muted: true; }
-                        }
+                FFSettingsSection {
+                    heading: "LIMITS";
+                    FFSettingsRow {
+                        label: "Host memory";
+                        align-end: true;
+                        FFSizeField { text: "48"; unit: "GiB"; }
                     }
-                    FFStatusText {
-                        height: ShellGeometry.settings-status-height;
-                        text: "Caps only lower the probed budgets. Changes apply from the next start.";
+                    FFSettingsRow {
+                        label: "VRAM";
+                        align-end: true;
+                        FFSizeField { unavailable: true; }
                     }
                 }
             }
@@ -662,6 +1066,12 @@ export component ThemeSheet inherits Window {
                     helper: "Deletes cached fuse stages.";
                     button-text: "Clearing…";
                     enabled: false;
+                }
+                FFSettingsActionRow {
+                    button-text: "Check now";
+                    enabled: false;
+                    busy: true;
+                    status-text: "Checking for updates…";
                 }
                 FFSettingsActionRow {
                     label: "Stage cache";
@@ -728,6 +1138,26 @@ export component ThemeSheet inherits Window {
                     label: "Accent";
                     divider: false;
                     FFRowText { text: "example.org/project"; accent: true; }
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: link text, rest / hover / focus"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "LINK TEXT";
+                FFSettingsRow {
+                    label: "Rest";
+                    FFLinkText { text: "Open download page"; }
+                }
+                FFSettingsRow {
+                    label: "Hover";
+                    FFLinkText { text: "Open download page"; hovered: true; }
+                }
+                FFSettingsRow {
+                    label: "Focus";
+                    divider: false;
+                    FFLinkText { text: "Open download page"; focused: true; }
                 }
             }
         }
@@ -992,6 +1422,7 @@ export component ThemeSheet inherits Window {
         GroupHeading { text: "Radius"; }
         HorizontalLayout {
             spacing: Theme.space-4;
+            RadiusSample { corner: Theme.radius-xs; label: "radius-xs"; }
             RadiusSample { corner: Theme.radius-sm; label: "radius-sm"; }
             RadiusSample { corner: Theme.radius-md; label: "radius-md"; }
             RadiusSample { corner: Theme.radius-lg; label: "radius-lg"; }
@@ -1216,6 +1647,16 @@ export component ThemeSheet inherits Window {
         }
         FFRowLabel {
             width: 320px;
+            label-text: "Score Radius (invalid)";
+            FFSlider { scale: "linear"; fraction: 0.4; value-text: "4"; invalid: true; }
+        }
+        FFRowLabel {
+            width: 320px;
+            label-text: "Sharp-source preference";
+            FFSlider { scale: "linear"; fraction: 0.4286; value-text: "4.0"; }
+        }
+        FFRowLabel {
+            width: 320px;
             label-text: "Epsilon (px)";
             FFSlider { scale: "logarithmic"; fraction: 0.5556; value-text: "0.0001"; }
         }
@@ -1339,12 +1780,12 @@ export component ThemeSheet inherits Window {
         GroupHeading { text: "Toolbar: transport button"; }
         HorizontalLayout {
             spacing: Theme.space-3;
-            FFButton { width: 116px; compact: true; kind: "primary"; glyph: "▶"; text: "Fuse stack"; }
-            FFButton { width: 116px; compact: true; kind: "default"; glyph: "⏸"; text: "Pause"; }
-            FFButton { width: 116px; compact: true; kind: "default"; glyph: "▶"; text: "Resume"; }
-            FFButton { width: 116px; compact: true; kind: "default"; glyph: "☐"; text: "Cancel"; }
-            FFButton { width: 116px; compact: true; kind: "quiet"; glyph: "☐"; text: "Cancelling…"; enabled: false; }
-            FFButton { width: 116px; compact: true; kind: "primary"; glyph: "↻"; text: "Retry"; }
+            FFButton { width: 116px; compact: true; kind: "primary"; has-icon: true; icon-source: @image-url("../../../assets/icons/play.svg"); text: "Fuse stack"; }
+            FFButton { width: 116px; compact: true; kind: "default"; has-icon: true; icon-source: @image-url("../../../assets/icons/pause.svg"); text: "Pause"; }
+            FFButton { width: 116px; compact: true; kind: "default"; has-icon: true; icon-source: @image-url("../../../assets/icons/play.svg"); text: "Resume"; }
+            FFButton { width: 116px; compact: true; kind: "default"; has-icon: true; icon-source: @image-url("../../../assets/icons/square.svg"); text: "Cancel"; }
+            FFButton { width: 116px; compact: true; kind: "quiet"; has-icon: true; icon-source: @image-url("../../../assets/icons/square.svg"); text: "Cancelling…"; enabled: false; }
+            FFButton { width: 116px; compact: true; kind: "primary"; has-icon: true; icon-source: @image-url("../../../assets/icons/rotate-cw.svg"); text: "Retry"; }
             FFButton { width: 116px; compact: true; kind: "default"; text: "Fuse stack"; enabled: false; }
             FFButton {
                 width: 140px;
@@ -1363,6 +1804,8 @@ export component ThemeSheet inherits Window {
             FFProgressBar { width: 400px; tone: "failed"; fraction: 0.24; }
             FFProgressBar { width: 400px; tone: "running"; fraction: 0.0; }
             FFProgressBar { width: 400px; tone: "running"; indeterminate: true; }
+            FFProgressBar { width: 400px; thickness: ShellGeometry.analytics-bar-height; corner-radius: Theme.radius-xs; fraction: 0.62; }
+            FFProgressBar { width: 400px; thickness: ShellGeometry.analytics-bar-height; fraction: 0.62; }
         }
 
         GroupHeading { text: "Loading indicator"; }
@@ -1496,6 +1939,14 @@ export component ThemeSheet inherits Window {
             confirm-label: "Add and re-fuse";
         }
 
+        GroupHeading { text: "Dialog footer: both secondary buttons"; }
+        FFDialogFooter {
+            width: 640px;
+            tertiary-label: "New project instead";
+            secondary-label: "Exclude instead";
+            confirm-label: "Remove and re-fuse";
+        }
+
         GroupHeading { text: "Dialog footer: renamed cancel button"; }
         FFDialogFooter {
             width: 480px;
@@ -1523,7 +1974,7 @@ export component ThemeSheet inherits Window {
 
         GroupHeading { text: "Dialog: warning, Remove's own footer"; }
         Rectangle {
-            width: 500px;
+            width: 640px;
             height: 320px;
             clip: true;
             FFDialog {
@@ -1531,9 +1982,11 @@ export component ThemeSheet inherits Window {
                 height: 100%;
                 open: true;
                 tone: "warning";
+                panel-width: 640px;
                 title: "Remove and fuse again?";
                 body: "This project already holds 2 checkpoints, and confirming keeps every one of them.";
                 info: "You can also start a new project with the same settings instead.";
+                tertiary-label: "New project instead";
                 secondary-label: "Exclude instead";
                 confirm-label: "Remove and re-fuse";
             }
@@ -1674,6 +2127,15 @@ export component ThemeSheet inherits Window {
 
         GroupHeading { text: "Dialog: segmented selector"; }
         FFSegmented { width: 168px; segments: ["TIFF", "JPEG"]; selected: "TIFF"; }
+
+        GroupHeading { text: "Dock: mode switch pill and labels"; }
+        HorizontalLayout {
+            spacing: Theme.space-4;
+            FFModePill { width: 60px; height: 28px; }
+            Rectangle { width: 80px; height: 28px; FFModeLabel { text: "STACKING"; cover: 0.0; } }
+            Rectangle { width: 80px; height: 28px; FFModePill { } FFModeLabel { text: "EDITOR"; cover: 1.0; } }
+            Rectangle { width: 80px; height: 28px; FFModeLabel { text: "EDITOR"; cover: 0.0; disabled: true; } }
+        }
 
         GroupHeading { text: "Projects overlay: chip"; }
         HorizontalLayout {

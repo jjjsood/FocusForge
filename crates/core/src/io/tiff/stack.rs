@@ -15,8 +15,8 @@ use super::super::error::TiffError;
 use super::super::frame::{FrameDesc, FrameReader};
 use super::super::paths::scan_frames;
 use super::super::{TIFF_EXTENSIONS, has_extension};
-use super::header::{TAG_STRIP_OFFSETS, TiffHeader};
-use crate::tile::{Rect, Tile};
+use super::header::{ByteOrder, TAG_STRIP_OFFSETS, TiffHeader};
+use crate::tile::{Rect, Sample, SampleFormat, Tile};
 use crate::timing::{TimingCounter, measurement_scope, record_timing};
 
 /// A directory of TIFF frames, opened once, mapped lazily per frame.
@@ -32,6 +32,8 @@ pub struct TiffStack {
     headers: Vec<TiffHeader>,
     descs: Vec<FrameDesc>,
     maps: Vec<OnceLock<Mmap>>,
+    /// Uniform across frames: `check_uniform` compares bit depths.
+    format: SampleFormat,
 }
 
 impl TiffStack {
@@ -56,19 +58,39 @@ impl TiffStack {
     /// Open exactly the files given, in the order given. No directory scan,
     /// no sorting.
     pub fn open_files(paths: &[PathBuf]) -> Result<Self, TiffError> {
+        Self::open_checked(paths, |header| {
+            header.require_fast_path().map(|()| SampleFormat::U16)
+        })
+    }
+
+    /// Open the staged composite at `path`: the 16-bit unsigned or 32-bit
+    /// float uncompressed chunky layout [`TiffHeader::require_staged_path`]
+    /// accepts. Source frames never come through here; [`Self::open_files`]
+    /// keeps refusing a float file.
+    pub fn open_staged(path: &Path) -> Result<Self, TiffError> {
+        Self::open_checked(std::slice::from_ref(&path.to_path_buf()), |header| {
+            header.require_staged_path()
+        })
+    }
+
+    fn open_checked(
+        paths: &[PathBuf],
+        accept: impl Fn(&TiffHeader) -> Result<SampleFormat, TiffError>,
+    ) -> Result<Self, TiffError> {
         if paths.is_empty() {
             return Err(TiffError::NoFrames {
                 path: PathBuf::new(),
             });
         }
         let mut headers = Vec::with_capacity(paths.len());
+        let mut format = SampleFormat::U16;
         for path in paths {
             let file = File::open(path).map_err(|source| TiffError::Io {
                 path: path.clone(),
                 source,
             })?;
             let header = TiffHeader::parse(path, &file)?;
-            header.require_fast_path()?;
+            format = accept(&header)?;
             if let Some(first) = headers.first() {
                 check_uniform(first, &header)?;
             }
@@ -80,7 +102,15 @@ impl TiffStack {
             headers,
             descs,
             maps,
+            format,
         })
+    }
+
+    /// The sample type the frames hold. Reads in the other type convert: a
+    /// `u16` read of a float frame narrows with [`Sample::narrow`], an `f32`
+    /// read of a 16-bit frame widens.
+    pub fn sample_format(&self) -> SampleFormat {
+        self.format
     }
 
     pub fn len(&self) -> usize {
@@ -157,6 +187,45 @@ impl TiffStack {
         rect: Rect,
         step: NonZeroU32,
         out: &mut [u16],
+    ) -> Result<(), TiffError> {
+        match self.format {
+            SampleFormat::U16 => self.read_step_as(frame, rect, step, out, |order, c| {
+                order.u16_from([c[0], c[1]])
+            }),
+            SampleFormat::F32 => self.read_step_as(frame, rect, step, out, |order, c| {
+                u16::narrow(order.f32_from([c[0], c[1], c[2], c[3]]))
+            }),
+        }
+    }
+
+    /// [`Self::read_tile_into`] in `f32` samples on the 16-bit scale: a float
+    /// frame is read as stored, a 16-bit one widened.
+    pub fn read_tile_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<(), TiffError> {
+        let step = NonZeroU32::MIN;
+        match self.format {
+            SampleFormat::U16 => self.read_step_as(frame, rect, step, out, |order, c| {
+                f32::from(order.u16_from([c[0], c[1]]))
+            }),
+            SampleFormat::F32 => self.read_step_as(frame, rect, step, out, |order, c| {
+                order.f32_from([c[0], c[1], c[2], c[3]])
+            }),
+        }
+    }
+
+    /// The strip walk behind every read: `decode` turns one stored sample (the
+    /// frame's `bytes_per_sample` bytes) into the requested type.
+    fn read_step_as<T: Copy>(
+        &self,
+        frame: usize,
+        rect: Rect,
+        step: NonZeroU32,
+        out: &mut [T],
+        decode: impl Fn(ByteOrder, &[u8]) -> T,
     ) -> Result<(), TiffError> {
         let _scope = measurement_scope("tiff_read");
         let header = &self.headers[frame];
@@ -245,18 +314,19 @@ impl TiffStack {
             let row_slice = &map[start as usize..end as usize];
             let out_row = &mut out[out_off..out_off + out_row_len];
 
+            let width = bytes_per_sample as usize;
             if step == 1 {
                 // The CPU pipeline's hot path: one flat per-sample loop.
-                for (i, chunk) in row_slice.chunks_exact(2).enumerate() {
-                    out_row[i] = header.byte_order.u16_from([chunk[0], chunk[1]]);
+                for (i, chunk) in row_slice.chunks_exact(width).enumerate() {
+                    out_row[i] = decode(header.byte_order, chunk);
                 }
             } else {
                 let pixels = row_slice
                     .chunks_exact(stride as usize)
                     .step_by(step as usize);
                 for (dst, pixel) in out_row.chunks_exact_mut(spp).zip(pixels) {
-                    for (d, chunk) in dst.iter_mut().zip(pixel.chunks_exact(2)) {
-                        *d = header.byte_order.u16_from([chunk[0], chunk[1]]);
+                    for (d, chunk) in dst.iter_mut().zip(pixel.chunks_exact(width)) {
+                        *d = decode(header.byte_order, chunk);
                     }
                 }
             }
@@ -328,10 +398,11 @@ pub fn is_frame_path(path: &Path) -> bool {
 /// and `RowsPerStrip` are deliberately not compared.
 pub(crate) fn check_uniform(first: &TiffHeader, other: &TiffHeader) -> Result<(), TiffError> {
     let mut detail = Vec::new();
-    if first.width != other.width || first.height != other.height {
+    let (first_width, first_height) = first.upright_dimensions();
+    let (other_width, other_height) = other.upright_dimensions();
+    if (first_width, first_height) != (other_width, other_height) {
         detail.push(format!(
-            "{}x{} vs first frame's {}x{}",
-            other.width, other.height, first.width, first.height
+            "{other_width}x{other_height} vs first frame's {first_width}x{first_height}"
         ));
     }
     if first.bits_per_sample != other.bits_per_sample {
@@ -370,35 +441,13 @@ pub(crate) fn check_uniform(first: &TiffHeader, other: &TiffHeader) -> Result<()
     }
 }
 
-/// Map `path` read-only for the lifetime of the returned [`Mmap`].
-///
-/// # Safety
-///
-/// This is the one place in the crate that touches `unsafe`
-/// (`memmap2::Mmap::map` is itself `unsafe fn`): mapping a file is
-/// undefined behavior if the file is modified while the mapping is alive
-/// (memmap2 0.9.11 docs, <https://docs.rs/memmap2/0.9.11/memmap2/struct.Mmap.html>).
-/// This reader never writes through a mapping it holds, and every caller in
-/// this crate opens a frame read-only for the mapping's whole lifetime;
-/// nothing here mutates a TIFF frame while any process might be mapping it.
-/// The `File`
-/// used to create the mapping is dropped as soon as this function returns;
-/// the mapping keeps the underlying pages alive on its own.
-// SAFETY: contract above; the only `unsafe` call this crate makes.
-#[allow(unsafe_code)]
+/// Map the TIFF frame at `path` read-only for the lifetime of the returned
+/// [`Mmap`].
 pub(crate) fn map_file(path: &Path) -> Result<Mmap, TiffError> {
-    let file = File::open(path).map_err(|source| TiffError::Io {
+    crate::io::map_read_only(path).map_err(|source| TiffError::Io {
         path: path.to_path_buf(),
         source,
-    })?;
-    // SAFETY: see this function's doc comment above -- every workflow in
-    // this repository treats a mapped TIFF file as read-only for as long as
-    // any mapping of it might be alive.
-    let mmap = unsafe { Mmap::map(&file) }.map_err(|source| TiffError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(mmap)
+    })
 }
 
 #[cfg(test)]

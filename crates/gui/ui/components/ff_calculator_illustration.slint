@@ -1,0 +1,93 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The calculator's line illustration, camera on a rail facing the subject,
+// in a lens or an objective variant, with `plane-count` evenly spaced focus
+// planes drawn over the subject. 770 x 240 px.
+
+import { Theme } from "../theme.slint";
+import { FFLeaderLine } from "ff_leader_line.slint";
+import { FFDimensionMark } from "ff_dimension_mark.slint";
+
+export component FFCalculatorIllustration inherits Rectangle {
+    // The microscope-objective art instead of the lens art.
+    in property <bool> objective: false;
+    // Planes drawn; the caller caps it.
+    in property <int> plane-count: 13;
+
+    // The planes always spread over the whole subject, near end to far end;
+    // a single plane sits at its middle.
+    property <float> span: 275.6;
+    property <float> pitch: root.plane-count > 1 ? root.span / (root.plane-count - 1) : 0;
+    // Half width of a plane's depth-of-field tint: reaches the neighbouring
+    // plane, up to a slab's own width.
+    property <float> tint-half: root.plane-count > 1 ? min(22.26, root.pitch * 1.106) : 22.26;
+
+    // The bracket reaches this far past the first two planes, up to two
+    // thirds of a pitch.
+    property <float> bracket-margin: min(14.7, root.pitch * 0.667);
+
+    // Width of the subject the planes span.
+    out property <length> stack-span: root.span * 1px;
+
+    width: 770px;
+    height: 240px;
+
+    // Scale the enclosing element applies to this illustration. The art is
+    // sized by it and counter-scaled about its centre, so it rasterises at
+    // the drawn size and stays on the planes.
+    in property <float> art-scale: 1.0;
+
+    Image {
+        x: -root.width * (root.art-scale - 1) / 2;
+        y: -root.height * (root.art-scale - 1) / 2;
+        width: root.width * root.art-scale;
+        height: root.height * root.art-scale;
+        transform-scale: 1 / root.art-scale;
+        source: root.objective ? @image-url("../../../../assets/illustrations/calculator-objective.svg")
+            : @image-url("../../../../assets/illustrations/calculator-lens.svg");
+    }
+
+    for i in root.plane-count: Rectangle {
+        x: (480.2 + (root.plane-count > 1 ? i * root.pitch : root.span / 2)) * 1px;
+        y: 51.03px;
+
+        Path {
+            x: -root.tint-half * 1px;
+            y: 0px;
+            width: 2 * root.tint-half * 1px;
+            height: 141.85px;
+            viewbox-width: 44.52;
+            viewbox-height: 141.85;
+            commands: "M 0 141.85 L 0 8.64 L 15.12 0 L 44.52 0 L 44.52 133.2 L 29.4 141.85 Z";
+            fill: Theme.accent-default.with-alpha(0.05);
+        }
+        Path {
+            x: -7.56px;
+            y: 0px;
+            width: 15.12px;
+            height: 141.85px;
+            viewbox-width: 15.12;
+            viewbox-height: 141.85;
+            commands: "M 7.56 4.31 L 0 8.64 L 0 141.85 L 7.56 137.52 M 7.56 4.31 L 15.12 0 L 15.12 133.2 L 7.56 137.52";
+            stroke: Theme.accent-default;
+            stroke-width: 1px;
+        }
+    }
+
+    // The first two planes are the ones the inset enlarges.
+    if root.plane-count > 1: FFLeaderLine {
+        x: (480.2 + root.pitch / 2 - 0.5) * 1px;
+        y: 13.2px;
+        width: 1px;
+        height: 21.6px;
+        dotted: true;
+        show-dot: false;
+    }
+    if root.plane-count > 1: FFDimensionMark {
+        x: (480.2 - root.bracket-margin) * 1px;
+        y: 34.6px;
+        width: (root.pitch + 2 * root.bracket-margin) * 1px;
+        height: 5px;
+        bracket: true;
+    }
+}

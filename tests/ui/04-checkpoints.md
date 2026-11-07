@@ -44,30 +44,34 @@ Start: --open fixtures/mantis-64/frames --fuse-tabs 0,0
     Expect: Must not: the second row becomes the selected one; the dialog is gone, the first row of the CHECKPOINTS list still has the raised background and the accent bar, the second row has neither, and `buttons AppWindow::editor-toolbar` still lists **Undo** with enabled true.
 20. Click the second row of the CHECKPOINTS list (`FFCheckpointRow::area` 1).
     Expect: the dialog titled "Save this state first?" appears again with the buttons "Cancel", "Save first, then restore" and "Discard and restore".
-21. Click **Discard and restore** (`AppWindow::close-guard`).
+21. Press Escape while the dialog "Save this state first?" is open.
+    Expect: Must not: the second row becomes the selected one; the dialog is gone, the first row of the CHECKPOINTS list still has the raised background and the accent bar, the second row has neither, and `buttons AppWindow::editor-toolbar` still lists **Undo** with enabled true.
+22. Click the second row of the CHECKPOINTS list (`FFCheckpointRow::area` 1).
+    Expect: the dialog titled "Save this state first?" appears again with the buttons "Cancel", "Save first, then restore" and "Discard and restore".
+23. Click **Discard and restore** (`AppWindow::close-guard`).
     Expect: the dialog is gone; the second row of the CHECKPOINTS list has the raised background and the accent bar and the first row has neither; the list still shows 2 rows; `buttons AppWindow::editor-toolbar` lists **Undo** with enabled false.
-22. Click the first row of the CHECKPOINTS list (`FFCheckpointRow::area` 0).
+24. Click the first row of the CHECKPOINTS list (`FFCheckpointRow::area` 0).
     Expect: Must not: a "Save this state first?" dialog appears; no dialog is shown, the first row has the raised background and the accent bar and the second row has neither.
 ## Delete a checkpoint
-23. Hover the first row of the CHECKPOINTS list (`FFCheckpointRow::area` 0).
+25. Hover the first row of the CHECKPOINTS list (`FFCheckpointRow::area` 0).
     Expect: a red trash icon shows at the right edge of the first row; the second row shows none; `buttons FFDock::checkpoint-panel` lists **Delete checkpoint** with id `FFCheckpointRow::trash` (once, for the first row); the list still shows 2 rows and no dialog is shown.
-24. Click **Delete checkpoint** (`FFCheckpointRow::trash`).
+26. Click **Delete checkpoint** (`FFCheckpointRow::trash`).
     Expect: a dialog titled "Delete this checkpoint?" opens with the first row's "algorithm · HH:MM:SS" as its context line and the line "The other checkpoint is untouched, and the stack is not fused again."; its buttons read **Cancel** and **Delete**, beside a **Close dialog** icon button at its top-right corner.
-25. Click **Cancel** (`AppWindow::checkpoint-delete`).
+27. Click **Cancel** (`AppWindow::checkpoint-delete`).
     Expect: Must not: a row disappears; the dialog is gone and the CHECKPOINTS list still shows 2 rows.
-26. Hover the first row of the CHECKPOINTS list again (`FFCheckpointRow::area` 0; the click on **Cancel** moved the pointer off the row).
+28. Hover the first row of the CHECKPOINTS list again (`FFCheckpointRow::area` 0; the click on **Cancel** moved the pointer off the row).
     Expect: `buttons FFDock::checkpoint-panel` lists **Delete checkpoint** with id `FFCheckpointRow::trash`; no dialog is shown.
-27. Click **Delete checkpoint** (`FFCheckpointRow::trash`).
+29. Click **Delete checkpoint** (`FFCheckpointRow::trash`).
     Expect: the "Delete this checkpoint?" dialog opens again.
-28. Click **Close dialog** (`AppWindow::checkpoint-delete`), the icon button at the dialog's top-right corner.
+30. Click **Close dialog** (`AppWindow::checkpoint-delete`), the icon button at the dialog's top-right corner.
     Expect: Must not: a row disappears; the dialog is gone and the CHECKPOINTS list still shows 2 rows.
-29. Hover the first row of the CHECKPOINTS list again (`FFCheckpointRow::area` 0; the click on **Close dialog** moved the pointer off the row).
+31. Hover the first row of the CHECKPOINTS list again (`FFCheckpointRow::area` 0; the click on **Close dialog** moved the pointer off the row).
     Expect: `buttons FFDock::checkpoint-panel` lists **Delete checkpoint** with id `FFCheckpointRow::trash`; no dialog is shown.
-30. Click **Delete checkpoint** (`FFCheckpointRow::trash`).
+32. Click **Delete checkpoint** (`FFCheckpointRow::trash`).
     Expect: the "Delete this checkpoint?" dialog opens again.
-31. Click **Delete** (`AppWindow::checkpoint-delete`).
+33. Click **Delete** (`AppWindow::checkpoint-delete`).
     Expect: the dialog is gone; the CHECKPOINTS list shows 1 row and no "None yet — fuse a stack" line; the remaining row has the raised background and the accent bar.
-32. Hover the remaining row of the CHECKPOINTS list (`FFCheckpointRow::area` 0).
+34. Hover the remaining row of the CHECKPOINTS list (`FFCheckpointRow::area` 0).
     Expect: Must not: a red trash icon appears on it; `buttons FFDock::checkpoint-panel` does not list **Delete checkpoint**.
-33. Click the first row of the CHECKPOINTS list (`FFCheckpointRow::area` 0).
+35. Click the first row of the CHECKPOINTS list (`FFCheckpointRow::area` 0).
     Expect: no dialog is shown; the first row has the raised background and the accent bar.

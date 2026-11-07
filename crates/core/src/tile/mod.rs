@@ -14,6 +14,7 @@ pub mod control;
 mod error;
 pub mod plan;
 pub mod preprocess;
+mod sample;
 pub mod scheduler;
 pub mod scratch;
 
@@ -27,6 +28,7 @@ pub use control::{NoControl, TileControl};
 pub use error::TileError;
 pub use plan::{PlannedTile, TilePlan};
 pub use preprocess::{FramePreprocess, NoopPreprocess};
+pub use sample::{Sample, SampleFormat};
 pub use scheduler::{ControlledRun, TileRunReport, TileScheduler, TileSchedulerOptions};
 pub use scratch::ScratchDir;
 
@@ -61,20 +63,21 @@ impl Rect {
 
 /// An owned crop of one frame's pixels.
 ///
-/// `samples` is chunky, row-major, native-endian `u16`, with length exactly
+/// `samples` is chunky, row-major, native-endian `u16` (`f32` for a
+/// `Tile<f32>`), with length exactly
 /// `rect.width * rect.height * samples_per_pixel`. A borrowed view over the
 /// backing `mmap` is not possible in general: `MM`-ordered files need a
 /// byte swap, a sub-row rectangle is non-contiguous in the mapping, and mmap
 /// bytes are not `u16`-aligned. "Zero-decode" means no decompression, never
 /// zero copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Tile {
+pub struct Tile<S = u16> {
     pub rect: Rect,
     pub samples_per_pixel: u32,
-    pub samples: Vec<u16>,
+    pub samples: Vec<S>,
 }
 
-impl Tile {
+impl<S> Tile<S> {
     #[inline]
     pub fn width(&self) -> u32 {
         self.rect.width
@@ -84,7 +87,9 @@ impl Tile {
     pub fn height(&self) -> u32 {
         self.rect.height
     }
+}
 
+impl<S: Copy> Tile<S> {
     /// Copy the sub-rectangle `rect` (in the same absolute frame coordinate
     /// space as `self.rect`) out of this tile's samples into `out`.
     ///
@@ -93,7 +98,7 @@ impl Tile {
     /// `self.rect`, and `out.len()` must equal exactly
     /// `rect.width * rect.height * samples_per_pixel`. Every consumer needs
     /// this to turn a read tile (with its margin) into its interior.
-    pub fn crop_into(&self, rect: Rect, out: &mut [u16]) -> Result<(), TileError> {
+    pub fn crop_into(&self, rect: Rect, out: &mut [S]) -> Result<(), TileError> {
         let spp = self.samples_per_pixel as usize;
         let in_bounds = rect.width > 0
             && rect.height > 0

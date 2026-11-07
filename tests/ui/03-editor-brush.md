@@ -4,7 +4,7 @@ Start: --open fixtures/mantis-64/frames --fuse-tabs 0 --enter-editor
 1. Click **Keep** (`AppWindow::divergence-warning`).
    Expect: the dialog "Keep this fused result?" is gone; the bottom bar reads "fused" followed by a time (for example "fused 16:34"); the toolbar row shows the captions "Size" and "Soft"; the CHECKPOINTS list in the right dock shows 1 row (within 60 s).
 2. Click **STACKING** (`FFModeSwitch::stacking-half`).
-   Expect: the toolbar row shows the **Fuse stack** button at its left and no longer shows "Size" or "Soft"; **Save checkpoint** at its right end is plain greyed text, not a button.
+   Expect: the toolbar row shows the **Fuse stack** button at its left and no longer shows "Size" or "Soft"; nothing is drawn at its right end (**Save checkpoint** is only in the editor toolbar).
 3. Click the Composite pane (`FFCanvas::pane-right`) while STACKING is selected.
    Expect: Must not: the toolbar row shows "Size", "Soft" or **Undo**; it still shows the **Fuse stack** button.
 4. Click **EDITOR** (`FFModeSwitch::editor-half`).

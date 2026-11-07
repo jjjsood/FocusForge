@@ -7,10 +7,13 @@
 //! callers; this file exercises the driver directly, through neither.
 
 mod common;
+#[path = "common/raw_dng.rs"]
+mod raw_dng;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use focusforge_core::algorithm::{
@@ -19,6 +22,7 @@ use focusforge_core::algorithm::{
 };
 use focusforge_core::align::warp::WarpedTile;
 use focusforge_core::align::{AlignError, FailurePolicy, Transform};
+use focusforge_core::display::{PreviewCost, PreviewKind, PreviewKinds, StagePreview};
 use focusforge_core::equalize::{EqualizeSettings, UNIT_GAIN};
 use focusforge_core::fuse::laplacian::Laplacian;
 use focusforge_core::gpu::{BackendInfo, TileBackend};
@@ -29,13 +33,14 @@ use focusforge_core::job::{
 };
 use focusforge_core::params::{ParamDesc, ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{
-    AlignRequest, FuseOutcome, FuseOutput, FuseProduct, FuseReport, FuseRequest, PipelineError,
-    RunStage, StageObserver,
+    AlignRequest, FreeSpaceProbe, FuseOutcome, FuseOutput, FuseProduct, FuseReport, FuseRequest,
+    PipelineError, RunStage, StageObserver, VolumeShortfall, VolumeSpace,
 };
 use focusforge_core::project::{self, Project};
 use focusforge_core::registry;
-use focusforge_core::tile::{Rect, Tile, TileError};
+use focusforge_core::tile::{Rect, SampleFormat, Tile, TileError};
 use focusforge_core::zmap::ZMapReader;
+use raw_dng::{DngSpec, write_dng};
 
 fn mantis_frames(count: usize) -> Vec<PathBuf> {
     let dir = common::mantis_512_dir().join("frames");
@@ -47,6 +52,19 @@ fn mantis_frames(count: usize) -> Vec<PathBuf> {
     entries.sort();
     entries.truncate(count);
     entries
+}
+
+/// `count` frames from `fixtures/mantis-64`, its three frames in order and
+/// repeated when `count` exceeds three.
+fn mantis_64_frames(count: usize) -> Vec<PathBuf> {
+    let dir = common::fixtures_dir().join("mantis-64/frames");
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("frames dir must exist")
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    entries.into_iter().cycle().take(count).collect()
 }
 
 fn scratch(label: &str) -> PathBuf {
@@ -87,12 +105,279 @@ fn base_request(label: &str, frames: Vec<PathBuf>, explicit: ParamValues) -> Fus
         resume: false,
         cache: true,
         poll: Duration::from_millis(5),
+        free_space: None,
     }
 }
 
 #[derive(Default)]
 struct NoopObserver;
 impl StageObserver for NoopObserver {}
+
+/// Every path is on the volume `name` with `free` bytes free.
+fn volume(name: &str, free: u64) -> std::io::Result<VolumeSpace> {
+    Ok(VolumeSpace {
+        volume: name.into(),
+        free,
+    })
+}
+
+/// A probe answering through `answer` that records every path it is asked about.
+fn recording_probe(
+    answer: impl Fn(&Path) -> std::io::Result<VolumeSpace> + Send + Sync + 'static,
+) -> (FreeSpaceProbe, Arc<Mutex<Vec<PathBuf>>>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&asked);
+    let probe: FreeSpaceProbe = Arc::new(move |path: &Path| {
+        log.lock().expect("probe log").push(path.to_path_buf());
+        answer(path)
+    });
+    (probe, asked)
+}
+
+/// Everything under `out_dir` is the volume "output", everything else "scratch".
+fn two_volumes(out_dir: &Path, scratch_free: u64, output_free: u64) -> FreeSpaceProbe {
+    let out_dir = out_dir.to_path_buf();
+    recording_probe(move |path| {
+        if path.starts_with(&out_dir) {
+            volume("output", output_free)
+        } else {
+            volume("scratch", scratch_free)
+        }
+    })
+    .0
+}
+
+fn run_plain(request: &FuseRequest) -> Result<FuseOutcome, PipelineError> {
+    focusforge_core::pipeline::run(request, &NoopObserver, JobControl::new(), None)
+}
+
+/// The shortfalls `request` is refused with under `probe`.
+fn refusal(request: &mut FuseRequest, probe: FreeSpaceProbe) -> Vec<VolumeShortfall> {
+    request.free_space = Some(probe);
+    match run_plain(request) {
+        Err(PipelineError::DiskSpace(shortfalls)) => shortfalls,
+        Err(other) => panic!("expected a disk-space refusal, got {other:?}"),
+        Ok(_) => panic!("a volume that is short must refuse the run"),
+    }
+}
+
+/// The one shortfall `request` is refused with when its single volume has
+/// nothing free.
+fn needed_on_one_volume(request: &mut FuseRequest) -> u64 {
+    let shortfalls = refusal(request, recording_probe(|_| volume("only", 0)).0);
+    assert_eq!(shortfalls.len(), 1, "{shortfalls:?}");
+    shortfalls[0].needed
+}
+
+/// A request whose result goes to a directory of its own, apart from the
+/// scratch root; returns that directory and the run directory.
+fn split_request(label: &str, file: &str) -> (FuseRequest, PathBuf, PathBuf) {
+    let mut request = base_request(label, mantis_frames(2), ParamValues::new());
+    let out_dir = scratch(&format!("{label}_out"));
+    request.output = FuseOutput::Seal(out_dir.join(file));
+    let root = request
+        .scratch_root
+        .parent()
+        .expect("run directory")
+        .to_path_buf();
+    (request, root, out_dir)
+}
+
+fn hold_beside_scratch(request: &mut FuseRequest) {
+    request.output = FuseOutput::Hold(request.scratch_root.with_file_name("held"));
+}
+
+#[test]
+fn run_space_staged_bytes_cover_written_staging() {
+    for (frames, tile_size) in [(2, 448), (3, 448), (2, 256), (3, 256)] {
+        let label = format!("space_staged_{frames}_{tile_size}");
+        let make = || {
+            // Three levels keep the 256-pixel tile larger than the support margin.
+            let mut explicit = ParamValues::new();
+            explicit.insert("levels".to_string(), ParamValue::Int(3));
+            let mut request = base_request(&label, mantis_frames(frames), explicit);
+            request.tile_size = Some(tile_size);
+            hold_beside_scratch(&mut request);
+            request
+        };
+        let needed = needed_on_one_volume(&mut make());
+        let FuseOutcome::Completed(report) = run_plain(&make()).expect("the hold run completes")
+        else {
+            panic!("expected a completed run");
+        };
+        let FuseProduct::Held(held) = report.product else {
+            panic!("a hold request reports a held checkpoint");
+        };
+        let written: u64 = [&held.composite, &held.zmap]
+            .iter()
+            .map(|file| std::fs::metadata(file).expect("held plane").len())
+            .sum();
+        assert!(
+            needed >= written && needed - written < 256 * 1024,
+            "{frames} frames, tile {tile_size}: needed {needed}, staged {written}"
+        );
+    }
+}
+
+#[test]
+fn tiff_run_refuses_when_run_space_is_short() {
+    let label = "space_short";
+    let needed = needed_on_one_volume(&mut base_request(
+        label,
+        mantis_frames(2),
+        ParamValues::new(),
+    ));
+    for free in [needed - 1, 0] {
+        let mut request = base_request(label, mantis_frames(2), ParamValues::new());
+        let root = request
+            .scratch_root
+            .parent()
+            .expect("run directory")
+            .to_path_buf();
+        request.free_space = Some(recording_probe(move |_| volume("only", free)).0);
+        let Err(error) = run_plain(&request) else {
+            panic!("a run that does not fit must be refused");
+        };
+        let PipelineError::DiskSpace(shortfalls) = &error else {
+            panic!("expected a disk-space refusal, got {error:?}");
+        };
+        assert_eq!(
+            shortfalls.as_slice(),
+            [VolumeShortfall {
+                path: root,
+                needed,
+                free
+            }]
+        );
+        let text = error.to_string();
+        for want in [
+            format!("{needed} bytes"),
+            format!("{free} bytes"),
+            format!("{:.1} GB", needed as f64 / 1e9),
+            format!("{:.1} GB", free as f64 / 1e9),
+        ] {
+            assert!(text.contains(&want), "{want:?} missing from {text}");
+        }
+        assert!(!request.scratch_root.join("projects").exists());
+        assert!(!request.scratch_root.join("resume").exists());
+    }
+}
+
+#[test]
+fn run_space_is_summed_per_volume() {
+    // Two volumes: one shortfall each, carrying only its own term.
+    let (mut request, root, out_dir) = split_request("space_volumes", "project.ffp");
+    let split = refusal(&mut request, two_volumes(&out_dir, 0, 0));
+    assert_eq!(split.len(), 2, "{split:?}");
+    let term = |dir: &Path| {
+        split
+            .iter()
+            .find(|shortfall| shortfall.path == dir)
+            .unwrap_or_else(|| panic!("{dir:?} missing from {split:?}"))
+            .needed
+    };
+    let (scratch_term, output_term) = (term(&root), term(&out_dir));
+    assert!(scratch_term > 0 && output_term > 0);
+
+    // One volume: the single shortfall carries the sum, at the first path.
+    let (mut request, root, _) = split_request("space_volumes", "project.ffp");
+    let one = refusal(&mut request, recording_probe(|_| volume("only", 0)).0);
+    assert_eq!(
+        one,
+        [VolumeShortfall {
+            path: root,
+            needed: scratch_term + output_term,
+            free: 0
+        }]
+    );
+
+    // Only the output volume short: only it is named, with its own bytes.
+    let (mut request, _, out_dir) = split_request("space_volumes", "project.ffp");
+    let only_output = refusal(&mut request, two_volumes(&out_dir, u64::MAX, 0));
+    assert_eq!(
+        only_output,
+        [VolumeShortfall {
+            path: out_dir,
+            needed: output_term,
+            free: 0
+        }]
+    );
+
+    // A hold asks about the scratch root alone.
+    let (mut request, root, _) = split_request("space_volumes", "project.ffp");
+    hold_beside_scratch(&mut request);
+    let (probe, asked) = recording_probe(|_| volume("only", 0));
+    refusal(&mut request, probe);
+    assert_eq!(asked.lock().expect("probe log").as_slice(), [root]);
+}
+
+#[test]
+fn run_proceeds_when_run_space_suffices() {
+    let held = |free: Option<u64>| {
+        let mut request = base_request("space_proceeds", mantis_64_frames(2), ParamValues::new());
+        hold_beside_scratch(&mut request);
+        request.free_space = free.map(|free| recording_probe(move |_| volume("only", free)).0);
+        let FuseOutcome::Completed(report) = run_plain(&request).expect("the run completes") else {
+            panic!("expected a completed run");
+        };
+        let FuseProduct::Held(held) = report.product else {
+            panic!("a hold request reports a held checkpoint");
+        };
+        std::fs::read(&held.composite).expect("composite is readable")
+    };
+    let mut request = base_request("space_proceeds", mantis_64_frames(2), ParamValues::new());
+    hold_beside_scratch(&mut request);
+    let needed = needed_on_one_volume(&mut request);
+    assert_eq!(held(Some(needed)), held(None));
+
+    // A sealed run whose two volumes each hold exactly their term.
+    let (mut request, _, out_dir) = split_request("space_proceeds_seal", "project.ffp");
+    request.frames = mantis_64_frames(2);
+    let split = refusal(&mut request, two_volumes(&out_dir, 0, 0));
+    let exact = |dir: &Path| split.iter().find(|s| s.path == dir).expect("volume").needed;
+    let (mut request, root, out_dir) = split_request("space_proceeds_seal", "project.ffp");
+    request.frames = mantis_64_frames(2);
+    request.free_space = Some(two_volumes(&out_dir, exact(&root), exact(&out_dir)));
+    assert!(matches!(
+        run_plain(&request).expect("a run that exactly fits completes"),
+        FuseOutcome::Completed(_)
+    ));
+}
+
+#[test]
+fn run_space_query_failure_refuses_the_run() {
+    let (mut request, _, out_dir) = split_request("space_query", "a/b/project.ffp");
+    let failing = out_dir.clone();
+    let (probe, asked) = recording_probe(move |path| {
+        if path.starts_with(&failing) {
+            Err(std::io::Error::other("output volume refused"))
+        } else {
+            volume("scratch", u64::MAX)
+        }
+    });
+    request.free_space = Some(probe);
+    let Err(error) = run_plain(&request) else {
+        panic!("an unanswered query must refuse the run");
+    };
+    let PipelineError::DiskSpaceQuery { path, .. } = &error else {
+        panic!("expected a query failure, got {error:?}");
+    };
+    assert_eq!(path, &out_dir);
+    let text = error.to_string();
+    assert!(text.contains("output volume refused"), "{text}");
+    assert!(text.contains(&out_dir.display().to_string()), "{text}");
+    assert_eq!(
+        asked
+            .lock()
+            .expect("probe log")
+            .iter()
+            .filter(|path| path.starts_with(&out_dir))
+            .collect::<Vec<_>>(),
+        [&out_dir]
+    );
+    assert!(!request.scratch_root.join("projects").exists());
+    assert!(!request.scratch_root.join("resume").exists());
+}
 
 #[test]
 fn run_resolves_params_against_the_frames_it_opens() {
@@ -145,6 +430,7 @@ struct StageLog {
 impl StageObserver for StageLog {
     fn stage(&self, stage: RunStage) {
         let label = match stage {
+            RunStage::Develop { .. } => "develop",
             RunStage::Prepare { .. } => "prepare",
             RunStage::Align { .. } => "align",
             RunStage::Fuse => "fuse",
@@ -263,11 +549,7 @@ fn cancel_during_alignment_stops_at_a_frame_boundary() {
     // per other worker, so a cancel noticed only once alignment returns
     // would register frames past that bound.
     let frame_count = CANCEL_ON + workers + 8;
-    let frames: Vec<PathBuf> = mantis_frames(8)
-        .into_iter()
-        .cycle()
-        .take(frame_count)
-        .collect();
+    let frames = mantis_64_frames(frame_count);
 
     for (policy, bound) in [("anchor", CANCEL_ON + workers - 1), ("chain", CANCEL_ON)] {
         let control = JobControl::new();
@@ -439,11 +721,7 @@ fn pause_during_alignment_stops_registering_frames() {
     // pause noticed only once alignment returns would register frames past
     // the bound below.
     let frame_count = PAUSE_ON + workers + 8;
-    let frames: Vec<PathBuf> = mantis_frames(8)
-        .into_iter()
-        .cycle()
-        .take(frame_count)
-        .collect();
+    let frames = mantis_64_frames(frame_count);
 
     // The pausing call itself, plus at most one in-flight registration per
     // other worker; the chain arm registers on one thread.
@@ -500,11 +778,7 @@ fn cancel_during_alignment_stops_at_a_frame_boundary_from_a_held_pause() {
     const PAUSE_ON: usize = 2;
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
     let frame_count = PAUSE_ON + workers + 8;
-    let frames: Vec<PathBuf> = mantis_frames(8)
-        .into_iter()
-        .cycle()
-        .take(frame_count)
-        .collect();
+    let frames = mantis_64_frames(frame_count);
 
     for (policy, bound) in [("anchor", PAUSE_ON + workers - 1), ("chain", PAUSE_ON)] {
         let control = JobControl::new();
@@ -639,7 +913,7 @@ fn align_progress_counts_every_frame() {
         };
         let mut request = base_request(
             &format!("align_progress_{count}"),
-            mantis_frames(count),
+            mantis_64_frames(count),
             ParamValues::new(),
         );
         request.align = Some(align);
@@ -673,7 +947,11 @@ fn align_progress_counts_every_frame() {
     }
 
     // No align stage at all: both counters stay at 0.
-    let request = base_request("align_progress_none", mantis_frames(2), ParamValues::new());
+    let request = base_request(
+        "align_progress_none",
+        mantis_64_frames(2),
+        ParamValues::new(),
+    );
     let control = JobControl::new();
     let outcome =
         focusforge_core::pipeline::run(&request, &NoopObserver, Arc::clone(&control), None)
@@ -735,7 +1013,7 @@ fn timed_align_request(
         "reference-policy".to_string(),
         ParamValue::Enum("chain".to_string()),
     );
-    let mut request = base_request(label, mantis_frames(count), ParamValues::new());
+    let mut request = base_request(label, mantis_64_frames(count), ParamValues::new());
     request.align = Some(AlignRequest {
         algorithm,
         explicit,
@@ -874,7 +1152,7 @@ impl StageObserver for PrepareTickLog {
 }
 
 fn prepare_request(label: &str, count: usize, equalize: Option<EqualizeSettings>) -> FuseRequest {
-    let mut request = base_request(label, mantis_frames(count), ParamValues::new());
+    let mut request = base_request(label, mantis_64_frames(count), ParamValues::new());
     request.align = Some(dummy_align_request());
     request.equalize = equalize;
     request.poll = Duration::from_millis(1);
@@ -1388,6 +1666,7 @@ impl TileBackend for CappedBackend {
         _samples_per_pixel: u32,
         _levels: u32,
         _transforms: &[Transform],
+        _sample_format: SampleFormat,
     ) -> Option<String> {
         self.asked.lock().unwrap().push((width, height));
         self.shortfall.clone()
@@ -1670,17 +1949,98 @@ fn no_backend_keeps_the_requested_tile_size() {
 }
 
 #[test]
-fn a_cap_below_the_levels_minimum_fails_with_no_interior() {
-    let Err(err) = held_run("cap_64", 448, 5, Some(capped_backend(64))) else {
-        panic!("a 64-pixel cap leaves no interior at five levels");
-    };
+fn deep_levels_past_the_device_cap_fuse_on_the_host() {
+    const CAP: u32 = 64;
+    let mut explicit = ParamValues::new();
+    explicit.insert("levels".to_string(), ParamValue::Int(4));
+    let algorithm = registry::find_stack("laplacian").expect("laplacian must be registered");
+    let minimum = algorithm.tile_support(&explicit).min_tile_size();
     assert!(
-        matches!(
-            err,
-            PipelineError::Tile(TileError::NoInterior { tile_size: 64, .. })
-        ),
-        "unexpected error: {err}"
+        CAP < minimum,
+        "the cap {CAP} must sit below the minimum {minimum}"
     );
+    let expected = format!(
+        "the GPU accepts tiles up to {CAP} px and 4 levels need {minimum} px; \
+         continuing on the CPU path"
+    );
+
+    let run = |label: &str,
+               tile_size: Option<u32>,
+               backend: Option<&'static dyn TileBackend>,
+               observer: &dyn StageObserver| {
+        let mut request = base_request(label, mantis_64_frames(3), explicit.clone());
+        request.output = FuseOutput::Hold(scratch(&format!("{label}_hold")));
+        request.tile_size = tile_size;
+        request.backend = backend;
+        let FuseOutcome::Completed(report) =
+            focusforge_core::pipeline::run(&request, observer, JobControl::new(), None)
+                .unwrap_or_else(|err| {
+                    panic!("{label}: a cap below the minimum must not fail: {err}")
+                })
+        else {
+            panic!("{label}: expected a completed run");
+        };
+        held_run_of(report)
+    };
+
+    for (name, tile_size) in [("default", None), ("explicit_512", Some(512))] {
+        let plain = run(
+            &format!("deep_plain_{name}"),
+            tile_size,
+            None,
+            &NoopObserver,
+        );
+        assert!(plain.report.gpu_fallback.is_none(), "{name}");
+
+        let backend = leaked_backend(CAP, None);
+        let observer = NoticeObserver::default();
+        let capped = run(
+            &format!("deep_capped_{name}"),
+            tile_size,
+            Some(backend),
+            &observer,
+        );
+        assert_eq!(
+            capped.report.gpu_fallback.as_deref(),
+            Some(expected.as_str()),
+            "{name}"
+        );
+        assert_eq!(
+            *observer.notices.lock().unwrap(),
+            std::slice::from_ref(&expected),
+            "{name}"
+        );
+        assert_eq!(capped.report.tile_size, plain.report.tile_size, "{name}");
+        assert!(
+            capped.report.tile_size > CAP,
+            "{name}: the uncapped size is kept"
+        );
+        assert!(
+            backend.asked.lock().unwrap().is_empty(),
+            "{name}: the notice replaces the shortfall query"
+        );
+        assert!(
+            capped.composite == plain.composite,
+            "{name}: composite on the host"
+        );
+        assert!(capped.zmap == plain.zmap, "{name}: Z-Map on the host");
+    }
+}
+
+#[test]
+fn an_explicit_tile_size_below_the_levels_minimum_is_refused_whatever_the_cap() {
+    for backend in [None, Some(capped_backend(64))] {
+        let Err(err) = held_run("explicit_64", 64, 5, backend) else {
+            panic!("a 64 px tile leaves no interior at five levels");
+        };
+        assert!(
+            matches!(
+                err,
+                PipelineError::Tile(TileError::NoInterior { tile_size: 64, .. })
+            ),
+            "unexpected error: {err}"
+        );
+    }
 }
 
 #[test]
@@ -2038,6 +2398,7 @@ struct StageProbe {
 impl StageObserver for StageProbe {
     fn stage(&self, stage: RunStage) {
         let label = match stage {
+            RunStage::Develop { .. } => "develop",
             RunStage::Prepare { .. } => "prepare",
             RunStage::Align { .. } => "align",
             RunStage::Fuse => "fuse",
@@ -2070,6 +2431,10 @@ fn prepare_stage_is_reported_before_align() {
         request.output = FuseOutput::Hold(scratch("eq_prepare_stage_hold"));
         focusforge_core::pipeline::run(&request, &probe, control, None).expect("the run completes");
         let seen = probe.seen.lock().unwrap();
+        assert!(
+            seen.iter().all(|(label, _)| *label != "develop"),
+            "a TIFF run develops nothing up front: {seen:?}"
+        );
         assert_eq!(seen[0].0, first);
         if first == "prepare" {
             assert_eq!(seen[0], ("prepare", JobStage::Prepare));
@@ -2539,4 +2904,799 @@ fn an_unhashable_frame_is_a_stage_cache_miss() {
         !report.align_cached,
         "a frame that cannot be hashed must not hit"
     );
+}
+
+// ---------------------------------------------------------------------
+// The opt-in preview feed.
+// ---------------------------------------------------------------------
+
+/// One preview as the observer saw it, with the thread it arrived on.
+#[derive(Clone)]
+struct Shown {
+    kind: PreviewKind,
+    width: u32,
+    height: u32,
+    extent: Rect,
+    covered: usize,
+    rgba: Vec<u8>,
+    tiles: Arc<[Rect]>,
+    thread: ThreadId,
+    thread_name: String,
+}
+
+enum Event {
+    Stage(&'static str),
+    Tick(ThreadId),
+    Shown(Shown),
+    Unavailable(PreviewKinds),
+}
+
+/// Subscribes to `kinds` and logs stages, ticks and previews in arrival order.
+struct PreviewLog {
+    kinds: PreviewKinds,
+    events: Mutex<Vec<Event>>,
+    /// How long each `preview` call takes, so the job outlives a delivery.
+    delay: Duration,
+}
+
+impl PreviewLog {
+    fn new(aligned_frame: bool, composite: bool) -> Self {
+        PreviewLog {
+            kinds: PreviewKinds {
+                aligned_frame,
+                composite,
+                heat: false,
+            },
+            events: Mutex::new(Vec::new()),
+            delay: Duration::ZERO,
+        }
+    }
+
+    fn with_heat(mut self) -> Self {
+        self.kinds.heat = true;
+        self
+    }
+
+    fn heat_only() -> Self {
+        PreviewLog::new(false, false).with_heat()
+    }
+
+    fn slow(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
+    fn shown(&self, wanted: impl Fn(PreviewKind) -> bool) -> Vec<Shown> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                Event::Shown(s) if wanted(s.kind) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn aligned(&self) -> Vec<Shown> {
+        self.shown(|kind| matches!(kind, PreviewKind::AlignedFrame { .. }))
+    }
+
+    fn composites(&self) -> Vec<Shown> {
+        self.shown(|kind| kind == PreviewKind::Composite)
+    }
+
+    fn heats(&self) -> Vec<Shown> {
+        self.shown(|kind| kind == PreviewKind::Heat)
+    }
+
+    /// The kinds of every `preview_unavailable` call, with the position of
+    /// each in the event order.
+    fn unavailable(&self) -> Vec<(usize, PreviewKinds)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter_map(|(at, event)| match event {
+                Event::Unavailable(kinds) => Some((at, *kinds)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Position of the first composite preview.
+    fn first_composite_at(&self) -> usize {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|event| matches!(event, Event::Shown(s) if s.kind == PreviewKind::Composite))
+            .expect("the run delivered a composite preview")
+    }
+
+    /// Position of the first stage marker named `name`.
+    fn stage_at(&self, name: &str) -> usize {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|event| matches!(event, Event::Stage(n) if *n == name))
+            .unwrap_or_else(|| panic!("the run never reported the {name} stage"))
+    }
+}
+
+impl StageObserver for PreviewLog {
+    fn stage(&self, stage: RunStage) {
+        let name = match stage {
+            RunStage::Develop { .. } => "develop",
+            RunStage::Prepare { .. } => "prepare",
+            RunStage::Align { .. } => "align",
+            RunStage::Fuse => "fuse",
+            RunStage::Seal => "seal",
+            RunStage::Finished => "finished",
+        };
+        self.events.lock().unwrap().push(Event::Stage(name));
+    }
+
+    fn tick(&self, _progress: &JobProgress) {
+        let id = std::thread::current().id();
+        self.events.lock().unwrap().push(Event::Tick(id));
+    }
+
+    fn preview_kinds(&self) -> PreviewKinds {
+        self.kinds
+    }
+
+    fn preview_unavailable(&self, kinds: PreviewKinds) {
+        self.events.lock().unwrap().push(Event::Unavailable(kinds));
+    }
+
+    fn preview(&self, preview: &StagePreview) {
+        let current = std::thread::current();
+        let covered = preview.rgba.chunks_exact(4).filter(|p| p[3] == 255).count();
+        self.events.lock().unwrap().push(Event::Shown(Shown {
+            kind: preview.kind,
+            width: preview.width,
+            height: preview.height,
+            extent: preview.extent,
+            covered,
+            rgba: preview.rgba.clone(),
+            tiles: Arc::clone(&preview.tiles),
+            thread: current.id(),
+            thread_name: current.name().unwrap_or_default().to_string(),
+        }));
+        std::thread::sleep(self.delay);
+    }
+}
+
+/// A held `pyramidal-ecc` run over `count` mantis frames.
+fn ecc_request(label: &str, count: usize, policy: &str) -> FuseRequest {
+    let mut explicit = ParamValues::new();
+    explicit.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum(policy.to_string()),
+    );
+    let mut request = base_request(label, mantis_frames(count), ParamValues::new());
+    request.align = Some(AlignRequest {
+        algorithm: registry::find_align("pyramidal-ecc").expect("pyramidal-ecc is registered"),
+        explicit,
+        lax: true,
+    });
+    request.output = FuseOutput::Hold(scratch(&format!("{label}_hold")));
+    request
+}
+
+fn run_observed(request: &FuseRequest, observer: &dyn StageObserver) -> FuseReport {
+    completed(focusforge_core::pipeline::run(
+        request,
+        observer,
+        JobControl::new(),
+        None,
+    ))
+}
+
+fn whole_frame(size: u32) -> Rect {
+    Rect {
+        x: 0,
+        y: 0,
+        width: size,
+        height: size,
+    }
+}
+
+#[test]
+fn preview_feed_delivers_aligned_frames() {
+    for policy in ["anchor", "chain"] {
+        let log = PreviewLog::new(true, false);
+        let request = ecc_request(&format!("pf_aligned_{policy}"), 4, policy);
+        let report = run_observed(&request, &log);
+        let reference = report.align.as_ref().unwrap().alignment.reference;
+
+        let aligned = log.aligned();
+        assert!(!aligned.is_empty(), "{policy}: no aligned-frame preview");
+        let (start, end) = (log.stage_at("align"), log.stage_at("fuse"));
+        let events = log.events.lock().unwrap();
+        for (at, event) in events.iter().enumerate() {
+            if matches!(event, Event::Shown(_)) {
+                assert!(start < at && at < end, "{policy}: preview outside align");
+            }
+        }
+        for preview in &aligned {
+            let PreviewKind::AlignedFrame { frame } = preview.kind else {
+                unreachable!("filtered to aligned frames")
+            };
+            assert_ne!(frame, reference, "{policy}: the reference was previewed");
+            assert!(preview.width.max(preview.height) <= 512);
+            assert_eq!(preview.width, preview.height, "{policy}: aspect");
+            assert_eq!(preview.extent, whole_frame(512), "{policy}: extent");
+        }
+    }
+}
+
+#[test]
+fn preview_feed_composite_grows_tile_by_tile() {
+    for (tile_size, crop) in [(480u32, false), (448, true)] {
+        // A slow delivery lets the job finish while the poll thread is inside
+        // it, so only the closing flush can show the last tiles.
+        let log = PreviewLog::new(false, true).slow(Duration::from_millis(400));
+        let mut explicit = ParamValues::new();
+        explicit.insert("levels".to_string(), ParamValue::Int(3));
+        let mut request = base_request(&format!("pf_grow_{tile_size}"), mantis_frames(3), explicit);
+        request.output = FuseOutput::Hold(scratch(&format!("pf_grow_{tile_size}_hold")));
+        request.tile_size = Some(tile_size);
+        request.crop = crop;
+        let report = run_observed(&request, &log);
+
+        let extent = report.crop.unwrap_or(whole_frame(512));
+        assert_eq!(report.crop.is_some(), crop);
+        let composites = log.composites();
+        assert!(!composites.is_empty(), "tile {tile_size}: no preview");
+        let mut previous = 0;
+        for preview in &composites {
+            assert!(preview.covered >= previous, "coverage must never shrink");
+            previous = preview.covered;
+            assert_eq!(preview.extent, extent);
+            assert_eq!(
+                (preview.width, preview.height),
+                (extent.width, extent.height)
+            );
+        }
+        let last = composites.last().unwrap();
+        assert_eq!(last.covered, (extent.width * extent.height) as usize);
+        let seal = log.stage_at("seal");
+        let events = log.events.lock().unwrap();
+        let last_shown = events
+            .iter()
+            .rposition(|e| matches!(e, Event::Shown(_)))
+            .unwrap();
+        assert!(last_shown < seal, "the full image arrives before the seal");
+    }
+}
+
+#[test]
+fn preview_feed_is_throttled_to_the_poll() {
+    let log = PreviewLog::new(true, true);
+    let mut request = ecc_request("pf_throttle", 4, "anchor");
+    request.tile_size = Some(256);
+    request
+        .explicit
+        .insert("levels".to_string(), ParamValue::Int(3));
+    run_observed(&request, &log);
+
+    let (align_at, fuse_at) = (log.stage_at("align"), log.stage_at("fuse"));
+    let events = log.events.lock().unwrap();
+    let tick_threads: Vec<ThreadId> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Tick(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert!(!tick_threads.is_empty());
+    let shown: Vec<&Shown> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Shown(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    for s in &shown {
+        assert!(tick_threads.contains(&s.thread), "not a poll thread");
+        assert!(!s.thread_name.starts_with("focusforge-align"));
+    }
+    // Per stage: the polls deliver at most one image per kind each, plus the
+    // one closing flush.
+    let ticks = |from: usize, to: usize| {
+        events[from..to]
+            .iter()
+            .filter(|e| matches!(e, Event::Tick(_)))
+            .count()
+    };
+    let aligned = shown
+        .iter()
+        .filter(|s| matches!(s.kind, PreviewKind::AlignedFrame { .. }))
+        .count();
+    let composites = shown.len() - aligned;
+    assert!(aligned <= ticks(align_at, fuse_at) + 1, "{aligned} aligned");
+    assert!(
+        composites <= ticks(fuse_at, events.len()) + 1,
+        "{composites} composite"
+    );
+}
+
+/// Overrides `preview` but never subscribes.
+#[derive(Default)]
+struct DeafSubscriber {
+    calls: AtomicUsize,
+}
+
+impl StageObserver for DeafSubscriber {
+    fn preview(&self, _preview: &StagePreview) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn preview_feed_absent_without_subscriber() {
+    let observer = DeafSubscriber::default();
+    let request = ecc_request("pf_absent", 3, "anchor");
+    run_observed(&request, &observer);
+    assert_eq!(observer.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn preview_cost_is_reported_per_requested_kind() {
+    let plain = run_observed(&ecc_request("pf_cost_plain", 3, "anchor"), &NoopObserver);
+    assert_eq!(plain.preview_cost, PreviewCost::default());
+
+    let log = PreviewLog::new(true, true);
+    let report = run_observed(&ecc_request("pf_cost_sub", 3, "anchor"), &log);
+    let cost = report.preview_cost;
+    assert!(cost.composite > Duration::ZERO, "composite work is charged");
+    assert!(
+        cost.aligned_frame > Duration::ZERO,
+        "aligned work is charged"
+    );
+    assert_eq!(cost.heat, Duration::ZERO, "heat was not requested");
+
+    let heat = PreviewLog::heat_only();
+    let report = run_observed(&ecc_request("pf_cost_heat", 3, "anchor"), &heat);
+    assert!(report.preview_cost.heat > Duration::ZERO);
+    assert_eq!(report.preview_cost.composite, Duration::ZERO);
+}
+
+fn mantis8_frames(count: usize) -> Vec<PathBuf> {
+    let dir = common::fixtures_dir().join("mantis8-64").join("frames");
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("frames dir must exist")
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    entries.truncate(count);
+    entries
+}
+
+#[test]
+fn preview_feed_leaves_output_bit_identical() {
+    let requests = |label: &str| {
+        let aligned = ecc_request(&format!("{label}_16"), 3, "anchor");
+        let mut eight = base_request(&format!("{label}_8"), mantis8_frames(3), ParamValues::new());
+        eight.output = FuseOutput::Hold(scratch(&format!("{label}_8_hold")));
+        [aligned, eight]
+    };
+    let plain = requests("pf_bits_plain");
+    let subscribed = requests("pf_bits_sub");
+    for (plain, subscribed) in plain.iter().zip(&subscribed) {
+        let log = PreviewLog::new(true, true);
+        let with = held_run_of(Box::new(run_observed(subscribed, &log)));
+        let without = held_run_of(Box::new(run_observed(plain, &NoopObserver)));
+        assert!(!log.composites().is_empty(), "the subscribed run previews");
+        assert!(with.composite == without.composite, "composite differs");
+        assert!(with.zmap == without.zmap, "Z-Map differs");
+    }
+}
+
+#[test]
+fn preview_feed_cached_and_resumed_runs() {
+    // A cached alignment registers nothing, so nothing is previewed.
+    let root = scratch("pf_cache_root");
+    let cache = StageCache::open(&root.join("scratch")).expect("the stage cache opens");
+    let cached = |label: &str, log: &PreviewLog| {
+        let mut request = ecc_request(label, 3, "anchor");
+        request.scratch_root = root.join("scratch");
+        completed(focusforge_core::pipeline::run(
+            &request,
+            log,
+            JobControl::new(),
+            Some(&cache),
+        ))
+    };
+    let first = PreviewLog::new(true, true);
+    assert!(!cached("pf_cache_a", &first).align_cached);
+    assert!(!first.aligned().is_empty());
+    let second = PreviewLog::new(true, true);
+    assert!(cached("pf_cache_b", &second).align_cached);
+    assert!(
+        second.aligned().is_empty(),
+        "a cached alignment previews nothing"
+    );
+    assert!(!second.composites().is_empty());
+
+    // A resumed fuse previews only the tiles it fuses itself, and an
+    // alignment read back from the resume ledger previews no frames.
+    for aligned in [false, true] {
+        let label = format!("pf_resume_{aligned}");
+        let mut request = if aligned {
+            ecc_request(&label, 3, "anchor")
+        } else {
+            base_request(&label, mantis_frames(3), ParamValues::new())
+        };
+        request
+            .explicit
+            .insert("levels".to_string(), ParamValue::Int(3));
+        request.tile_size = Some(256);
+        request.max_host_memory = Some(1);
+        request.poll = Duration::from_millis(1);
+        request.output = FuseOutput::Hold(scratch(&format!("{label}_hold")));
+        let control = JobControl::new();
+        let outcome = focusforge_core::pipeline::run(
+            &request,
+            &CancelAfterFirstUnit(Arc::clone(&control)),
+            control,
+            None,
+        )
+        .expect("a cancel is not an error");
+        assert!(matches!(outcome, FuseOutcome::Cancelled { .. }));
+        request.resume = true;
+        let log = PreviewLog::new(aligned, true);
+        let report = run_observed(&request, &log);
+        assert_eq!(
+            report.align_source,
+            if aligned { "resumed" } else { "skipped" },
+            "aligned={aligned}"
+        );
+        assert!(
+            log.aligned().is_empty(),
+            "aligned={aligned}: a resumed alignment previews no frames"
+        );
+        let composites = log.composites();
+        let last = composites.last().expect("the resumed run previews");
+        assert!(last.covered > 0, "aligned={aligned}");
+        assert!(
+            last.covered < 512 * 512,
+            "aligned={aligned}: tiles fused before the cancel must not appear"
+        );
+    }
+}
+
+#[test]
+fn preview_feed_gpu_path() {
+    for lost in [false, true] {
+        let backend = || -> &'static dyn TileBackend {
+            Box::leak(Box::new(CappedBackend {
+                cap: u32::MAX,
+                shortfall: None,
+                asked: Mutex::new(Vec::new()),
+                lost,
+            }))
+        };
+        let plain = held_run_observed("pf_gpu_plain", 256, 3, Some(backend()), &NoopObserver)
+            .expect("an unsubscribed backend run");
+        let log = PreviewLog::new(false, true);
+        let run = held_run_observed("pf_gpu_sub", 256, 3, Some(backend()), &log)
+            .expect("a subscribed backend run");
+        assert!(run.composite == plain.composite, "lost={lost}: composite");
+        assert!(run.zmap == plain.zmap, "lost={lost}: Z-Map");
+        let last = log.composites().pop().expect("the backend path previews");
+        assert_eq!(last.covered, 512 * 512, "lost={lost}");
+    }
+}
+
+#[test]
+fn preview_feed_subscribes_per_kind() {
+    let only_composite = PreviewLog::new(false, true);
+    run_observed(&ecc_request("pf_kind_c", 3, "anchor"), &only_composite);
+    assert!(only_composite.aligned().is_empty());
+    assert!(!only_composite.composites().is_empty());
+
+    let only_aligned = PreviewLog::new(true, false);
+    run_observed(&ecc_request("pf_kind_a", 3, "anchor"), &only_aligned);
+    assert!(only_aligned.composites().is_empty());
+    assert!(!only_aligned.aligned().is_empty());
+}
+
+const STACK_ALGORITHMS: [&str; 3] = ["laplacian", "depth-map", "weighted-average"];
+
+/// A held run over three mantis frames with `algorithm`, observed by `observer`.
+fn heat_run(
+    label: &str,
+    algorithm: &str,
+    tile_size: u32,
+    crop: bool,
+    observer: &dyn StageObserver,
+) -> FuseReport {
+    let mut explicit = ParamValues::new();
+    if algorithm == "laplacian" {
+        explicit.insert("levels".to_string(), ParamValue::Int(3));
+    }
+    let mut request = base_request(label, mantis_frames(3), explicit);
+    request.algorithm = registry::find_stack(algorithm).expect("a registered algorithm");
+    request.output = FuseOutput::Hold(scratch(&format!("{label}_hold")));
+    request.tile_size = Some(tile_size);
+    request.crop = crop;
+    run_observed(&request, observer)
+}
+
+#[test]
+fn sharpness_heatmap_covers_every_tile() {
+    for algorithm in STACK_ALGORITHMS {
+        for (tile_size, crop) in [(256u32, false), (448, true)] {
+            let label = format!("hm_cover_{algorithm}_{tile_size}");
+            let log = PreviewLog::new(false, true).with_heat();
+            let report = heat_run(&label, algorithm, tile_size, crop, &log);
+            let context = format!("{algorithm} tile {tile_size} crop {crop}");
+
+            assert!(report.tiles >= 2, "{context}: {} tiles", report.tiles);
+            let (heats, composites) = (log.heats(), log.composites());
+            assert!(!heats.is_empty(), "{context}: no heat preview");
+            let mut previous = 0;
+            for heat in &heats {
+                assert!(heat.covered >= previous, "{context}: coverage shrank");
+                previous = heat.covered;
+                assert_eq!(heat.extent, composites[0].extent, "{context}: extent");
+                assert_eq!(
+                    (heat.width, heat.height),
+                    (composites[0].width, composites[0].height),
+                    "{context}: size"
+                );
+            }
+            let last = heats.last().unwrap();
+            assert_eq!(
+                last.covered,
+                (last.width * last.height) as usize,
+                "{context}"
+            );
+            let events = log.events.lock().unwrap();
+            let last_shown = events
+                .iter()
+                .rposition(|e| matches!(e, Event::Shown(s) if s.kind == PreviewKind::Heat))
+                .unwrap();
+            drop(events);
+            assert!(
+                last_shown < log.stage_at("seal"),
+                "{context}: arrives before the seal"
+            );
+        }
+    }
+}
+
+#[test]
+fn composite_preview_carries_the_tile_grid() {
+    for (tile_size, crop) in [(256u32, false), (256, true), (448, true)] {
+        let label = format!("grid_{tile_size}_{crop}");
+        let log = PreviewLog::new(false, true).with_heat();
+        heat_run(&label, "laplacian", tile_size, crop, &log);
+        let shown: Vec<Shown> = log.heats().into_iter().chain(log.composites()).collect();
+        assert!(
+            !shown.is_empty(),
+            "tile {tile_size} crop {crop}: no preview"
+        );
+        for preview in &shown {
+            let (w, h) = (preview.extent.width, preview.extent.height);
+            assert!(
+                preview.tiles.len() > 1,
+                "tile {tile_size} crop {crop}: {} tiles",
+                preview.tiles.len()
+            );
+            let mut painted = vec![0u8; w as usize * h as usize];
+            for tile in preview.tiles.iter() {
+                assert!(tile.x + tile.width <= w && tile.y + tile.height <= h);
+                for y in tile.y..tile.y + tile.height {
+                    for x in tile.x..tile.x + tile.width {
+                        painted[(y * w + x) as usize] += 1;
+                    }
+                }
+            }
+            assert!(
+                painted.iter().all(|&n| n == 1),
+                "tile {tile_size} crop {crop}: the tiles do not partition the output extent"
+            );
+            assert_eq!(preview.tiles, shown[0].tiles, "one grid per run");
+        }
+    }
+}
+
+#[test]
+fn sharpness_heatmap_scale_is_run_wide() {
+    for algorithm in STACK_ALGORITHMS {
+        let last_heat = |tile_size: u32| {
+            let log = PreviewLog::heat_only();
+            let label = format!("hm_scale_{algorithm}_{tile_size}");
+            heat_run(&label, algorithm, tile_size, false, &log);
+            log.heats().pop().expect("a heat preview").rgba
+        };
+        let whole = last_heat(512);
+        assert!(
+            whole.chunks_exact(4).any(|p| p[0] > 0),
+            "{algorithm}: all cold"
+        );
+        for tile_size in [256, 480] {
+            assert!(
+                last_heat(tile_size) == whole,
+                "{algorithm}: tile {tile_size} differs from one 512 tile"
+            );
+        }
+    }
+}
+
+#[test]
+fn sharpness_heatmap_absent_for_algorithm_without_plane() {
+    let all = PreviewLog::new(true, true).with_heat();
+    let mut request = base_request("hm_absent", mantis_frames(3), ParamValues::new());
+    request.algorithm = registry::find_stack("dummy-stack").expect("dummy-stack is registered");
+    request.output = FuseOutput::Hold(scratch("hm_absent_hold"));
+    run_observed(&request, &all);
+
+    let calls = all.unavailable();
+    assert_eq!(calls.len(), 1, "one call");
+    let heat_only = PreviewKinds {
+        heat: true,
+        ..PreviewKinds::default()
+    };
+    assert_eq!(calls[0].1, heat_only);
+    assert!(all.stage_at("fuse") < calls[0].0);
+    assert!(calls[0].0 < all.first_composite_at());
+    assert!(all.heats().is_empty(), "no heat without a plane");
+    assert!(!all.composites().is_empty(), "the composite still grows");
+
+    let no_heat = PreviewLog::new(true, true);
+    request.output = FuseOutput::Hold(scratch("hm_absent_off_hold"));
+    run_observed(&request, &no_heat);
+    assert!(no_heat.unavailable().is_empty(), "heat was not asked for");
+
+    let supported = PreviewLog::heat_only();
+    heat_run("hm_absent_supported", "laplacian", 448, false, &supported);
+    assert!(
+        supported.unavailable().is_empty(),
+        "laplacian supplies heat"
+    );
+}
+
+#[test]
+fn sharpness_heatmap_output_identical_with_and_without_subscriber() {
+    use focusforge_core::display::PreviewFeed;
+
+    let heat_only = PreviewKinds {
+        heat: true,
+        ..PreviewKinds::default()
+    };
+    assert!(PreviewFeed::new(heat_only, (64, 64)).is_some());
+    assert!(PreviewFeed::new(PreviewKinds::default(), (64, 64)).is_none());
+
+    for algorithm in STACK_ALGORITHMS {
+        let run = |label: &str, observer: &dyn StageObserver| {
+            held_run_of(Box::new(heat_run(
+                &format!("hm_bits_{algorithm}_{label}"),
+                algorithm,
+                256,
+                false,
+                observer,
+            )))
+        };
+        let plain = run("plain", &NoopObserver);
+        let without_heat = run("no_heat", &PreviewLog::new(true, true));
+        let log = PreviewLog::new(true, true).with_heat();
+        let with_heat = run("heat", &log);
+        assert!(!log.heats().is_empty(), "{algorithm}: heat was delivered");
+        for (label, other) in [("without heat", &without_heat), ("with heat", &with_heat)] {
+            assert!(
+                other.composite == plain.composite,
+                "{algorithm} {label}: composite"
+            );
+            assert!(other.zmap == plain.zmap, "{algorithm} {label}: Z-Map");
+        }
+
+        let only_heat = PreviewLog::heat_only();
+        run("heat_only", &only_heat);
+        assert!(!only_heat.heats().is_empty());
+        assert!(only_heat.composites().is_empty(), "{algorithm}: per-kind");
+    }
+}
+
+/// `count` 12-bit DNG frames of `width` x `height` under `dir`, each sharp in
+/// its own vertical band and bright enough that the as-shot white balance
+/// lifts the red channel past white.
+fn raw_frames(dir: &Path, count: usize, width: u32, height: u32) -> Vec<PathBuf> {
+    (0..count)
+        .map(|frame| {
+            let samples = (0..width * height)
+                .map(|i| {
+                    let (x, y) = (i % width, i / width);
+                    let band = (x as usize * count / width as usize).min(count - 1);
+                    let amplitude = if band == frame { 380 } else { 50 };
+                    let checker = if (x / 2 + y / 2) % 2 == 0 {
+                        0
+                    } else {
+                        amplitude
+                    };
+                    (2_700 + frame as u32 * 40 + checker) as u16
+                })
+                .collect();
+            let mut spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], samples);
+            spec.width = width;
+            spec.height = height;
+            spec.as_shot_neutral = Some([0.5, 1.0, 0.625]);
+            let written = write_dng(&spec, false);
+            let path = dir.join(format!("{frame:02}.dng"));
+            std::fs::copy(written.path(), &path).expect("the DNG frame copies");
+            path
+        })
+        .collect()
+}
+
+#[test]
+fn raw_run_previews_its_f32_composite_and_heat() {
+    let frames = raw_frames(&scratch("raw_preview_frames"), 3, 320, 256);
+    let mut explicit = ParamValues::new();
+    explicit.insert("levels".to_string(), ParamValue::Int(2));
+    let mut request = base_request("raw_preview", frames, explicit);
+    request.output = FuseOutput::Hold(scratch("raw_preview_hold"));
+    request.tile_size = Some(128);
+    let log = PreviewLog::new(false, true).with_heat();
+    let report = run_observed(&request, &log);
+
+    let FuseProduct::Held(held) = &report.product else {
+        panic!("a held run");
+    };
+    assert_eq!(
+        focusforge_core::io::TiffStack::open_staged(&held.composite)
+            .expect("the held composite opens")
+            .sample_format(),
+        SampleFormat::F32,
+        "a RAW stack fuses into an f32 composite"
+    );
+    assert!(report.tiles >= 2, "{} tiles", report.tiles);
+    assert!(log.unavailable().is_empty(), "every kind is delivered");
+
+    for (kind, shown) in [("composite", log.composites()), ("heat", log.heats())] {
+        let last = shown.last().unwrap_or_else(|| panic!("no {kind} preview"));
+        assert_eq!(
+            last.covered,
+            (last.width * last.height) as usize,
+            "the last {kind} preview covers the whole extent"
+        );
+        assert!(
+            last.rgba.chunks_exact(4).any(|p| p[..3] != [0, 0, 0]),
+            "the {kind} preview is not black"
+        );
+        assert!(last.tiles.len() >= 2, "the {kind} preview carries the grid");
+    }
+}
+
+#[test]
+fn sharpness_heatmap_backend_path() {
+    let cpu = PreviewLog::heat_only();
+    held_run_observed("hm_backend_cpu", 256, 3, None, &cpu).expect("a plain CPU run");
+    let expected = cpu.heats().pop().expect("the CPU path previews heat");
+    assert_eq!(expected.covered, 512 * 512);
+
+    for lost in [false, true] {
+        let backend: &'static dyn TileBackend = Box::leak(Box::new(CappedBackend {
+            cap: u32::MAX,
+            shortfall: None,
+            asked: Mutex::new(Vec::new()),
+            lost,
+        }));
+        let log = PreviewLog::heat_only();
+        held_run_observed(&format!("hm_backend_{lost}"), 256, 3, Some(backend), &log)
+            .expect("a subscribed backend run");
+        let last = log.heats().pop().expect("the backend path previews heat");
+        assert_eq!(last.covered, 512 * 512, "lost={lost}");
+        assert!(
+            last.rgba == expected.rgba,
+            "lost={lost}: differs from the CPU run"
+        );
+    }
 }

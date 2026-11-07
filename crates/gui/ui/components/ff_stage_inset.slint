@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A square card over the stage image: the sharpness of every tile fused so far.
+
+import { Theme } from "../theme.slint";
+import { FFHeatLegend } from "ff_heat_legend.slint";
+
+export component FFStageInset inherits Rectangle {
+    in property <image> heat;
+    // Fades the card out.
+    in property <bool> fading: false;
+
+    width: 160px;
+    height: 206px;
+    background: Theme.surface-raised;
+    border-width: 1px;
+    border-color: Theme.border-default;
+    opacity: root.fading ? 0 : 1;
+    animate opacity { duration: Theme.motion-slow; easing: ease-out; }
+
+    VerticalLayout {
+        padding-left: Theme.space-2;
+        padding-right: Theme.space-2;
+        padding-top: Theme.space-2;
+        padding-bottom: Theme.space-2;
+        spacing: Theme.space-1;
+
+        Text {
+            height: 14px;
+            text: "Sharpness";
+            color: Theme.text-secondary;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+        }
+
+        Rectangle {
+            height: 144px;
+            background: Theme.surface-canvas;
+
+            Image {
+                source: root.heat;
+                width: parent.width;
+                height: parent.height;
+                image-fit: contain;
+            }
+        }
+
+        FFHeatLegend { }
+    }
+}

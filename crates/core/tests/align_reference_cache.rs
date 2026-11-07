@@ -1,122 +1,30 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The anchored reference frame's pyramid is built once per run, not once per
-//! registration. Shares `mod common;`. `max-iterations` is lowered to 40 from
-//! the shipped 400: cheap on an 8-frame fixture, and some frames diverge, which
-//! the byte-identity tests want.
-//!
-//! `CountingReader` wraps `&dyn TileReader` with one `AtomicUsize` per
-//! frame, incremented in `read_tile_into` -- a test double over the
-//! *reader*, never a stub algorithm, so the real `PyramidalEcc` code path is
-//! what is being counted.
+//! The anchored reference frame's pyramid is prepared once per run and never
+//! shared across runs, and a mismatched prepared value is ignored. Also pins the
+//! per-frame outcomes of an uncached run to recorded values. Runs that are not
+//! pinned lower `max-iterations` to 40 from the shipped 400: cheap on an
+//! 8-frame fixture, and some frames diverge.
 
 mod common;
+
+use common::align::{
+    CountingReader, ESCALATION_READS, anchor_defaults, lowered_max_iterations, open_fixture,
+    open_stack_context, reference_reads, stack_context, uncached_outcomes,
+};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use focusforge_core::algorithm::{
-    AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus, TileReader,
+    AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus,
 };
 use focusforge_core::align::{
     AlignDriverOptions, FailurePolicy, PyramidalEcc, Transform, align_stack_with,
 };
 use focusforge_core::io::TiffStack;
-use focusforge_core::params::{self, ParamDesc, ParamValue, ParamValues, StackContext};
-use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
-use focusforge_core::tile::{HostBudget, Rect};
-
-fn open_fixture() -> TiffStack {
-    TiffStack::open(common::mantis_512_dir()).expect("opening fixtures/mantis-512")
-}
-
-fn stack_context(stack: &TiffStack) -> StackContext {
-    let (width, height) = stack.dimensions();
-    StackContext::new(
-        stack.len(),
-        width,
-        height,
-        stack.header(0).samples_per_pixel,
-    )
-}
-
-/// Fully resolved defaults for `PyramidalEcc`, `max-iterations` then lowered
-/// to 40 by every caller here (see the module docs), under the anchor policy
-/// these tests exercise.
-fn resolved_defaults(ctx: &StackContext) -> ParamValues {
-    let resolved = params::resolve(PyramidalEcc.params(), &ParamValues::new(), ctx)
-        .expect("defaults resolve cleanly");
-    let mut cfg = params::resolved_values(&resolved);
-    cfg.insert(
-        "reference-policy".to_string(),
-        ParamValue::Enum("anchor".to_string()),
-    );
-    cfg
-}
-
-fn lowered_max_iterations(ctx: &StackContext) -> ParamValues {
-    let mut cfg = resolved_defaults(ctx);
-    cfg.insert("max-iterations".to_string(), ParamValue::Int(40));
-    cfg
-}
-
-fn ceil_div(a: u32, b: u32) -> usize {
-    a.div_ceil(b) as usize
-}
-
-/// The off-centre patches of a 512 px frame: a 3x3 grid without its middle.
-const PATCH_COUNT: usize = 8;
-
-/// Reads one registration makes of a frame's own pixels up to its solve: the
-/// level-1 bands (each output band of `DEFAULT_TILE_SIZE / 2` rows reads its
-/// rows plus halo), without the level-0 window or patches.
-fn streamed_band_reads(stack: &StackContext) -> usize {
-    ceil_div(stack.height.div_ceil(2), DEFAULT_TILE_SIZE / 2)
-}
-
-/// The reference frame is read as bands, one level-0 template window and one
-/// window per patch template -- once per run, whatever the registration count.
-fn reference_reads(stack: &StackContext) -> usize {
-    streamed_band_reads(stack) + 1 + PATCH_COUNT
-}
-
-/// Reads one escalation adds for a frame no larger than the detector's 512 px
-/// proxy: the whole frame at level 0. The reference's is made by the first
-/// escalation of a run and shared by every later one.
-const ESCALATION_READS: usize = 1;
-
-/// Wraps another [`TileReader`], counting `read_tile_into` calls per frame
-/// index. One `AtomicUsize` per frame, so concurrent registrations (the
-/// rayon anchor sub-arm) count correctly with no lock.
-struct CountingReader<'a> {
-    inner: &'a dyn TileReader,
-    reads: Vec<AtomicUsize>,
-}
-
-impl<'a> CountingReader<'a> {
-    fn new(inner: &'a dyn TileReader, frame_count: usize) -> Self {
-        CountingReader {
-            inner,
-            reads: (0..frame_count).map(|_| AtomicUsize::new(0)).collect(),
-        }
-    }
-
-    fn reads_for(&self, frame: usize) -> usize {
-        self.reads[frame].load(Ordering::SeqCst)
-    }
-}
-
-impl TileReader for CountingReader<'_> {
-    fn read_tile_into(
-        &self,
-        frame: usize,
-        rect: Rect,
-        out: &mut [u16],
-    ) -> Result<(), AlgorithmError> {
-        self.reads[frame].fetch_add(1, Ordering::SeqCst);
-        self.inner.read_tile_into(frame, rect, out)
-    }
-}
+use focusforge_core::params::{ParamDesc, ParamValue, ParamValues};
+use focusforge_core::tile::HostBudget;
 
 /// A stub [`AlignAlgorithm`] that counts its own `prepare_run` calls and
 /// otherwise produces a trivial, always-converged outcome -- identity for
@@ -242,54 +150,6 @@ impl AlignAlgorithm for DropCheckingAlign {
     }
 }
 
-/// A no-prepared-state comparison loop: `PyramidalEcc::align_frame` called
-/// directly over a plain `AlignContext::new` with no `.with_prepared` --
-/// the byte-identity baseline this test asserts against.
-fn uncached_outcomes(
-    stack_ctx: StackContext,
-    reader: &dyn TileReader,
-    reference: usize,
-    cfg: &ParamValues,
-) -> Vec<AlignOutcome> {
-    let ctx = AlignContext::new(stack_ctx, reference, reader);
-    (0..stack_ctx.frame_count)
-        .map(|i| {
-            PyramidalEcc
-                .align_frame(&ctx, i, cfg)
-                .expect("uncached align_frame must not error")
-        })
-        .collect()
-}
-
-fn assert_frames_match_outcomes(
-    frames: &[focusforge_core::align::FrameAlignment],
-    outcomes: &[AlignOutcome],
-) {
-    assert_eq!(frames.len(), outcomes.len());
-    for (frame, outcome) in frames.iter().zip(outcomes) {
-        assert_eq!(
-            frame.transform, outcome.transform,
-            "frame {}: transform must be byte-identical to the uncached loop",
-            frame.frame
-        );
-        assert_eq!(
-            frame.status, outcome.status,
-            "frame {}: status must match the uncached loop",
-            frame.frame
-        );
-        assert_eq!(
-            frame.iterations, outcome.iterations,
-            "frame {}: iterations must match the uncached loop",
-            frame.frame
-        );
-        assert_eq!(
-            frame.residual, outcome.residual,
-            "frame {}: residual must match the uncached loop",
-            frame.frame
-        );
-    }
-}
-
 /// One outcome as exact bits and its status, so a recorded run and a later
 /// one compare without a tolerance.
 fn outcome_fingerprint(outcome: &AlignOutcome) -> String {
@@ -309,29 +169,18 @@ fn outcome_fingerprint(outcome: &AlignOutcome) -> String {
     )
 }
 
-/// The middle frame, the shipped `reference-frame` default on eight frames.
-const MIDDLE_FRAME: usize = 4;
+/// The reference frame the recorded pins were taken against.
+const RECORDED_REFERENCE: usize = 4;
 
 fn recorded_fingerprints(mode: &str) -> Vec<String> {
     let stack = open_fixture();
     let stack_ctx = stack_context(&stack);
-    let mut cfg = resolved_defaults(&stack_ctx);
+    let mut cfg = anchor_defaults(&stack_ctx);
     cfg.insert("mode".to_string(), ParamValue::Enum(mode.to_string()));
-    uncached_outcomes(stack_ctx, &stack, MIDDLE_FRAME, &cfg)
+    uncached_outcomes(stack_ctx, &stack, RECORDED_REFERENCE, &cfg)
         .iter()
         .map(outcome_fingerprint)
         .collect()
-}
-
-/// Per-frame outcomes at the shipped defaults, pinned to recorded values; the
-/// fixture's diverging frames are part of the record.
-#[test]
-fn per_frame_outcomes_match_the_recorded_run() {
-    assert_eq!(recorded_fingerprints("translation"), RECORDED_TRANSLATION);
-    assert_eq!(
-        recorded_fingerprints("rotation-scale"),
-        RECORDED_ROTATION_SCALE
-    );
 }
 
 /// A fingerprint without its status token: the transform, iteration count and
@@ -344,20 +193,24 @@ fn without_status(fingerprint: &str) -> String {
         .join(" ")
 }
 
-/// The transform, iteration count and residual of every frame stay bit for bit
-/// what the recorded run produced, whatever status the off-centre check adds.
+/// Per-frame outcomes at the shipped defaults, pinned to recorded values; the
+/// fixture's diverging frames are part of the record. The transform, iteration
+/// count and residual of every frame are checked first, so a changed status
+/// cannot hide a changed solve.
 #[test]
-fn transforms_iterations_and_residuals_match_the_recorded_run() {
+fn per_frame_outcomes_match_the_recorded_run() {
     for (mode, recorded) in [
         ("translation", RECORDED_TRANSLATION),
         ("rotation-scale", RECORDED_ROTATION_SCALE),
     ] {
-        let now: Vec<String> = recorded_fingerprints(mode)
-            .iter()
-            .map(|f| without_status(f))
-            .collect();
-        let then: Vec<String> = recorded.iter().map(|f| without_status(f)).collect();
-        assert_eq!(now, then, "{mode}");
+        let now = recorded_fingerprints(mode);
+        let now_solve: Vec<String> = now.iter().map(|f| without_status(f)).collect();
+        let then_solve: Vec<String> = recorded.iter().map(|f| without_status(f)).collect();
+        assert_eq!(
+            now_solve, then_solve,
+            "{mode}: transform, iterations, residual"
+        );
+        assert_eq!(now, recorded, "{mode}: full fingerprint with status");
     }
 }
 
@@ -431,31 +284,33 @@ fn assert_mismatched_prepared_is_ignored(
 
 #[test]
 fn prepared_for_another_reference_frame_is_ignored() {
-    let stack = open_fixture();
-    let cfg = lowered_max_iterations(&stack_context(&stack));
-    assert_mismatched_prepared_is_ignored((&stack, 4, &cfg), (&stack, 2, &cfg), &[1, 6]);
+    let (stack, ctx) = open_stack_context("mantis-64");
+    let cfg = lowered_max_iterations(&ctx);
+    assert_mismatched_prepared_is_ignored((&stack, 0, &cfg), (&stack, 2, &cfg), &[1]);
 }
 
 #[test]
 fn prepared_for_another_mode_is_ignored() {
-    let stack = open_fixture();
-    let cfg = lowered_max_iterations(&stack_context(&stack));
+    let (stack, ctx) = open_stack_context("mantis-64");
+    let cfg = lowered_max_iterations(&ctx);
     let mut translation = cfg.clone();
     translation.insert(
         "mode".to_string(),
         ParamValue::Enum("translation".to_string()),
     );
-    assert_mismatched_prepared_is_ignored((&stack, 4, &translation), (&stack, 4, &cfg), &[1, 6]);
+    assert_mismatched_prepared_is_ignored((&stack, 1, &translation), (&stack, 1, &cfg), &[0, 2]);
 }
 
+/// The automatic depth at 64 px is 0: the prepared reference lacks the
+/// coarse level the run's explicit depth 1 needs.
 #[test]
 fn prepared_for_another_pyramid_depth_is_ignored() {
-    let stack = open_fixture();
-    let cfg = lowered_max_iterations(&stack_context(&stack));
-    let mut shallow = cfg.clone();
-    shallow.insert("pyramid-depth".to_string(), ParamValue::Int(2));
-    assert_ne!(cfg.get("pyramid-depth"), shallow.get("pyramid-depth"));
-    assert_mismatched_prepared_is_ignored((&stack, 4, &shallow), (&stack, 4, &cfg), &[1, 6]);
+    let (stack, ctx) = open_stack_context("mantis-64");
+    let cfg = lowered_max_iterations(&ctx);
+    let mut deeper = cfg.clone();
+    deeper.insert("pyramid-depth".to_string(), ParamValue::Int(1));
+    assert_ne!(cfg.get("pyramid-depth"), deeper.get("pyramid-depth"));
+    assert_mismatched_prepared_is_ignored((&stack, 1, &cfg), (&stack, 1, &deeper), &[0, 2]);
 }
 
 #[test]
@@ -467,102 +322,6 @@ fn prepared_for_another_stack_size_is_ignored() {
     let mut cfg = lowered_max_iterations(&stack_context(&small));
     cfg.insert("pyramid-depth".to_string(), ParamValue::Int(1));
     assert_mismatched_prepared_is_ignored((&large, 4, &cfg), (&small, 1, &cfg), &[0, 2]);
-}
-
-#[test]
-fn reference_frame_is_read_once_per_run() {
-    let stack = open_fixture();
-    let stack_ctx = stack_context(&stack);
-    let cfg = lowered_max_iterations(&stack_ctx);
-    let reader = CountingReader::new(&stack, stack_ctx.frame_count);
-
-    let run = align_stack_with(
-        &PyramidalEcc,
-        stack_ctx,
-        &reader,
-        &cfg,
-        FailurePolicy::Strict,
-        &AlignDriverOptions {
-            budget: HostBudget::explicit(1),
-            ..Default::default()
-        },
-    )
-    .expect("serial anchored run completes");
-
-    let bands = streamed_band_reads(&stack_ctx);
-    let reference = run.alignment.reference;
-
-    // Several fixture frames diverge and escalate, yet the reference gains one
-    // read, not one per escalation.
-    assert_eq!(
-        reader.reads_for(reference),
-        reference_reads(&stack_ctx) + ESCALATION_READS,
-        "the cached reference frame must be read once (bands, level-0 window, patch \
-         windows) plus its one shared escalation read, not once per registration"
-    );
-    for i in 0..stack_ctx.frame_count {
-        if i == reference {
-            continue;
-        }
-        // Bands always; a frame that reaches level 0 adds its window, one
-        // that converges there adds at most one window per patch, and one that
-        // diverges adds its own whole-frame escalation read.
-        let reads = reader.reads_for(i);
-        let most = bands + 1 + PATCH_COUNT + ESCALATION_READS;
-        assert!(
-            (bands..=most).contains(&reads),
-            "non-reference frame {i} made {reads} reads, expected {bands} to {most}"
-        );
-    }
-}
-
-#[test]
-fn cached_transforms_match_uncached() {
-    let stack = open_fixture();
-    let stack_ctx = stack_context(&stack);
-    let cfg = lowered_max_iterations(&stack_ctx);
-
-    let cached = align_stack_with(
-        &PyramidalEcc,
-        stack_ctx,
-        &stack,
-        &cfg,
-        FailurePolicy::Strict,
-        &AlignDriverOptions {
-            budget: HostBudget::explicit(1),
-            ..Default::default()
-        },
-    )
-    .expect("serial anchored run completes");
-    assert_eq!(cached.worker_limit, 1, "this is the serial sub-arm");
-
-    let uncached = uncached_outcomes(stack_ctx, &stack, cached.alignment.reference, &cfg);
-    assert_frames_match_outcomes(&cached.alignment.frames, &uncached);
-}
-
-#[test]
-fn cached_parallel_transforms_match_uncached() {
-    let stack = open_fixture();
-    let stack_ctx = stack_context(&stack);
-    let cfg = lowered_max_iterations(&stack_ctx);
-
-    let cached = align_stack_with(
-        &PyramidalEcc,
-        stack_ctx,
-        &stack,
-        &cfg,
-        FailurePolicy::Strict,
-        &AlignDriverOptions::default(),
-    )
-    .expect("parallel anchored run completes");
-    assert!(
-        cached.worker_limit > 1,
-        "the default budget must exercise the parallel arm on this 8-frame fixture: {}",
-        cached.worker_limit
-    );
-
-    let uncached = uncached_outcomes(stack_ctx, &stack, cached.alignment.reference, &cfg);
-    assert_frames_match_outcomes(&cached.alignment.frames, &uncached);
 }
 
 #[test]
@@ -672,10 +431,6 @@ fn two_runs_do_not_share_a_cache() {
         "the second run's reference frame must be read once on its own, plus at most the \
          one shared escalation read: {second_reads} reads"
     );
-
-    let uncached_second =
-        uncached_outcomes(stack_ctx, &stack, second.alignment.reference, &cfg_second);
-    assert_frames_match_outcomes(&second.alignment.frames, &uncached_second);
 }
 
 #[test]

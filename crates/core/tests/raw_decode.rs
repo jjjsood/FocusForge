@@ -4,14 +4,24 @@ mod common;
 #[path = "common/raw_dng.rs"]
 mod raw_dng;
 
-use focusforge_core::algorithm::TileReader;
+use focusforge_core::algorithm::{AlgorithmError, TileReader};
+use focusforge_core::equalize::{EqualizeSettings, UNIT_GAIN};
 use focusforge_core::io::Rect;
-use focusforge_core::io::{FrameError, RawError, RawStack};
+use focusforge_core::io::{FrameError, FrameReader, RawError, RawStack};
+use focusforge_core::job::{JobControl, JobStage};
+use focusforge_core::params::{ParamValue, ParamValues};
+use focusforge_core::pipeline::{
+    FreeSpaceProbe, FuseOutcome, FuseOutput, FuseProduct, FuseRequest, PipelineError, RunStage,
+    StageObserver, VolumeShortfall, VolumeSpace,
+};
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
 use rawler::rawsource::RawSource;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
+use crate::common::target_tmp;
 use crate::raw_dng::{DngSpec, write_dng};
 
 #[test]
@@ -203,6 +213,7 @@ fn synthetic_dng_metadata_roundtrips() {
         let metadata = reader.metadata(0).expect("DNG metadata");
         let shifted_cfa = [cfa[3], cfa[2], cfa[1], cfa[0]];
         assert_eq!(reader.dimensions(), (4, 3));
+        assert_eq!(FrameReader::frame(&reader, 0).orientation, 1);
         assert_eq!(metadata.storage_bits, Some(bits));
         assert_eq!(metadata.decoder_bits, None);
         assert_eq!(metadata.black_levels.as_deref(), Some(&[128.0; 4][..]));
@@ -482,14 +493,14 @@ fn decoded_frames_stay_within_budget() {
     let one_frame_budget =
         8 * 8 * 30 + std::fs::metadata(full.path()).expect("full DNG size").len();
     let recovered = RawStack::open_files_with_budget(
-        &[PathBuf::from(withheld.path()), PathBuf::from(full.path())],
+        &[PathBuf::from(full.path()), PathBuf::from(withheld.path())],
         one_frame_budget,
     )
     .expect("both headers open without decode");
     assert!(
         recovered
             .read_tile_into(
-                0,
+                1,
                 Rect {
                     x: 0,
                     y: 0,
@@ -502,7 +513,7 @@ fn decoded_frames_stay_within_budget() {
     );
     recovered
         .read_tile_into(
-            1,
+            0,
             Rect {
                 x: 0,
                 y: 0,
@@ -572,7 +583,7 @@ fn decoded_frames_stay_within_budget() {
             &mut output,
         )
         .expect_err("overflowed geometry must fail before decode");
-    assert!(error.to_string().contains("overflows cache accounting"));
+    assert!(error.to_string().contains("overflows a byte count"));
 }
 
 #[test]
@@ -597,8 +608,92 @@ fn sigma_pin_rejects_a_replaced_fixture() {
     );
 }
 
+/// Prints how far scratch reads of whole corpus frames fall from cached reads.
 #[test]
-#[ignore]
+#[ignore = "measurement: prints the scratch-versus-cached read error of corpus frames; needs the FOCUSFORGE_RAW_SAMPLES corpus"]
+fn raw_scratch_error_on_corpus_frames() {
+    let Some(samples) = std::env::var_os("FOCUSFORGE_RAW_SAMPLES") else {
+        eprintln!("skip: FOCUSFORGE_RAW_SAMPLES is not set");
+        return;
+    };
+    for name in ["panasonic-dmc-lx7.rw2", "fujifilm-x-s10.raf"] {
+        let path = PathBuf::from(&samples).join(name);
+        if !path.is_file() {
+            eprintln!("skip: {} is missing", path.display());
+            continue;
+        }
+        let cached = RawStack::open_files(std::slice::from_ref(&path)).expect("sample opens");
+        let developed = RawStack::open_files(std::slice::from_ref(&path)).expect("sample opens");
+        let root = target_tmp();
+        developed
+            .develop_once(root.path(), u64::MAX, 1, &|| false, &AtomicUsize::new(0))
+            .expect("the pass develops the frame");
+        let (width, height) = cached.dimensions();
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let count = width as usize * height as usize * 3;
+
+        let (mut want16, mut got16) = (vec![0u16; count], vec![0u16; count]);
+        cached
+            .read_tile_into(0, rect, &mut want16)
+            .expect("cached u16 read");
+        developed
+            .read_tile_into(0, rect, &mut got16)
+            .expect("mapped u16 read");
+        let differing16 = want16.iter().zip(&got16).filter(|(w, g)| w != g).count();
+        let worst16 = want16.iter().zip(&got16).map(|(w, g)| w.abs_diff(*g)).max();
+        let over = |limit: u16| {
+            want16
+                .iter()
+                .zip(&got16)
+                .filter(|(w, g)| w.abs_diff(**g) > limit)
+                .count()
+        };
+
+        let (mut want, mut got) = (vec![0f32; count], vec![0f32; count]);
+        cached
+            .read_tile_f32_into(0, rect, &mut want)
+            .expect("cached f32 read");
+        developed
+            .read_tile_f32_into(0, rect, &mut got)
+            .expect("mapped f32 read");
+        let differing = want.iter().zip(&got).filter(|(w, g)| w != g).count();
+        let worst = want
+            .iter()
+            .zip(&got)
+            .map(|(w, g)| (w - g).abs())
+            .fold(0.0f32, f32::max);
+        let worst_relative = want
+            .iter()
+            .zip(&got)
+            .map(|(w, g)| (w - g).abs() / (w.abs() / 65_535.0).max(1.0))
+            .fold(0.0f32, f32::max);
+        let (low, high) = got.iter().fold((f32::MAX, f32::MIN), |(low, high), v| {
+            (low.min(*v), high.max(*v))
+        });
+        eprintln!(
+            "{name}: {width}x{height} u16 max diff {worst16:?} LSB, {differing16} differ; \
+             u16 diff over 8/16/32/64 LSB: {}/{}/{}/{}; \
+             f32 max diff {worst} (relative bound {worst_relative}) LSB, {differing} differ; \
+             mapped f32 min {low} max {high}",
+            over(8),
+            over(16),
+            over(32),
+            over(64),
+        );
+        assert!(
+            got.iter().all(|value| value.is_finite()),
+            "{name}: a mapped read is not finite"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs the FOCUSFORGE_RAW_SAMPLES corpus"]
 fn canon_dummy_metadata_has_no_pixel_buffer() {
     let Some(samples) = std::env::var_os("FOCUSFORGE_RAW_SAMPLES") else {
         eprintln!("skip: FOCUSFORGE_RAW_SAMPLES is not set");
@@ -627,7 +722,7 @@ fn canon_dummy_metadata_has_no_pixel_buffer() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs the FOCUSFORGE_RAW_SAMPLES corpus"]
 fn canon_develops_after_lazy_open() {
     let Some(samples) = std::env::var_os("FOCUSFORGE_RAW_SAMPLES") else {
         eprintln!("skip: FOCUSFORGE_RAW_SAMPLES is not set");
@@ -656,7 +751,7 @@ fn canon_develops_after_lazy_open() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs the FOCUSFORGE_RAW_LOCAL_SAMPLES corpus"]
 fn local_canon_cr3_smoke() {
     let Some(samples) = std::env::var_os("FOCUSFORGE_RAW_LOCAL_SAMPLES") else {
         eprintln!("skip: FOCUSFORGE_RAW_LOCAL_SAMPLES is not set");
@@ -722,7 +817,7 @@ fn local_canon_cr3_smoke() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs the FOCUSFORGE_RAW_SAMPLES corpus"]
 fn supported_corpus_dummy_metadata_has_no_pixel_buffers() {
     let Some(samples) = std::env::var_os("FOCUSFORGE_RAW_SAMPLES") else {
         eprintln!("skip: FOCUSFORGE_RAW_SAMPLES is not set");
@@ -750,7 +845,7 @@ fn supported_corpus_dummy_metadata_has_no_pixel_buffers() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs the FOCUSFORGE_RAW_SAMPLES corpus"]
 fn corpus_matches_manifest() {
     let (Some(samples), Some(expectations)) = (
         std::env::var_os("FOCUSFORGE_RAW_SAMPLES"),
@@ -1150,4 +1245,1415 @@ fn matrix_delta(left: &[f32], right: &[f32]) -> f32 {
         .zip(right)
         .map(|(left, right)| (left - right).abs())
         .fold(0.0, f32::max)
+}
+
+/// A frame decode runs the decoder's own parallel loops while it holds the
+/// decode lock. A second read reaching the pool at any point of that decode
+/// must not end up running on a worker the decode waits for.
+#[test]
+fn a_pool_read_arriving_during_a_decode_finishes() {
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    const SIDE: u32 = 512;
+    let mut spec = DngSpec::new(
+        12,
+        64,
+        4095,
+        [0, 1, 1, 2],
+        vec![512; (SIDE * SIDE) as usize],
+    );
+    spec.width = SIDE;
+    spec.height = SIDE;
+    let dng = write_dng(&spec, false);
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: SIDE,
+        height: 1,
+    };
+    for arrival_ms in (0..120).step_by(2) {
+        let reader = Arc::new(
+            RawStack::open_files(&[PathBuf::from(dng.path()), PathBuf::from(dng.path())])
+                .expect("DNG pair opens"),
+        );
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("test pool"),
+        );
+        let (done, finished) = mpsc::channel();
+        let read = move |reader: Arc<RawStack>, frame: usize, done: mpsc::Sender<()>| {
+            reader
+                .read_tile_into(frame, rect, &mut vec![0; SIDE as usize * 3])
+                .expect("frame develops");
+            let _ = done.send(());
+        };
+        {
+            let (reader, pool, done) = (Arc::clone(&reader), Arc::clone(&pool), done.clone());
+            std::thread::spawn(move || pool.install(|| read(reader, 0, done)));
+        }
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(arrival_ms));
+            pool.spawn(move || read(reader, 1, done));
+        });
+        for _ in 0..2 {
+            finished
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap_or_else(|_| {
+                    panic!("a read arriving {arrival_ms} ms into a decode never finishes")
+                });
+        }
+    }
+}
+
+/// As-shot multipliers `[2.0, 1.0, 1.6]`.
+const AS_SHOT_NEUTRAL: [f32; 3] = [0.5, 1.0, 0.625];
+const XYZ_TO_CAMERA: [f32; 9] = [0.72, -0.21, -0.08, -0.31, 1.12, 0.12, -0.02, 0.19, 0.55];
+
+fn tinted_spec(samples: Vec<u16>, width: u32, height: u32, cfa: [u8; 4]) -> DngSpec {
+    let mut spec = DngSpec::new(12, 64, 4095, cfa, samples);
+    spec.width = width;
+    spec.height = height;
+    spec.as_shot_neutral = Some(AS_SHOT_NEUTRAL);
+    spec.color_matrix = Some(XYZ_TO_CAMERA);
+    spec
+}
+
+fn tinted_look() -> focusforge_core::io::raw::LookTransform {
+    let matrix = [
+        [XYZ_TO_CAMERA[0], XYZ_TO_CAMERA[1], XYZ_TO_CAMERA[2]],
+        [XYZ_TO_CAMERA[3], XYZ_TO_CAMERA[4], XYZ_TO_CAMERA[5]],
+        [XYZ_TO_CAMERA[6], XYZ_TO_CAMERA[7], XYZ_TO_CAMERA[8]],
+    ];
+    focusforge_core::io::raw::LookTransform::new([2.0, 1.0, 1.6, f32::NAN], matrix)
+}
+
+fn quantize(value: f64) -> u16 {
+    (value.clamp(0.0, 1.0) * f64::from(u16::MAX) + 0.5) as u16
+}
+
+fn read_whole(reader: &RawStack) -> Vec<u16> {
+    let (width, height) = reader.dimensions();
+    let mut out = vec![0; width as usize * height as usize * 3];
+    reader
+        .read_tile_into(
+            0,
+            Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            &mut out,
+        )
+        .expect("frame develops");
+    out
+}
+
+/// A flat field's camera-linear value: its sample scaled between the black
+/// and white levels of [`tinted_spec`].
+fn flat_field(level: u16) -> (Vec<u16>, f64) {
+    (
+        vec![level; 64],
+        f64::from(level - 64) / f64::from(4095 - 64),
+    )
+}
+
+#[test]
+fn camera_space_flat_field_is_the_look_of_the_level_scaled_sample() {
+    let (samples, linear) = flat_field(900);
+    let dng = write_dng(&tinted_spec(samples, 8, 8, [0, 1, 1, 2]), false);
+    let reader = RawStack::open_files(&[PathBuf::from(dng.path())]).expect("DNG opens");
+    let expected = tinted_look().forward([linear; 3]).map(quantize);
+    for pixel in read_whole(&reader).chunks_exact(3) {
+        for channel in 0..3 {
+            assert!(
+                pixel[channel].abs_diff(expected[channel]) <= 1,
+                "{pixel:?} against {expected:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn camera_space_one_channel_over_white_leaves_the_others_alone() {
+    let (samples, linear) = flat_field(2600);
+    let dng = write_dng(&tinted_spec(samples, 8, 8, [0, 1, 1, 2]), false);
+    let reader = RawStack::open_files(&[PathBuf::from(dng.path())]).expect("DNG opens");
+    let look = tinted_look().forward([linear; 3]);
+    assert!(look.iter().any(|v| *v > 1.0) && look.iter().any(|v| (0.1..0.9).contains(v)));
+    let expected = look.map(quantize);
+    for pixel in read_whole(&reader).chunks_exact(3) {
+        for channel in 0..3 {
+            assert!(
+                pixel[channel].abs_diff(expected[channel]) <= 1,
+                "{pixel:?} against {expected:?}"
+            );
+        }
+    }
+}
+
+fn rawler_default_read(path: &std::path::Path) -> (usize, usize, Vec<u16>) {
+    use rawler::imgop::develop::{Intermediate, RawDevelop};
+    let source = RawSource::new(path).expect("source opens");
+    let decoder = rawler::get_decoder(&source).expect("decoder");
+    let image = decoder
+        .raw_image(&source, &RawDecodeParams::default(), false)
+        .expect("raw image");
+    let Intermediate::ThreeColor(pixels) = RawDevelop::default()
+        .develop_intermediate(&image)
+        .expect("develops")
+    else {
+        panic!("three-colour development expected");
+    };
+    let (width, height) = (pixels.width, pixels.height);
+    let samples = pixels
+        .into_flatten()
+        .into_iter()
+        .map(|v| quantize(f64::from(v)))
+        .collect();
+    (width, height, samples)
+}
+
+fn assert_matches_rawler_where_unclipped(path: &std::path::Path) {
+    let (width, height, rawler) = rawler_default_read(path);
+    let reader = RawStack::open_files(&[path.to_path_buf()]).expect("RAW opens");
+    assert_eq!(reader.dimensions(), (width as u32, height as u32));
+    let ours = read_whole(&reader);
+    let (mut compared, mut worst) = (0_usize, 0_u16);
+    for (a, b) in ours.chunks_exact(3).zip(rawler.chunks_exact(3)) {
+        if a.iter().any(|v| *v == 0 || *v == u16::MAX) {
+            continue;
+        }
+        compared += 1;
+        for channel in 0..3 {
+            worst = worst.max(a[channel].abs_diff(b[channel]));
+        }
+    }
+    assert!(
+        compared * 2 > width * height,
+        "only {compared} pixels compared"
+    );
+    assert!(worst <= 2, "{} differs by {worst} LSB", path.display());
+}
+
+#[test]
+fn camera_space_matches_rawler_on_tinted_synthetic_dngs() {
+    for cfa in [[0, 1, 1, 2], [1, 0, 2, 1], [2, 1, 1, 0]] {
+        let samples = (0..512).map(|i| 64 + (i * 1400 / 511) as u16).collect();
+        let dng = write_dng(&tinted_spec(samples, 32, 16, cfa), false);
+        assert_matches_rawler_where_unclipped(dng.path());
+    }
+}
+
+/// Two flat frames one stop apart in camera-linear light, equalized to the
+/// shared target: the camera-linear value both must reach.
+fn equalized_pair() -> (Vec<tempfile::NamedTempFile>, f64) {
+    let (dark, dark_linear) = flat_field(64 + 400);
+    let (bright, bright_linear) = flat_field(64 + 800);
+    assert!((bright_linear / dark_linear - 2.0).abs() < 1e-12);
+    let files = [dark, bright]
+        .into_iter()
+        .map(|samples| write_dng(&tinted_spec(samples, 8, 8, [0, 1, 1, 2]), false))
+        .collect();
+    (files, (dark_linear + bright_linear) / 2.0)
+}
+
+fn equalization_of(reader: &RawStack) -> focusforge_core::equalize::EqualizationReport {
+    use std::sync::atomic::AtomicUsize;
+    focusforge_core::equalize::estimate(
+        reader,
+        2,
+        reader.dimensions(),
+        3,
+        focusforge_core::equalize::EqualizeSettings {
+            max_gain: 4.0,
+            target_stops: 0.0,
+        },
+        1,
+        &AtomicUsize::new(0),
+        &|| false,
+    )
+    .expect("equalization estimates")
+}
+
+fn open_pair(files: &[tempfile::NamedTempFile]) -> RawStack {
+    let paths: Vec<PathBuf> = files.iter().map(|f| PathBuf::from(f.path())).collect();
+    RawStack::open_files(&paths).expect("DNG pair opens")
+}
+
+#[test]
+fn equalize_raw_estimates_on_camera_linear_means() {
+    let (files, target) = equalized_pair();
+    let report = equalization_of(&open_pair(&files));
+    let (dark, bright) = (&report.frames[0], &report.frames[1]);
+    let scale = f64::from(u16::MAX);
+    assert!(
+        (dark.mean - 400.0 / 4031.0 * scale).abs() < 0.1,
+        "{}",
+        dark.mean
+    );
+    assert!(
+        (bright.mean - 800.0 / 4031.0 * scale).abs() < 0.1,
+        "{}",
+        bright.mean
+    );
+    assert!((report.target - target * scale).abs() < 0.1);
+    assert!((dark.applied / bright.applied - 2.0).abs() < 1e-4);
+}
+
+#[test]
+fn equalize_raw_brings_a_frame_at_a_known_offset_to_the_reference_exposure() {
+    use focusforge_core::equalize::GainReader;
+    let (files, target) = equalized_pair();
+    let reader = open_pair(&files);
+    let gains = equalization_of(&reader).recorded().gains;
+    let expected = tinted_look().forward([target; 3]).map(quantize);
+    let gained = GainReader::new(&reader, &gains);
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: 8,
+        height: 8,
+    };
+    let step = std::num::NonZeroU32::new(2).expect("nonzero step");
+    for frame in 0..2 {
+        let mut whole = vec![0; 8 * 8 * 3];
+        gained
+            .read_tile_into(frame, rect, &mut whole)
+            .expect("gained read");
+        let mut covered = vec![0; 8 * 8 * 3];
+        let coverage = gained
+            .read_tile_coverage_into(frame, rect, &mut covered)
+            .expect("gained coverage read");
+        let mut stepped = vec![0; 4 * 4 * 3];
+        gained
+            .read_tile_step_into(frame, rect, step, 3, &mut stepped)
+            .expect("gained step read");
+        assert!(coverage.is_none());
+        for read in [&whole, &covered, &stepped] {
+            for pixel in read.chunks_exact(3) {
+                for channel in 0..3 {
+                    assert!(
+                        pixel[channel].abs_diff(expected[channel]) <= 1,
+                        "frame {frame}: {pixel:?} against {expected:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn equalize_raw_gains_replay_on_a_later_read() {
+    use focusforge_core::equalize::GainReader;
+    let (files, _) = equalized_pair();
+    let first = open_pair(&files);
+    let gains = equalization_of(&first).recorded().gains;
+    let rect = Rect {
+        x: 1,
+        y: 2,
+        width: 5,
+        height: 4,
+    };
+    let read = |reader: &RawStack, frame: usize| {
+        let mut out = vec![0; 5 * 4 * 3];
+        GainReader::new(reader, &gains)
+            .read_tile_into(frame, rect, &mut out)
+            .expect("gained read");
+        out
+    };
+    let later = open_pair(&files);
+    for frame in 0..2 {
+        assert_eq!(read(&first, frame), read(&later, frame));
+    }
+}
+
+fn whole_rect(reader: &RawStack) -> Rect {
+    let (width, height) = reader.dimensions();
+    Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    }
+}
+
+/// `value` narrowed the way the `u16` read narrows an `f32` one.
+fn narrowed(value: f32) -> u16 {
+    (value.clamp(0.0, 65_535.0) + 0.5).floor() as u16
+}
+
+fn flat_dng(level: u16, width: u32, height: u32) -> (tempfile::NamedTempFile, f64) {
+    let linear = f64::from(level - 64) / f64::from(4095 - 64);
+    let samples = vec![level; (width * height) as usize];
+    (
+        write_dng(&tinted_spec(samples, width, height, [0, 1, 1, 2]), false),
+        linear,
+    )
+}
+
+#[test]
+fn raw_f32_read_keeps_headroom_and_matches_the_look() {
+    use focusforge_core::equalize::UNIT_GAIN;
+    let (dng, linear) = flat_dng(2600, 40, 24);
+    let reader = RawStack::open_files(&[PathBuf::from(dng.path())]).expect("DNG opens");
+    assert_eq!(
+        reader.sample_format(),
+        focusforge_core::tile::SampleFormat::F32
+    );
+    let sub = Rect {
+        x: 5,
+        y: 3,
+        width: 17,
+        height: 9,
+    };
+    let scale = f64::from(u16::MAX);
+    let look = tinted_look();
+    for gain in [UNIT_GAIN, UNIT_GAIN / 2] {
+        let ratio = f64::from(gain) / f64::from(UNIT_GAIN);
+        let expected = look.forward([linear * ratio; 3]).map(|v| v * scale);
+        for rect in [sub, whole_rect(&reader)] {
+            let mut wide = vec![0.0f32; rect.width as usize * rect.height as usize * 3];
+            reader
+                .read_tile_gained_f32_into(0, rect, gain, &mut wide)
+                .expect("f32 gained read");
+            for pixel in wide.chunks_exact(3) {
+                for channel in 0..3 {
+                    assert!(
+                        (f64::from(pixel[channel]) - expected[channel]).abs() < 0.5,
+                        "gain {gain}: {pixel:?} against {expected:?}"
+                    );
+                }
+            }
+            let mut narrow = vec![0u16; wide.len()];
+            reader
+                .read_tile_gained_into(0, rect, gain, &mut narrow)
+                .expect("u16 gained read");
+            assert!(
+                narrow.iter().zip(&wide).all(|(n, w)| *n == narrowed(*w)),
+                "the u16 read is the narrowed f32 read"
+            );
+        }
+        let clips = expected.iter().any(|v| *v > scale);
+        assert_eq!(clips, gain == UNIT_GAIN, "{expected:?}");
+    }
+    let mut plain = vec![0.0f32; 3];
+    let one = Rect {
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 1,
+    };
+    reader.read_tile_f32_into(0, one, &mut plain).expect("read");
+    assert!(plain.iter().any(|v| *v > 65_535.0), "{plain:?}");
+}
+
+#[test]
+fn raw_f32_read_rejects_out_of_frame_rects_and_wrong_lengths() {
+    let (dng, _) = flat_dng(900, 40, 24);
+    let reader = RawStack::open_files(&[PathBuf::from(dng.path())]).expect("DNG opens");
+    for rect in [
+        Rect {
+            x: 39,
+            y: 0,
+            width: 2,
+            height: 1,
+        },
+        Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 1,
+        },
+        Rect {
+            x: u32::MAX,
+            y: 0,
+            width: 2,
+            height: 1,
+        },
+    ] {
+        let mut out = vec![9.0f32; 6];
+        let error = reader
+            .read_tile_f32_into(0, rect, &mut out)
+            .expect_err("a rect outside the frame is refused");
+        assert!(
+            error.to_string().contains("outside developed frame"),
+            "{error}"
+        );
+        assert_eq!(out, vec![9.0; 6]);
+    }
+    let whole = whole_rect(&reader);
+    for len in [40 * 24 * 3 - 1, 40 * 24 * 3 + 1] {
+        let mut out = vec![7.0f32; len];
+        let error = reader
+            .read_tile_f32_into(0, whole, &mut out)
+            .expect_err("a wrong length is refused");
+        assert!(error.to_string().contains(&len.to_string()), "{error}");
+        assert!(out.iter().all(|v| *v == 7.0));
+    }
+}
+
+#[test]
+fn equalize_raw_surfaces_a_decode_error() {
+    let (good, _) = flat_dng(900, 8, 8);
+    let truncated = write_dng(&tinted_spec(vec![900; 64], 8, 8, [0, 1, 1, 2]), true);
+    let files = [good, truncated];
+    let reader = open_pair(&files);
+    let started = std::sync::atomic::AtomicUsize::new(0);
+    let error = focusforge_core::equalize::estimate(
+        &reader,
+        2,
+        reader.dimensions(),
+        3,
+        focusforge_core::equalize::EqualizeSettings {
+            max_gain: 4.0,
+            target_stops: 0.0,
+        },
+        1,
+        &started,
+        &|| false,
+    )
+    .expect_err("frame 1 cannot be decoded");
+    let text = error.to_string();
+    assert!(
+        text.contains(&truncated_name(reader.metadata(1).expect("metadata"))),
+        "{text}"
+    );
+    assert!(!text.contains("no linear-light mean"), "{text}");
+}
+
+fn truncated_name(metadata: &focusforge_core::io::raw::RawMetadata) -> String {
+    metadata
+        .path
+        .file_name()
+        .expect("file name")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Frame side: large enough that the fusion's tile margin leaves an interior.
+const SIDE: u32 = 112;
+
+/// The pixel the stacks are compared at: the frame centre, clear of the edge.
+const PROBE: Rect = Rect {
+    x: SIDE / 2,
+    y: SIDE / 2,
+    width: 1,
+    height: 1,
+};
+
+/// Serves only the `u16` read, so the sample format stays the `u16` default
+/// and every consumer reads clipped samples.
+struct NarrowOnly<'a>(&'a dyn TileReader);
+
+impl TileReader for NarrowOnly<'_> {
+    fn read_tile_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), focusforge_core::algorithm::AlgorithmError> {
+        self.0.read_tile_into(frame, rect, out)
+    }
+}
+
+/// The pixel `PROBE` of the weighted-average fusion of the two square frames
+/// `reader` serves.
+fn fused_probe_pixel(reader: &dyn TileReader, label: &str) -> Vec<u16> {
+    use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
+    use focusforge_core::io::TiffStack;
+    use focusforge_core::params::{self, ParamValues, StackContext};
+    use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
+
+    let (width, height, frame_count) = (SIDE, SIDE, 2);
+    let context = StackContext::new(frame_count, width, height, 3);
+    let algo = focusforge_core::registry::find_stack("weighted-average")
+        .expect("weighted-average resolves");
+    let resolved = params::resolve(algo.params(), &ParamValues::default(), &context)
+        .expect("parameters resolve");
+    let values = params::resolved_values(&resolved);
+
+    let temp = target_tmp();
+    let out_dir = temp.path();
+    let composite = out_dir.join(format!("{label}.tif"));
+    let mut options = TileSchedulerOptions::explicit_budget(out_dir.join(label), 1 << 30);
+    options.apply_support(algo.tile_support(&values));
+    options.tile_size = 80;
+    let scheduler = TileScheduler::new(reader, context, 3, &options).expect("scheduler builds");
+    let consumer = FusionConsumer::create(
+        algo,
+        values,
+        &composite,
+        None,
+        FusionGeometry {
+            width,
+            height,
+            samples_per_pixel: 3,
+            frame_count: frame_count as u32,
+            crop: None,
+            description: None,
+        },
+    )
+    .expect("consumer creates");
+    scheduler
+        .run(&NoopPreprocess, &consumer)
+        .expect("fusion runs");
+    consumer.finish().expect("fusion finishes");
+
+    TiffStack::open_files(&[composite])
+        .expect("composite reopens")
+        .read_tile(0, PROBE)
+        .expect("composite read")
+        .samples
+}
+
+/// A frame of 2x2-cell checkerboard texture: cells alternate between `level`
+/// and `level + 200`. Frames of different `level` carry identical detail, so
+/// the sharpness weights of a pair are equal.
+fn textured_dng(level: u16) -> tempfile::NamedTempFile {
+    let samples = (0..SIDE * SIDE)
+        .map(|i| {
+            let (x, y) = (i % SIDE, i / SIDE);
+            level + if (x / 2 + y / 2) % 2 == 0 { 0 } else { 200 }
+        })
+        .collect();
+    write_dng(&tinted_spec(samples, SIDE, SIDE, [0, 1, 1, 2]), false)
+}
+
+/// The probe pixel of each frame at `levels` as the reader serves it, and the
+/// weighted-average fusions of the frames through gain and warp readers: once
+/// natively `f32`, once through [`NarrowOnly`].
+#[derive(Debug)]
+struct PairFused {
+    frames: [[f32; 3]; 2],
+    wide: Vec<u16>,
+    narrow: Vec<u16>,
+}
+
+fn raw_pair_fused(levels: [u16; 2], label: &str) -> PairFused {
+    use focusforge_core::align::{Transform, WarpingReader};
+    use focusforge_core::equalize::{GainReader, UNIT_GAIN};
+
+    let files: Vec<_> = levels.iter().map(|level| textured_dng(*level)).collect();
+    let raw = open_pair(&files);
+    let mut frames = [[0.0f32; 3]; 2];
+    for (frame, pixel) in frames.iter_mut().enumerate() {
+        raw.read_tile_f32_into(frame, PROBE, pixel)
+            .expect("f32 read");
+    }
+    let gained = GainReader::new(&raw, &[UNIT_GAIN; 2]);
+    let warping = WarpingReader::new(&gained, (SIDE, SIDE), 3, vec![Transform::identity(); 2]);
+    PairFused {
+        frames,
+        wide: fused_probe_pixel(&warping, &format!("{label}-f32")),
+        narrow: fused_probe_pixel(&NarrowOnly(&warping), &format!("{label}-u16")),
+    }
+}
+
+impl PairFused {
+    /// The second frame's weight at the probe, read off the green channel of
+    /// `fused`: the sharpness weights are per pixel, the same for every
+    /// channel, and green stays below white in every frame, so clipping
+    /// cannot move it.
+    fn share(&self, fused: &[u16]) -> f32 {
+        let [a, b] = self.frames.map(|pixel| pixel[1]);
+        (f32::from(fused[1]) - a) / (b - a)
+    }
+
+    /// The blend of the frames' probe pixels at `share`, narrowed once, with
+    /// each frame clipped at white first when `clip` is set.
+    fn blend(&self, share: f32, clip: bool) -> [u16; 3] {
+        let [a, b] = self
+            .frames
+            .map(|pixel| pixel.map(|v| if clip { v.min(65_535.0) } else { v }));
+        std::array::from_fn(|c| narrowed(a[c] + share * (b[c] - a[c])))
+    }
+
+    /// Per channel, how far the unclipped second frame exceeds white.
+    fn headroom(&self) -> [f32; 3] {
+        self.frames[1].map(|v| (v - 65_535.0).max(0.0))
+    }
+
+    /// `fused` equals the blend of the frames at its own share, to 3 LSB.
+    fn assert_blend(&self, fused: &[u16], clip: bool, what: &str) {
+        let share = self.share(fused);
+        let expected = self.blend(share, clip);
+        assert!(
+            (0..3).all(|c| fused[c].abs_diff(expected[c]) <= 3),
+            "{what}: {fused:?} against {expected:?} at share {share}"
+        );
+    }
+}
+
+// Both frames carry the same texture, so the `f32` stack mixes them at the
+// probe and blends the unclipped samples, clipping the result once. The
+// `NarrowOnly` stack clips each frame at the read first: the second frame's
+// headroom is gone from the blend and from its sharpness weight.
+#[test]
+fn raw_f32_stack_fuses_unclipped_highlights_and_clips_once() {
+    let fused = raw_pair_fused([1500, 2600], "highlights");
+    assert!(
+        fused.frames.iter().all(|pixel| pixel[1] < 65_535.0),
+        "{fused:?}"
+    );
+    assert!(fused.headroom().iter().any(|v| *v > 100.0), "{fused:?}");
+    fused.assert_blend(&fused.wide, false, "f32 stack");
+    fused.assert_blend(&fused.narrow, true, "clipped stack");
+    // The blend is a real mix, and clipping the frames first would move it.
+    let share = fused.share(&fused.wide);
+    assert!((0.1..0.9).contains(&share), "share {share}");
+    let (unclipped, clipped) = (fused.blend(share, false), fused.blend(share, true));
+    assert!(
+        (0..3).any(|c| unclipped[c].abs_diff(clipped[c]) > 100),
+        "{unclipped:?} against {clipped:?}"
+    );
+    assert!(
+        (0..3).any(|c| fused.wide[c].abs_diff(fused.narrow[c]) > 100),
+        "{fused:?}"
+    );
+}
+
+#[test]
+fn raw_f32_stack_agrees_with_the_u16_stack_below_white() {
+    let fused = raw_pair_fused([900, 1200], "below-white");
+    assert_eq!(fused.headroom(), [0.0; 3], "{fused:?}");
+    assert!((0.1..0.9).contains(&fused.share(&fused.wide)), "{fused:?}");
+    fused.assert_blend(&fused.wide, false, "f32 stack");
+    fused.assert_blend(&fused.narrow, false, "u16 stack");
+    assert!(
+        (0..3).all(|c| fused.wide[c].abs_diff(fused.narrow[c]) <= 1),
+        "{fused:?}"
+    );
+}
+
+/// A gradient frame in the tinted camera, its pixels moving with `shift`.
+fn gradient_dng(width: u32, height: u32, shift: u32) -> tempfile::NamedTempFile {
+    let samples = (0..width * height)
+        .map(|i| ((((i % width) + (i / width)) * 8 + shift) % 4000) as u16)
+        .collect();
+    write_dng(&tinted_spec(samples, width, height, [0, 1, 1, 2]), false)
+}
+
+fn copies_of(dng: &tempfile::NamedTempFile, count: usize, dir: &Path) -> Vec<PathBuf> {
+    (0..count)
+        .map(|index| {
+            let path = dir.join(format!("{index:02}.dng"));
+            std::fs::copy(dng.path(), &path).expect("copy the DNG frame");
+            path
+        })
+        .collect()
+}
+
+struct NoopObserver;
+impl StageObserver for NoopObserver {}
+
+fn raw_request(
+    frames: Vec<PathBuf>,
+    root: &Path,
+    equalize: Option<EqualizeSettings>,
+    max_host_memory: Option<u64>,
+) -> FuseRequest {
+    let mut explicit = ParamValues::new();
+    explicit.insert("levels".to_string(), ParamValue::Int(3));
+    FuseRequest {
+        frames,
+        output: FuseOutput::Seal(root.join("project.ffp")),
+        scratch_root: root.join("scratch"),
+        staging_key: "raw-develop".to_string(),
+        algorithm: focusforge_core::registry::find_stack("laplacian")
+            .expect("laplacian is registered"),
+        explicit,
+        align: None,
+        crop: false,
+        equalize,
+        tile_size: Some(160),
+        max_host_memory,
+        backend: None,
+        align_backend: None,
+        resume: false,
+        cache: false,
+        poll: std::time::Duration::from_millis(5),
+        free_space: None,
+    }
+}
+
+#[test]
+fn raw_stack_develops_each_frame_once() {
+    let dng = gradient_dng(256, 256, 0);
+    for equalize in [
+        None,
+        Some(EqualizeSettings {
+            max_gain: 4.0,
+            target_stops: 0.0,
+        }),
+    ] {
+        let root = target_tmp();
+        let frames = copies_of(&dng, 8, root.path());
+        // Room for two developed frames and a decode, far below the stack.
+        let request = raw_request(frames, root.path(), equalize, Some(12 * 1024 * 1024));
+        let outcome =
+            focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+                .expect("the RAW run completes");
+        let FuseOutcome::Completed(report) = outcome else {
+            panic!("expected a completed run");
+        };
+        assert_eq!(
+            report.develop_counts,
+            Some(vec![1; 8]),
+            "equalize: {equalize:?}"
+        );
+    }
+}
+
+/// Largest read difference, in 16-bit output LSB, a frame read through the
+/// scratch file may show against the same read through the in-memory cache:
+/// half-precision storage reaches 86 LSB on the Panasonic and 42 on the
+/// Fujifilm bench frame, a few samples in a million above 32.
+const SCRATCH_TOLERANCE: f32 = 96.0;
+
+/// Whether a scratch read `got` is within [`SCRATCH_TOLERANCE`] of the cached
+/// read `want`; the bound grows relative to `want` above white.
+fn within_scratch_bound(want: f32, got: f32) -> bool {
+    (got - want).abs() <= SCRATCH_TOLERANCE * (want.abs() / 65_535.0).max(1.0)
+}
+
+fn assert_scratch_f32_reads(want: &[f32], got: &[f32], what: &str) {
+    assert_eq!(want.len(), got.len(), "{what}");
+    for (index, (want, got)) in want.iter().zip(got).enumerate() {
+        assert!(
+            within_scratch_bound(*want, *got),
+            "{what}: sample {index} read {got} against {want}"
+        );
+    }
+}
+
+fn assert_scratch_u16_reads(want: &[u16], got: &[u16], what: &str) {
+    assert_eq!(want.len(), got.len(), "{what}");
+    for (index, (want, got)) in want.iter().zip(got).enumerate() {
+        assert!(
+            f32::from(want.abs_diff(*got)) <= SCRATCH_TOLERANCE,
+            "{what}: sample {index} read {got} against {want}"
+        );
+    }
+}
+
+#[test]
+fn raw_develop_pass_reads_match_cached_reads() {
+    const SIDE: (u32, u32) = (40, 30);
+    let files: Vec<_> = (0..3)
+        .map(|i| gradient_dng(SIDE.0, SIDE.1, i * 700))
+        .collect();
+    let paths: Vec<PathBuf> = files.iter().map(|f| PathBuf::from(f.path())).collect();
+    let cached = RawStack::open_files(&paths).expect("DNG stack opens");
+    let developed = RawStack::open_files(&paths).expect("DNG stack opens");
+    let root = target_tmp();
+    developed
+        .develop_once(root.path(), u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+        .expect("the pass develops every frame");
+    assert_eq!(developed.develop_counts(), Some(vec![1; 3]));
+    let rects = [
+        Rect {
+            x: 0,
+            y: 0,
+            width: SIDE.0,
+            height: SIDE.1,
+        },
+        Rect {
+            x: SIDE.0 - 5,
+            y: SIDE.1 - 3,
+            width: 5,
+            height: 3,
+        },
+        Rect {
+            x: SIDE.0 - 1,
+            y: SIDE.1 - 1,
+            width: 1,
+            height: 1,
+        },
+    ];
+    for frame in 0..3 {
+        for rect in rects {
+            let samples = rect.width as usize * rect.height as usize * 3;
+            for gain in [UNIT_GAIN, UNIT_GAIN * 3 / 2, UNIT_GAIN / 3] {
+                let (mut want, mut got) = (vec![0u16; samples], vec![0u16; samples]);
+                cached
+                    .read_tile_gained_into(frame, rect, gain, &mut want)
+                    .expect("cached read");
+                developed
+                    .read_tile_gained_into(frame, rect, gain, &mut got)
+                    .expect("mapped read");
+                assert_scratch_u16_reads(
+                    &want,
+                    &got,
+                    &format!("u16 frame {frame} {rect:?} gain {gain}"),
+                );
+
+                let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
+                cached
+                    .read_tile_gained_f32_into(frame, rect, gain, &mut want)
+                    .expect("cached read");
+                developed
+                    .read_tile_gained_f32_into(frame, rect, gain, &mut got)
+                    .expect("mapped read");
+                assert_scratch_f32_reads(
+                    &want,
+                    &got,
+                    &format!("f32 frame {frame} {rect:?} gain {gain}"),
+                );
+            }
+            let (mut want, mut got) = (vec![0u16; samples], vec![0u16; samples]);
+            cached
+                .read_tile_into(frame, rect, &mut want)
+                .expect("cached read");
+            developed
+                .read_tile_into(frame, rect, &mut got)
+                .expect("mapped read");
+            assert_scratch_u16_reads(&want, &got, &format!("unit gain frame {frame} {rect:?}"));
+            let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
+            cached
+                .read_tile_f32_into(frame, rect, &mut want)
+                .expect("cached read");
+            developed
+                .read_tile_f32_into(frame, rect, &mut got)
+                .expect("mapped read");
+            assert_scratch_f32_reads(
+                &want,
+                &got,
+                &format!("unit gain f32 frame {frame} {rect:?}"),
+            );
+        }
+        assert_eq!(
+            cached.linear_means(frame).expect("cached means"),
+            developed.linear_means(frame).expect("mapped means"),
+            "means of frame {frame}"
+        );
+    }
+    assert_eq!(developed.develop_counts(), Some(vec![1; 3]));
+}
+
+fn scratch_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("scratch directory lists") {
+            let path = entry.expect("scratch entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+#[test]
+fn raw_scratch_file_size_matches_encoding() {
+    let dng = gradient_dng(48, 20, 0);
+    let root = target_tmp();
+    let paths = copies_of(&dng, 8, root.path());
+    let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+    let scratch = root.path().join("scratch");
+    std::fs::create_dir(&scratch).expect("scratch root");
+    stack
+        .develop_once(&scratch, u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+        .expect("the pass develops every frame");
+    let frame_bytes = stack.scratch_frame_bytes().expect("frame bytes fit");
+    assert_eq!(frame_bytes, 48 * 20 * 6);
+    let files = scratch_files(&scratch);
+    assert_eq!(files.len(), 8, "{files:?}");
+    for file in files {
+        let length = std::fs::metadata(&file).expect("scratch file").len();
+        assert_eq!(length, frame_bytes, "{}", file.display());
+    }
+}
+
+#[test]
+fn raw_scratch_keeps_values_above_white() {
+    let files = [textured_dng(2600), textured_dng(1500)];
+    let cached = open_pair(&files);
+    let developed = open_pair(&files);
+    let root = target_tmp();
+    developed
+        .develop_once(root.path(), u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+        .expect("the pass develops every frame");
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: SIDE,
+        height: SIDE,
+    };
+    let samples = SIDE as usize * SIDE as usize * 3;
+    let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
+    cached
+        .read_tile_f32_into(0, rect, &mut want)
+        .expect("cached read");
+    developed
+        .read_tile_f32_into(0, rect, &mut got)
+        .expect("mapped read");
+    assert!(got.iter().any(|value| *value > 65_535.0 + 100.0));
+    assert_scratch_f32_reads(&want, &got, "highlight frame");
+}
+
+#[test]
+fn raw_develops_overlap() {
+    let dng = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]),
+        false,
+    );
+    let one = 8 * 8 * 30 + std::fs::metadata(dng.path()).expect("DNG size").len();
+    let paths = vec![PathBuf::from(dng.path()); 4];
+    let root = target_tmp();
+    let developed = AtomicUsize::new(0);
+    let pass = |budget: u64, workers: usize| {
+        let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+        developed.store(0, Ordering::SeqCst);
+        let result = stack.develop_once(root.path(), budget, workers, &|| false, &developed);
+        (stack, result)
+    };
+
+    let (stack, result) = pass(4 * one, 4);
+    assert_eq!(result.expect("four reservations fit"), 4);
+    assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
+    assert_eq!(developed.load(Ordering::SeqCst), 4);
+    let (stack, result) = pass(one + one / 2, 4);
+    assert_eq!(result.expect("one and a half reservations fit one"), 1);
+    assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
+    assert_eq!(developed.load(Ordering::SeqCst), 4);
+    let (stack, result) = pass(100 * one, 8);
+    assert_eq!(result.expect("workers beyond the frames idle"), 4);
+    assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
+    assert_eq!(developed.load(Ordering::SeqCst), 4);
+
+    let (stack, result) = pass(one - 1, 4);
+    let error = result.expect_err("a budget below one reservation refuses");
+    assert!(
+        matches!(
+            error,
+            AlgorithmError::Frame(FrameError::Raw(RawError::CacheTooSmall { required, .. }))
+                if required == one
+        ),
+        "{error}"
+    );
+    assert_eq!(stack.develop_counts(), Some(vec![0; 4]));
+    assert_eq!(developed.load(Ordering::SeqCst), 0);
+}
+
+/// `root` holds no file or directory.
+fn assert_scratch_empty(root: &Path) {
+    let left: Vec<_> = match std::fs::read_dir(root) {
+        Ok(entries) => entries.flatten().map(|entry| entry.path()).collect(),
+        Err(_) => Vec::new(),
+    };
+    assert!(left.is_empty(), "scratch left behind: {left:?}");
+}
+
+#[test]
+fn raw_develop_failure_leaves_no_scratch() {
+    let good = gradient_dng(256, 256, 0);
+    let withheld = write_dng(
+        &tinted_spec(vec![64; 256 * 256], 256, 256, [0, 1, 1, 2]),
+        true,
+    );
+    let root = target_tmp();
+    let frames = vec![
+        PathBuf::from(good.path()),
+        PathBuf::from(withheld.path()),
+        PathBuf::from(good.path()),
+    ];
+    let request = raw_request(frames, root.path(), None, None);
+    let Err(error) =
+        focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+    else {
+        panic!("a frame without pixels must end the run");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains(&withheld.path().display().to_string()),
+        "{error}"
+    );
+    assert_scratch_empty(&request.scratch_root);
+
+    let request = raw_request(copies_of(&good, 3, root.path()), root.path(), None, None);
+    let control = JobControl::new();
+    control.cancel();
+    let outcome = focusforge_core::pipeline::run(&request, &NoopObserver, control, None)
+        .expect("a pre-cancelled run is not an error");
+    assert!(matches!(outcome, FuseOutcome::Cancelled { .. }));
+    assert_scratch_empty(&request.scratch_root);
+}
+
+/// Records the stage announcements and, on [`RunStage::Develop`], what the
+/// control reports at that moment; cancels the run there when asked.
+struct DevelopWatch {
+    control: Arc<JobControl>,
+    cancel_on_develop: bool,
+    seen: Mutex<Vec<&'static str>>,
+    at_develop: Mutex<Option<(JobStage, usize, usize)>>,
+}
+
+impl DevelopWatch {
+    fn new(control: &Arc<JobControl>, cancel_on_develop: bool) -> Self {
+        DevelopWatch {
+            control: Arc::clone(control),
+            cancel_on_develop,
+            seen: Mutex::default(),
+            at_develop: Mutex::default(),
+        }
+    }
+}
+
+impl StageObserver for DevelopWatch {
+    fn stage(&self, stage: RunStage) {
+        let name = match stage {
+            RunStage::Develop { frames } => {
+                let p = self.control.progress();
+                *self.at_develop.lock().expect("no panic while logging") =
+                    Some((p.stage, p.develop_total, frames));
+                if self.cancel_on_develop {
+                    self.control.cancel();
+                }
+                "develop"
+            }
+            RunStage::Prepare { .. } => "prepare",
+            RunStage::Align { .. } => "align",
+            RunStage::Fuse => "fuse",
+            _ => "other",
+        };
+        self.seen.lock().expect("no panic while logging").push(name);
+    }
+}
+
+#[test]
+fn raw_run_reports_the_develop_stage() {
+    let dng = gradient_dng(64, 64, 0);
+    for count in [3, 5] {
+        let root = target_tmp();
+        let request = raw_request(
+            copies_of(&dng, count, root.path()),
+            root.path(),
+            Some(EqualizeSettings {
+                max_gain: 4.0,
+                target_stops: 0.0,
+            }),
+            None,
+        );
+        let control = JobControl::new();
+        let watch = DevelopWatch::new(&control, false);
+        let outcome = focusforge_core::pipeline::run(&request, &watch, Arc::clone(&control), None)
+            .expect("the RAW run completes");
+        let FuseOutcome::Completed(report) = outcome else {
+            panic!("expected a completed run");
+        };
+        let seen = watch.seen.lock().expect("no panic while logging");
+        assert_eq!(
+            seen[..2],
+            ["develop", "prepare"],
+            "{count} frames: {seen:?}"
+        );
+        assert_eq!(
+            *watch.at_develop.lock().expect("no panic while logging"),
+            Some((JobStage::Develop, count, count)),
+            "the control is on the develop stage when it is announced"
+        );
+        let progress = control.progress();
+        assert_eq!(
+            (progress.develop_done, progress.develop_total),
+            (count, count)
+        );
+        assert!(report.stages.develop.is_some(), "{:?}", report.stages);
+    }
+
+    let root = target_tmp();
+    let request = raw_request(copies_of(&dng, 4, root.path()), root.path(), None, None);
+    let control = JobControl::new();
+    let watch = DevelopWatch::new(&control, true);
+    let outcome = focusforge_core::pipeline::run(&request, &watch, Arc::clone(&control), None)
+        .expect("a cancelled run is not an error");
+    assert!(matches!(outcome, FuseOutcome::Cancelled { .. }));
+    assert_eq!(
+        watch.seen.lock().expect("no panic while logging")[..],
+        ["develop"],
+        "nothing follows a cancel raised on the develop announcement"
+    );
+    assert_scratch_empty(&request.scratch_root);
+}
+
+/// Cancels the run from a tick that reports every frame developed, and
+/// records the stage announcements that follow.
+struct CancelWhenDeveloped {
+    control: Arc<JobControl>,
+    seen: Mutex<Vec<&'static str>>,
+}
+
+impl StageObserver for CancelWhenDeveloped {
+    fn stage(&self, stage: RunStage) {
+        let name = match stage {
+            RunStage::Develop { .. } => "develop",
+            RunStage::Prepare { .. } => "prepare",
+            _ => "other",
+        };
+        self.seen.lock().expect("no panic while logging").push(name);
+    }
+
+    fn tick(&self, progress: &focusforge_core::job::JobProgress) {
+        if progress.stage == JobStage::Develop && progress.develop_done == progress.develop_total {
+            self.control.cancel();
+        }
+    }
+}
+
+#[test]
+fn a_cancel_landing_as_the_develop_pass_ends_stops_the_run_in_that_stage() {
+    let dng = gradient_dng(64, 64, 0);
+    let root = target_tmp();
+    let request = raw_request(
+        copies_of(&dng, 4, root.path()),
+        root.path(),
+        Some(EqualizeSettings {
+            max_gain: 4.0,
+            target_stops: 0.0,
+        }),
+        None,
+    );
+    let control = JobControl::new();
+    let watch = CancelWhenDeveloped {
+        control: Arc::clone(&control),
+        seen: Mutex::default(),
+    };
+    let outcome = focusforge_core::pipeline::run(&request, &watch, Arc::clone(&control), None)
+        .expect("a cancelled run is not an error");
+    assert!(matches!(outcome, FuseOutcome::Cancelled { .. }));
+    assert_eq!(
+        watch.seen.lock().expect("no panic while logging")[..],
+        ["develop"],
+        "the preparation pass is never announced after the cancel"
+    );
+    assert_eq!(control.progress().stage, JobStage::Develop);
+    assert_scratch_empty(&request.scratch_root);
+}
+
+#[test]
+fn raw_scratch_unwritable_is_a_named_error() {
+    let dng = gradient_dng(8, 8, 0);
+    let paths = vec![PathBuf::from(dng.path()); 2];
+    let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+    let blocker = tempfile::NamedTempFile::new_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("a regular file at the scratch root");
+    let error = stack
+        .develop_once(blocker.path(), u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+        .expect_err("a scratch root that is a file cannot hold a directory");
+    assert!(
+        error
+            .to_string()
+            .contains(&blocker.path().display().to_string()),
+        "{error}"
+    );
+    assert_eq!(stack.develop_counts(), Some(vec![0; 2]));
+}
+
+/// Every path is on the volume `name` with `free` bytes free.
+fn volume(name: &str, free: u64) -> std::io::Result<VolumeSpace> {
+    Ok(VolumeSpace {
+        volume: name.into(),
+        free,
+    })
+}
+
+/// A probe answering through `answer` that records every path it is asked about.
+fn recording_probe(
+    answer: impl Fn(&Path) -> std::io::Result<VolumeSpace> + Send + Sync + 'static,
+) -> (FreeSpaceProbe, Arc<Mutex<Vec<PathBuf>>>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&asked);
+    let probe: FreeSpaceProbe = Arc::new(move |path: &Path| {
+        log.lock().expect("probe log").push(path.to_path_buf());
+        answer(path)
+    });
+    (probe, asked)
+}
+
+fn run_raw(request: &FuseRequest) -> Result<FuseOutcome, PipelineError> {
+    focusforge_core::pipeline::run(request, &NoopObserver, JobControl::new(), None)
+}
+
+/// The one shortfall `request` is refused with when its single volume has
+/// `free` bytes.
+fn single_shortfall(request: &mut FuseRequest, free: u64) -> VolumeShortfall {
+    request.free_space = Some(recording_probe(move |_| volume("only", free)).0);
+    let Err(PipelineError::DiskSpace(mut shortfalls)) = run_raw(request) else {
+        panic!("a run that does not fit must be refused");
+    };
+    assert_eq!(shortfalls.len(), 1, "{shortfalls:?}");
+    shortfalls.remove(0)
+}
+
+/// Holds the result beside the scratch root.
+fn hold_request(frames: Vec<PathBuf>, root: &Path) -> FuseRequest {
+    let mut request = raw_request(frames, root, None, None);
+    request.output = FuseOutput::Hold(root.join("held"));
+    request
+}
+
+/// The summed length of the composite and Z-Map a completed hold run staged.
+fn held_len(request: &FuseRequest) -> u64 {
+    let FuseOutcome::Completed(report) = run_raw(request).expect("the RAW run completes") else {
+        panic!("expected a completed run");
+    };
+    let FuseProduct::Held(held) = report.product else {
+        panic!("a hold request reports a held checkpoint");
+    };
+    [&held.composite, &held.zmap]
+        .iter()
+        .map(|file| std::fs::metadata(file).expect("held plane").len())
+        .sum()
+}
+
+#[test]
+fn scratch_space_needed_matches_written_scratch() {
+    for (width, height, count) in [(33, 17, 1), (62, 26, 5)] {
+        let dng = gradient_dng(width, height, 0);
+        let root = target_tmp();
+        let paths = copies_of(&dng, count, root.path());
+        let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).expect("scratch root");
+        let needed = stack.develop_scratch_bytes().expect("the figure fits");
+        stack
+            .develop_once(&scratch, u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+            .expect("the pass develops every frame");
+        let (width, height) = stack.dimensions();
+        assert_eq!(
+            needed,
+            count as u64 * u64::from(width) * u64::from(height) * 6
+        );
+        let files = scratch_files(&scratch);
+        assert_eq!(files.len(), count, "{files:?}");
+        let written: u64 = files
+            .iter()
+            .map(|file| std::fs::metadata(file).expect("scratch file").len())
+            .sum();
+        assert_eq!(needed, written, "{width}x{height} x {count}");
+    }
+}
+
+#[test]
+fn raw_run_space_staged_bytes_cover_written_staging() {
+    let dng = gradient_dng(64, 48, 0);
+    let develop = 4 * 64 * 48 * 6;
+    let root = target_tmp();
+    let frames = copies_of(&dng, 4, root.path());
+    let needed = single_shortfall(&mut hold_request(frames.clone(), root.path()), 0).needed;
+    let written = held_len(&hold_request(frames, root.path()));
+    let staged = needed - develop;
+    assert!(
+        staged >= written && staged - written < 256 * 1024,
+        "needed {needed}, developed {develop}, staged {written}"
+    );
+}
+
+#[test]
+fn raw_run_space_includes_developed_scratch() {
+    let dng = gradient_dng(64, 48, 0);
+    let develop = 4 * 64 * 48 * 6;
+    let root = target_tmp();
+    let frames = copies_of(&dng, 4, root.path());
+    let staged = held_len(&hold_request(frames.clone(), root.path()));
+    let probe_root = target_tmp();
+    let probe_frames = copies_of(&dng, 4, probe_root.path());
+    let needed = single_shortfall(&mut hold_request(probe_frames, probe_root.path()), 0).needed;
+    // The sealed result adds its temporary compressed planes to the scratch
+    // volume and the project itself to the output volume.
+    for free in [develop - 1, 0] {
+        let root = target_tmp();
+        let frames = copies_of(&dng, 4, root.path());
+        let mut request = raw_request(frames, root.path(), None, None);
+        let shortfall = single_shortfall(&mut request, free);
+        assert_eq!(shortfall.free, free);
+        assert!(
+            shortfall.needed >= develop + 3 * staged,
+            "needed {} for {develop} developed and {staged} staged",
+            shortfall.needed
+        );
+        assert!(shortfall.needed > needed);
+        assert_scratch_empty(&root.path().join("scratch"));
+        let text = PipelineError::DiskSpace(vec![shortfall.clone()]).to_string();
+        for want in [
+            shortfall.path.display().to_string(),
+            format!("{} bytes", shortfall.needed),
+            format!("{free} bytes"),
+            "0.0 GB".to_string(),
+        ] {
+            assert!(text.contains(&want), "{want:?} missing from {text}");
+        }
+    }
+}
+
+#[test]
+fn raw_run_proceeds_when_run_space_suffices() {
+    let dng = gradient_dng(64, 48, 0);
+    let held = |free: Option<u64>| {
+        let root = target_tmp();
+        let frames = copies_of(&dng, 4, root.path());
+        let mut request = hold_request(frames, root.path());
+        request.free_space = free.map(|free| recording_probe(move |_| volume("only", free)).0);
+        let FuseOutcome::Completed(report) = run_raw(&request).expect("the RAW run completes")
+        else {
+            panic!("expected a completed run");
+        };
+        assert_eq!(report.develop_counts, Some(vec![1; 4]));
+        let FuseProduct::Held(held) = report.product else {
+            panic!("a hold request reports a held checkpoint");
+        };
+        std::fs::read(&held.composite).expect("composite is readable")
+    };
+    let root = target_tmp();
+    let frames = copies_of(&dng, 4, root.path());
+    let needed = single_shortfall(&mut hold_request(frames, root.path()), 0).needed;
+    assert_eq!(held(Some(needed)), held(None));
+}
+
+#[test]
+fn scratch_space_query_uses_nearest_existing_ancestor() {
+    let dng = gradient_dng(64, 48, 0);
+    let root = target_tmp();
+    let frames = copies_of(&dng, 2, root.path());
+    let mut request = raw_request(frames, root.path(), None, None);
+    request.scratch_root = PathBuf::from("scratch-space-ancestor-test/deeper");
+    let (probe, asked) = recording_probe(|_| volume("only", 0));
+    request.free_space = Some(probe);
+    assert!(matches!(
+        run_raw(&request),
+        Err(PipelineError::DiskSpace(_))
+    ));
+    let cwd = std::env::current_dir().expect("working directory");
+    let asked = asked.lock().expect("probe log");
+    assert!(asked.contains(&cwd), "{asked:?}");
+    assert!(!cwd.join("scratch-space-ancestor-test").exists());
+}
+
+#[test]
+fn scratch_space_query_failure_refuses_the_run() {
+    let dng = gradient_dng(64, 48, 0);
+    let root = target_tmp();
+    let frames = copies_of(&dng, 2, root.path());
+    let mut request = raw_request(frames, root.path(), None, None);
+    request.free_space = Some(Arc::new(|_: &Path| {
+        Err(std::io::Error::other("volume query refused"))
+    }));
+    let Err(error) = run_raw(&request) else {
+        panic!("an unanswered query must refuse the run");
+    };
+    assert!(
+        matches!(error, PipelineError::DiskSpaceQuery { .. }),
+        "{error:?}"
+    );
+    let text = error.to_string();
+    assert!(text.contains("volume query refused"), "{text}");
+    assert!(text.contains(&root.path().display().to_string()), "{text}");
+    assert_scratch_empty(&root.path().join("scratch"));
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // A boxed text/value display, used standalone and nested inside
-// `FFSlider`'s readout and `FFMenu`'s closed row.
+// `FFMenu`'s closed row.
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
@@ -15,6 +15,9 @@ export component FFField inherits Rectangle {
     // Sits on a tint as light as its own fill: draws the base surface.
     in property <bool> recessed: false;
     in property <TextHorizontalAlignment> text-alignment: left;
+    // Typed into rather than displayed; `edited` carries the whole text per keystroke.
+    in property <bool> editable: false;
+    callback edited(string);
 
     height: ShellGeometry.field-height;
     border-radius: Theme.radius-sm;
@@ -23,7 +26,7 @@ export component FFField inherits Rectangle {
     background: root.hovered ? Theme.surface-hover : root.recessed ? Theme.surface-base : Theme.surface-overlay;
     opacity: root.disabled ? 0.5 : 1.0;
 
-    Text {
+    if !root.editable: Text {
         x: Theme.space-2;
         width: parent.width - 2 * Theme.space-2;
         height: 100%;
@@ -35,4 +38,21 @@ export component FFField inherits Rectangle {
         vertical-alignment: center;
         overflow: elide;
     }
+    input := TextInput {
+        visible: root.editable;
+        enabled: root.editable;
+        x: Theme.space-2;
+        width: parent.width - 2 * Theme.space-2;
+        height: 100%;
+        text: root.text;
+        color: Theme.text-primary;
+        font-size: Theme.text-value.size;
+        font-weight: Theme.text-value.weight;
+        horizontal-alignment: root.text-alignment;
+        vertical-alignment: center;
+        single-line: true;
+        edited => { root.edited(self.text); }
+    }
+    // A user edit replaces the text binding; a pushed text still lands.
+    changed text => { input.text = root.text; }
 }

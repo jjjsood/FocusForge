@@ -7,6 +7,7 @@
 //! when proven: a ±1 LSB-reachable near-tie at some pyramid level, or the
 //! warp's ±1 LSB tolerance propagated through `collapse` (one or two sources).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use focusforge_core::algorithm::{StackAlgorithm, TileCtx, TileReader};
@@ -19,14 +20,10 @@ use focusforge_core::io::TiffStack;
 use focusforge_core::params::{ParamValue, ParamValues, StackContext};
 use focusforge_core::tile::{NoopPreprocess, Rect, Tile, TileScheduler, TileSchedulerOptions};
 use focusforge_core::zmap::ZMapReader;
-use focusforge_gpu::harness::{GpuBackend, gpu_backend};
+use focusforge_gpu::harness::gpu_backend;
 use focusforge_gpu::transfer::readback_count;
 
-use crate::common::open_stack;
-
-/// `128 * f32::EPSILON` -- the `parity_fusion.rs` near-tie bound, printed
-/// as a diagnostic beside the reachability verdict, which is what classifies.
-const NEAR_TIE_REL: f32 = 128.0 * f32::EPSILON;
+use crate::common::{NEAR_TIE_REL, non_identity_transforms, open_stack};
 
 const LEVELS: u32 = 5;
 
@@ -94,6 +91,30 @@ fn level_pixel(pixel: usize, width: u32, level: u32) -> LevelPixel {
     }
 }
 
+/// Every frame's whole warped plane, read through the `WarpingReader` once
+/// per comparison. The near-tie proof perturbs copies of these planes and
+/// never re-runs the bicubic resample for a probe.
+struct WarpedPlanes {
+    geom: CanvasGeom,
+    frames: Vec<Vec<u16>>,
+}
+
+impl WarpedPlanes {
+    fn read(reader: &WarpingReader, frame_count: usize, geom: CanvasGeom) -> Self {
+        let rect = full_rect(geom.width, geom.height);
+        let frames = (0..frame_count)
+            .map(|frame| {
+                let mut samples = vec![0u16; (geom.width * geom.height * geom.spp) as usize];
+                reader
+                    .read_tile_into(frame, rect, &mut samples)
+                    .expect("read warped frame for the near-tie proof");
+                samples
+            })
+            .collect();
+        Self { geom, frames }
+    }
+}
+
 fn scratch_base(label: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("parity_pipeline_scratch_{label}"))
 }
@@ -109,19 +130,6 @@ fn full_rect(width: u32, height: u32) -> Rect {
         width,
         height,
     }
-}
-
-/// Every frame but frame 0 gets the same non-identity similarity transform,
-/// milder than `Transform::similarity(1.02, 0.03, 1.5, -1.0)` (used by the
-/// per-kernel warp parity tests) so near-ties and warp-noise do not stack
-/// across too wide an interaction space. It is still non-identity (~0.5%
-/// scale, ~0.43 degree rotation, sub-pixel translation), keeping the warp
-/// stage inside the compared pipeline.
-fn non_identity_transforms(frame_count: usize) -> Vec<Transform> {
-    let t = Transform::similarity(1.005, 0.0075, 0.4, -0.25);
-    (0..frame_count)
-        .map(|i| if i == 0 { Transform::identity() } else { t })
-        .collect()
 }
 
 struct RunOutputs {
@@ -173,16 +181,11 @@ fn run_cpu(label: &str, transforms: Vec<Transform>) -> RunOutputs {
 
 /// `None` when there is no usable adapter -- callers `return` early on
 /// `None`, printing the skip reason themselves via [`focusforge_gpu::device::shared_device_or_skip`].
-/// `backend` is a parameter, not always [`gpu_backend`]'s singleton, so the
-/// same plan can run a second time against
-/// `GpuBackend::with_max_device_bytes(1)`: a CPU-twin parity check at two
-/// different device budgets.
-fn run_gpu(
-    label: &str,
-    transforms: Vec<Transform>,
-    backend: &dyn TileBackend,
-) -> Option<RunOutputs> {
+/// A run in which any tile fell back to the host path fails: the GPU is then
+/// not what was compared.
+fn run_gpu(label: &str, transforms: Vec<Transform>) -> Option<RunOutputs> {
     focusforge_gpu::device::shared_device_or_skip()?;
+    let backend = gpu_backend().expect("gpu backend");
 
     let stack = open_stack();
     let (width, height) = stack.dimensions();
@@ -225,6 +228,12 @@ fn run_gpu(
     scheduler
         .run(&NoopPreprocess, &consumer)
         .expect("gpu run must succeed");
+    let fallback_tiles = consumer.fallback_tiles();
+    assert_eq!(
+        fallback_tiles, 0,
+        "{label}: {fallback_tiles} tile(s) fell back to the host path, so the GPU did not \
+         produce this result"
+    );
     sink.finish().expect("finish must succeed");
 
     Some(RunOutputs {
@@ -256,27 +265,17 @@ fn read_zmap(path: &Path) -> Vec<u16> {
 }
 
 /// Every frame's level-`level` windowed score over the whole canvas (the
-/// 512x512x3x8 fixture fits in memory), through the same `WarpingReader` the
-/// CPU run used, so a pixel's near-tie margin is a lookup. Builds the full
-/// `LEVELS`-deep pyramid; runs once per level via [`level_scores_cached`].
-fn whole_canvas_level_scores(
-    stack: &TiffStack,
-    transforms: &[Transform],
-    width: u32,
-    height: u32,
-    spp: u32,
-    level: u32,
-) -> Vec<Vec<f32>> {
-    let reader = WarpingReader::new(stack, (width, height), spp, transforms.to_vec());
-    let rect = full_rect(width, height);
+/// 512x512x3x8 fixture fits in memory), from the frames' warped planes, so a
+/// pixel's near-tie margin is a lookup. Builds the full `LEVELS`-deep pyramid;
+/// runs once per level via [`level_scores_cached`].
+fn whole_canvas_level_scores(planes: &WarpedPlanes, level: u32) -> Vec<Vec<f32>> {
+    let CanvasGeom { width, height, spp } = planes.geom;
     let radius = score_radius(LEVELS, level);
-    (0..stack.len())
-        .map(|f| {
-            let mut samples = vec![0u16; (width * height * spp) as usize];
-            reader
-                .read_tile_into(f, rect, &mut samples)
-                .expect("read frame for near-tie recomputation");
-            let pyr = pyramid::build(&samples, width, height, spp, LEVELS).expect("build pyramid");
+    planes
+        .frames
+        .iter()
+        .map(|samples| {
+            let pyr = pyramid::build(samples, width, height, spp, LEVELS).expect("build pyramid");
             score_plane(&pyr.levels()[level as usize], radius)
         })
         .collect()
@@ -289,69 +288,30 @@ fn whole_canvas_level_scores(
 /// whole per-pixel loop, built at most once per level actually needed.
 fn level_scores_cached<'a>(
     cache: &'a mut [Option<Vec<Vec<f32>>>],
-    stack: &TiffStack,
-    transforms: &[Transform],
-    width: u32,
-    height: u32,
-    spp: u32,
+    planes: &WarpedPlanes,
     level: u32,
 ) -> &'a [Vec<f32>] {
     cache[level as usize]
-        .get_or_insert_with(|| {
-            whole_canvas_level_scores(stack, transforms, width, height, spp, level)
-        })
+        .get_or_insert_with(|| whole_canvas_level_scores(planes, level))
         .as_slice()
 }
 
-/// Frame `frame`'s level-`lp.level` score at `lp.mapped_pixel` after applying
-/// every raw `(tap, delta)` in `deltas` (every channel, clamped `0..=65535`),
-/// via the real `score_plane`/`score_radius`. Builds only `lp.level + 1`
-/// pyramid levels: level `k`'s Laplacian needs only `G_k` and `G_{k+1}`.
-fn score_with_deltas(
-    reader: &WarpingReader,
-    width: u32,
-    height: u32,
-    spp: u32,
-    frame: usize,
-    lp: LevelPixel,
-    deltas: &[(usize, i32)],
-) -> f32 {
-    let rect = full_rect(width, height);
-    let mut samples = vec![0u16; (width * height * spp) as usize];
-    reader
-        .read_tile_into(frame, rect, &mut samples)
-        .expect("re-read frame for reachability probe");
-    for &(tap, delta) in deltas {
-        for c in 0..spp as usize {
-            let idx = tap * spp as usize + c;
-            let perturbed = i32::from(samples[idx]) + delta;
-            samples[idx] = perturbed.clamp(0, 65535) as u16;
-        }
-    }
-    let pyr = pyramid::build(&samples, width, height, spp, lp.level + 1)
-        .expect("build pyramid for probe");
-    let radius = score_radius(LEVELS, lp.level);
-    score_plane(&pyr.levels()[lp.level as usize], radius)[lp.mapped_pixel]
-}
-
-/// [`score_with_deltas`] at the single raw sample `lp.raw_pixel`, whatever
-/// `lp.level`: the ±1 LSB tolerance is a raw-sample property, and
+/// Frame `frame`'s level-`lp.level` score at `lp.mapped_pixel` after the
+/// single raw-sample perturbation `delta` at `lp.raw_pixel`, via
+/// [`score_from_samples`]: the ±1 LSB tolerance is a raw-sample property, and
 /// `lp.raw_pixel` feeds level `lp.level`'s mapped pixel most directly.
 fn perturbed_frame_score_at(
-    reader: &WarpingReader,
-    width: u32,
-    height: u32,
-    spp: u32,
+    planes: &WarpedPlanes,
     frame: usize,
     lp: LevelPixel,
     delta: i32,
 ) -> f32 {
-    score_with_deltas(
-        reader,
+    let CanvasGeom { width, height, spp } = planes.geom;
+    score_from_samples(
+        &planes.frames[frame],
         width,
         height,
         spp,
-        frame,
         lp,
         &[(lp.raw_pixel, delta)],
     )
@@ -397,25 +357,7 @@ fn score_at_pixel_fast(level: &pyramid::Plane, radius: u32, pixel: usize) -> f32
     acc
 }
 
-/// Reads frame `frame`'s whole warped plane once; the full-window search
-/// perturbs copies of it ([`samples_with_deltas`]) instead of re-running the
-/// bicubic resample for each of its hundreds of probes.
-fn read_frame_samples(
-    reader: &WarpingReader,
-    width: u32,
-    height: u32,
-    spp: u32,
-    frame: usize,
-) -> Vec<u16> {
-    let rect = full_rect(width, height);
-    let mut samples = vec![0u16; (width * height * spp) as usize];
-    reader
-        .read_tile_into(frame, rect, &mut samples)
-        .expect("read frame for window search");
-    samples
-}
-
-/// `base` (one frame's already-warped plane, from [`read_frame_samples`])
+/// `base` (one frame's already-warped plane, from [`WarpedPlanes`])
 /// with every `(tap, delta)` pair in `deltas` applied (every channel,
 /// clamped `0..=65535`) -- a cheap in-memory copy-and-perturb, never a
 /// re-read.
@@ -433,7 +375,7 @@ fn samples_with_deltas(base: &[u16], spp: u32, deltas: &[(usize, i32)]) -> Vec<u
 
 /// The real `score_plane` value at `lp.mapped_pixel` (level `lp.level`)
 /// after applying `deltas` to `base` and rebuilding a `lp.level + 1`-level
-/// pyramid (see [`score_with_deltas`]'s doc for why that depth is enough).
+/// pyramid (level `k`'s Laplacian needs only `G_k` and `G_{k+1}`).
 /// Every number the full-window search reports goes through this, never
 /// [`score_from_samples_fast`].
 fn score_from_samples(
@@ -626,24 +568,20 @@ fn minimal_symmetric_taps(
 /// pixel is a proven near-tie under the full score window, and the minimal
 /// symmetric tap count ([`minimal_symmetric_taps`]) against the window's
 /// total is printed as the "how much of the window actually moved" figure.
-/// Each frame's warped plane is read exactly once ([`read_frame_samples`]),
-/// however many probes the search below makes.
 fn full_window_reachable_near_tie(
-    reader: &WarpingReader,
-    width: u32,
-    height: u32,
-    spp: u32,
+    planes: &WarpedPlanes,
     lp: LevelPixel,
     recorded_winner: usize,
     disputed_winner: usize,
 ) -> bool {
+    let CanvasGeom { width, height, spp } = planes.geom;
     let raw_pixel = lp.raw_pixel;
     let level = lp.level;
-    let winner_base = read_frame_samples(reader, width, height, spp, recorded_winner);
-    let challenger_base = read_frame_samples(reader, width, height, spp, disputed_winner);
+    let winner_base = &planes.frames[recorded_winner];
+    let challenger_base = &planes.frames[disputed_winner];
     let window_size = window_taps(width, height, raw_pixel).len();
     let (winner_worst, winner_ranked) = full_window_worst_case(
-        &winner_base,
+        winner_base,
         width,
         height,
         spp,
@@ -651,7 +589,7 @@ fn full_window_reachable_near_tie(
         ScoreDirection::Minimize,
     );
     let (challenger_best, challenger_ranked) = full_window_worst_case(
-        &challenger_base,
+        challenger_base,
         width,
         height,
         spp,
@@ -668,9 +606,9 @@ fn full_window_reachable_near_tie(
     );
     if flip_reached {
         let minimal_k = minimal_symmetric_taps(
-            &winner_base,
-            &challenger_base,
-            CanvasGeom { width, height, spp },
+            winner_base,
+            challenger_base,
+            planes.geom,
             lp,
             &winner_ranked,
             &challenger_ranked,
@@ -740,32 +678,22 @@ fn top_two_frames(scores: &[Vec<f32>], mapped_pixel: usize) -> (usize, usize) {
 /// [`full_window_reachable_near_tie`] pushes `recorded_winner` to its worst
 /// and `disputed_winner` to its best over the whole 17x17 score window.
 fn reachable_near_tie(
-    reader: &WarpingReader,
+    planes: &WarpedPlanes,
     scores: &[Vec<f32>],
-    geom: CanvasGeom,
     lp: LevelPixel,
     recorded_winner: usize,
     disputed_winner: usize,
 ) -> bool {
-    let CanvasGeom { width, height, spp } = geom;
     for frame in 0..scores.len() {
         for delta in [1i32, -1i32] {
-            let perturbed = perturbed_frame_score_at(reader, width, height, spp, frame, lp, delta);
+            let perturbed = perturbed_frame_score_at(planes, frame, lp, delta);
             let new_winner = argmax_with_override(scores, lp.mapped_pixel, frame, perturbed);
             if new_winner != recorded_winner {
                 return true;
             }
         }
     }
-    full_window_reachable_near_tie(
-        reader,
-        width,
-        height,
-        spp,
-        lp,
-        recorded_winner,
-        disputed_winner,
-    )
+    full_window_reachable_near_tie(planes, lp, recorded_winner, disputed_winner)
 }
 
 /// Whether `lp` is a proven near-tie (±1 LSB reachability via
@@ -774,9 +702,8 @@ fn reachable_near_tie(
 /// check at every level: a flipped near-tie picks a different, equally valid
 /// frame whose value can differ by hundreds of LSBs.
 fn near_tie_status(
-    reader: &WarpingReader,
+    planes: &WarpedPlanes,
     scores: &[Vec<f32>],
-    geom: CanvasGeom,
     lp: LevelPixel,
     recorded_winner: usize,
     disputed_winner: usize,
@@ -784,8 +711,7 @@ fn near_tie_status(
     let mut pixel_scores: Vec<f32> = scores.iter().map(|s| s[lp.mapped_pixel]).collect();
     pixel_scores.sort_by(|a, b| b.partial_cmp(a).expect("scores are always finite"));
     let (best, runner_up) = (pixel_scores[0], pixel_scores[1]);
-    let is_near_tie =
-        reachable_near_tie(reader, scores, geom, lp, recorded_winner, disputed_winner);
+    let is_near_tie = reachable_near_tie(planes, scores, lp, recorded_winner, disputed_winner);
     (is_near_tie, best, runner_up)
 }
 
@@ -794,31 +720,26 @@ fn near_tie_status(
 /// samples ([`samples_with_deltas`]'s clamp), through the actual
 /// [`Laplacian::fuse`] over the whole canvas; other frames stay unperturbed.
 fn rebuild_composite_pixel_with_perturbations(
-    reader: &WarpingReader,
-    frame_count: usize,
-    geom: CanvasGeom,
+    planes: &WarpedPlanes,
     perturbations: &[(usize, usize, i32)],
     pixel: usize,
 ) -> Vec<u16> {
-    let CanvasGeom { width, height, spp } = geom;
+    let CanvasGeom { width, height, spp } = planes.geom;
     let rect = full_rect(width, height);
-    let tiles: Vec<Tile> = (0..frame_count)
-        .map(|f| {
-            let samples = read_frame_samples(reader, width, height, spp, f);
+    let tiles: Vec<Tile> = planes
+        .frames
+        .iter()
+        .enumerate()
+        .map(|(f, base)| {
             let deltas: Vec<(usize, i32)> = perturbations
                 .iter()
                 .filter(|&&(frame, _, _)| frame == f)
                 .map(|&(_, tap, delta)| (tap, delta))
                 .collect();
-            let samples = if deltas.is_empty() {
-                samples
-            } else {
-                samples_with_deltas(&samples, spp, &deltas)
-            };
             Tile {
                 rect,
                 samples_per_pixel: spp,
-                samples,
+                samples: samples_with_deltas(base, spp, &deltas),
             }
         })
         .collect();
@@ -833,20 +754,12 @@ fn rebuild_composite_pixel_with_perturbations(
 
 /// [`rebuild_composite_pixel_with_perturbations`] for a single source.
 fn rebuild_composite_pixel_with_perturbation(
-    reader: &WarpingReader,
-    frame_count: usize,
-    geom: CanvasGeom,
+    planes: &WarpedPlanes,
     winner: usize,
     pixel: usize,
     delta: i32,
 ) -> Vec<u16> {
-    rebuild_composite_pixel_with_perturbations(
-        reader,
-        frame_count,
-        geom,
-        &[(winner, pixel, delta)],
-        pixel,
-    )
+    rebuild_composite_pixel_with_perturbations(planes, &[(winner, pixel, delta)], pixel)
 }
 
 /// Whether a lone ±1 LSB perturbation of the recorded winner's raw sample
@@ -856,25 +769,16 @@ fn rebuild_composite_pixel_with_perturbation(
 /// tolerance amplified by `collapse`'s clamp-to-edge taps at a boundary.
 /// Returns `(exempted, best_reachable_delta)`.
 fn warp_noise_propagation_reachable(
-    reader: &WarpingReader,
-    frame_count: usize,
-    geom: CanvasGeom,
+    planes: &WarpedPlanes,
     winner: usize,
     pixel: usize,
     baseline: &[u16],
     observed_delta: i32,
 ) -> (bool, i32) {
-    let spp = geom.spp as usize;
+    let spp = planes.geom.spp as usize;
     let mut best_reachable = 0i32;
     for delta in [1i32, -1i32] {
-        let perturbed = rebuild_composite_pixel_with_perturbation(
-            reader,
-            frame_count,
-            geom,
-            winner,
-            pixel,
-            delta,
-        );
+        let perturbed = rebuild_composite_pixel_with_perturbation(planes, winner, pixel, delta);
         let reach = (0..spp)
             .map(|c| (i32::from(perturbed[c]) - i32::from(baseline[c])).abs())
             .max()
@@ -924,15 +828,14 @@ fn runner_up_frame(scores: &[Vec<f32>], mapped_pixel: usize, winner: usize) -> u
 /// `"same-frame-neighbor"` or `"two-frame"`, whichever produced
 /// `best_reachable_delta`, meaningful only when `exempted` is true.
 fn combined_warp_noise_reachable(
-    reader: &WarpingReader,
-    frame_count: usize,
-    geom: CanvasGeom,
+    planes: &WarpedPlanes,
     frames: WinnerRunnerUp,
     pixel: usize,
     baseline: &[u16],
     observed_delta: i32,
 ) -> (bool, i32, &'static str) {
-    let spp = geom.spp as usize;
+    let CanvasGeom { width, height, spp } = planes.geom;
+    let spp = spp as usize;
     let reach_of = |perturbed: &[u16]| -> i32 {
         (0..spp)
             .map(|c| (i32::from(perturbed[c]) - i32::from(baseline[c])).abs())
@@ -944,13 +847,11 @@ fn combined_warp_noise_reachable(
     let mut best_mechanism = "";
 
     for &(dx, dy) in &NEIGHBOR_OFFSETS {
-        let neighbor = neighbor_pixel(geom.width, geom.height, pixel, dx, dy);
+        let neighbor = neighbor_pixel(width, height, pixel, dx, dy);
         for winner_delta in [1i32, -1i32] {
             for neighbor_delta in [1i32, -1i32] {
                 let perturbed = rebuild_composite_pixel_with_perturbations(
-                    reader,
-                    frame_count,
-                    geom,
+                    planes,
                     &[
                         (frames.winner, pixel, winner_delta),
                         (frames.winner, neighbor, neighbor_delta),
@@ -973,9 +874,7 @@ fn combined_warp_noise_reachable(
         for winner_delta in [1i32, -1i32] {
             for runner_up_delta in [1i32, -1i32] {
                 let perturbed = rebuild_composite_pixel_with_perturbations(
-                    reader,
-                    frame_count,
-                    geom,
+                    planes,
                     &[
                         (frames.winner, pixel, winner_delta),
                         (frames.runner_up, pixel, runner_up_delta),
@@ -998,32 +897,30 @@ fn combined_warp_noise_reachable(
     )
 }
 
+/// The Z-Map parity contract at every pixel: the GPU's winner equals the
+/// CPU's, or the pixel is a ±1 LSB-reachable near-tie ([`near_tie_status`]).
+/// This is a different proof from `common::assert_matches_cpu_outside_near_ties`,
+/// which classifies by score margin alone; here the CPU run goes through the
+/// warp stage, so the margin must account for the warp's own ±1 LSB tolerance.
+/// Returns the differing pixels, each now a proven near-tie.
 fn assert_zmap_exact_or_near_tie(
     gpu_zmap: &[u16],
     cpu_zmap: &[u16],
     scores: &[Vec<f32>],
-    reader: &WarpingReader,
-    width: u32,
-    height: u32,
-    spp: u32,
-) {
-    let mut differing = 0usize;
+    planes: &WarpedPlanes,
+) -> HashSet<usize> {
+    let width = planes.geom.width;
+    let mut near_ties = HashSet::new();
     for (p, (&g, &c)) in gpu_zmap.iter().zip(cpu_zmap.iter()).enumerate() {
         if g == c {
             continue;
         }
-        differing += 1;
+        near_ties.insert(p);
         let recorded_winner = c as usize;
         let disputed_winner = g as usize;
         let lp = level_pixel(p, width, 0);
-        let (is_near_tie, best, runner_up) = near_tie_status(
-            reader,
-            scores,
-            CanvasGeom { width, height, spp },
-            lp,
-            recorded_winner,
-            disputed_winner,
-        );
+        let (is_near_tie, best, runner_up) =
+            near_tie_status(planes, scores, lp, recorded_winner, disputed_winner);
         let static_bound = NEAR_TIE_REL * best;
         println!(
             "whole-pipeline zmap parity: pixel {p} differs (gpu={g}, cpu={c}), \
@@ -1037,10 +934,16 @@ fn assert_zmap_exact_or_near_tie(
              static_bound={static_bound}"
         );
     }
-    println!("whole-pipeline zmap parity: {differing} differing index(es), all proven near-ties");
+    println!(
+        "whole-pipeline zmap parity: {} differing index(es), all proven near-ties",
+        near_ties.len()
+    );
+    near_ties
 }
 
-/// A composite delta of more than 1 LSB is checked whether or not the
+/// The one whole-pipeline CPU/GPU comparison. The Z-Map must match at every
+/// pixel except proven near-ties ([`assert_zmap_exact_or_near_tie`]). A
+/// composite delta of more than 1 LSB is checked whether or not the
 /// level-0 Z-Map disagrees -- level 0 is tried first (cheapest, and the
 /// only level with an actual observed GPU winner), then levels `1..LEVELS`
 /// in order, each via CPU's own winner/runner-up margin at that level
@@ -1048,21 +951,15 @@ fn assert_zmap_exact_or_near_tie(
 /// (`fuse_planes_gpu`'s tail only reads back level 0). The pixel is
 /// exempted from the tight assertion the moment any level explains it; the
 /// explaining level is counted and logged, never silently dropped.
-/// `backend` is a parameter so the same comparison runs at two device
-/// budgets ([`gpu_stack_matches_cpu_stack_at_probed_budget`],
-/// [`gpu_stack_matches_cpu_stack_at_a_forced_one_tile_budget`]).
-fn assert_gpu_matches_cpu_stack(
-    label: &str,
-    backend: &dyn TileBackend,
-    transforms: Vec<Transform>,
-) -> Vec<u16> {
+/// Returns the GPU Z-Map.
+fn assert_gpu_matches_cpu_stack(label: &str, transforms: Vec<Transform>) -> Vec<u16> {
     let stack = open_stack();
     let (width, height) = stack.dimensions();
     let spp = stack.header(0).samples_per_pixel;
     let frame_count = stack.len();
 
     let cpu = run_cpu(&format!("{label}_composite"), transforms.clone());
-    let Some(gpu) = run_gpu(&format!("{label}_composite"), transforms.clone(), backend) else {
+    let Some(gpu) = run_gpu(&format!("{label}_composite"), transforms.clone()) else {
         return Vec::new();
     };
 
@@ -1074,13 +971,23 @@ fn assert_gpu_matches_cpu_stack(
     let gpu_zmap = read_zmap(&gpu.zmap_path);
     assert_eq!(cpu_zmap.len(), gpu_zmap.len());
 
-    let reader = WarpingReader::new(&stack, (width, height), spp, transforms.clone());
-    let geom = CanvasGeom {
-        width,
-        height,
-        spp: cspp,
-    };
+    let reader = WarpingReader::new(&stack, (width, height), spp, transforms);
+    let planes = WarpedPlanes::read(
+        &reader,
+        frame_count,
+        CanvasGeom {
+            width,
+            height,
+            spp: cspp,
+        },
+    );
     let mut level_scores: Vec<Option<Vec<Vec<f32>>>> = (0..LEVELS).map(|_| None).collect();
+    let zmap_near_ties = assert_zmap_exact_or_near_tie(
+        &gpu_zmap,
+        &cpu_zmap,
+        level_scores_cached(&mut level_scores, &planes, 0),
+        &planes,
+    );
 
     let spp_usize = cspp as usize;
     let pixel_count = cpu_zmap.len();
@@ -1106,36 +1013,14 @@ fn assert_gpu_matches_cpu_stack(
         let mut explaining_level: Option<u32> = None;
         if pixel_worst_delta > 1 {
             // Level 0 first: the only level with an observed GPU Z-Map value
-            // to compare against.
-            if cpu_zmap[pixel] != gpu_zmap[pixel] {
-                let lp = level_pixel(pixel, width, 0);
-                let scores = level_scores_cached(
-                    &mut level_scores,
-                    &stack,
-                    &transforms,
-                    width,
-                    height,
-                    spp,
-                    0,
-                );
-                let (found, best, runner_up) = near_tie_status(
-                    &reader,
-                    scores,
-                    geom,
-                    lp,
-                    cpu_zmap[pixel] as usize,
-                    gpu_zmap[pixel] as usize,
-                );
+            // to compare against. Every pixel where the Z-Maps differ was
+            // proven a near-tie by `assert_zmap_exact_or_near_tie` above.
+            if zmap_near_ties.contains(&pixel) {
                 println!(
-                    "pixel {pixel} level 0: cpu_zmap={} gpu_zmap={} margin={} \
-                     reachable_near_tie={found}",
-                    cpu_zmap[pixel],
-                    gpu_zmap[pixel],
-                    best - runner_up
+                    "pixel {pixel} level 0: cpu_zmap={} gpu_zmap={} reachable_near_tie=true",
+                    cpu_zmap[pixel], gpu_zmap[pixel]
                 );
-                if found {
-                    explaining_level = Some(0);
-                }
+                explaining_level = Some(0);
             }
 
             // Levels 1..LEVELS have no per-level GPU Z-Map to compare
@@ -1147,25 +1032,11 @@ fn assert_gpu_matches_cpu_stack(
             if explaining_level.is_none() {
                 for level in 1..LEVELS {
                     let lp = level_pixel(pixel, width, level);
-                    let scores = level_scores_cached(
-                        &mut level_scores,
-                        &stack,
-                        &transforms,
-                        width,
-                        height,
-                        spp,
-                        level,
-                    );
+                    let scores = level_scores_cached(&mut level_scores, &planes, level);
                     let (recorded_winner, disputed_winner) =
                         top_two_frames(scores, lp.mapped_pixel);
-                    let (found, best, runner_up) = near_tie_status(
-                        &reader,
-                        scores,
-                        geom,
-                        lp,
-                        recorded_winner,
-                        disputed_winner,
-                    );
+                    let (found, best, runner_up) =
+                        near_tie_status(&planes, scores, lp, recorded_winner, disputed_winner);
                     println!(
                         "pixel {pixel} level {level}: cpu winner={recorded_winner} \
                          runner_up={disputed_winner} margin={} reachable_near_tie={found}",
@@ -1193,9 +1064,7 @@ fn assert_gpu_matches_cpu_stack(
                 .map(|c| cpu_samples[pixel * spp_usize + c])
                 .collect();
             let (found, reach) = warp_noise_propagation_reachable(
-                &reader,
-                frame_count,
-                geom,
+                &planes,
                 winner,
                 pixel,
                 &baseline,
@@ -1210,20 +1079,10 @@ fn assert_gpu_matches_cpu_stack(
             // Third, still cheaper-than-full-window exemption class,
             // tried only when the single-source probe above also failed.
             if !found {
-                let level0_scores = level_scores_cached(
-                    &mut level_scores,
-                    &stack,
-                    &transforms,
-                    width,
-                    height,
-                    spp,
-                    0,
-                );
+                let level0_scores = level_scores_cached(&mut level_scores, &planes, 0);
                 let runner_up = runner_up_frame(level0_scores, pixel, winner);
                 let (combined_found, combined_reach, mechanism) = combined_warp_noise_reachable(
-                    &reader,
-                    frame_count,
-                    geom,
+                    &planes,
                     WinnerRunnerUp { winner, runner_up },
                     pixel,
                     &baseline,
@@ -1302,30 +1161,6 @@ fn assert_gpu_matches_cpu_stack(
     gpu_zmap
 }
 
-#[test]
-fn gpu_stack_matches_cpu_stack_at_probed_budget() {
-    if focusforge_gpu::device::shared_device_or_skip().is_none() {
-        return;
-    }
-    let backend = gpu_backend().expect("gpu backend");
-    let transforms = non_identity_transforms(open_stack().len());
-    assert_gpu_matches_cpu_stack("probed_budget", backend, transforms);
-}
-
-/// The same comparison, forced onto a one-tile-in-flight `GpuBackend`
-/// (`GpuBackend::with_max_device_bytes(1)`) -- proves the composite and
-/// Z-Map do not move when the number of tiles in flight changes: the
-/// budget trades speed, never correctness.
-#[test]
-fn gpu_stack_matches_cpu_stack_at_a_forced_one_tile_budget() {
-    if focusforge_gpu::device::shared_device_or_skip().is_none() {
-        return;
-    }
-    let backend = GpuBackend::with_max_device_bytes(1).expect("tiny gpu backend");
-    let transforms = non_identity_transforms(open_stack().len());
-    assert_gpu_matches_cpu_stack("tiny_budget", &backend, transforms);
-}
-
 /// A translation of frame 3 by `(-12.5, 0)` leaves a wide uncovered band at
 /// its right edge, and the similarity leaves thin uncovered rims; in both
 /// the GPU stack matches the CPU stack and never names a frame at a pixel
@@ -1335,7 +1170,6 @@ fn gpu_stack_matches_cpu_stack_with_uncovered_borders() {
     if focusforge_gpu::device::shared_device_or_skip().is_none() {
         return;
     }
-    let backend = gpu_backend().expect("gpu backend");
     let stack = open_stack();
     let (width, height) = stack.dimensions();
     let spp = stack.header(0).samples_per_pixel;
@@ -1346,7 +1180,7 @@ fn gpu_stack_matches_cpu_stack_with_uncovered_borders() {
         ("uncovered_translation", shifted),
         ("uncovered_similarity", non_identity_transforms(frame_count)),
     ] {
-        let zmap = assert_gpu_matches_cpu_stack(label, backend, transforms.clone());
+        let zmap = assert_gpu_matches_cpu_stack(label, transforms.clone());
         let reader = WarpingReader::new(&stack, (width, height), spp, transforms);
         let canvas = Rect {
             x: 0,
@@ -1381,48 +1215,6 @@ fn gpu_stack_matches_cpu_stack_with_uncovered_borders() {
         );
         println!("{label}: {uncovered_pixels} uncovered frame pixels, none named by the Z-Map");
     }
-}
-
-/// See [`assert_gpu_matches_cpu_stack`]'s own doc comment: `backend` is a
-/// parameter for the identical reason.
-fn assert_gpu_matches_cpu_zmap(label: &str, backend: &dyn TileBackend) {
-    let stack = open_stack();
-    let (width, height) = stack.dimensions();
-    let spp = stack.header(0).samples_per_pixel;
-    let frame_count = stack.len();
-    let transforms = non_identity_transforms(frame_count);
-
-    let cpu = run_cpu(&format!("{label}_zmap"), transforms.clone());
-    let Some(gpu) = run_gpu(&format!("{label}_zmap"), transforms.clone(), backend) else {
-        return;
-    };
-
-    let cpu_zmap = read_zmap(&cpu.zmap_path);
-    let gpu_zmap = read_zmap(&gpu.zmap_path);
-    assert_eq!(cpu_zmap.len(), gpu_zmap.len());
-
-    let scores = whole_canvas_level_scores(&stack, &transforms, width, height, spp, 0);
-    let reader = WarpingReader::new(&stack, (width, height), spp, transforms.clone());
-    assert_zmap_exact_or_near_tie(&gpu_zmap, &cpu_zmap, &scores, &reader, width, height, spp);
-}
-
-#[test]
-fn gpu_zmap_matches_cpu_zmap_exactly() {
-    if focusforge_gpu::device::shared_device_or_skip().is_none() {
-        return;
-    }
-    let backend = gpu_backend().expect("gpu backend");
-    assert_gpu_matches_cpu_zmap("probed_budget", backend);
-}
-
-/// The Z-Map twin of [`gpu_stack_matches_cpu_stack_at_a_forced_one_tile_budget`].
-#[test]
-fn gpu_zmap_matches_cpu_zmap_exactly_at_a_forced_one_tile_budget() {
-    if focusforge_gpu::device::shared_device_or_skip().is_none() {
-        return;
-    }
-    let backend = GpuBackend::with_max_device_bytes(1).expect("tiny gpu backend");
-    assert_gpu_matches_cpu_zmap("tiny_budget", &backend);
 }
 
 #[test]
@@ -1478,11 +1270,15 @@ fn warp_noise_propagation_reachable_bounds_a_boundary_pixel() {
     let cpu_zmap = read_zmap(&cpu.zmap_path);
 
     let reader = WarpingReader::new(&stack, (width, height), spp, transforms);
-    let geom = CanvasGeom {
-        width,
-        height,
-        spp: cspp,
-    };
+    let planes = WarpedPlanes::read(
+        &reader,
+        frame_count,
+        CanvasGeom {
+            width,
+            height,
+            spp: cspp,
+        },
+    );
 
     let pixel = 68615usize;
     let winner = cpu_zmap[pixel] as usize;
@@ -1497,7 +1293,7 @@ fn warp_noise_propagation_reachable_bounds_a_boundary_pixel() {
     // least 1 LSB at a boundary pixel -- that is the whole mechanism this
     // check exists to recognise.
     let (small_found, small_reach) =
-        warp_noise_propagation_reachable(&reader, frame_count, geom, winner, pixel, &baseline, 1);
+        warp_noise_propagation_reachable(&planes, winner, pixel, &baseline, 1);
     assert!(
         small_found,
         "a 1 LSB observed delta must be reachable (reached {small_reach})"
@@ -1506,15 +1302,8 @@ fn warp_noise_propagation_reachable_bounds_a_boundary_pixel() {
     // An implausibly large observed delta must never be reachable from a
     // single ±1 LSB sample perturbation -- this is the bound that keeps the
     // mechanism from silently explaining away a real correctness bug.
-    let (large_found, large_reach) = warp_noise_propagation_reachable(
-        &reader,
-        frame_count,
-        geom,
-        winner,
-        pixel,
-        &baseline,
-        60000,
-    );
+    let (large_found, large_reach) =
+        warp_noise_propagation_reachable(&planes, winner, pixel, &baseline, 60000);
     assert!(
         !large_found,
         "a 60000 LSB observed delta must not be reachable from a single ±1 LSB perturbation \

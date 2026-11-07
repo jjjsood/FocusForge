@@ -1,0 +1,274 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The step calculator overlay: the optics switch, the illustration with its
+// entered fields at leader lines and calculated values as dimension marks,
+// the summary band and the legend.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFOverlayFrame } from "../components/ff_overlay_frame.slint";
+import { FFSegmented } from "../components/ff_segmented.slint";
+import { FFField } from "../components/ff_field.slint";
+import { FFRowLabel } from "../components/ff_row_label.slint";
+import { FFStatusText } from "../components/ff_status_text.slint";
+import { FFLeaderLine } from "../components/ff_leader_line.slint";
+import { FFDimensionMark } from "../components/ff_dimension_mark.slint";
+import { FFCalculatorIllustration } from "../components/ff_calculator_illustration.slint";
+import { FFCalculatorInset } from "../components/ff_calculator_inset.slint";
+import { FFSummaryBand, SummaryCell } from "../components/ff_summary_band.slint";
+import { FFCalculatorLegend } from "../components/ff_calculator_legend.slint";
+
+export { SummaryCell }
+
+export struct CalculatorFieldView {
+    label: string,
+    text: string,
+    // The violation line shown under the field; empty while the entry is valid.
+    error: string,
+    shown: bool,
+}
+
+// One entered field with its label (`above`, `below` or `right`) and its
+// violation line under the box. The slot's origin is the box's top-left.
+component FieldSlot inherits Rectangle {
+    in property <CalculatorFieldView> view;
+    in property <string> label-side: "above";
+    callback edited(string);
+
+    property <length> line-height: ShellGeometry.violation-line-height;
+    property <length> line-gap: ShellGeometry.violation-line-gap;
+
+    visible: root.view.shown;
+    width: Theme.space-12 + Theme.space-2;
+    height: ShellGeometry.field-height;
+
+    caption := FFRowLabel {
+        label-text: root.view.label;
+        width: self.preferred-width;
+        height: self.preferred-height;
+        x: root.label-side == "right" ? root.width + Theme.space-2 : (root.width - self.width) / 2;
+        y: root.label-side == "above" ? -11px - self.height / 2
+            : root.label-side == "below" ? 37px - self.height / 2 + (root.view.error != "" ? root.line-height + root.line-gap : 0px)
+            : (root.height - self.height) / 2;
+    }
+    FFField {
+        width: 100%;
+        height: 100%;
+        editable: true;
+        invalid: root.view.error != "";
+        text: root.view.text;
+        text-alignment: right;
+        edited(text) => { root.edited(text); }
+    }
+    if root.view.error != "": violation := FFStatusText {
+        x: root.label-side == "right" ? 0px : (root.width - self.width) / 2;
+        y: root.height + root.line-gap;
+        width: self.preferred-width;
+        height: root.line-height;
+        text: root.view.error;
+        tone: "failure";
+    }
+}
+
+export component FFCalculatorOverlay inherits Rectangle {
+    in property <bool> open: false;
+    in property <bool> objective: false;
+    in property <[string]> optics-labels: [];
+    in property <string> optics-selected: "";
+    // The five entered fields in layout order: time per frame, magnification,
+    // the optics' own input, overlap, depth range.
+    in property <[CalculatorFieldView]> fields: [];
+    in property <[SummaryCell]> entered: [];
+    in property <[SummaryCell]> calculated: [];
+    in property <string> step-text: "";
+    in property <string> depth-of-field-text: "";
+    in property <string> frames-text: "";
+    in property <string> duration-text: "";
+    in property <int> planes: 13;
+    in property <float> overlap: 0.25;
+    callback close-requested();
+    callback optics-chosen(string);
+    callback field-edited(int, string);
+
+    // While a field whose caption sits below its box shows a violation line, that
+    // caption moves down and the footer gives the same height to the summary band.
+    property <bool> below-line-shown: root.fields[2].error != "" || root.fields[4].error != "";
+
+    // The drawing is laid out on a board 892 x 543 px (the overlay body at the
+    // smallest window) and scaled uniformly, centred between the header rule and
+    // the summary band. The body height excludes a violation line, so the scale does
+    // not change when one appears.
+    property <length> plain-body-height: frame.height - frame.header-height - 1px
+        - (Theme.space-12 + Theme.space-2);
+    out property <float> drawing-scale: clamp(
+        min(frame.width / ShellGeometry.calculator-board-width,
+            root.plain-body-height / ShellGeometry.calculator-board-height),
+        1, ShellGeometry.calculator-max-scale);
+    out property <length> drawing-x: (frame.width - root.drawing-scale * ShellGeometry.calculator-drawing-width) / 2
+        - root.drawing-scale * ShellGeometry.calculator-drawing-x;
+    out property <length> drawing-y: (root.plain-body-height - ShellGeometry.summary-band-height
+        - root.drawing-scale * (ShellGeometry.calculator-drawing-height + root.grow)) / 2
+        - root.drawing-scale * ShellGeometry.calculator-drawing-y;
+
+    // While the Overlap violation line shows, the inset card is taller by this much
+    // and everything below it, with the centred box, moves down by the same amount.
+    property <length> grow: root.fields[3].error != "" ? Theme.space-4 + Theme.space-1 : 0px;
+
+    // A field box keeps its size; its corner sits where its leader's field end
+    // is drawn, plus the board offset between the two.
+    pure function anchor-x(end: length, corner: length) -> length {
+        root.drawing-x + root.drawing-scale * end + (corner - end)
+    }
+    pure function anchor-y(end: length, corner: length) -> length {
+        root.drawing-y + root.drawing-scale * end + (corner - end)
+    }
+
+    visible: root.open;
+
+    TouchArea {
+        scroll-event(event) => { accept }
+    }
+    FocusScope {
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.close-requested();
+                return accept;
+            }
+            reject
+        }
+
+        frame := FFOverlayFrame {
+            title: "Step calculator";
+            footer-height: Theme.space-12 + Theme.space-2
+                - (root.below-line-shown ? ShellGeometry.violation-line-height + ShellGeometry.violation-line-gap : 0px);
+            close-requested => { root.close-requested(); }
+
+            FFRowLabel {
+                x: Theme.space-4;
+                y: Theme.space-3 + 2px;
+                label-text: "Optics";
+            }
+            optics := FFSegmented {
+                x: Theme.space-4;
+                y: 35px;
+                width: 240px;
+                height: ShellGeometry.field-height;
+                section: true;
+                segments: root.optics-labels;
+                selected: root.optics-selected;
+                segment-selected(label) => { root.optics-chosen(label); }
+            }
+
+            drawing := Rectangle {
+                x: root.drawing-x;
+                y: root.drawing-y;
+                width: ShellGeometry.calculator-board-width;
+                height: ShellGeometry.calculator-board-height;
+                transform-scale: root.drawing-scale;
+                transform-origin: { x: 0px, y: 0px };
+
+                illustration := FFCalculatorIllustration {
+                    x: 62px;
+                    y: 157.3px + root.grow;
+                    objective: root.objective;
+                    plane-count: root.planes;
+                    art-scale: root.drawing-scale;
+                }
+                FFDimensionMark {
+                    x: 542.2px;
+                    y: 357.5px + root.grow;
+                    width: illustration.stack-span;
+                    label: "Frames";
+                    value: root.frames-text;
+                    label2: "Duration";
+                    value2: root.duration-text;
+                }
+                FFDimensionMark {
+                    x: 542.2px;
+                    y: 381.5px + root.grow;
+                    width: 261px;
+                }
+                FFRowLabel {
+                    x: 542.2px - self.preferred-width / 2;
+                    y: 404px + root.grow - self.preferred-height / 2;
+                    label-text: "Start";
+                }
+                FFRowLabel {
+                    x: 803.2px - self.preferred-width / 2;
+                    y: 404px + root.grow - self.preferred-height / 2;
+                    label-text: "End";
+                }
+                inset := FFCalculatorInset {
+                    x: 456.5px;
+                    y: 11.5px;
+                    step-text: root.step-text;
+                    depth-of-field-text: root.depth-of-field-text;
+                    overlap: root.overlap;
+                    extra-height: root.grow;
+                }
+
+                // Leader lines from each field to the part it names.
+                leader-0 := FFLeaderLine { x: 201.5px; y: 123px + root.grow; width: 5px; height: 84.1px; show-dot: false; }
+                leader-1 := FFLeaderLine { x: 175.2px; y: 204.6px + root.grow; width: 29.3px; height: 5px; horizontal: true; dot-at-end: false; }
+                if !root.objective: leader-2 := FFLeaderLine { x: 285px; y: 179px + root.grow; width: 5px; height: 52.9px; }
+                leader-3 := FFLeaderLine {
+                    x: root.objective ? 352.4px : 344.1px;
+                    y: (root.objective ? 287px : 315.7px) + root.grow;
+                    width: 5px;
+                    height: root.objective ? 116px : 87.3px;
+                    dot-at-end: false;
+                }
+                leader-4 := FFLeaderLine { x: 670.2px; y: 387px + root.grow; width: 5px; height: 16px; dot-at-end: false; }
+                leader-5 := FFLeaderLine { x: 579px; y: 98.5px; width: 5px; height: 40.5px; dot-at-end: false; }
+            }
+
+            slot-0 := FieldSlot {
+                x: root.anchor-x(203.5px, 176px);
+                y: root.anchor-y(123px + root.grow, 97px + root.grow);
+                view: root.fields[0];
+                edited(text) => { root.field-edited(0, text); }
+            }
+            slot-1 := FieldSlot {
+                x: root.anchor-x(287px, 256px);
+                y: root.anchor-y(179px + root.grow, 153px + root.grow);
+                view: root.fields[1];
+                edited(text) => { root.field-edited(1, text); }
+            }
+            slot-2 := FieldSlot {
+                x: root.anchor-x(root.objective ? 354.4px : 346.1px, root.objective ? 328px : 304px);
+                y: root.anchor-y(403px + root.grow, 401px + root.grow);
+                view: root.fields[2];
+                label-side: "below";
+                edited(text) => { root.field-edited(2, text); }
+            }
+            slot-3 := FieldSlot {
+                x: root.anchor-x(581px, 552px);
+                y: root.anchor-y(139px, 137px);
+                view: root.fields[3];
+                label-side: "right";
+                edited(text) => { root.field-edited(3, text); }
+            }
+            slot-4 := FieldSlot {
+                x: root.anchor-x(672.2px, 648px);
+                y: root.anchor-y(403px + root.grow, 401px + root.grow);
+                view: root.fields[4];
+                label-side: "below";
+                edited(text) => { root.field-edited(4, text); }
+            }
+
+            summary := FFSummaryBand {
+                x: 0px;
+                y: frame.footer-y - frame.header-height - 1px - self.height;
+                width: frame.width;
+                entered: root.entered;
+                calculated: root.calculated;
+            }
+        }
+        FFCalculatorLegend {
+            x: Theme.space-4;
+            y: frame.footer-y + (frame.footer-height - self.height) / 2;
+            width: self.preferred-width;
+            height: Theme.space-4;
+        }
+    }
+}

@@ -28,8 +28,13 @@ Start: --open fixtures/mantis-64/frames
 ## Run one by hand
 
 1. Build the app, create a scratch save folder, then start it with the journey's `Start:` arguments, a scratch settings folder and that save folder (saves and exports land there with no file chooser, never beside the fixtures):
-   `mkdir -p .scratch/ui/save`
+   `mkdir -p .scratch/ui/save .scratch/ui/config/focusforge && printf '[updates]\ncheck_on_start = false\n' > .scratch/ui/config/focusforge/settings.toml`
+   The seed keeps the run off the network: with the table missing, the window checks for a newer release at start.
    `target/debug/focusforge-gui <Start args> --config-dir .scratch/ui/config --save-folder .scratch/ui/save`
 2. Do the steps in order. After each step compare the window with its `Expect:`.
 3. A step whose `Expect:` does not hold is a failure; note its number and what the window showed, then carry on with the next step.
 4. Close the window when done.
+
+## Journeys that need local camera files or a human
+
+`manual/` holds journeys that cannot run unattended: their input is not a checked-in fixture (real camera RAW files that are too large to commit, or a folder built under `.scratch/`), or every step in a section needs a person (the mouse wheel, held mouse buttons, the window's own keyboard focus, a seeded crash report). They use the same format and the same steps as the numbered journeys, start with a short list of files to copy into `.scratch/` when they need any, and are run by hand as above; the numbered journeys in this folder do not cover them.

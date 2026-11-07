@@ -2,11 +2,12 @@
 
 //! Format-neutral facts and tile access for an opened set of frames.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
 
 use serde::{Deserialize, Serialize};
 
-use crate::algorithm::TileReader;
+use crate::algorithm::{AlgorithmError, TileReader};
 use crate::params::StackContext;
 
 /// One frame's identity for resume comparison, geometry, and layout facts.
@@ -15,6 +16,9 @@ pub struct FrameDesc {
     pub path: PathBuf,
     pub file_size: u64,
     pub image_description: Option<String>,
+    /// EXIF Orientation (1-8) the reader applies to serve the frame upright;
+    /// 1 when the frame is served as stored.
+    pub orientation: u16,
     pub width: u32,
     pub height: u32,
     pub samples_per_pixel: u32,
@@ -45,7 +49,7 @@ pub struct RawIdentity {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum FrameError {
-    /// RAW and TIFF frames cannot share one development path.
+    /// RAW, JPEG and TIFF frames cannot share one development path.
     #[error("{} is {found}, but first frame {} is {first}", path.display(), first_path.display())]
     MixedFormats {
         /// First frame path.
@@ -63,6 +67,9 @@ pub enum FrameError {
     /// A read through a RAW-backed reader failed.
     #[error(transparent)]
     Raw(#[from] crate::io::RawError),
+    /// A read through a JPEG-backed reader failed.
+    #[error(transparent)]
+    Jpeg(#[from] crate::io::JpegError),
 }
 
 /// An opened set of frames and its tile-shaped pixel source.
@@ -80,6 +87,36 @@ pub trait FrameReader: TileReader + Send + Sync {
 
     /// Frame `index`'s description.
     fn frame(&self, index: usize) -> &FrameDesc;
+
+    /// Full-frame develops per frame since this reader opened, in frame
+    /// order; `None` for readers that keep no count.
+    fn develop_counts(&self) -> Option<Vec<u64>> {
+        None
+    }
+
+    /// Develops every frame once into files under `scratch_root`, which later
+    /// reads are served from: up to `workers` at a time, within `budget` bytes
+    /// of decode reservations. Returns how many develop at once, `0` for a
+    /// reader with nothing to develop. `cancelled` is polled before each frame
+    /// ([`AlgorithmError::Cancelled`]); a failed or cancelled pass leaves
+    /// nothing under `scratch_root`. `developed` gains one as each frame
+    /// finishes.
+    fn develop_once(
+        &self,
+        _scratch_root: &Path,
+        _budget: u64,
+        _workers: usize,
+        _cancelled: &(dyn Fn() -> bool + Sync),
+        _developed: &AtomicUsize,
+    ) -> Result<usize, AlgorithmError> {
+        Ok(0)
+    }
+
+    /// Bytes [`FrameReader::develop_once`] writes under its `scratch_root`;
+    /// `0` for a reader that develops nothing.
+    fn develop_scratch_bytes(&self) -> Result<u64, AlgorithmError> {
+        Ok(0)
+    }
 
     /// Facts used to resolve stack-dependent parameters.
     fn stack_context(&self) -> StackContext {

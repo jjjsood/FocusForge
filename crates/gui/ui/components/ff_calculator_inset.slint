@@ -1,0 +1,107 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The calculator's enlarged view of the first two focus planes: each plane's
+// depth of field, the step between them and the depth-of-field span, drawn
+// for the entered `overlap`.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFDimensionMark } from "ff_dimension_mark.slint";
+
+// A focus plane's outline with its depth-of-field tint behind it, centred on
+// the plane.
+component Plane inherits Rectangle {
+    width: 12.3px;
+    height: 47px;
+
+    Path {
+        x: -61.95px;
+        y: 0px;
+        width: 136.2px;
+        height: 47px;
+        viewbox-width: 136.2;
+        viewbox-height: 47;
+        commands: "M 0 47 L 0 7 L 12.3 0 L 136.2 0 L 136.2 40 L 123.9 47 Z";
+        fill: Theme.accent-default.with-alpha(0.11);
+    }
+    Path {
+        x: 0px;
+        y: 0px;
+        width: 12.3px;
+        height: 47px;
+        viewbox-width: 12.3;
+        viewbox-height: 47;
+        commands: "M 0 47 L 0 7 L 12.3 0 L 12.3 40 Z";
+        stroke: Theme.accent-default;
+        stroke-width: 1.25px;
+    }
+}
+
+export component FFCalculatorInset inherits Rectangle {
+    in property <string> step-text: "";
+    in property <string> depth-of-field-text: "";
+    // The share of one depth of field the next frame repeats, 0 to 0.9.
+    in property <float> overlap: 0.25;
+    // The centre line's height inside the card.
+    out property <length> axis-y: 89.5px;
+    property <length> plane-a-x: 78.5px;
+    property <length> plane-b-x: root.plane-a-x + 123.9px * (1 - root.overlap);
+    property <length> planes-y: 66px;
+    // Room added under the card's content, for a line that hangs from the field below.
+    in property <length> extra-height: 0px;
+
+    width: ShellGeometry.calculator-inset-width;
+    height: ShellGeometry.calculator-inset-height + root.extra-height;
+    background: Theme.surface-base;
+    border-width: 1px;
+    border-color: Theme.border-default;
+    border-radius: Theme.radius-md;
+
+    Text {
+        x: Theme.space-4;
+        y: Theme.space-3;
+        text: "FIRST TWO PLANES, ENLARGED";
+        color: Theme.text-muted;
+        font-size: Theme.text-section.size;
+        font-weight: Theme.text-section.weight;
+    }
+    // The marks' extension lines down to the planes.
+    for x[i] in [root.plane-a-x, root.plane-b-x, root.plane-b-x - 61.95px, root.plane-b-x + 61.95px]: Rectangle {
+        x: x;
+        y: i < 2 ? 31.5px : 51.5px;
+        width: 1px;
+        height: root.planes-y - self.y;
+        background: Theme.border-strong;
+    }
+    for i in 24: Rectangle {
+        x: 6.5px + i * 10px;
+        y: root.axis-y;
+        width: 7px;
+        height: 1px;
+        background: Theme.border-strong;
+    }
+    Plane {
+        x: root.plane-a-x - 6.15px;
+        y: root.planes-y;
+    }
+    Plane {
+        x: root.plane-b-x - 6.15px;
+        y: root.planes-y;
+    }
+    FFDimensionMark {
+        x: root.plane-a-x;
+        y: 27.5px;
+        width: root.plane-b-x - root.plane-a-x;
+        label: "Step";
+        value: root.step-text;
+        caption-outside: true;
+    }
+    FFDimensionMark {
+        x: root.plane-b-x - 61.95px;
+        y: 47.5px;
+        width: 123.9px;
+        label: "Depth of field";
+        value: root.depth-of-field-text;
+        caption-outside: true;
+    }
+}

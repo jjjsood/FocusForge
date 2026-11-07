@@ -2,6 +2,8 @@
 
 mod common;
 
+use common::only_project;
+
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -19,17 +21,6 @@ fn run(dir: &Path, args: &[&str]) -> common::CliOutput {
 
 fn arg(path: &Path) -> &str {
     path.to_str().expect("test paths are UTF-8")
-}
-
-fn only_project(dir: &Path) -> PathBuf {
-    let mut projects: Vec<PathBuf> = std::fs::read_dir(dir)
-        .unwrap()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "ffp"))
-        .collect();
-    assert_eq!(projects.len(), 1, "one project expected in {dir:?}");
-    projects.pop().unwrap()
 }
 
 struct SharedStack {

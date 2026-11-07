@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{Datelike, Days, Local, NaiveDate};
-use common::{enter_editor, paint};
+use common::{enter_editor, fused_tab, paint, record_events, scratch_controller, settle_all};
 use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::ParamValues;
@@ -35,7 +35,7 @@ use slint::{ComponentHandle, Model};
 /// `cargo test -p focusforge-gui --test checkpoint_panel
 /// writes_a_long_history_project -- --ignored`.
 #[test]
-#[ignore]
+#[ignore = "writes .scratch/checkpoint-long-history/long.ffp for a manual scroll check"]
 fn writes_a_long_history_project() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -52,7 +52,7 @@ fn writes_a_long_history_project() {
 /// fires a change handler.
 #[test]
 fn a_fresh_window_press_on_the_drawn_thumb_does_not_jump() {
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -438,12 +438,6 @@ fn wait_for_render(controller: &mut AppController) {
     common::settle_session(controller);
 }
 
-fn scratch_controller(name: &str) -> AppController {
-    let mut controller = AppController::new();
-    controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
-    controller
-}
-
 #[test]
 fn selecting_a_row_materializes_and_marks_it() {
     let project = build_edited("checkpoint_panel_select");
@@ -583,13 +577,6 @@ fn editor_on_head(name: &str) -> (Edited, AppController) {
     enter_editor(&mut controller);
     loaded_composite(&mut controller, None);
     (project, controller)
-}
-
-fn record_events(controller: &mut AppController) -> Arc<Mutex<Vec<ShellEvent>>> {
-    let events: Arc<Mutex<Vec<ShellEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink = events.clone();
-    controller.set_sink(Arc::new(move |event| sink.lock().unwrap().push(event)));
-    events
 }
 
 /// Two `Save checkpoint` presses inside one second list the second one
@@ -1094,6 +1081,10 @@ fn clicking_the_current_row_with_ops_asks_to_restore_it() {
     paint(&mut controller, stroke(3, 1, 1));
     click(&mut controller, &project.root);
     let copy = controller.pending_restore_copy().expect("the dialog is up");
+    assert!(
+        !events.lock().unwrap().is_empty(),
+        "opening the question emits, so the empty recorder above was connected"
+    );
     let target = controller
         .checkpoints_panel()
         .entries
@@ -1156,6 +1147,11 @@ fn an_open_restore_question_blocks_closing() {
     assert!(controller.pending_close().is_none());
     assert_eq!(controller.project_tabs().len(), tabs);
     assert!(controller.pending_restore_copy().is_some());
+
+    // Answering the question does emit, so the empty recorder above is not
+    // an unconnected one.
+    controller.close_guard_confirmed();
+    assert!(!events.lock().unwrap().is_empty());
 }
 
 /// Switching, in editor mode, to a tab whose current row still renders keeps
@@ -1332,11 +1328,7 @@ fn installed_window(
     Arc<Mutex<AppController>>,
     focusforge_gui::bridge::Installed,
 ) {
-    // The testing platform installs once per thread.
-    thread_local! {
-        static INIT: std::sync::Once = const { std::sync::Once::new() };
-    }
-    INIT.with(|init| init.call_once(i_slint_backend_testing::init_no_event_loop));
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller));
@@ -1490,28 +1482,6 @@ fn open_three(name: &str) -> (Edited, String, AppController) {
     let mut controller = scratch_controller(name);
     common::open_and_settle(&mut controller, std::slice::from_ref(&edited.project));
     (edited, child, controller)
-}
-
-/// An unsaved tab over three copied frames with `fuses` in-memory fused
-/// checkpoints, the newest one current.
-fn fused_tab(name: &str, fuses: usize) -> AppController {
-    let frames = common::tree(&format!("{name}_frames"));
-    for i in 0..3 {
-        fs::copy(
-            common::fixture_frame("mantis-64", i),
-            frames.join(format!("{i:02}.tif")),
-        )
-        .expect("fixture frame must copy");
-    }
-    let mut controller = scratch_controller(name);
-    common::open_and_settle(&mut controller, &[frames]);
-    controller.set_align_algorithm("dummy-align");
-    for _ in 0..fuses {
-        assert!(controller.start_fuse());
-        while common::wait_for_settle(&mut controller, Duration::from_secs(60)).is_some() {}
-    }
-    assert_eq!(controller.checkpoint_count(), Some(fuses));
-    controller
 }
 
 /// Opens the delete question on row `id`.
@@ -2004,24 +1974,6 @@ fn only_fresh(controller: &AppController) -> (String, u64) {
     fresh.into_iter().next().unwrap()
 }
 
-/// An unsaved tab over three copied `mantis-64` frames, not yet fused.
-fn open_frames_tab(controller: &mut AppController, name: &str) {
-    let frames = common::tree(&format!("{name}_frames"));
-    for i in 0..3 {
-        fs::copy(
-            common::fixture_frame("mantis-64", i),
-            frames.join(format!("{i:02}.tif")),
-        )
-        .expect("fixture frame must copy");
-    }
-    common::open_and_settle(controller, &[frames]);
-    controller.set_align_algorithm("dummy-align");
-}
-
-fn settle_runs(controller: &mut AppController) {
-    while common::wait_for_settle(controller, Duration::from_secs(60)).is_some() {}
-}
-
 /// Every creation path marks exactly the row it adds, with a generation above
 /// every earlier one.
 #[test]
@@ -2090,18 +2042,16 @@ fn a_new_checkpoint_row_is_the_only_fresh_row() {
     let (key, snapshot) = only_fresh(&fused);
     assert_eq!(key, "held:1", "the snapshot is the fresh row");
     assert!(snapshot > first);
-    settle_runs(&mut fused);
+    settle_all(&mut fused);
     let (key, generation) = only_fresh(&fused);
     assert_eq!(key, "held:2", "the second fuse's row replaces it");
     assert!(generation > snapshot);
 
     // The parked divergence's `Keep`.
-    let mut parked = AppController::new();
-    parked.set_scratch_root_for_test(common::tree("checkpoint_panel_fresh_keep_scratch"));
-    let mantis_512 = common::workspace_root().join("fixtures").join("mantis-512");
-    common::open_and_settle(&mut parked, &[mantis_512]);
+    let mut parked = scratch_controller("checkpoint_panel_fresh_keep");
+    common::open_frames_from(&mut parked, "mantis-64", "checkpoint_panel_fresh_keep", 3);
     assert!(parked.start_fuse());
-    common::wait_for_settle(&mut parked, Duration::from_secs(300));
+    common::wait_for_settle(&mut parked, Duration::from_secs(60));
     assert!(parked.pending_divergence().is_some());
     assert!(
         fresh_entries(&parked).is_empty(),
@@ -2173,12 +2123,12 @@ fn flash_boundaries_background_tab_empty_snapshot_failed_save() {
     // A fuse finishing on a tab not in view marks nothing, then or later.
     let name = "checkpoint_panel_fresh_background";
     let mut controller = scratch_controller(name);
-    open_frames_tab(&mut controller, &format!("{name}_a"));
-    open_frames_tab(&mut controller, &format!("{name}_b"));
+    common::open_mantis64_tab(&mut controller, &format!("{name}_a"), 3);
+    common::open_mantis64_tab(&mut controller, &format!("{name}_b"), 3);
     controller.select_project(0);
     assert!(controller.start_fuse());
     controller.select_project(1);
-    settle_runs(&mut controller);
+    settle_all(&mut controller);
     assert_eq!(controller.active_project(), Some(1));
     assert!(fresh_entries(&controller).is_empty());
     assert_eq!(controller.take_checkpoint_flash(), None);

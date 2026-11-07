@@ -1,0 +1,27 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Inter, the typeface of the FocusForge window (SIL OFL 1.1, docs/assets/fonts/OFL.txt).
+   Replaces mdBook's bundled Open Sans; code falls back to the system monospace. */
+
+@font-face {
+    font-family: "Inter";
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url("../assets/fonts/Inter-Regular.ttf") format("truetype");
+}
+
+@font-face {
+    font-family: "Inter";
+    font-style: normal;
+    font-weight: 500;
+    font-display: swap;
+    src: url("../assets/fonts/Inter-Medium.ttf") format("truetype");
+}
+
+@font-face {
+    font-family: "Inter";
+    font-style: normal;
+    font-weight: 600;
+    font-display: swap;
+    src: url("../assets/fonts/Inter-SemiBold.ttf") format("truetype");
+}

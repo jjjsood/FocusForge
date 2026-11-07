@@ -17,13 +17,13 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::entry::RAW_EXTENSIONS;
-use crate::job::{ExportFormat, JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
+use crate::job::{DNG_EXTENSIONS, ExportFormat, JPEG_EXTENSIONS, PNG_EXTENSIONS, TIFF_EXTENSIONS};
 
 /// Opens the OS folder picker. `None` on cancel (or a missing dialog
 /// backend, rfd#320).
 pub fn pick_entry() -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .set_title("Open folder or project")
+        .set_title("Choose a folder")
         .pick_folder()
 }
 
@@ -84,6 +84,7 @@ fn image_extensions(format: ExportFormat) -> &'static [&'static str] {
         ExportFormat::Tiff => TIFF_EXTENSIONS,
         ExportFormat::Png => PNG_EXTENSIONS,
         ExportFormat::Jpeg => JPEG_EXTENSIONS,
+        ExportFormat::Dng => DNG_EXTENSIONS,
     }
 }
 
@@ -129,14 +130,11 @@ fn ensure_extension(path: PathBuf, format: ExportFormat) -> Option<PathBuf> {
     }
 }
 
-/// Opens the OS file picker, multi-select, filtered to TIFF frames -- the
-/// `Images` panel's Add path. `None` on cancel (or a missing dialog backend,
-/// rfd#320), the same as its two siblings.
+/// Opens the OS file picker, multi-select, filtered to TIFF frames, JPEG
+/// frames and camera RAW -- the `Images` panel's Add path. `None` on cancel
+/// (or a missing dialog backend, rfd#320), the same as its two siblings.
 pub fn pick_frames() -> Option<Vec<PathBuf>> {
-    rfd::FileDialog::new()
-        .set_title("Add frames")
-        .add_filter("TIFF frames", &["tif", "tiff"])
-        .pick_files()
+    with_frame_filters(rfd::FileDialog::new().set_title("Add frames")).pick_files()
 }
 
 /// `extensions` in lower and upper case: portal filters are case-sensitive
@@ -148,15 +146,28 @@ fn both_cases(extensions: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Opens the OS file picker, multi-select, filtered to TIFF frames and to
-/// camera RAW -- the empty state's `Open…`. `None` on cancel (or a missing
-/// dialog backend, rfd#320).
+/// The filters of every file the entry path reads as a frame, one per kind.
+fn frame_filters() -> [(&'static str, Vec<String>); 3] {
+    [
+        ("TIFF frames", both_cases(TIFF_EXTENSIONS)),
+        ("JPEG frames", both_cases(JPEG_EXTENSIONS)),
+        ("Camera RAW", both_cases(RAW_EXTENSIONS)),
+    ]
+}
+
+fn with_frame_filters(dialog: rfd::FileDialog) -> rfd::FileDialog {
+    frame_filters()
+        .into_iter()
+        .fold(dialog, |dialog, (name, extensions)| {
+            dialog.add_filter(name, &extensions)
+        })
+}
+
+/// Opens the OS file picker, multi-select, filtered to TIFF frames, JPEG
+/// frames and camera RAW -- the empty state's `Open…`. `None` on cancel (or a
+/// missing dialog backend, rfd#320).
 pub fn pick_images() -> Option<Vec<PathBuf>> {
-    rfd::FileDialog::new()
-        .set_title("Open images")
-        .add_filter("TIFF frames", &both_cases(TIFF_EXTENSIONS))
-        .add_filter("Camera RAW", &both_cases(RAW_EXTENSIONS))
-        .pick_files()
+    with_frame_filters(rfd::FileDialog::new().set_title("Open images")).pick_files()
 }
 
 /// Which dialog [`request`] opens.
@@ -166,9 +177,9 @@ pub enum DialogRequest {
     Entry,
     /// The `.ffp` file picker.
     Project,
-    /// The multi-select TIFF frame picker.
+    /// The multi-select TIFF, JPEG and camera RAW frame picker.
     Frames,
-    /// The multi-select TIFF and camera RAW picker that starts a project.
+    /// The multi-select TIFF, JPEG and camera RAW picker that starts a project.
     Images,
     /// The project save dialog, starting at the proposed path.
     SaveProject(PathBuf),
@@ -282,6 +293,24 @@ mod tests {
                 "{given} under {format:?}"
             );
         }
+    }
+
+    #[test]
+    fn frame_filters_cover_every_frame_extension() {
+        let filters = frame_filters();
+        let mut offered: Vec<&str> = filters
+            .iter()
+            .flat_map(|(_, extensions)| extensions.iter().map(String::as_str))
+            .collect();
+        let mut expected: Vec<String> = [TIFF_EXTENSIONS, JPEG_EXTENSIONS, RAW_EXTENSIONS]
+            .into_iter()
+            .flatten()
+            .flat_map(|ext| [ext.to_string(), ext.to_uppercase()])
+            .collect();
+        offered.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(offered, expected);
+        assert!(!offered.contains(&"png") && !offered.contains(&"PNG"));
     }
 
     #[test]

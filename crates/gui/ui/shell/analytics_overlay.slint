@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The Analytics overlay: the sharp-area count of every frame of the open
+// stack, as one row each, or the count's waiting and failure states.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFOverlayFrame } from "../components/ff_overlay_frame.slint";
+import { FFSectionHeading } from "../components/ff_section_heading.slint";
+import { FFStatusText } from "../components/ff_status_text.slint";
+import { FFAnalyticsRow } from "../components/ff_analytics_row.slint";
+import { FFLoadingPanel } from "../components/ff_loading_panel.slint";
+import { FFScrollbar } from "../components/ff_scrollbar.slint";
+
+export struct AnalyticsRowView {
+    chip: color,
+    name: string,
+    mm-text: string,
+    fraction: float,
+    count: int,
+    // "pending" | "partial" | "final"
+    value-state: string,
+}
+
+export component FFAnalyticsOverlay inherits Rectangle {
+    in property <bool> open: false;
+    // "waiting" | "counting" | "rows" | "failed"; `rows` is empty in the
+    // waiting and failed states.
+    in property <string> state: "waiting";
+    in property <[AnalyticsRowView]> rows: [];
+    in property <string> error: "";
+    callback close-requested();
+
+    visible: root.open;
+
+    // Swallows the click and the wheel, so neither reaches the canvas below.
+    TouchArea {
+        scroll-event(e) => { accept }
+    }
+    FFOverlayFrame {
+        title: "Analytics";
+        footer-height: 0px;
+        close-requested => { root.close-requested(); }
+
+        FFSectionHeading {
+            x: Theme.space-4;
+            y: 18px;
+            label: "SHARP AREAS PER IMAGE";
+            flat: true;
+            strong: true;
+        }
+        FFStatusText {
+            x: Theme.space-4;
+            y: 34px;
+            height: 16px;
+            text: "Image areas that are sharpest in this image";
+        }
+
+        scroller := Flickable {
+            y: 63px;
+            width: parent.width;
+            height: parent.height - self.y;
+
+            VerticalLayout {
+                alignment: start;
+
+                for row in root.rows: FFAnalyticsRow {
+                    chip: row.chip;
+                    name: row.name;
+                    mm-text: row.mm-text;
+                    fraction: row.fraction;
+                    count: row.count;
+                    value-state: row.value-state;
+                }
+            }
+        }
+        FFScrollbar {
+            x: parent.width - self.width - Theme.space-2;
+            y: scroller.y;
+            height: scroller.height;
+            content-height: scroller.viewport-height;
+            viewport-height: scroller.height;
+            offset: -scroller.viewport-y;
+        }
+        if root.state == "waiting": FFLoadingPanel {
+            x: (parent.width - self.width) / 2;
+            y: scroller.y + (scroller.height - self.height) / 2;
+            width: parent.width - 2 * Theme.space-4;
+            framed: false;
+            show-spinner: false;
+            title: "No stack loaded";
+            caption: "Load a stack to count its sharp areas.";
+        }
+        if root.state == "failed": FFLoadingPanel {
+            x: (parent.width - self.width) / 2;
+            y: scroller.y + (scroller.height - self.height) / 2;
+            width: parent.width - 2 * Theme.space-4;
+            framed: false;
+            show-spinner: false;
+            tone: "failed";
+            title: "Counting failed";
+            caption: root.error;
+        }
+    }
+}

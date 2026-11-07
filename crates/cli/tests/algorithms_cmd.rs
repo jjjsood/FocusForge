@@ -9,13 +9,9 @@
 
 mod common;
 
-use std::process::Command;
+use common::bin;
 
 use focusforge_core::registry;
-
-fn bin() -> Command {
-    common::cli_bin("algorithms_cmd")
-}
 
 /// All three real algorithms (`laplacian`, `weighted-average`,
 /// `depth-map`) reach the CLI with no id named in CLI source -- the test
@@ -148,10 +144,13 @@ fn pyramid_depth_reports_size_derived_default() {
     let line = pyramid_depth_line(&stdout);
     assert!(line.contains("default from the loaded frames"), "{line}");
     assert!(!line.contains("value 4 (Default)"), "{line}");
-    assert!(
-        stdout.contains("shorter side at 64 px or more"),
-        "the help names the 64 px rule: {stdout}"
-    );
+    for rule in [
+        "smallest copy at least 64 px on its shorter side",
+        "frames under 127 px align at full size only",
+        "a 512 px frame gets 3",
+    ] {
+        assert!(stdout.contains(rule), "the help states `{rule}`: {stdout}");
+    }
 
     let output = bin()
         .args(["algorithms", "pyramidal-ecc", "--set", "pyramid-depth=2"])
@@ -389,7 +388,11 @@ fn project_params_json_lists_every_project_descriptor() {
     }
     let equalize = params.iter().find(|p| p["id"] == "equalize").unwrap();
     let help = equalize["help"].as_str().unwrap();
-    assert!(help.contains("not a linear-light correction"), "{help}");
+    assert!(
+        help.contains("one gain") && help.contains("source files unchanged"),
+        "{help}"
+    );
+    assert!(!help.contains("linear-light"), "{help}");
     let target = params
         .iter()
         .find(|p| p["id"] == "equalize-target")
@@ -400,7 +403,7 @@ fn project_params_json_lists_every_project_descriptor() {
         target["help"]
             .as_str()
             .unwrap()
-            .contains("0.0 keeps the mean encoded brightness of the stacked sources"),
+            .contains("0.0 keeps the average brightness of the stacked sources"),
         "{target}"
     );
 }

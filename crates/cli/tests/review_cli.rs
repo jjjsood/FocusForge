@@ -6,10 +6,10 @@
 //! sources, the wrapped `--json` document, the table/JSON agreement, the
 //! write-nothing assertion and the refusal to group.
 //!
-//! Two costs, paid once each: [`shared_laplacian_run`] is the **one** real
-//! `laplacian` fusion over `fixtures/mantis-512` this file pays for
-//! (~25 s), reused by every test that needs a genuinely measured sharpness
-//! ratio and Z-Map spread to compare against. Every other test either drives
+//! [`shared_laplacian_run`] is the **one** real `laplacian` fusion over
+//! `fixtures/mantis-512` this file runs, and one test reads it: the genuinely
+//! measured sharpness ratio and Z-Map spread, compared against a degenerate
+//! stack. Every other test either drives
 //! `dummy-stack` over tiny synthetic frames (milliseconds) or seals a
 //! project directly through `focusforge_core::project::seal` with
 //! hand-picked `Metrics`, which is cheaper still and gives exact control
@@ -24,7 +24,6 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
 use std::time::{Instant, SystemTime};
 
 use common::{CliOutput, mantis_512_dir};
@@ -65,63 +64,49 @@ fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
     )
 }
 
-/// The one `laplacian` run this file pays for: `fixtures/mantis-512`, no
-/// grouping split (one project, so a single-group manifest), reused by
-/// every test that needs a genuinely measured sharpness ratio and Z-Map
-/// spread.
+/// The one `laplacian` run this file makes: `fixtures/mantis-512`, no
+/// grouping split (one project, so a single-group manifest).
 struct SharedRun {
-    /// The run's own working directory, held alive for the process's
-    /// lifetime: every test that reads [`SharedRun::out`] does so long after
-    /// this struct's builder closure returns, so the directory must outlive
-    /// the `OnceLock` cell, not just that closure. The `OnceLock` static is
-    /// never dropped, so `common::TmpDir::drop`'s `remove_dir_all` never
-    /// runs for this one.
+    /// The run's own working directory; dropped, and removed, with this value.
     cwd: common::TmpDir,
     /// The `-o` directory, also `review`'s target.
     out: PathBuf,
 }
 
-fn shared_laplacian_run() -> &'static SharedRun {
-    static ONCE: OnceLock<SharedRun> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let cwd = common::tmp_dir("review_cli_shared_laplacian");
-        let out = cwd.join("out");
-        std::fs::create_dir_all(&out).unwrap();
-        let mut args = vec![
-            "stack".to_string(),
-            mantis_512_dir().to_str().unwrap().to_string(),
-            "-o".to_string(),
-            out.to_str().unwrap().to_string(),
-            "--algorithm".to_string(),
-            "laplacian".to_string(),
-            "--no-align".to_string(),
-            "--no-crop".to_string(),
-        ];
-        if cfg!(feature = "gpu") {
-            args.push("--cpu".to_string());
-        }
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let result = run_cli_in(&cwd, &args);
-        assert!(
-            result.success,
-            "shared laplacian run must succeed -- stderr: {}",
-            result.stderr
-        );
-        SharedRun { cwd, out }
-    })
+fn shared_laplacian_run() -> SharedRun {
+    let cwd = common::tmp_dir("review_cli_shared_laplacian");
+    let out = cwd.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let mut args = vec![
+        "stack".to_string(),
+        mantis_512_dir().to_str().unwrap().to_string(),
+        "-o".to_string(),
+        out.to_str().unwrap().to_string(),
+        "--algorithm".to_string(),
+        "laplacian".to_string(),
+        "--no-align".to_string(),
+        "--no-crop".to_string(),
+    ];
+    if cfg!(feature = "gpu") {
+        args.push("--cpu".to_string());
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let result = run_cli_in(&cwd, &args);
+    assert!(
+        result.success,
+        "shared laplacian run must succeed -- stderr: {}",
+        result.stderr
+    );
+    SharedRun { cwd, out }
 }
 
-/// The shared run's own `review --json` document, computed once and reused
-/// by every test that needs a real, independently measured sharpness ratio
-/// to compare a hand-built project against.
-fn shared_review_document() -> &'static serde_json::Value {
-    static ONCE: OnceLock<serde_json::Value> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let run = shared_laplacian_run();
-        let result = run_cli_in(&run.cwd, &["review", run.out.to_str().unwrap(), "--json"]);
-        assert!(result.success, "stderr: {}", result.stderr);
-        serde_json::from_str(&result.stdout).expect("review --json must parse")
-    })
+/// The shared run's own `review --json` document: a real, independently
+/// measured sharpness ratio to compare a hand-built project against.
+fn shared_review_document() -> serde_json::Value {
+    let run = shared_laplacian_run();
+    let result = run_cli_in(&run.cwd, &["review", run.out.to_str().unwrap(), "--json"]);
+    assert!(result.success, "stderr: {}", result.stderr);
+    serde_json::from_str(&result.stdout).expect("review --json must parse")
 }
 
 // --- dummy-stack multi-group helpers, milliseconds each ---------------------
@@ -507,23 +492,71 @@ fn a_completed_but_unmeasured_result_reports_a_metrics_reason() {
 }
 
 #[test]
-fn review_record_has_identity_outcome_sharpness_and_spread() {
+fn review_of_a_real_run_is_measured_and_a_degenerate_stack_scores_lower() {
     let doc = shared_review_document();
     let results = doc["results"].as_array().unwrap();
-    assert_eq!(results.len(), 1, "one group, one record: {results:?}");
+    assert_eq!(
+        results.len(),
+        1,
+        "[real record] one group, one record: {results:?}"
+    );
     let record = &results[0];
     assert!(record["identity"].as_str().is_some_and(|s| !s.is_empty()));
     assert_eq!(record["outcome"], "completed");
     let metrics = &record["metrics"];
-    assert!(!metrics.is_null(), "{record}");
+    assert!(!metrics.is_null(), "[real record] {record}");
     let ratio = metrics["sharpness_ratio"].as_f64().expect("a ratio");
-    assert!(ratio > 0.0, "sharpness ratio must be positive: {ratio}");
+    assert!(
+        ratio > 0.0,
+        "[real record] sharpness ratio must be positive: {ratio}"
+    );
     assert_eq!(metrics["distinct_sources"], 8);
     let coherence = metrics["coherence"].as_f64().expect("a coherence value");
     assert!(
         (0.0..=1.0).contains(&coherence),
-        "coherence must be a fraction: {coherence}"
+        "[real record] coherence must be a fraction: {coherence}"
     );
+
+    // A hand-built stack that repeats one frame scores below the real run.
+    let degenerate_metrics = Metrics {
+        composite_lapvar: Some(1_000.0),
+        max_input_lapvar: Some(50_000.0),
+        lapvar_window: None,
+    };
+    let (dir, project_path) = seal_project(
+        "review_cli_degenerate",
+        degenerate_metrics,
+        4,
+        Some(0), // every pixel picks the same one source -- one frame repeated.
+    );
+    write_manifest(
+        &dir,
+        dir.to_str().unwrap(),
+        &[manifest_entry(
+            "degenerate",
+            "completed",
+            vec![project_path.display().to_string()],
+            0.05,
+            None,
+        )],
+    );
+    let review = run_cli_in(&dir, &["review", dir.to_str().unwrap(), "--json"]);
+    assert!(review.success, "[degenerate] stderr: {}", review.stderr);
+    let degenerate: serde_json::Value = serde_json::from_str(&review.stdout).unwrap();
+    let degenerate_metrics = &degenerate["results"][0]["metrics"];
+    let degenerate_ratio = degenerate_metrics["sharpness_ratio"].as_f64().unwrap();
+    assert!(
+        degenerate_ratio < ratio,
+        "[degenerate] a degenerate stack must score a strictly lower sharpness ratio: \
+         degenerate={degenerate_ratio} real={ratio}"
+    );
+    assert_eq!(
+        degenerate_metrics["distinct_sources"], 1,
+        "[degenerate] one frame repeated uses exactly one distinct source"
+    );
+    // Coherence is deliberately *not* asserted lower here: a single-source
+    // map is perfectly coherent at 1.0, so coherence ranks results only
+    // alongside the source count, never alone.
 }
 
 #[test]
@@ -567,54 +600,6 @@ fn review_values_do_not_depend_on_the_directory_name() {
         doc_a["results"][0]["metrics"], doc_b["results"][0]["metrics"],
         "the same project's metrics must not depend on the reviewing directory's name"
     );
-}
-
-#[test]
-fn a_degenerate_stack_scores_lower_on_sharpness_and_narrower_on_spread() {
-    let real = shared_review_document();
-    let real_ratio = real["results"][0]["metrics"]["sharpness_ratio"]
-        .as_f64()
-        .expect("the real fixture must carry a sharpness ratio");
-
-    let degenerate_metrics = Metrics {
-        composite_lapvar: Some(1_000.0),
-        max_input_lapvar: Some(50_000.0),
-        lapvar_window: None,
-    };
-    let (dir, project_path) = seal_project(
-        "review_cli_degenerate",
-        degenerate_metrics,
-        4,
-        Some(0), // every pixel picks the same one source -- one frame repeated.
-    );
-    write_manifest(
-        &dir,
-        dir.to_str().unwrap(),
-        &[manifest_entry(
-            "degenerate",
-            "completed",
-            vec![project_path.display().to_string()],
-            0.05,
-            None,
-        )],
-    );
-    let review = run_cli_in(&dir, &["review", dir.to_str().unwrap(), "--json"]);
-    assert!(review.success, "stderr: {}", review.stderr);
-    let doc: serde_json::Value = serde_json::from_str(&review.stdout).unwrap();
-    let metrics = &doc["results"][0]["metrics"];
-    let degenerate_ratio = metrics["sharpness_ratio"].as_f64().unwrap();
-    assert!(
-        degenerate_ratio < real_ratio,
-        "a degenerate stack must score a strictly lower sharpness ratio: \
-         degenerate={degenerate_ratio} real={real_ratio}"
-    );
-    assert_eq!(
-        metrics["distinct_sources"], 1,
-        "one frame repeated uses exactly one distinct source"
-    );
-    // Coherence is deliberately *not* asserted lower here: a single-source
-    // map is perfectly coherent at 1.0, so coherence ranks results only
-    // alongside the source count, never alone.
 }
 
 #[test]

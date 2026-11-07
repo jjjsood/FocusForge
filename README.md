@@ -28,13 +28,16 @@
 ## Features
 
 **From shoot to sharp image**
-- Drop in a focus bracket straight from the camera, RAW or 16-bit TIFF, and get one image sharp from front to back
+- Drop in a focus bracket straight from the camera, camera RAW, TIFF or JPEG, and get one image sharp from front to back
 - Shot several subjects in one session? FocusForge sorts the card into separate stacks for you; check the split before it runs
 - Long brackets of high-resolution frames run on an ordinary computer, however much memory the stack would need
 - Shot handheld, or your lens breathes while focusing? Frames are lined up first and the edges trimmed to what every shot covers
 - Flickering light or exposure drift between shots is evened out
-- Three methods to choose from: Details as the all-rounder, Soft transitions for gentler blends between frames, Focus map when you plan to retouch a lot
-- Fast on a graphics card, the same result without one
+- Three methods to choose from: Details as the all-rounder, Soft transitions for gentler blends between frames, Focus map for the most coherent source map to pick from
+- Plan a bracket before shooting: the step calculator turns lens or objective, magnification, overlap and depth range into a focus step, frame count, duration and disk need, in the window or with `focusforge-cli step-plan`
+- See which frames hold the sharpest areas: the Analytics overlay and `focusforge-cli sharp-areas` count them per image
+- Fast on a graphics card, the same result without one; the window also starts where only a software renderer is available
+- RAW stacks keep highlights above white until the final image is written
 
 **Fixing what the stack got wrong**
 - Halos, ghosting or a misplaced bristle? Brush in the right frame by hand with a soft brush
@@ -50,7 +53,9 @@
 
 **Delivering the result**
 - Export TIFF, PNG or JPEG with your camera metadata, colour profile and keywords intact
+- Hand a RAW stack's result to a raw converter as a linear DNG, with exposure and white balance adjustable there
 - If something breaks, FocusForge packs a privacy-safe report you can send in
+- Learn when a newer release exists: a quiet notice at start, or `focusforge-cli check-update`
 
 Details for each are in the [guides](docs/README.md).
 
@@ -58,7 +63,7 @@ Details for each are in the [guides](docs/README.md).
 
 Linux: install the matching `.deb` or run its AppImage from [Releases](https://github.com/jjjsood/FocusForge/releases), or build from source.
 macOS: open the matching `.dmg` from [Releases](https://github.com/jjjsood/FocusForge/releases) and drag it to Applications, or build from source.
-Windows: run the matching `.msi` from [Releases](https://github.com/jjjsood/FocusForge/releases), or build from source. See [getting started](docs/getting-started.md) for paths.
+Windows: run the matching `.msi` from [Releases](https://github.com/jjjsood/FocusForge/releases), or build from source; no Visual C++ redistributable is needed. See [getting started](docs/getting-started.md) for paths.
 
 ## Quick start
 
@@ -111,7 +116,7 @@ auto-crop that precedes fusion are both on by default (`--no-align` /
 `--no-crop` turn them off); `focusforge-cli align` reports the same
 transforms on their own, before any fusion runs. See
 [`docs/guide/stacking.md`](docs/guide/stacking.md) for the other algorithms
-and their parameters, and [`docs/guide/batch-runs.md`](docs/guide/batch-runs.md)
+and their parameters, and [`docs/reference/batch-runs.md`](docs/reference/batch-runs.md)
 for stacking a folder that holds more than one stack.
 
 The Mantis photographs and derived comparison image are used only within this
@@ -126,17 +131,29 @@ target/release/focusforge-gui --open path/to/frames/
 Opens the same folder into a window instead of the command line, one tab
 per detected stack. See [`docs/guide/gui.md`](docs/guide/gui.md).
 
+## Network use
+
+FocusForge makes one network request: at start, in the background, it asks
+the release server whether a newer final release exists. The request is a
+single HTTPS GET that waits at most 5 seconds and carries only the client
+name `FocusForge/<version>`: no identifier, setting or file data. Nothing is
+downloaded or installed, and a failed check stays silent. Turn it off with
+**Settings → About → Check for updates at start**; with it off no request is
+made. **Check now** and `focusforge-cli check-update` run the same check on
+demand.
+
 ## Documentation
 
-See [`docs/`](docs/README.md) for [getting started](docs/getting-started.md)
-and the guides (the window, stacking, alignment, retouching, checkpoint
-history, batch runs, diagnostics) and the
-reference for every `focusforge-cli` subcommand, the project format and the
-TIFF layouts it reads and writes.
+The user manual is an mdBook whose source is in [`docs/`](docs/README.md). It
+covers focus stacking and shooting practice, [getting started](docs/getting-started.md),
+the window, stacking, alignment, retouching, checkpoints, export and
+settings, troubleshooting and a glossary. The appendix is the reference for
+every `focusforge-cli` subcommand, the project format and the TIFF layouts it
+reads and writes.
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for layout, tests and the contribution gate;
+Open pull requests against `develop`. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for layout, tests and the contribution gate;
 [Code of Conduct](CODE_OF_CONDUCT.md), [Security policy](SECURITY.md) and [changelog](CHANGELOG.md) set community standards.
 
 ## License

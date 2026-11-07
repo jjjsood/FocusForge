@@ -9,6 +9,8 @@
 
 mod common;
 
+use common::only_project;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -50,17 +52,6 @@ fn oracle(a: &Path, b: &Path) -> i32 {
 
 fn assert_identical(a: &Path, b: &Path) {
     assert_eq!(oracle(a, b), 0, "{a:?} differs from {b:?}");
-}
-
-fn only_project(dir: &Path) -> PathBuf {
-    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "ffp"))
-        .collect();
-    assert_eq!(found.len(), 1, "exactly one project expected in {dir:?}");
-    found.pop().unwrap()
 }
 
 fn listed(dir: &Path, project: &Path) -> Vec<Value> {

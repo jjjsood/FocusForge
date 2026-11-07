@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // A settings row with one action button on the right and, always reserved
-// beneath it, a one-line status slot in the helper's column.
+// beneath it, a one-line status slot in the helper's column. While `busy` a
+// spinner sits in the label column beside the status text.
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
@@ -9,6 +10,7 @@ import { FFRowLabel } from "ff_row_label.slint";
 import { FFRowText } from "ff_row_text.slint";
 import { FFButton } from "ff_button.slint";
 import { FFStatusText } from "ff_status_text.slint";
+import { FFSpinner } from "ff_spinner.slint";
 
 export component FFSettingsActionRow inherits VerticalLayout {
     in property <string> label: "";
@@ -16,6 +18,7 @@ export component FFSettingsActionRow inherits VerticalLayout {
     in property <string> helper: "";
     in property <string> button-text: "";
     in property <bool> enabled: true;
+    in property <bool> busy: false;
     in property <string> status-text: "";
     // "none" | "success" | "warning" | "failure".
     in property <string> status-tone: "none";
@@ -61,6 +64,11 @@ export component FFSettingsActionRow inherits VerticalLayout {
 
     Rectangle {
         height: ShellGeometry.settings-status-gap + ShellGeometry.settings-status-height;
+
+        if root.busy: FFSpinner {
+            x: ShellGeometry.settings-label-width - Theme.space-2 - self.width;
+            y: ShellGeometry.settings-status-gap + (ShellGeometry.settings-status-height - self.height) / 2;
+        }
 
         status := FFStatusText {
             x: ShellGeometry.settings-label-width;

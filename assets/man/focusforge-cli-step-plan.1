@@ -1,0 +1,39 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH focusforge-cli-step-plan 1  "step-plan 0.2.0-rc.1" 
+.SH NAME
+focusforge\-cli\-step\-plan \- Compute the focus step, frame count, duration and disk need of a focus stack
+.SH SYNOPSIS
+\fBfocusforge\-cli step\-plan\fR [\fB\-\-set\fR] [\fB\-\-json\fR] [\fB\-v \fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Compute the focus step, frame count, duration and disk need of a focus stack.
+.PP
+Depth of field is DOF = 0.55 µm / NA². A lens has NA = 1 / (2 · N · (1 + m)) from its marked f\-stop N and the magnification m; an objective states its NA. The step is DOF · (1 − overlap).
+.SH OPTIONS
+.TP
+\fB\-\-set\fR \fI<KEY=VALUE>\fR
+Set a parameter: `\-\-set key=value`, repeatable. A repeated key is last\-wins
+.TP
+\fB\-\-json\fR
+Print the plan as one JSON object
+.TP
+\fB\-v\fR
+Increase log detail (repeatable)
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Log errors only
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH EXTRA
+Parameters (\-\-set KEY=VALUE):
+  magnification  Magnification (x) (default 1, 0.01 to 100)
+  optics         Optics (default lens, one of lens, objective)
+  aperture       f\-stop (default 8, 0.7 to 64)
+  na             Numerical aperture (NA) (default 0.25, 0.01 to 0.95)
+  overlap        Overlap (fraction of the depth of field) (default 0.25, 0 to 0.9)
+  range_mm       Depth range (mm) (default 5, 0 to 1000)
+  frame_seconds  Time per frame (s) (default 1, 0 to 3600)
+  frame_mb       Size per frame (MB) (default 50, 0 to 2000)
+.SH VERSION
+v0.2.0\-rc.1

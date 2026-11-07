@@ -15,7 +15,7 @@ use focusforge_core::align::{AlignError, Transform};
 use focusforge_core::gpu::{
     AlignBackend, BackendInfo, EccMomentSession, EccSessionRequest, TileBackend,
 };
-use focusforge_core::tile::{Rect, Tile};
+use focusforge_core::tile::{Rect, SampleFormat, Tile};
 
 use crate::budget::{
     DeviceBudget, ProbeOutcome, VramBudget, buffer_limit_shortfalls, device_bytes_per_tile,
@@ -25,7 +25,7 @@ use crate::budget::{
 use crate::device::{GpuError, SharedDevice, block_on, settled_device, shared_device};
 use crate::ecc::{self, EccState};
 use crate::errors;
-use crate::fuse::{self, FusionPipelines};
+use crate::fuse::{self, FusedSample, FusionPipelines};
 use crate::pack::{packed_len, unpack_samples};
 use crate::pipeline::{
     Pipeline, build_pipeline, run_pass, storage_entry, uniform_entry, upload_params,
@@ -52,12 +52,19 @@ pub struct GpuBackend {
     /// The settled budget and its provenance, reported through
     /// [`Self::device_budget`].
     device_budget: DeviceBudget,
+    /// The budget before any ceiling, reported through
+    /// [`Self::probed_budget`].
+    probed_budget: DeviceBudget,
     /// The ECC alignment kernels and the templates their sessions share.
     ecc: EccState,
 }
 
 impl GpuBackend {
-    fn with_budget(device: &'static SharedDevice, device_budget: DeviceBudget) -> Self {
+    fn with_budget(
+        device: &'static SharedDevice,
+        device_budget: DeviceBudget,
+        probed_budget: DeviceBudget,
+    ) -> Self {
         GpuBackend {
             device,
             pipeline: OnceLock::new(),
@@ -65,6 +72,7 @@ impl GpuBackend {
             warp_pipelines: WarpPipelines::new(),
             budget: Arc::new(VramBudget::new(device_budget.bytes())),
             device_budget,
+            probed_budget,
             ecc: EccState::default(),
         }
     }
@@ -91,6 +99,7 @@ impl GpuBackend {
         Ok(GpuBackend::with_budget(
             device,
             device_budget.capped_to(ceiling),
+            device_budget,
         ))
     }
 
@@ -101,10 +110,8 @@ impl GpuBackend {
     /// like a flag-capped `HostBudget` one crate over.
     pub fn with_max_device_bytes(max_device_bytes: u64) -> Result<GpuBackend, &'static GpuError> {
         let device = shared_device()?;
-        Ok(GpuBackend::with_budget(
-            device,
-            DeviceBudget::explicit(max_device_bytes),
-        ))
+        let budget = DeviceBudget::explicit(max_device_bytes);
+        Ok(GpuBackend::with_budget(device, budget, budget))
     }
 
     /// The budget wrapping [`Self::warp_fuse_tile`]'s dispatch -- the
@@ -116,6 +123,13 @@ impl GpuBackend {
     /// The settled device-byte budget and where it came from.
     pub fn device_budget(&self) -> DeviceBudget {
         self.device_budget
+    }
+
+    /// The device-byte budget the probe settled on, before any ceiling: the
+    /// most a ceiling can usefully name. [`Self::device_budget`] is this
+    /// lowered by the ceiling the backend was built with.
+    pub fn probed_budget(&self) -> DeviceBudget {
+        self.probed_budget
     }
 
     /// Refuses a `width x height` read rect at `samples_per_pixel` whose
@@ -190,8 +204,16 @@ impl TileBackend for GpuBackend {
         samples_per_pixel: u32,
         levels: u32,
         transforms: &[Transform],
+        sample_format: SampleFormat,
     ) -> Option<String> {
-        let (bytes, _) = tile_bytes(width, height, samples_per_pixel, levels, transforms);
+        let (bytes, _) = tile_bytes(
+            width,
+            height,
+            samples_per_pixel,
+            levels,
+            transforms,
+            sample_format,
+        );
         tile_shortfall_message(width, height, bytes, self.device_budget.bytes())
     }
 
@@ -314,12 +336,46 @@ impl TileBackend for GpuBackend {
         samples_per_pixel: u32,
         levels: u32,
     ) -> Result<TileOutput, AlgorithmError> {
+        self.warp_fuse::<u16>(reader, frame, transforms, rect, samples_per_pixel, levels)
+    }
+
+    fn warp_fuse_tile_f32(
+        &self,
+        reader: &dyn TileReader,
+        frame: (u32, u32),
+        transforms: &[Transform],
+        rect: Rect,
+        samples_per_pixel: u32,
+        levels: u32,
+    ) -> Result<TileOutput<f32>, AlgorithmError> {
+        self.warp_fuse::<f32>(reader, frame, transforms, rect, samples_per_pixel, levels)
+    }
+
+    fn device_lost(&self) -> bool {
+        self.device.lost()
+    }
+}
+
+impl GpuBackend {
+    /// The body of [`TileBackend::warp_fuse_tile`] and
+    /// [`TileBackend::warp_fuse_tile_f32`]: the budget permit and error
+    /// scopes around one tile, read back as `O`.
+    fn warp_fuse<O: FusedSample>(
+        &self,
+        reader: &dyn TileReader,
+        frame: (u32, u32),
+        transforms: &[Transform],
+        rect: Rect,
+        samples_per_pixel: u32,
+        levels: u32,
+    ) -> Result<TileOutput<O>, AlgorithmError> {
         let (bytes, warped) = tile_bytes(
             rect.width,
             rect.height,
             samples_per_pixel,
             levels,
             transforms,
+            reader.sample_format(),
         );
         self.check_tile(rect.width, rect.height, samples_per_pixel, warped)?;
 
@@ -332,7 +388,7 @@ impl TileBackend for GpuBackend {
         let device = self.device.device();
         let result = errors::with_validation_scope(device, || {
             let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-            let result = crate::stack_tile::warp_fuse_tile_gpu(
+            let result = crate::stack_tile::warp_fuse_tile_gpu::<O>(
                 self.device,
                 &self.warp_pipelines,
                 &self.fuse_pipelines,
@@ -365,10 +421,6 @@ impl TileBackend for GpuBackend {
 
         result
     }
-
-    fn device_lost(&self) -> bool {
-        self.device.lost()
-    }
 }
 
 /// The device bytes of one `width x height` tile, and whether any frame is
@@ -380,10 +432,18 @@ fn tile_bytes(
     samples_per_pixel: u32,
     levels: u32,
     transforms: &[Transform],
+    sample_format: SampleFormat,
 ) -> (u64, bool) {
     let warped = transforms.iter().any(|t| *t != Transform::identity());
     (
-        device_bytes_per_tile(width, height, samples_per_pixel, levels, warped),
+        device_bytes_per_tile(
+            width,
+            height,
+            samples_per_pixel,
+            levels,
+            warped,
+            sample_format,
+        ),
         warped,
     )
 }
@@ -591,10 +651,25 @@ pub fn align_backend_for(
     (Some(lazy), String::new())
 }
 
-/// Reason-led, because [`GpuError::VramExhausted`] (an adapter that cannot
-/// serve the minimum budget) falls back here exactly like a missing adapter.
+/// One short stderr line naming the reason class only: a missing adapter and
+/// [`GpuError::VramExhausted`] (an adapter that cannot serve the minimum
+/// budget) fall back alike. The driver's full text goes to the log, and to
+/// stderr at `-v`.
 fn cpu_fallback_line(reason: &GpuError) -> String {
-    format!("{reason}; continuing on the CPU path")
+    tracing::info!(%reason, "falling back to the CPU path");
+    let class = match reason {
+        GpuError::NoAdapter { .. } => "no usable GPU adapter".to_string(),
+        GpuError::LimitsShort { .. } => "adapter is short on required limits".to_string(),
+        GpuError::RequestDevice(_) => "failed to create wgpu device".to_string(),
+        GpuError::TileTooLarge { .. } => "tile exceeds a device limit".to_string(),
+        GpuError::KernelValidation { kernel, .. } => format!("kernel {kernel} failed validation"),
+        GpuError::Readback { .. } => "readback failed".to_string(),
+        GpuError::DeviceOutOfMemory { .. } => "GPU ran out of device memory mid-run".to_string(),
+        GpuError::VramExhausted { floor_bytes, .. } => {
+            format!("device cannot serve even the minimum VRAM budget of {floor_bytes} bytes")
+        }
+    };
+    format!("{class}; continuing on the CPU path")
 }
 
 #[cfg(test)]
@@ -609,23 +684,42 @@ mod tests {
     use focusforge_core::fuse::laplacian::Laplacian;
 
     #[test]
-    fn cpu_fallback_line_leads_with_the_reason() {
+    fn cpu_fallback_line_names_the_reason_class_without_detail() {
         let exhausted = GpuError::VramExhausted {
             floor_bytes: 268_435_456,
             detail: "allocation refused".to_string(),
         };
         assert_eq!(
             cpu_fallback_line(&exhausted),
-            "device cannot serve even the minimum VRAM budget of 268435456 bytes: \
-             allocation refused; continuing on the CPU path"
+            "device cannot serve even the minimum VRAM budget of 268435456 bytes; \
+             continuing on the CPU path"
+        );
+        let limits = GpuError::LimitsShort {
+            detail: "max_buffer_size 1024 < 2048".to_string(),
+        };
+        assert_eq!(
+            cpu_fallback_line(&limits),
+            "adapter is short on required limits; continuing on the CPU path"
         );
         let no_adapter = GpuError::NoAdapter {
             reason: "no backend available".to_string(),
         };
         assert_eq!(
             cpu_fallback_line(&no_adapter),
-            "no usable GPU adapter: no backend available; continuing on the CPU path"
+            "no usable GPU adapter; continuing on the CPU path"
         );
+    }
+
+    #[test]
+    fn cpu_fallback_line_is_one_short_line_for_a_long_driver_message() {
+        let reason = (1..=12)
+            .map(|n| format!("backend {n}: Err(NotFound) while enumerating adapters"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(reason.len() > 500);
+        let line = cpu_fallback_line(&GpuError::NoAdapter { reason });
+        assert_eq!(line, "no usable GPU adapter; continuing on the CPU path");
+        assert!(!line.contains('\n') && line.len() <= 120, "{line}");
     }
 
     #[test]

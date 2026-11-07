@@ -9,6 +9,8 @@
 
 mod common;
 
+use common::align::resolved_defaults;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -19,7 +21,7 @@ use focusforge_core::align::{
     PyramidalEcc, Transform, align_stack_with, detector_threshold, fit_between,
 };
 use focusforge_core::io::{TiffStack, frame_paths};
-use focusforge_core::params::{self, ParamValues, StackContext};
+use focusforge_core::params::StackContext;
 use focusforge_core::registry;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 
@@ -42,14 +44,6 @@ fn reference_frame_paths(stack_dir: &Path) -> Vec<PathBuf> {
                 .is_some_and(|n| n.contains("IMG_"))
         })
         .collect()
-}
-
-/// `pyramidal-ecc`'s shipped defaults resolved against `ctx`.
-fn resolved_defaults(ctx: &StackContext) -> ParamValues {
-    let algo = registry::find_align("pyramidal-ecc").expect("pyramidal-ecc is registered");
-    let resolved = params::resolve(algo.params(), &ParamValues::new(), ctx)
-        .expect("shipped defaults must resolve cleanly");
-    params::resolved_values(&resolved)
 }
 
 /// Runs `align_stack_with` over the reference stack exactly once per

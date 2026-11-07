@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// A value slider with a numeric readout. `scale: "logarithmic"` adds a
-// decade-tick line below the track and is 14 px taller than the default
-// linear scale. `compact` is the bar form: a track 2 px high (`track-width`
-// wide, 72 px by default), a 10 px thumb and the value as plain text
-// instead of a field.
+// A value slider with a plain-text numeric readout. `scale: "logarithmic"`
+// adds a decade-tick line below the track and is 14 px taller than the
+// default linear scale. `compact` is the bar form: a track 2 px high
+// (`track-width` wide, 72 px by default) and a 10 px thumb.
 
 import { Theme } from "../theme.slint";
-import { FFField } from "ff_field.slint";
 
 export component FFSlider inherits Rectangle {
     in property <string> scale: "linear"; // "linear" | "logarithmic"
@@ -76,17 +74,18 @@ export component FFSlider inherits Rectangle {
             }
         }
 
-        if !root.compact: FFField {
+        if !root.compact: readout := Text {
             x: parent.width - self.width;
             y: 0px;
             width: 60px;
             height: 26px;
             text: root.value-text;
-            disabled: root.disabled;
-            focused: key.has-focus && !root.disabled;
-            invalid: root.invalid;
-            recessed: root.recessed;
-            text-alignment: right;
+            color: root.invalid ? Theme.status-failure : (key.has-focus && !root.disabled) ? Theme.accent-default : Theme.text-primary;
+            opacity: root.disabled ? 0.5 : 1.0;
+            font-size: Theme.text-value.size;
+            font-weight: Theme.text-value.weight;
+            horizontal-alignment: right;
+            vertical-alignment: center;
         }
         if root.compact: Text {
             x: track.width + Theme.space-2;
@@ -119,7 +118,7 @@ export component FFSlider inherits Rectangle {
     // The decade scale line -- logarithmic only, each label placed
     // explicitly rather than through a layout's own `alignment`: `1e-9`
     // flush with the track's own left edge, `1` flush with its right edge
-    // (the readout field starts right after), the two between it centred
+    // (the readout text follows it), the two between it centred
     // on their own third of the track.
     if root.scale == "logarithmic": Rectangle {
         x: 0px;

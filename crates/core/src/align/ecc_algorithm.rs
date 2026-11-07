@@ -85,7 +85,7 @@ use crate::fuse::pyramid::{KERNEL, Plane};
 use crate::params::{EnumVariant, ParamDesc, ParamKind, ParamValue, ParamValues, StackContext};
 use crate::registry::AlignRegistration;
 use crate::tile::plan::{DEFAULT_TILE_SIZE, MAX_LEVELS};
-use crate::tile::{Rect, Tile};
+use crate::tile::{Rect, Sample, SampleFormat};
 use crate::timing::{TimingCounter, measurement_scope, record_level_iterations, record_timing};
 
 /// Pixels the level-0 window extends past the seed's source footprint. Absorbs
@@ -174,8 +174,9 @@ const MAX_REGION_PIXELS: u32 = 1 << 20;
 const LEVEL0_REGION_PIXELS: u32 = 4 * MAX_REGION_PIXELS;
 
 /// The fewest solve-region pixels at which a level is offered to an align
-/// backend. Smaller levels cost less to solve than to hand over.
-const ECC_BACKEND_MIN_REGION_PX: u64 = 1_000_000;
+/// backend that does not ask for another floor. Smaller levels cost less to
+/// solve than to hand over.
+pub(crate) const ECC_BACKEND_MIN_REGION_PX: u64 = 1_000_000;
 const _: () = assert!(ECC_BACKEND_MIN_REGION_PX <= MAX_REGION_PIXELS as u64);
 
 /// The floor on a pyramid level's shorter dimension the `auto`
@@ -230,10 +231,10 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         ParamDesc {
             id: "mode".to_string(),
             label: "Mode".to_string(),
-            help: "Translation-only (2 DOF) or rotation+scale (4 DOF, for \
-                   focus breathing) -- selects which degrees of freedom the \
-                   solver moves inside the one projective Transform; the \
-                   unmoved degrees of freedom stay at their identity values."
+            help: "Translation only follows a camera that shifts between \
+                   shots, while Rotation + Scale also follows the slight turn \
+                   and change of size that refocusing causes (focus \
+                   breathing)."
                 .to_string(),
             kind: ParamKind::Enum {
                 variants: vec![
@@ -251,32 +252,29 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "max-iterations".to_string(),
             label: "Max Iterations".to_string(),
-            help: "The per-level iteration cap. A level that reaches it stops \
-                   short of `epsilon-px` and reports `HitCap`, keeping its last \
-                   transform rather than failing; when its last ten steps were \
-                   flat or oscillating it reports `Stalled` and keeps the best \
-                   correlation transform instead. \
-                   Frames that converge earlier stop on `epsilon-px` and pay \
-                   nothing. On a 61-frame 44.8 MP stack no level needed more \
-                   than 202 iterations."
+            help: "The most correction steps alignment spends on each pyramid \
+                   level of a frame, after which it keeps the best match \
+                   found so far instead of failing, so raising it only costs \
+                   time on frames that are hard to align."
                 .to_string(),
             kind: ParamKind::Int { min: 1, max: 1000 },
             default: ParamValue::Int(400),
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "epsilon-px".to_string(),
             label: "Epsilon (px)".to_string(),
-            help: "Maximum corner displacement in level pixels -- the \
-                   per-iteration step measure the solver converges to, not \
-                   a correlation threshold. Applies at full resolution; \
-                   coarser levels stop at 100 times it."
+            help: "How small, in pixels at full size, a correction step has \
+                   to get before alignment treats a frame as settled, so a \
+                   smaller value aligns more precisely and takes longer."
                 .to_string(),
             kind: ParamKind::Float {
                 min: 1e-9,
@@ -288,16 +286,16 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "pyramid-depth".to_string(),
             label: "Pyramid Depth".to_string(),
-            help: "How many coarser pyramid levels to register through \
-                   before refining at full resolution. `auto` derives the \
-                   depth from the loaded frames: the deepest one whose \
-                   coarsest level keeps the shorter side at 64 px or more, \
-                   so frames shorter than 127 px register at full \
-                   resolution only (0) and a 512 px frame gets 3."
+            help: "How many reduced copies of each frame alignment works \
+                   through before the full-size pass, where automatic picks \
+                   the deepest that keeps the smallest copy at least 64 px \
+                   on its shorter side, so frames under 127 px align at full \
+                   size only and a 512 px frame gets 3."
                 .to_string(),
             kind: ParamKind::Int {
                 min: 0,
@@ -307,6 +305,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: Some(Arc::new(auto_pyramid_depth)),
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "reference-policy".to_string(),
@@ -331,6 +330,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "reference-frame".to_string(),
@@ -358,6 +358,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
     ]
 });
@@ -526,13 +527,17 @@ impl PyramidalEcc {
     ) -> Result<AlignPyramid, AlgorithmError> {
         let _scope = measurement_scope("pyramid_prepare");
         let stack = ctx.stack();
-        AlignPyramid::stream(
-            (stack.width, stack.height, stack.samples_per_pixel),
-            depth,
-            DEFAULT_TILE_SIZE / 2,
-            |rect, out| ctx.read_tile_into(frame, rect, out),
-        )
-        .map_err(|e| match e {
+        let extent = (stack.width, stack.height, stack.samples_per_pixel);
+        let band_rows = DEFAULT_TILE_SIZE / 2;
+        let streamed = match ctx.sample_format() {
+            SampleFormat::U16 => AlignPyramid::stream(extent, depth, band_rows, |rect, out| {
+                ctx.read_tile_into(frame, rect, out)
+            }),
+            SampleFormat::F32 => AlignPyramid::stream(extent, depth, band_rows, |rect, out| {
+                ctx.read_tile_f32_into(frame, rect, out)
+            }),
+        };
+        streamed.map_err(|e| match e {
             StreamError::Read(e) => e,
             StreamError::Pyramid(e) => wrap_error(e),
         })
@@ -663,6 +668,9 @@ impl PyramidalEcc {
         traced: bool,
     ) -> Result<(Attempt, Escalation), AlgorithmError> {
         let frame_pyramid = Self::build_pyramid(ctx, frame, depth)?;
+        if let Some(sink) = ctx.preview() {
+            sink.offer(frame, &frame_pyramid);
+        }
         let first = Self::solve_from(
             ctx,
             frame,
@@ -1139,33 +1147,47 @@ fn read_luma_window(
     frame: usize,
     rect: Rect,
 ) -> Result<Plane, AlgorithmError> {
+    match ctx.sample_format() {
+        SampleFormat::U16 => {
+            luma_window::<u16>(ctx, rect, |out| ctx.read_tile_into(frame, rect, out))
+        }
+        SampleFormat::F32 => {
+            luma_window::<f32>(ctx, rect, |out| ctx.read_tile_f32_into(frame, rect, out))
+        }
+    }
+}
+
+fn luma_window<S: Sample>(
+    ctx: &AlignContext<'_>,
+    rect: Rect,
+    read: impl FnOnce(&mut [S]) -> Result<(), AlgorithmError>,
+) -> Result<Plane, AlgorithmError> {
     let spp = ctx.stack().samples_per_pixel;
-    let mut tile = Tile {
-        rect: Rect {
-            x: 0,
-            y: 0,
-            width: rect.width,
-            height: rect.height,
-        },
-        samples_per_pixel: spp,
-        samples: vec![0u16; rect.width as usize * rect.height as usize * spp as usize],
-    };
+    let mut samples = vec![S::default(); rect.width as usize * rect.height as usize * spp as usize];
     record_timing(
         TimingCounter::AllocationBytes,
-        (tile.samples.capacity() * std::mem::size_of::<u16>()) as u64,
+        (samples.capacity() * std::mem::size_of::<S>()) as u64,
     );
     record_timing(TimingCounter::AllocationOperations, 1);
-    ctx.read_tile_into(frame, rect, &mut tile.samples)?;
+    read(&mut samples)?;
     let mut assembler = LumaAssembler::new(rect.width, rect.height);
-    assembler.push_tile(&tile).map_err(wrap_error)?;
+    let local = Rect {
+        x: 0,
+        y: 0,
+        width: rect.width,
+        height: rect.height,
+    };
+    assembler
+        .push_samples(local, spp, &samples)
+        .map_err(wrap_error)?;
     assembler.finish().map_err(wrap_error)
 }
 
 /// Solves one pyramid level. A template region of at least
-/// [`ECC_BACKEND_MIN_REGION_PX`] pixels is offered to the context's align
-/// backend; a level with no backend, a declined one or a smaller region runs on
-/// the CPU. The off-centre patch checks call [`solve_prepared`] directly and
-/// are never offered.
+/// [`min_ecc_region_px`](crate::gpu::AlignBackend::min_ecc_region_px) pixels
+/// is offered to the context's align backend; a level with no backend, a
+/// declined one or a smaller region runs on the CPU. The off-centre patch
+/// checks call [`solve_prepared`] directly and are never offered.
 fn solve_routed(
     ctx: &AlignContext<'_>,
     template: &EccTemplate,
@@ -1176,8 +1198,10 @@ fn solve_routed(
     mut trace: Option<&mut Vec<EccIteration>>,
 ) -> Result<EccResult, AlgorithmError> {
     let region = template.region();
-    let offered = u64::from(region.width) * u64::from(region.height) >= ECC_BACKEND_MIN_REGION_PX;
-    if let Some(backend) = ctx.align_backend().filter(|_| offered)
+    let pixels = u64::from(region.width) * u64::from(region.height);
+    if let Some(backend) = ctx
+        .align_backend()
+        .filter(|backend| pixels >= backend.min_ecc_region_px())
         && let Some(result) = solve_prepared_on(
             template,
             moving,
@@ -1697,6 +1721,65 @@ mod tests {
         }
     }
 
+    /// [`MemReader`]'s frames served as `f32` only: its `u16` read fails.
+    struct WideReader(MemReader);
+
+    impl TileReader for WideReader {
+        fn sample_format(&self) -> SampleFormat {
+            SampleFormat::F32
+        }
+
+        fn read_tile_into(&self, _: usize, _: Rect, _: &mut [u16]) -> Result<(), AlgorithmError> {
+            Err(AlgorithmError::Failed {
+                algorithm: "wide".to_string(),
+                detail: "serves f32 only".to_string(),
+            })
+        }
+
+        fn read_tile_f32_into(
+            &self,
+            frame: usize,
+            rect: Rect,
+            out: &mut [f32],
+        ) -> Result<(), AlgorithmError> {
+            let mut narrow = vec![0u16; out.len()];
+            self.0.read_tile_into(frame, rect, &mut narrow)?;
+            for (wide, narrow) in out.iter_mut().zip(narrow) {
+                *wide = f32::from(narrow);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ecc_reads_an_f32_serving_context_through_its_f32_read() {
+        let shifts = [(0.0, 0.0), (3.0, -2.0)];
+        let wide = WideReader(reader(W, H, &shifts, false));
+        let narrow = reader(W, H, &shifts, false);
+        let stack = StackContext::new(2, W, H, 1);
+        let mut cfg = crate::params::resolved_values(
+            &crate::params::resolve(PyramidalEcc.params(), &ParamValues::new(), &stack).unwrap(),
+        );
+        cfg.insert("pyramid-depth".to_string(), ParamValue::Int(1));
+        cfg.insert("max-iterations".to_string(), ParamValue::Int(20));
+        cfg.insert(
+            "mode".to_string(),
+            ParamValue::Enum("translation".to_string()),
+        );
+        let found = PyramidalEcc
+            .align_frame(&AlignContext::new(stack, 0, &wide), 1, &cfg)
+            .unwrap();
+        let expected = PyramidalEcc
+            .align_frame(&AlignContext::new(stack, 0, &narrow), 1, &cfg)
+            .unwrap();
+        assert_eq!(found, expected);
+        let (_, _, tx, ty) = found.transform.similarity_parts();
+        assert!(
+            (tx - 3.0).abs() < 0.05 && (ty + 2.0).abs() < 0.05,
+            "({tx}, {ty})"
+        );
+    }
+
     /// The scene's sinusoids: spatial frequency per pixel (x, y), phase,
     /// amplitude and whether it is fine detail.
     const RIPPLES: [(f64, f64, f64, f64, bool); 8] = [
@@ -2044,10 +2127,7 @@ mod tests {
             .unwrap();
         let without = PyramidalEcc.align_frame(&ctx, 1, &cfg).unwrap();
         assert_eq!(with, without);
-        assert!(matches!(
-            with.status,
-            AlignStatus::Converged | AlignStatus::HitCap | AlignStatus::Stalled
-        ));
+        assert_eq!(with.status, AlignStatus::Converged);
     }
 
     #[test]
@@ -2394,10 +2474,7 @@ mod tests {
         let mem = reader(W, H, &[(0.0, 0.0), (3.0, -2.0)], false);
         for mode in [EccMode::Translation, EccMode::Similarity] {
             let (reference, attempt, escalation) = registered(&mem, mode, 2, 1);
-            assert!(matches!(
-                attempt.status,
-                AlignStatus::Converged | AlignStatus::HitCap | AlignStatus::Stalled
-            ));
+            assert_eq!(attempt.status, AlignStatus::Converged, "{mode:?}");
             assert_eq!(escalation, Escalation::default(), "{mode:?}");
             assert!(reference.features.get().is_none(), "{mode:?}");
         }
@@ -2424,13 +2501,7 @@ mod tests {
                 "{mode:?}"
             );
             assert!(reference.features.get().is_some());
-            assert!(
-                matches!(
-                    attempt.status,
-                    AlignStatus::Converged | AlignStatus::HitCap | AlignStatus::Stalled
-                ),
-                "{mode:?}: {attempt:?}"
-            );
+            assert_eq!(attempt.status, AlignStatus::Converged, "{mode:?}");
             let (scale, radians, tx, ty) = attempt.transform.similarity_parts();
             assert!(
                 (tx - 150.0).abs() < 0.05 && (ty + 90.0).abs() < 0.05,
@@ -2438,8 +2509,40 @@ mod tests {
             );
             if mode == EccMode::Translation {
                 assert_eq!((scale, radians), (1.0, 0.0), "a pure translation");
+                prepared_run_matches_unprepared(&mem);
             }
         }
+    }
+
+    /// Aligning frame 1 against a reference built by `prepare_run` gives the
+    /// outcome of aligning without one; the shared reference detects nothing
+    /// until a frame needs its features.
+    fn prepared_run_matches_unprepared(mem: &MemReader) {
+        let stack = StackContext::new(2, W, H, 1);
+        let ctx = AlignContext::new(stack, 0, mem);
+        let mut cfg = crate::params::resolved_values(
+            &crate::params::resolve(PyramidalEcc.params(), &ParamValues::new(), &stack).unwrap(),
+        );
+        cfg.insert("pyramid-depth".to_string(), ParamValue::Int(2));
+        cfg.insert(
+            "mode".to_string(),
+            ParamValue::Enum("translation".to_string()),
+        );
+
+        let prepared = PyramidalEcc.prepare_run(&ctx, &cfg).unwrap().unwrap();
+        let shared = prepared.downcast_ref::<PreparedReference>().unwrap();
+        assert!(shared.features.get().is_none(), "preparing detects nothing");
+        let with = PyramidalEcc
+            .align_frame(
+                &AlignContext::new(stack, 0, mem).with_prepared(Some(&*prepared)),
+                1,
+                &cfg,
+            )
+            .unwrap();
+        assert!(shared.features.get().is_some());
+        let without = PyramidalEcc.align_frame(&ctx, 1, &cfg).unwrap();
+        assert_eq!(with, without);
+        assert_eq!(with.status, AlignStatus::Converged);
     }
 
     #[test]
@@ -2497,10 +2600,7 @@ mod tests {
             },
             "{fit:?}"
         );
-        assert!(
-            !matches!(attempt.status, AlignStatus::Diverged(_)),
-            "{attempt:?}"
-        );
+        assert_eq!(attempt.status, AlignStatus::Converged, "{attempt:?}");
         let (_, _, tx, ty) = attempt.transform.similarity_parts();
         assert!(
             (tx - shift.0).abs() < 0.05 && (ty - shift.1).abs() < 0.05,
@@ -2713,44 +2813,13 @@ mod tests {
         assert_eq!(seed_level(2049, 1367, 5), Some(3));
     }
 
-    #[test]
-    fn a_driver_prepared_reference_gives_the_same_seeded_outcome_as_none() {
-        let mem = blob_reader(&[(0.0, 0.0), (150.0, -90.0)]);
-        let stack = StackContext::new(2, W, H, 1);
-        let ctx = AlignContext::new(stack, 0, &mem);
-        let mut cfg = crate::params::resolved_values(
-            &crate::params::resolve(PyramidalEcc.params(), &ParamValues::new(), &stack).unwrap(),
-        );
-        cfg.insert("pyramid-depth".to_string(), ParamValue::Int(2));
-        cfg.insert(
-            "mode".to_string(),
-            ParamValue::Enum("translation".to_string()),
-        );
-
-        let prepared = PyramidalEcc.prepare_run(&ctx, &cfg).unwrap().unwrap();
-        let shared = prepared.downcast_ref::<PreparedReference>().unwrap();
-        assert!(shared.features.get().is_none(), "preparing detects nothing");
-        let with = PyramidalEcc
-            .align_frame(
-                &AlignContext::new(stack, 0, &mem).with_prepared(Some(&*prepared)),
-                1,
-                &cfg,
-            )
-            .unwrap();
-        assert!(shared.features.get().is_some());
-        let without = PyramidalEcc.align_frame(&ctx, 1, &cfg).unwrap();
-        assert_eq!(with, without);
-        assert!(matches!(
-            with.status,
-            AlignStatus::Converged | AlignStatus::HitCap | AlignStatus::Stalled
-        ));
-    }
-
     /// Records every region offered to it; declines each, or opens a session
-    /// that sums the moments on the CPU.
+    /// that sums the moments on the CPU. Asks for regions of at least
+    /// `min_region_px` pixels.
     struct RecordingBackend {
         offered: std::sync::Mutex<Vec<Rect>>,
         accept: bool,
+        min_region_px: u64,
     }
 
     impl RecordingBackend {
@@ -2758,7 +2827,13 @@ mod tests {
             Self {
                 offered: std::sync::Mutex::new(Vec::new()),
                 accept,
+                min_region_px: ECC_BACKEND_MIN_REGION_PX,
             }
+        }
+
+        fn with_min_region_px(mut self, min_region_px: u64) -> Self {
+            self.min_region_px = min_region_px;
+            self
         }
 
         fn offered(&self) -> Vec<Rect> {
@@ -2767,6 +2842,10 @@ mod tests {
     }
 
     impl AlignBackend for RecordingBackend {
+        fn min_ecc_region_px(&self) -> u64 {
+            self.min_region_px
+        }
+
         fn open_ecc(
             &self,
             request: &EccSessionRequest<'_>,
@@ -2780,18 +2859,21 @@ mod tests {
 
     #[test]
     fn ecc_level_routing_skips_small_regions() {
-        const BIG_W: u32 = 1700;
-        const BIG_H: u32 = 1100;
-        let region0 = PyramidalEcc::solve_region(BIG_W, BIG_H, 0);
-        let region1 = PyramidalEcc::solve_region(BIG_W / 2, BIG_H / 2, 1);
         let pixels = |r: Rect| u64::from(r.width) * u64::from(r.height);
-        assert_eq!((region0.width, region0.height), (1275, 825));
-        assert!(pixels(region0) >= ECC_BACKEND_MIN_REGION_PX);
-        assert!(pixels(region1) < ECC_BACKEND_MIN_REGION_PX);
+        let big_region0 = PyramidalEcc::solve_region(1700, 1100, 0);
+        let big_region1 = PyramidalEcc::solve_region(1700 / 2, 1100 / 2, 1);
+        assert_eq!((big_region0.width, big_region0.height), (1275, 825));
+        assert!(pixels(big_region0) >= ECC_BACKEND_MIN_REGION_PX);
+        assert!(pixels(big_region1) < ECC_BACKEND_MIN_REGION_PX);
+
+        const SIDE: u32 = 256;
+        let region0 = PyramidalEcc::solve_region(SIDE, SIDE, 0);
+        let region1 = PyramidalEcc::solve_region(SIDE / 2, SIDE / 2, 1);
+        assert_eq!((pixels(region0), pixels(region1)), (36_864, 9_216));
 
         let shift = (0.4, -0.3);
-        let mem = reader(BIG_W, BIG_H, &[(0.0, 0.0), shift], false);
-        let stack = StackContext::new(2, BIG_W, BIG_H, 1);
+        let mem = reader(SIDE, SIDE, &[(0.0, 0.0), shift], false);
+        let stack = StackContext::new(2, SIDE, SIDE, 1);
         let config = |policy: &str| {
             let mut cfg = crate::params::resolved_values(
                 &crate::params::resolve(PyramidalEcc.params(), &ParamValues::new(), &stack)
@@ -2826,11 +2908,19 @@ mod tests {
         };
 
         let plain = run("anchor", None);
-        let declining = RecordingBackend::new(false);
-        assert_eq!(run("anchor", Some(&declining)), plain);
-        assert_eq!(declining.offered(), vec![region0]);
+        let shipped = RecordingBackend::new(false);
+        run("anchor", Some(&shipped));
+        assert_eq!(shipped.offered(), vec![], "the default threshold is 1e6 px");
 
-        let accepting = RecordingBackend::new(true);
+        let at_the_boundary = RecordingBackend::new(false).with_min_region_px(pixels(region0));
+        assert_eq!(run("anchor", Some(&at_the_boundary)), plain);
+        assert_eq!(at_the_boundary.offered(), vec![region0]);
+
+        let one_above = RecordingBackend::new(false).with_min_region_px(pixels(region0) + 1);
+        assert_eq!(run("anchor", Some(&one_above)), plain);
+        assert_eq!(one_above.offered(), vec![]);
+
+        let accepting = RecordingBackend::new(true).with_min_region_px(pixels(region0));
         let chained = run("chain", Some(&accepting));
         assert_eq!(accepting.offered(), vec![region0]);
         let m = chained.frames[1].transform.m;
@@ -2838,8 +2928,11 @@ mod tests {
         assert!((m[1][2] - shift.1).abs() < 0.05, "y {}", m[1][2]);
     }
 
-    /// Opens sessions whose first `moments` call reports a lost device.
-    struct LosingBackend;
+    /// Opens sessions whose first `moments` call reports a lost device; asks
+    /// for regions of at least `min_region_px` pixels.
+    struct LosingBackend {
+        min_region_px: u64,
+    }
 
     struct LostSession;
 
@@ -2852,6 +2945,10 @@ mod tests {
     }
 
     impl AlignBackend for LosingBackend {
+        fn min_ecc_region_px(&self) -> u64 {
+            self.min_region_px
+        }
+
         fn open_ecc(
             &self,
             _request: &EccSessionRequest<'_>,
@@ -2862,11 +2959,10 @@ mod tests {
 
     #[test]
     fn align_stage_reruns_on_cpu_after_a_backend_loss() {
-        const BIG_W: u32 = 1700;
-        const BIG_H: u32 = 1100;
+        const SIDE: u32 = 256;
         let shifts = [(0.0, 0.0), (0.6, -0.2), (-0.35, 0.45)];
-        let mem = reader(BIG_W, BIG_H, &shifts, false);
-        let stack = StackContext::new(3, BIG_W, BIG_H, 1);
+        let mem = reader(SIDE, SIDE, &shifts, false);
+        let stack = StackContext::new(3, SIDE, SIDE, 1);
         let mut cfg = crate::params::resolved_values(
             &crate::params::resolve(PyramidalEcc.params(), &ParamValues::new(), &stack).unwrap(),
         );
@@ -2898,14 +2994,14 @@ mod tests {
         assert_eq!(plain.rerun_reason, None);
 
         let done = Arc::new(AtomicUsize::new(0));
-        let rerun = run(Some(&LosingBackend), &done);
+        let rerun = run(Some(&LosingBackend { min_region_px: 1 }), &done);
         assert_eq!(rerun.alignment, plain.alignment);
         assert!(!rerun.backend_used);
         let reason = rerun.rerun_reason.expect("the loss is reported");
         assert!(reason.contains("the device was lost"), "{reason}");
         assert_eq!(done.load(Ordering::SeqCst), stack.frame_count);
 
-        let accepting = RecordingBackend::new(true);
+        let accepting = RecordingBackend::new(true).with_min_region_px(1);
         let accepted = run(Some(&accepting), &Arc::new(AtomicUsize::new(0)));
         assert!(accepted.backend_used);
         assert_eq!(accepted.rerun_reason, None);

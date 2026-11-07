@@ -17,15 +17,7 @@ use slint::ComponentHandle;
 /// otherwise reports 800 x 600 until set (`i-slint-backend-testing`
 /// 1.17.1's `TestingWindow`).
 fn app_at(width: u32, height: u32) -> AppWindow {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window()
         .set_size(slint::PhysicalSize::new(width, height));
@@ -183,7 +175,8 @@ fn checkpoint_panel_touches_no_storage() {
     // panel lists, beside `job.rs`, which reads its planes, and `brush.rs`,
     // which builds the stored stroke's path in core's own point type.
     // `performance_settings.rs` parses its cap strings with core's size
-    // syntax. Excluded by name: this test's own subject is the checkpoint
+    // syntax. `calculator.rs` plans through core's step calculator.
+    // Excluded by name: this test's own subject is the checkpoint
     // panel, not the whole crate. Source preview reductions also read frames.
     let canvas_files = [
         "checkpoints.rs",
@@ -199,6 +192,8 @@ fn checkpoint_panel_touches_no_storage() {
         "source_previews.rs",
         "overlay.rs",
         "performance_settings.rs",
+        "calculator.rs",
+        "analytics.rs",
         "recent.rs",
         "settings.rs",
     ];
@@ -1138,16 +1133,7 @@ fn px_for_rows(rows: usize) -> f32 {
 /// way the running app fills them.
 fn input_map_window(width: u32, height: u32, controller: &AppController) -> AppWindow {
     let app = app_at(width, height);
-    let rows: Vec<focusforge_gui::InputRow> = controller
-        .input_rows()
-        .into_iter()
-        .map(|r| focusforge_gui::InputRow {
-            input: r.input.into(),
-            stacking: r.stacking.into(),
-            editor: r.editor.into(),
-        })
-        .collect();
-    app.set_input_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    focusforge_gui::bridge::push_input_map_view(&app, controller);
     app.set_settings_open(true);
     app.set_settings_section("input-map".into());
     app
@@ -1244,6 +1230,124 @@ fn input_map_tab_shows_the_controller_rows() {
     }
 }
 
+/// The status lines at the top of the tab, top to bottom: the provenance
+/// line, then one per refusal.
+fn input_map_status_lines(tab: &ElementHandle) -> Vec<String> {
+    by_position(tab.query_descendants().match_type_name("FFStatusText"))
+        .iter()
+        .map(|line| line.accessible_label().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Installs what `input_config::load` made of `config_dir` on `controller`
+/// the way the running app does.
+fn install_loaded(controller: &mut AppController, config_dir: &std::path::Path) {
+    let loaded = focusforge_gui::input_config::load(config_dir);
+    controller.install_input_table(loaded.table);
+    controller.install_input_source(&loaded.provenance, &loaded.problems);
+}
+
+/// A controller never given a source shows the built-in line; one given a
+/// settings file with a changed binding names that file and the count.
+#[test]
+fn input_map_tab_shows_where_the_bindings_come_from() {
+    let fresh = AppController::new();
+    let app = input_map_window(1440, 900, &fresh);
+    assert_eq!(
+        input_map_status_lines(&input_map_tab(&app)),
+        ["Built-in bindings."]
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.toml");
+    fs::write(
+        &path,
+        "[input]\n[[input.bindings]]\ntrigger = \"shift+wheel\"\nstacking = \"pan\"\n",
+    )
+    .unwrap();
+    let mut controller = AppController::new();
+    install_loaded(&mut controller, dir.path());
+    let app = input_map_window(1440, 900, &controller);
+    assert_eq!(
+        input_map_status_lines(&input_map_tab(&app)),
+        [format!(
+            "Read from {}: 1 binding differs from the built-in ones.",
+            path.display()
+        )]
+    );
+
+    let no_table = tempfile::tempdir().unwrap();
+    fs::write(no_table.path().join("settings.toml"), "[recent]\n").unwrap();
+    let mut controller = AppController::new();
+    install_loaded(&mut controller, no_table.path());
+    let app = input_map_window(1440, 900, &controller);
+    assert_eq!(
+        input_map_status_lines(&input_map_tab(&app)),
+        ["Built-in bindings."],
+        "a settings file without an [input] table supplies no bindings"
+    );
+
+    let unchanged = tempfile::tempdir().unwrap();
+    fs::write(unchanged.path().join("settings.toml"), "[input]\n").unwrap();
+    let mut controller = AppController::new();
+    install_loaded(&mut controller, unchanged.path());
+    let app = input_map_window(1440, 900, &controller);
+    assert_eq!(
+        input_map_status_lines(&input_map_tab(&app)),
+        [format!(
+            "Read from {}: 0 bindings differ from the built-in ones.",
+            unchanged.path().join("settings.toml").display()
+        )]
+    );
+}
+
+/// A refused `[input]` table opens on the built-in rows with the built-in
+/// line and one failure line per problem, as `load` words it.
+#[test]
+fn input_map_tab_names_a_refused_table() {
+    let cases = [
+        (
+            "unknown trigger",
+            "[input]\n[[input.bindings]]\ntrigger = \"banana-drag\"\nstacking = \"pan\"\n",
+        ),
+        (
+            "duplicate trigger",
+            "[input]\n[[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"pan\"\n\
+             [[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"zoom-at-cursor\"\n",
+        ),
+        ("unparsable TOML", "[input\n"),
+    ];
+    let tab_source =
+        fs::read_to_string(common::ui_dir().join("shell/settings_modal/input_map_tab.slint"))
+            .unwrap();
+    assert!(
+        tab_source.contains("tone: \"failure\""),
+        "the refusal lines draw in the failure tone"
+    );
+
+    for (label, body) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("settings.toml"), body).unwrap();
+        let loaded = focusforge_gui::input_config::load(dir.path());
+        assert!(!loaded.problems.is_empty(), "{label}: the table is refused");
+        let mut expected = vec!["Built-in bindings.".to_string()];
+        expected.extend(loaded.problems.iter().map(ToString::to_string));
+
+        let mut controller = AppController::new();
+        install_loaded(&mut controller, dir.path());
+        let app = input_map_window(1440, 900, &controller);
+        let tab = input_map_tab(&app);
+        assert_eq!(input_map_status_lines(&tab), expected, "{label}");
+
+        let rows: Vec<[String; 3]> = AppController::new()
+            .input_rows()
+            .into_iter()
+            .map(|row| [row.input, row.stacking, row.editor])
+            .collect();
+        assert_eq!(&input_map_cells(&tab)[1..], rows, "{label}: built-in rows");
+    }
+}
+
 /// A 1 px rule sits directly under the header and under every row, the last
 /// one included.
 #[test]
@@ -1300,19 +1404,20 @@ fn input_map_rows_stay_inside_the_content_area() {
     }
 }
 
-/// Under the Projects overview a failure shows no toast and stays unread,
-/// and the closed toast never blocks a click on the card underneath it.
+/// A failure raised under the Projects overview shows no toast and stays
+/// unread, and the toast it leaves closed never blocks a click on the card
+/// underneath it.
 #[test]
-fn projects_suppresses_a_failure_toast_and_keeps_it_unread() {
+fn a_suppressed_toast_never_blocks_a_card_click() {
     let mut controller = common::controller_with_frames("shell_projects_failure", 3);
-    controller.set_align_algorithm("dummy-align");
     controller.toggle_projects_overlay();
     assert!(controller.start_fuse());
+    let refused = controller
+        .add_frames(&[common::fixture_frame("mantis-64", 0)])
+        .expect_err("a running job refuses an add");
     assert!(
-        controller
-            .add_frames(&[common::fixture_frame("mantis-64", 4)])
-            .is_err(),
-        "a running job refuses an add"
+        matches!(refused, focusforge_gui::entry::ImportRefused::JobRunning),
+        "{refused:?}"
     );
     common::wait_for_settle(&mut controller, std::time::Duration::from_secs(60));
     let controller: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
@@ -1882,6 +1987,33 @@ fn transport() {
     assert_rect(&app, "FFToolbar::cancel-button", (186.0, 43.0, 116.0, 26.0));
 }
 
+/// The stacking toolbar carries the run's transport only: no "Save checkpoint"
+/// text in any run state, while the editor toolbar keeps its real button.
+#[test]
+fn stacking_toolbar_has_no_save_checkpoint_caption() {
+    let app = app_at(1440, 900);
+    app.set_show_empty_state(false);
+    app.set_mode("stacking".into());
+    for state in ["idle", "running", "paused", "failed", "queued"] {
+        app.set_toolbar_run_state(state.into());
+        for label in ["Save checkpoint", "Fuse stack · Save checkpoint"] {
+            assert_eq!(
+                ElementHandle::find_by_accessible_label(&app, label).count(),
+                0,
+                "{label:?} must not be drawn in the {state} state"
+            );
+        }
+    }
+    app.set_mode("editor".into());
+    let buttons = ElementHandle::find_by_accessible_label(&app, "Save checkpoint")
+        .filter(|e| e.accessible_role() == Some(AccessibleRole::Button))
+        .count();
+    assert_eq!(
+        buttons, 1,
+        "the editor toolbar keeps its Save checkpoint button"
+    );
+}
+
 /// The bottom bar's progress track, in reading order (stage -> step -> bar
 /// -> ETA), at the base width and at the 1200px minimum: the bar's width is
 /// dynamic, always ending `Theme.space-4` before the ETA.
@@ -2143,9 +2275,36 @@ fn performance_placeholders(tab: &ElementHandle) -> Vec<String> {
     .collect()
 }
 
-/// The tab draws what the controller's view holds: the switch, both cap
-/// fields (or their placeholders) and the three read-only figures, whichever
-/// way the stored settings are.
+fn performance_unit_menus(tab: &ElementHandle) -> Vec<ElementHandle> {
+    by_position(
+        tab.query_descendants()
+            .match_accessible_role(AccessibleRole::Combobox),
+    )
+}
+
+/// The row of an open unit list that reads `label`.
+fn open_unit_option(tab: &ElementHandle, label: &str) -> ElementHandle {
+    tab.query_descendants()
+        .match_id("FFMenuList::option-row")
+        .find_all()
+        .into_iter()
+        .find(|row| row.accessible_label().as_deref() == Some(label))
+        .unwrap_or_else(|| panic!("no {label:?} row in an open unit list"))
+}
+
+fn performance_texts(tab: &ElementHandle) -> Vec<String> {
+    by_position(
+        tab.query_descendants()
+            .match_accessible_role(AccessibleRole::Text),
+    )
+    .iter()
+    .map(|text| text.accessible_label().unwrap_or_default().to_string())
+    .collect()
+}
+
+/// The tab draws what the controller's view holds: the switch, a number and a
+/// unit for each memory limit (or the placeholder), and the backend row,
+/// whichever way the stored settings are.
 #[test]
 fn performance_tab_shows_the_controller_view() {
     let mut on = AppController::new();
@@ -2155,7 +2314,10 @@ fn performance_tab_shows_the_controller_view() {
     capped.set_host_memory_cap("2GiB");
     capped.set_vram_cap("512MiB");
 
-    for (controller, gpu, caps) in [(on, true, ["", ""]), (capped, false, ["2GiB", "512MiB"])] {
+    for (controller, gpu, caps, placeholders) in [
+        (on, true, None, vec!["Not probed yet"]),
+        (capped, false, Some((["2", "512"], ["GiB", "MiB"])), vec![]),
+    ] {
         let view = controller.performance_view();
         assert_eq!(view.gpu, gpu);
         let shared: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
@@ -2163,26 +2325,65 @@ fn performance_tab_shows_the_controller_view() {
         let tab = performance_tab(&app);
 
         assert_eq!(performance_switch_is_on(&tab), gpu);
-        let texts: Vec<String> = performance_cap_inputs(&tab)
+        let numbers: Vec<String> = performance_cap_inputs(&tab)
             .iter()
             .map(|input| input.accessible_value().unwrap_or_default().to_string())
             .collect();
-        assert_eq!(texts, caps);
-        let placeholders = performance_placeholders(&tab);
-        if gpu {
-            assert_eq!(placeholders, ["No cap", "No cap"]);
-        } else {
-            assert!(placeholders.is_empty(), "{placeholders:?}");
-        }
         assert_eq!(
-            performance_row_texts(&tab),
+            numbers,
+            [view.host_cap.text.clone(), view.vram_cap.text.clone()]
+        );
+        let units: Vec<(String, String)> = performance_unit_menus(&tab)
+            .iter()
+            .map(|menu| {
+                (
+                    menu.accessible_label().unwrap_or_default().to_string(),
+                    menu.accessible_value().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            units,
             [
-                view.backend.as_str(),
-                view.host_budget.as_str(),
-                view.vram_budget.as_str()
+                (
+                    "Host memory unit".to_string(),
+                    view.host_cap.unit.label().to_string()
+                ),
+                (
+                    "VRAM unit".to_string(),
+                    view.vram_cap.unit.label().to_string()
+                ),
             ]
         );
-        assert_eq!(view.vram_budget, "Not probed yet");
+        match caps {
+            Some((expected_numbers, expected_units)) => {
+                assert_eq!(numbers, expected_numbers);
+                assert_eq!(
+                    [view.host_cap.unit.label(), view.vram_cap.unit.label()],
+                    expected_units
+                );
+            }
+            None => {
+                assert!(
+                    !numbers[0].is_empty() && numbers[0].bytes().all(|b| b.is_ascii_digit()),
+                    "the host row shows the default budget: {numbers:?}"
+                );
+                assert_eq!(numbers[1], "", "the VRAM row has no number before a probe");
+            }
+        }
+        assert_eq!(performance_placeholders(&tab), placeholders);
+        assert_eq!(performance_row_texts(&tab), [view.backend.as_str()]);
+        let texts = performance_texts(&tab);
+        for label in ["Host memory", "VRAM"] {
+            assert!(
+                texts.iter().any(|text| text == label),
+                "no {label:?} in {texts:?}"
+            );
+        }
+        assert!(
+            texts.iter().all(|text| !text.contains("budget")),
+            "the tab has no budget row: {texts:?}"
+        );
     }
 }
 
@@ -2207,11 +2408,16 @@ fn performance_tab_composes_only_shared_components() {
         "FFSettingsSection {",
         "FFSettingsRow {",
         "FFToggle {",
-        "FFTextField {",
+        "FFSizeField {",
+        "FFErrorRow {",
+        "FFMenuList {",
         "FFRowText {",
         "FFStatusText {",
     ] {
         assert!(tab.contains(shared), "the tab does not draw {shared}");
+    }
+    for gone in ["FFTextField {", "Host budget", "VRAM budget"] {
+        assert!(!tab.contains(gone), "the tab still has {gone}");
     }
 }
 
@@ -2268,7 +2474,7 @@ fn storage_tab_shows_the_controller_view() {
     fs::write(config.join("settings.toml"), "").unwrap();
     let mut controller = AppController::new();
     controller.install_recent(Vec::new(), config);
-    controller.set_diagnostics_dirs(Some(data.clone()), None);
+    controller.set_diagnostics_dirs(Some(data.clone()));
     controller.set_scratch_root_for_test(data.join("scratch"));
 
     let view = controller.storage_view();
@@ -2377,13 +2583,28 @@ fn type_into(app: &AppWindow, text: &str) {
     }
 }
 
-/// Clicking the switch asks for the opposite setting, and typing in a cap
-/// field reports every edit with the cursor's new position.
+fn press_key(app: &AppWindow, key: slint::platform::Key) {
+    use slint::platform::WindowEvent;
+    let text: slint::SharedString = key.into();
+    app.window()
+        .dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+    app.window()
+        .dispatch_event(WindowEvent::KeyReleased { text });
+}
+
+/// Clicking the switch asks for the opposite setting. Typing in a number
+/// reports every accepted digit with the cursor's new position and commits
+/// nothing; leaving the number or pressing Enter commits once each, and
+/// picking a unit reports it.
 #[test]
 fn performance_controls_report_to_their_callbacks() {
+    use slint::platform::{Key, PointerEventButton, WindowEvent};
+
     let controller = AppController::new();
     let shared: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
     let app = performance_window(&shared);
+    app.window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(true));
     let tab = performance_tab(&app);
 
     let toggled = std::rc::Rc::new(std::cell::RefCell::new(Vec::<bool>::new()));
@@ -2401,6 +2622,16 @@ fn performance_controls_report_to_their_callbacks() {
         let edits = vram_edits.clone();
         move |text| edits.borrow_mut().push(text.to_string())
     });
+    let commits = std::rc::Rc::new(std::cell::Cell::new(0));
+    app.on_performance_cap_committed({
+        let commits = commits.clone();
+        move || commits.set(commits.get() + 1)
+    });
+    let host_units = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    app.on_performance_host_unit_selected({
+        let units = host_units.clone();
+        move |unit| units.borrow_mut().push(unit.to_string())
+    });
     let cursors = std::rc::Rc::new(std::cell::RefCell::new(Vec::<(char, f32, f32)>::new()));
     app.on_performance_host_cap_cursor_moved({
         let cursors = cursors.clone();
@@ -2416,16 +2647,36 @@ fn performance_controls_report_to_their_callbacks() {
         .match_id("FFToggle::area")
         .find_first()
         .expect("the switch has a touch area")
-        .mock_single_click(slint::platform::PointerEventButton::Left);
+        .mock_single_click(PointerEventButton::Left);
     assert_eq!(*toggled.borrow(), [!before]);
 
     let inputs = performance_cap_inputs(&tab);
-    inputs[0].mock_single_click(slint::platform::PointerEventButton::Left);
-    type_into(&app, "2G");
-    inputs[1].mock_single_click(slint::platform::PointerEventButton::Left);
+    let shown = inputs[0].accessible_value().unwrap_or_default();
+    inputs[0].mock_single_click(PointerEventButton::Left);
+    type_into(&app, "2G5");
+    assert_eq!(
+        *host_edits.borrow(),
+        [format!("{shown}2"), format!("{shown}25")],
+        "the letter is not accepted into the number"
+    );
+    slint::platform::update_timers_and_animations();
+    assert_eq!(commits.get(), 0, "typing commits nothing");
+
+    inputs[1].mock_single_click(PointerEventButton::Left);
+    slint::platform::update_timers_and_animations();
+    assert_eq!(commits.get(), 1, "leaving the host number commits once");
     type_into(&app, "5");
-    assert_eq!(*host_edits.borrow(), ["2", "2G"]);
     assert_eq!(*vram_edits.borrow(), ["5"]);
+    assert_eq!(commits.get(), 1, "typing commits nothing");
+    press_key(&app, Key::Return);
+    assert_eq!(commits.get(), 2, "Enter commits once");
+
+    assert!(host_units.borrow().is_empty(), "no unit was picked yet");
+    let mut state = app.get_performance();
+    state.host_cap.unit_open = true;
+    app.set_performance(state);
+    open_unit_option(&tab, "GiB").mock_single_click(PointerEventButton::Left);
+    assert_eq!(*host_units.borrow(), ["GiB"]);
 
     let cursors = cursors.borrow();
     let host: Vec<_> = cursors.iter().filter(|c| c.0 == 'h').collect();
@@ -2438,10 +2689,92 @@ fn performance_controls_report_to_their_callbacks() {
         vram.last().is_some_and(|c| c.1 > 0.0),
         "typing moves the VRAM cursor right: {vram:?}"
     );
-    let visible = 136.0 - 2.0 * 6.0;
+    let visible = 112.0 - 2.0 * 6.0;
     assert!(
         cursors.iter().all(|c| (c.2 - visible).abs() < EPS),
         "the visible width is the field less its two insets: {cursors:?}"
+    );
+}
+
+/// Confirming a number the system cannot give clamps the row, and the field
+/// shows the clamped value rather than the digits that were typed.
+#[test]
+fn cap_field_shows_the_clamped_value_after_an_edit() {
+    use focusforge_gui::SettingsSection;
+    use slint::platform::{Key, PointerEventButton};
+
+    let rig = settings_escape::rig();
+    rig.open_settings(SettingsSection::Performance);
+    focusforge_gui::bridge::push_performance_view(&rig.app, &rig.controller);
+    let tab = performance_tab(&rig.app);
+    let host = performance_cap_inputs(&tab).remove(0);
+
+    let shown = host.accessible_value().unwrap_or_default();
+    host.mock_single_click(PointerEventButton::Left);
+    type_into(&rig.app, "99999999");
+    assert_eq!(
+        host.accessible_value().as_deref(),
+        Some(format!("{shown}99999999").as_str())
+    );
+    press_key(&rig.app, Key::Return);
+
+    let view = rig.controller.lock().unwrap().performance_view();
+    assert_ne!(view.host_cap.text, "99999999", "the number was clamped");
+    assert!(
+        view.host_cap.limit.starts_with("Max "),
+        "{:?}",
+        view.host_cap.limit
+    );
+    assert_eq!(
+        host.accessible_value().as_deref(),
+        Some(view.host_cap.text.as_str()),
+        "the field shows the view's number, not the typed digits"
+    );
+    let lines: Vec<String> = by_position(
+        tab.query_descendants()
+            .match_type_name("FFErrorRow")
+            .match_descendants()
+            .match_accessible_role(AccessibleRole::Text),
+    )
+    .iter()
+    .map(|line| line.accessible_label().unwrap_or_default().to_string())
+    .collect();
+    assert_eq!(
+        lines,
+        [view.host_cap.limit.as_str()],
+        "the line names the maximum"
+    );
+}
+
+/// A unit picked while a typed number is unconfirmed commits it in that unit;
+/// a clamp there shows the clamped value in the field too.
+#[test]
+fn cap_field_shows_the_clamped_value_after_a_unit_pick() {
+    use focusforge_gui::SettingsSection;
+    use slint::platform::PointerEventButton;
+
+    let rig = settings_escape::rig();
+    rig.open_settings(SettingsSection::Performance);
+    focusforge_gui::bridge::push_performance_view(&rig.app, &rig.controller);
+    let tab = performance_tab(&rig.app);
+    let host = performance_cap_inputs(&tab).remove(0);
+
+    host.mock_single_click(PointerEventButton::Left);
+    type_into(&rig.app, "99999999");
+    rig.controller.lock().unwrap().toggle_host_unit_list();
+    focusforge_gui::bridge::push_performance_view(&rig.app, &rig.controller);
+    open_unit_option(&tab, "GiB").mock_single_click(PointerEventButton::Left);
+
+    let view = rig.controller.lock().unwrap().performance_view();
+    assert!(
+        view.host_cap.limit.starts_with("Max "),
+        "{:?}",
+        view.host_cap.limit
+    );
+    assert_eq!(
+        host.accessible_value().as_deref(),
+        Some(view.host_cap.text.as_str()),
+        "the field shows the view's number, not the typed digits"
     );
 }
 
@@ -2575,15 +2908,16 @@ fn about_tab_shows_the_build_metadata() {
         "the source is the repository without its scheme"
     );
     let notice = |version: &str| -> Vec<String> {
-        vec![
-            "FOCUSFORGE".to_string(),
-            format!("Version | {version}"),
-            "License | GPL-3.0".to_string(),
-            "NOTICE".to_string(),
-            "Copyright © 2026 Johannes Sood".to_string(),
-            ABOUT_REDISTRIBUTE.to_string(),
-            ABOUT_WARRANTY.to_string(),
-        ]
+        let mut rows = about_rows_around(version, "", &[]);
+        rows.extend(
+            [
+                "Copyright © 2026 Johannes Sood",
+                ABOUT_REDISTRIBUTE,
+                ABOUT_WARRANTY,
+            ]
+            .map(String::from),
+        );
+        rows
     };
     assert_eq!(rest, notice(version));
 
@@ -2595,6 +2929,162 @@ fn about_tab_shows_the_build_metadata() {
     let (source_row, rest) = rows.split_last().unwrap();
     assert_eq!(source_row, "Source | example.org/x");
     assert_eq!(rest, notice("9.9.9"));
+}
+
+/// The rows from the top of the tab through the NOTICE heading: the Check now
+/// row (an empty label and value column around its button), its status line,
+/// then `result`.
+fn about_rows_around(version: &str, status: &str, result: &[&str]) -> Vec<String> {
+    let mut rows: Vec<String> = [
+        "FOCUSFORGE",
+        &format!("Version | {version}"),
+        "License | GPL-3.0",
+        "UPDATES",
+        "Check for updates at start",
+        " |  | Check now",
+        status,
+    ]
+    .map(String::from)
+    .into();
+    rows.extend(result.iter().map(|row| row.to_string()));
+    rows.push("NOTICE".into());
+    rows
+}
+
+/// The spinners inside the About tab.
+fn spinners(app: &AppWindow) -> usize {
+    let tab = ElementQuery::from_root(app)
+        .match_descendants()
+        .match_type_name("FFAboutTab")
+        .find_first()
+        .expect("no FFAboutTab element found");
+    tab.query_descendants()
+        .match_type_name("FFSpinner")
+        .find_all()
+        .len()
+}
+
+/// The update controls draw what the controller's state says: the status slot
+/// and the spinner while checking, the two-line result row for a newer
+/// version, one line for a failure, and the save error with its follow-up.
+#[test]
+fn about_tab_draws_the_update_states() {
+    use focusforge_gui::UpdateControlsState;
+    let version = env!("CARGO_PKG_VERSION");
+    let app = about_window();
+    // Rows below the viewport are not drawn, so a state's rows are read down
+    // to the NOTICE heading, which every state keeps in view.
+    let draw = |state: UpdateControlsState| {
+        app.set_update_controls(state);
+        let mut rows = about_rows(&app);
+        let notice = rows.iter().position(|row| row == "NOTICE").unwrap();
+        rows.truncate(notice + 1);
+        rows
+    };
+    let idle = UpdateControlsState {
+        check_on_start: true,
+        check_enabled: true,
+        status_tone: "none".into(),
+        ..Default::default()
+    };
+
+    assert_eq!(draw(idle.clone()), about_rows_around(version, "", &[]));
+    assert_eq!(spinners(&app), 0, "idle");
+
+    let checking = draw(UpdateControlsState {
+        checking: true,
+        check_enabled: false,
+        status: "Checking for updates…".into(),
+        ..idle.clone()
+    });
+    assert_eq!(
+        checking,
+        about_rows_around(version, "Checking for updates…", &[])
+    );
+    assert_eq!(spinners(&app), 1, "checking");
+
+    let up_to_date = draw(UpdateControlsState {
+        status: "FocusForge is up to date.".into(),
+        status_tone: "success".into(),
+        ..idle.clone()
+    });
+    assert_eq!(
+        up_to_date,
+        about_rows_around(version, "FocusForge is up to date.", &[])
+    );
+    assert_eq!(spinners(&app), 0, "up to date");
+
+    let newer = draw(UpdateControlsState {
+        result_text: "FocusForge 999.0.0 is available.".into(),
+        skip_enabled: true,
+        ..idle.clone()
+    });
+    assert_eq!(
+        newer,
+        about_rows_around(
+            version,
+            "",
+            &[
+                "FocusForge 999.0.0 is available.",
+                "Open download page | Skip this version"
+            ]
+        ),
+        "the result is two lines: the text, then the link beside the Skip button"
+    );
+    assert_eq!(spinners(&app), 0, "newer");
+
+    let failed = draw(UpdateControlsState {
+        failure: "Could not check for updates: connection refused".into(),
+        ..idle.clone()
+    });
+    assert_eq!(
+        failed,
+        about_rows_around(
+            version,
+            "",
+            &["Could not check for updates: connection refused"]
+        ),
+        "the failure is one line"
+    );
+    assert_eq!(spinners(&app), 0, "failed");
+
+    let save_error = draw(UpdateControlsState {
+        save_error: "settings.toml: not valid TOML, left untouched".into(),
+        ..idle
+    });
+    assert_eq!(
+        save_error,
+        about_rows_around(
+            version,
+            "",
+            &[
+                "settings.toml: not valid TOML, left untouched",
+                "The change is active for this session."
+            ]
+        )
+    );
+    assert_eq!(spinners(&app), 0, "save error");
+
+    // The longest state overflows the viewport; scrolled to the end, Source
+    // is still the last row.
+    let tab = ElementQuery::from_root(&app)
+        .match_descendants()
+        .match_type_name("FFAboutTab")
+        .find_first()
+        .expect("no FFAboutTab element found");
+    let (pos, size) = (tab.absolute_position(), tab.size());
+    app.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+            position: slint::LogicalPosition::new(
+                pos.x + size.width / 2.0,
+                pos.y + size.height / 2.0,
+            ),
+            delta_x: 0.0,
+            delta_y: -400.0,
+        });
+    let rows = about_rows(&app);
+    let last = rows.last().expect("the tab draws rows");
+    assert!(last.starts_with("Source | "), "{last:?}");
 }
 
 /// The tab is layout over shared components: its sections, rows and texts are
@@ -2614,7 +3104,16 @@ fn about_tab_composes_only_shared_components() {
     ] {
         assert!(!tab.contains(needle), "the tab sets {needle:?}");
     }
-    for shared in ["FFSettingsSection {", "FFSettingsRow {", "FFRowText {"] {
+    for shared in [
+        "FFSettingsSection {",
+        "FFSettingsRow {",
+        "FFRowText {",
+        "FFSettingsActionRow {",
+        "FFToggle {",
+        "FFLinkText {",
+        "FFScrollbar {",
+        "Flickable {",
+    ] {
         assert!(tab.contains(shared), "the tab does not draw {shared}");
     }
 }
@@ -2996,7 +3495,7 @@ fn appearance_save_failure_keeps_the_session_choice_and_surfaces_its_error() {
         .unwrap()
         .install_recent(Vec::new(), config_dir);
 
-    let app = app_at(1200, 760);
+    let app = app_at(1200, 900);
     let _installed = focusforge_gui::bridge::install(
         &app,
         controller.clone(),
@@ -3038,6 +3537,22 @@ fn appearance_save_failure_keeps_the_session_choice_and_surfaces_its_error() {
         })
         .find_first()
         .expect("the source-rows note precedes the save failure");
+    let tab = ElementQuery::from_root(&app)
+        .match_descendants()
+        .match_type_name("FFAppearanceTab")
+        .find_first()
+        .expect("the Appearance tab is mounted");
+    let tab_pos = tab.absolute_position();
+    let tab_size = tab.size();
+    app.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+            position: slint::LogicalPosition::new(
+                tab_pos.x + tab_size.width / 2.0,
+                tab_pos.y + tab_size.height / 2.0,
+            ),
+            delta_x: 0.0,
+            delta_y: -400.0,
+        });
     let session_note = ElementQuery::from_root(&app)
         .match_descendants()
         .match_accessible_role(AccessibleRole::Text)
@@ -3048,6 +3563,11 @@ fn appearance_save_failure_keeps_the_session_choice_and_surfaces_its_error() {
         })
         .find_first()
         .expect("the session note follows the save failure");
+    assert!(
+        session_note.absolute_position().y + session_note.size().height
+            <= tab_pos.y + tab_size.height,
+        "the scrolled tab shows the session note inside its visible area"
+    );
     let error_pos = error.absolute_position();
     let error_size = error.size();
     assert!(
@@ -3068,7 +3588,6 @@ fn appearance_save_failure_keeps_the_session_choice_and_surfaces_its_error() {
 
 mod notification {
     use super::*;
-    use focusforge_core::params::ParamValue;
     use focusforge_gui::notifications::Kind;
     use slint::platform::{Key, PointerEventButton, WindowEvent};
     use std::cell::RefCell;
@@ -3173,15 +3692,15 @@ mod notification {
     /// settled afterwards: one failure record per refusal. The first toast is
     /// held while the run settles, so a slow settle cannot expire it.
     fn controller_with_refusals(name: &str, refusals: usize) -> AppController {
-        let mut controller = common::controller_with_frames(name, 4);
-        controller.set_align_algorithm("dummy-align");
+        let mut controller = common::controller_with_frames(name, 3);
         assert!(controller.start_fuse());
         for _ in 0..refusals {
+            let refused = controller
+                .add_frames(&[common::fixture_frame("mantis-64", 0)])
+                .expect_err("a running job refuses an add");
             assert!(
-                controller
-                    .add_frames(&[common::fixture_frame("mantis-64", 4)])
-                    .is_err(),
-                "a running job refuses an add"
+                matches!(refused, focusforge_gui::entry::ImportRefused::JobRunning),
+                "{refused:?}"
             );
             controller.hold_toast(true);
         }
@@ -3235,6 +3754,55 @@ mod notification {
         }
     }
 
+    fn button_rect(app: &AppWindow, label: &str) -> (f32, f32, f32, f32) {
+        let found: Vec<_> = ElementQuery::from_root(app)
+            .match_accessible_role(AccessibleRole::Button)
+            .find_all()
+            .into_iter()
+            .filter(|b| b.accessible_label().as_deref() == Some(label))
+            .collect();
+        assert_eq!(found.len(), 1, "exactly one button named {label:?}");
+        let (pos, size) = (found[0].absolute_position(), found[0].size());
+        (pos.x, pos.y, size.width, size.height)
+    }
+
+    #[test]
+    fn analytics_button_sits_under_the_calculator_button() {
+        for height in [600u32, 760, 900] {
+            let controller =
+                common::controller_with_frames(&format!("shell_analytics_{height}"), 2);
+            let rig = rig(controller, 1440, height);
+            let h = height as f32;
+            let calculator = button_rect(&rig.app, "Step calculator");
+            let analytics = button_rect(&rig.app, "Analytics");
+            assert_eq!(analytics.0, calculator.0, "same x at {height}");
+            assert_eq!(
+                (analytics.2, analytics.3),
+                (calculator.2, calculator.3),
+                "same size at {height}"
+            );
+            assert_eq!(analytics.1, calculator.1 + 40.0, "40 px below at {height}");
+
+            assert_rect(&rig.app, "FFIconBar::bell", (8.0, h - 80.0, 32.0, 32.0));
+            assert_rect(&rig.app, "FFIconBar::settings", (8.0, h - 40.0, 32.0, 32.0));
+
+            // Declared after the rail, the button takes the click the rail's
+            // ground would otherwise get.
+            rig.controller
+                .lock()
+                .unwrap()
+                .set_analytics_hold(Duration::from_secs(30));
+            rig.click(
+                analytics.0 + analytics.2 / 2.0,
+                analytics.1 + analytics.3 / 2.0,
+            );
+            assert!(
+                rig.controller.lock().unwrap().analytics_open(),
+                "the click reaches the button at {height}"
+            );
+        }
+    }
+
     #[test]
     fn unread_badge_counts_and_hides_at_zero() {
         let rig = rig(controller_with_refusals("shell_badge", 3), 1440, 900);
@@ -3275,6 +3843,11 @@ mod notification {
             "the first record is up"
         );
         assert_eq!(rig.app.get_toast_kind(), "failure");
+        assert_eq!(
+            rig.app.get_toast_link_label(),
+            "Open notification",
+            "a record without a url keeps the default link text"
+        );
 
         // The `Open notification` link.
         rig.click(64.0 + 80.0, 92.0 + 44.0);
@@ -3319,7 +3892,7 @@ mod notification {
     }
 
     #[test]
-    fn center_keys_select_expand_and_escape_returns_focus_to_the_bell() {
+    fn center_keys_select_expand_and_escape_hands_focus_to_the_canvas() {
         let rig = rig(controller_with_refusals("shell_center_keys", 2), 1440, 900);
         let ids = rig.ids();
         let (x, y) = Rig::bell(900.0);
@@ -3347,8 +3920,8 @@ mod notification {
 
         rig.key(Key::Return);
         assert!(
-            rig.center_open(),
-            "focus is on the bell, so Return opens the center again"
+            !rig.center_open(),
+            "focus is on the canvas, so Return does not open the center again"
         );
     }
 
@@ -3404,14 +3977,7 @@ mod notification {
 
     #[test]
     fn a_brightness_row_names_the_frame_file() {
-        let mut controller = common::controller_with_frames("shell_brightness_row", 4);
-        controller.set_align_algorithm("dummy-align");
-        controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
-        controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.5));
-        controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.25));
-        controller.toggle_frame_excluded(0);
-        assert!(controller.start_fuse());
-        common::wait_for_settle(&mut controller, Duration::from_secs(60));
+        let controller = common::every_frame_clamps("shell_brightness_row", Some(0));
         let project = controller.notifications()[0]
             .project_title
             .clone()
@@ -3423,8 +3989,20 @@ mod notification {
                 .all(|n| n.kind == Kind::Warning)
         );
 
+        for (note, file) in controller.notifications().iter().zip(["01.tif", "02.tif"]) {
+            assert_eq!(note.title, "Brightness not fully matched");
+            assert_eq!(
+                note.message,
+                format!("{file} could not be brought to the same brightness as the other frames.")
+            );
+            let lower = note.message.to_lowercase();
+            for banned in ["target limited", "bound", "residual", "gain of", "frame 0"] {
+                assert!(!lower.contains(banned), "{banned:?} in {:?}", note.message);
+            }
+        }
+
         let rig = rig(controller, 1440, 900);
-        assert_eq!(rig.app.get_toast_title(), "Brightness target limited");
+        assert_eq!(rig.app.get_toast_title(), "Brightness not fully matched");
         assert_eq!(rig.app.get_toast_kind(), "warning");
         let (x, y) = Rig::bell(900.0);
         rig.click(x, y);
@@ -3439,10 +4017,10 @@ mod notification {
             .collect();
         assert_eq!(
             contexts.len(),
-            3,
+            2,
             "the excluded frame is not part of the run"
         );
-        for (context, file) in contexts.iter().rev().zip(["01.tif", "02.tif", "03.tif"]) {
+        for (context, file) in contexts.iter().rev().zip(["01.tif", "02.tif"]) {
             assert!(
                 context.starts_with(&format!("{project} · {file}")),
                 "{context:?} names {file}"
@@ -3453,7 +4031,7 @@ mod notification {
     #[test]
     fn a_crash_toast_carries_the_crash_kind() {
         let mut controller = AppController::new();
-        controller.set_diagnostics_dirs(Some(crash_data_dir("shell_crash_toast")), None);
+        controller.set_diagnostics_dirs(Some(crash_data_dir("shell_crash_toast")));
         controller.scan_crash_notice();
         let rig = rig(controller, 1440, 900);
         assert!(rig.app.get_toast_open());
@@ -3466,7 +4044,7 @@ mod notification {
     #[test]
     fn crash_diagnostics_opens_settings_on_the_diagnostics_section() {
         let mut controller = AppController::new();
-        controller.set_diagnostics_dirs(Some(crash_data_dir("shell_crash_diagnostics")), None);
+        controller.set_diagnostics_dirs(Some(crash_data_dir("shell_crash_diagnostics")));
         controller.scan_crash_notice();
         let rig = rig(controller, 1440, 900);
         assert_eq!(rig.app.get_settings_section().as_str(), "performance");
@@ -3482,7 +4060,11 @@ mod notification {
     /// unread bell glyph and the muted close glyph are `FFIconButton`'s own.
     #[test]
     fn icon_bar_and_center_set_no_colour_themselves() {
-        for file in ["shell/icon_bar.slint", "shell/notification_center.slint"] {
+        for file in [
+            "shell/icon_bar.slint",
+            "shell/notification_center.slint",
+            "shell/analytics_overlay.slint",
+        ] {
             let source = ui_source(file);
             for needle in [
                 "color:",
@@ -3507,7 +4089,7 @@ mod notification {
         let crashes = data.join("crashes");
         let writable = fs::metadata(&crashes).unwrap().permissions();
         let mut controller = AppController::new();
-        controller.set_diagnostics_dirs(Some(data), None);
+        controller.set_diagnostics_dirs(Some(data));
         controller.scan_crash_notice();
         let rig = rig(controller, 1440, 900);
         let id = rig.ids()[0];
@@ -3641,6 +4223,63 @@ mod settings_escape {
     }
 
     #[test]
+    fn escape_from_a_cap_field_closes_settings_and_commits_it() {
+        let rig = rig();
+        rig.controller.lock().unwrap().set_host_cap_unit("MiB");
+        rig.open_settings(SettingsSection::Performance);
+        focusforge_gui::bridge::push_performance_view(&rig.app, &rig.controller);
+        let tab = performance_tab(&rig.app);
+        let host = performance_cap_inputs(&tab).remove(0);
+
+        host.mock_single_click(PointerEventButton::Left);
+        for _ in 0..12 {
+            press_key(&rig.app, Key::Backspace);
+            press_key(&rig.app, Key::Delete);
+        }
+        type_into(&rig.app, "200");
+        assert!(rig.app.get_settings_open());
+        rig.escape();
+
+        assert!(
+            !rig.app.get_settings_open(),
+            "Escape closes Settings while a number holds focus"
+        );
+        let row = rig.controller.lock().unwrap().performance_view().host_cap;
+        assert_eq!(
+            (row.text.as_str(), row.unit.label(), row.invalid),
+            ("200", "MiB", false)
+        );
+    }
+
+    #[test]
+    fn escape_closes_an_open_unit_list_before_settings() {
+        let rig = rig();
+        rig.open_settings(SettingsSection::Performance);
+        focusforge_gui::bridge::push_performance_view(&rig.app, &rig.controller);
+        let tab = performance_tab(&rig.app);
+        performance_unit_menus(&tab)[0].invoke_accessible_default_action();
+        assert!(rig.controller.lock().unwrap().unit_list_open());
+        assert!(
+            rig.app.get_performance().host_cap.unit_open,
+            "the list is drawn open"
+        );
+
+        rig.escape();
+        assert!(
+            rig.app.get_settings_open(),
+            "the first Escape keeps Settings"
+        );
+        assert!(!rig.controller.lock().unwrap().unit_list_open());
+        assert!(!rig.app.get_performance().host_cap.unit_open);
+
+        rig.escape();
+        assert!(
+            !rig.app.get_settings_open(),
+            "the second Escape closes Settings"
+        );
+    }
+
+    #[test]
     fn escape_closes_settings_and_leaves_the_overlay_to_the_next_escape() {
         let rig = rig();
         rig.controller.lock().unwrap().toggle_projects_overlay();
@@ -3686,7 +4325,8 @@ mod dialog_close {
             on_question_open_as_one => "question-open-as-one",
             on_question_open_as_many => "question-open-as-many",
             on_question_cancelled => "question-cancelled",
-            on_refusal_pick_another_folder => "refusal-pick-another-folder",
+            on_refusal_dismissed => "refusal-dismissed",
+            on_refusal_confirmed => "refusal-confirmed",
             on_mismatch_open_anyway => "mismatch-open-anyway",
             on_mismatch_locate_frames => "mismatch-locate-frames",
             on_mismatch_cancelled => "mismatch-cancelled",
@@ -3696,6 +4336,7 @@ mod dialog_close {
             on_export_cancelled => "export-cancelled",
             on_frame_warning_cancelled => "frame-warning-cancelled",
             on_frame_warning_secondary_pressed => "frame-warning-secondary-pressed",
+            on_frame_warning_tertiary_pressed => "frame-warning-tertiary-pressed",
             on_frame_warning_confirmed => "frame-warning-confirmed",
             on_divergence_discarded => "divergence-discarded",
             on_divergence_kept => "divergence-kept",
@@ -3890,7 +4531,6 @@ mod dialog_close {
     fn export_close_button_cancels_a_running_write() {
         let app = app_at(1440, 900);
         let mut fused = common::controller_with_frames("export_close_writing", 2);
-        fused.set_align_algorithm("dummy-align");
         assert!(fused.start_fuse());
         while common::wait_for_settle(&mut fused, std::time::Duration::from_secs(60)).is_some() {}
         assert_eq!(fused.checkpoint_count(), Some(1), "the fixture fuses");
@@ -4071,7 +4711,6 @@ mod dialog_escape {
     /// open in the controller and pushed to the window.
     fn fused_export_rig(name: &str) -> Rig {
         let mut fused = common::controller_with_frames(name, 2);
-        fused.set_align_algorithm("dummy-align");
         assert!(fused.start_fuse());
         while common::wait_for_settle(&mut fused, Duration::from_secs(60)).is_some() {}
         assert_eq!(fused.checkpoint_count(), Some(1), "the fixture fuses");
@@ -4330,4 +4969,448 @@ mod dialog_escape {
             );
         }
     }
+}
+
+mod fading_overlays {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use focusforge_gui::{AppWindow, ProjectCardView, Theme};
+    use i_slint_backend_testing::{ElementHandle, ElementQuery};
+    use slint::platform::{Key, WindowEvent};
+    use slint::{ComponentHandle, Global};
+
+    use super::app_at;
+
+    fn advance(ms: u64) {
+        i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(ms));
+    }
+
+    fn click(app: &AppWindow, element: &ElementHandle) {
+        let (at, size) = (element.absolute_position(), element.size());
+        let position =
+            slint::LogicalPosition::new(at.x + size.width / 2.0, at.y + size.height / 2.0);
+        for event in [
+            slint::platform::WindowEvent::PointerPressed {
+                position,
+                button: slint::platform::PointerEventButton::Left,
+            },
+            slint::platform::WindowEvent::PointerReleased {
+                position,
+                button: slint::platform::PointerEventButton::Left,
+            },
+        ] {
+            app.window().dispatch_event(event);
+        }
+    }
+
+    /// One overlay under test: how it opens, the elements a click would
+    /// trigger, the count of callbacks those clicks fire and the fade length.
+    struct Overlay {
+        name: &'static str,
+        set_open: Box<dyn Fn(bool)>,
+        targets: Vec<ElementHandle>,
+        fired: Rc<Cell<u32>>,
+        fade_ms: u64,
+    }
+
+    impl Overlay {
+        /// What a user sees of the overlay: the opacity its first target
+        /// renders with, the product of its parents' fades.
+        fn opacity(&self) -> f32 {
+            self.targets[0].computed_opacity()
+        }
+
+        /// Opens or closes, then reads the opacity once so the fade starts
+        /// at the current tick.
+        fn set(&self, open: bool) -> f32 {
+            (self.set_open)(open);
+            self.opacity()
+        }
+
+        /// Clicks every target and returns how many callbacks fired.
+        fn click_all(&self, app: &AppWindow) -> u32 {
+            let before = self.fired.get();
+            for target in &self.targets {
+                click(app, target);
+            }
+            self.fired.get() - before
+        }
+    }
+
+    fn dialog(app: &AppWindow) -> Overlay {
+        let fired = Rc::new(Cell::new(0));
+        app.on_checkpoint_delete_confirmed({
+            let fired = fired.clone();
+            move || fired.set(fired.get() + 1)
+        });
+        app.set_checkpoint_delete_open(true);
+        let confirm = ElementHandle::find_by_accessible_label(app, "Delete")
+            .next()
+            .expect("the checkpoint delete dialog has a Delete button");
+        app.set_checkpoint_delete_open(false);
+        advance(1000);
+        let weak = app.as_weak();
+        Overlay {
+            name: "checkpoint delete dialog",
+            set_open: Box::new(move |open| weak.unwrap().set_checkpoint_delete_open(open)),
+            targets: vec![confirm],
+            fired,
+            fade_ms: 150,
+        }
+    }
+
+    fn toast(app: &AppWindow) -> Overlay {
+        let fired = Rc::new(Cell::new(0));
+        app.on_toast_activated({
+            let fired = fired.clone();
+            move |_| fired.set(fired.get() + 1)
+        });
+        app.on_toast_dismissed({
+            let fired = fired.clone();
+            move || fired.set(fired.get() + 1)
+        });
+        app.set_toast_open(true);
+        let link = ElementQuery::from_root(app)
+            .match_id("FFToast::card")
+            .find_first()
+            .expect("the toast has a card");
+        let close = ElementHandle::find_by_accessible_label(app, "Dismiss notification")
+            .next()
+            .expect("the toast has a close control");
+        app.set_toast_open(false);
+        advance(1000);
+        let weak = app.as_weak();
+        Overlay {
+            name: "toast",
+            set_open: Box::new(move |open| weak.unwrap().set_toast_open(open)),
+            targets: vec![link, close],
+            fired,
+            fade_ms: 400,
+        }
+    }
+
+    fn overview(app: &AppWindow) -> Overlay {
+        let card = ProjectCardView {
+            kind: "open".into(),
+            opened: true,
+            current: false,
+            unsaved: false,
+            fusing: false,
+            fusing_fraction: 0.0,
+            project_name: "demo".into(),
+            meta_text: "".into(),
+            headline: "".into(),
+            stage: "".into(),
+            reason: "".into(),
+            action_label: "".into(),
+            has_picture: false,
+            picture: slint::Image::default(),
+            x: 0.0,
+            y: 0.0,
+        };
+        app.set_project_cards(Rc::new(slint::VecModel::from(vec![card])).into());
+        app.set_gallery_content_height(300.0);
+        let fired = Rc::new(Cell::new(0));
+        app.on_projects_card_clicked({
+            let fired = fired.clone();
+            move |_| fired.set(fired.get() + 1)
+        });
+        app.set_projects_overlay_open(true);
+        let card = ElementQuery::from_root(app)
+            .match_inherits("FFProjectCard")
+            .find_first()
+            .expect("the gallery draws the card");
+        app.set_projects_overlay_open(false);
+        advance(1000);
+        let weak = app.as_weak();
+        Overlay {
+            name: "projects overview",
+            set_open: Box::new(move |open| weak.unwrap().set_projects_overlay_open(open)),
+            targets: vec![card],
+            fired,
+            fade_ms: 150,
+        }
+    }
+
+    fn settings(app: &AppWindow) -> Overlay {
+        let fired = Rc::new(Cell::new(0));
+        app.on_settings_close_requested({
+            let fired = fired.clone();
+            move || fired.set(fired.get() + 1)
+        });
+        app.set_settings_open(true);
+        let close = ElementHandle::find_by_accessible_label(app, "Close settings")
+            .next()
+            .expect("the settings modal has a close control");
+        app.set_settings_open(false);
+        advance(1000);
+        let weak = app.as_weak();
+        Overlay {
+            name: "settings",
+            set_open: Box::new(move |open| weak.unwrap().set_settings_open(open)),
+            targets: vec![close],
+            fired,
+            fade_ms: 150,
+        }
+    }
+
+    /// Records the text of every `canvas-key-pressed`.
+    fn record_canvas_keys(app: &AppWindow) -> Rc<RefCell<Vec<slint::SharedString>>> {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        app.on_canvas_key_pressed({
+            let seen = seen.clone();
+            move |text, _, _, _| seen.borrow_mut().push(text)
+        });
+        seen
+    }
+
+    /// Presses and releases `key`, running the `changed` handlers first as
+    /// the event loop does before an event.
+    fn press(app: &AppWindow, key: Key) {
+        slint::platform::update_timers_and_animations();
+        let text: slint::SharedString = key.into();
+        app.window()
+            .dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+        app.window()
+            .dispatch_event(WindowEvent::KeyReleased { text });
+    }
+
+    /// A toast reopened while it fades out turns back to fully shown and
+    /// takes clicks from that moment.
+    #[test]
+    fn a_toast_reopened_mid_fade_out_is_fully_shown() {
+        let app = app_at(1440, 900);
+        app.set_show_empty_state(false);
+        let toast = toast(&app);
+
+        toast.set(true);
+        advance(toast.fade_ms);
+        assert_eq!(toast.opacity(), 1.0, "fully shown before it closes");
+        toast.set(false);
+        advance(toast.fade_ms / 3);
+        let closing = toast.opacity();
+        assert!(closing > 0.0 && closing < 1.0, "fading out: {closing}");
+
+        toast.set(true);
+        assert_eq!(
+            toast.click_all(&app),
+            toast.targets.len() as u32,
+            "a click right after the reopen fires"
+        );
+        advance(toast.fade_ms);
+        assert_eq!(toast.opacity(), 1.0, "fully shown after the fade");
+    }
+
+    /// A settings close set from Rust hands keyboard focus to the canvas at
+    /// once, though the content stays drawn while it fades out.
+    #[test]
+    fn a_settings_close_set_from_rust_moves_focus_to_the_canvas() {
+        let app = app_at(1440, 900);
+        app.window()
+            .dispatch_event(WindowEvent::WindowActiveChanged(true));
+        app.set_show_empty_state(false);
+        let settings = settings(&app);
+        let keys = record_canvas_keys(&app);
+
+        settings.set(true);
+        advance(settings.fade_ms);
+        assert_eq!(settings.opacity(), 1.0, "fully shown before it closes");
+
+        settings.set(false);
+        assert!(settings.opacity() > 0.0, "the content is still drawn");
+        press(&app, Key::Escape);
+        assert_eq!(*keys.borrow(), [slint::SharedString::from(Key::Escape)]);
+        assert_eq!(settings.fired.get(), 0, "closing settings take no key");
+    }
+
+    /// Right after a close, and while the fade runs, Escape and Return reach
+    /// the window and the overlay takes neither them nor a click on its
+    /// button.
+    #[test]
+    fn a_closed_overlay_takes_no_key_or_click() {
+        let app = app_at(1440, 900);
+        app.window()
+            .dispatch_event(WindowEvent::WindowActiveChanged(true));
+        app.set_show_empty_state(false);
+        let overlays = [dialog(&app), toast(&app), overview(&app), settings(&app)];
+        let keys = record_canvas_keys(&app);
+
+        for overlay in &overlays {
+            let name = overlay.name;
+            overlay.set(true);
+            advance(overlay.fade_ms);
+            assert_eq!(
+                overlay.opacity(),
+                1.0,
+                "{name} fully shown before it closes"
+            );
+            overlay.set(false);
+            for step in [0, overlay.fade_ms / 3, overlay.fade_ms] {
+                advance(step);
+                let before = (keys.borrow().len(), overlay.fired.get());
+                press(&app, Key::Escape);
+                press(&app, Key::Return);
+                assert_eq!(
+                    (keys.borrow().len(), overlay.fired.get()),
+                    (before.0 + 2, before.1),
+                    "{name}: Escape and Return reach the window ({step} ms after the close)"
+                );
+                assert_eq!(
+                    overlay.click_all(&app),
+                    0,
+                    "{name}: a click on its button fires nothing ({step} ms after the close)"
+                );
+            }
+        }
+    }
+
+    /// A dialog, the toast and the projects overview fade in taking clicks
+    /// at once, fade out taking none from the first frame, and are gone at
+    /// 0 ms under reduced motion.
+    #[test]
+    fn closing_overlays_take_no_input_while_they_fade() {
+        let app = app_at(1440, 900);
+        app.set_show_empty_state(false);
+        let overlays = [dialog(&app), toast(&app), overview(&app)];
+
+        for overlay in &overlays {
+            let name = overlay.name;
+            assert_eq!(overlay.set(false), 0.0, "{name} starts closed");
+            assert_eq!(overlay.click_all(&app), 0, "{name}: closed takes no click");
+
+            overlay.set(true);
+            advance(overlay.fade_ms / 3);
+            let opening = overlay.opacity();
+            assert!(
+                opening > 0.0 && opening < 1.0,
+                "{name} fading in: {opening}"
+            );
+            assert_eq!(
+                overlay.click_all(&app),
+                overlay.targets.len() as u32,
+                "{name}: a click mid-fade-in fires"
+            );
+            advance(overlay.fade_ms);
+            assert_eq!(overlay.opacity(), 1.0, "{name} fully shown");
+
+            overlay.set(false);
+            advance(overlay.fade_ms / 3);
+            let closing = overlay.opacity();
+            assert!(
+                closing > 0.0 && closing < 1.0,
+                "{name} fading out: {closing}"
+            );
+            assert_eq!(
+                overlay.click_all(&app),
+                0,
+                "{name}: a click mid-fade-out fires nothing"
+            );
+            advance(overlay.fade_ms);
+            assert_eq!(overlay.opacity(), 0.0, "{name} gone after the fade");
+
+            Theme::get(&app).set_reduce_motion(true);
+            assert_eq!(
+                overlay.set(true),
+                1.0,
+                "{name}: instant in under reduced motion"
+            );
+            assert_eq!(
+                overlay.set(false),
+                0.0,
+                "{name}: instant out under reduced motion"
+            );
+            assert_eq!(overlay.click_all(&app), 0, "{name}: gone takes no click");
+            Theme::get(&app).set_reduce_motion(false);
+        }
+    }
+}
+
+/// The "Save to" field keeps showing the controller's destination after
+/// the user has typed into it: the fresh name after a write and the
+/// re-derived default after the data folder changes.
+#[test]
+fn diagnostics_destination_field_follows_the_controller_after_an_edit() {
+    use focusforge_gui::SettingsSection;
+    use focusforge_gui::diagnostics::DiagnosticsStatus;
+    use i_slint_backend_testing::mock_elapsed_time;
+    use std::time::Duration;
+
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let rig = settings_escape::rig();
+    rig.controller
+        .lock()
+        .unwrap()
+        .set_diagnostics_dirs(Some(first.path().to_path_buf()));
+    rig.open_settings(SettingsSection::Diagnostics);
+    focusforge_gui::bridge::push_diagnostics_view(&rig.app, &rig.controller);
+
+    let field_text = |rig: &settings_escape::Rig| {
+        mock_elapsed_time(Duration::from_millis(50));
+        ElementQuery::from_root(&rig.app)
+            .match_id("FFDiagnosticsPanel::dest-field")
+            .find_first()
+            .expect("the Save to field")
+            .query_descendants()
+            .match_id("FFTextField::input")
+            .find_first()
+            .expect("the field's input")
+            .accessible_value()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let destination = |rig: &settings_escape::Rig| {
+        rig.controller
+            .lock()
+            .unwrap()
+            .diagnostics_view()
+            .destination
+    };
+
+    rig.click_element("FFDiagnosticsPanel::dest-field");
+    type_into(&rig.app, "-first");
+    assert_eq!(
+        field_text(&rig),
+        destination(&rig),
+        "typing edits the field"
+    );
+    let typed = destination(&rig);
+    assert!(typed.contains("-first"), "{typed}");
+
+    rig.controller
+        .lock()
+        .unwrap()
+        .finish_bundle_write(DiagnosticsStatus::Written);
+    focusforge_gui::bridge::push_diagnostics_view(&rig.app, &rig.controller);
+    let fresh = destination(&rig);
+    assert_ne!(fresh, typed, "a write moves the destination on");
+    assert_eq!(field_text(&rig), fresh, "the field shows the fresh name");
+
+    rig.click_element("FFDiagnosticsPanel::dest-field");
+    type_into(&rig.app, "-second");
+    assert_eq!(field_text(&rig), destination(&rig));
+    let typed_again = destination(&rig);
+
+    rig.controller
+        .lock()
+        .unwrap()
+        .set_diagnostics_dirs(Some(second.path().to_path_buf()));
+    focusforge_gui::bridge::push_diagnostics_view(&rig.app, &rig.controller);
+    let rederived = destination(&rig);
+    assert_ne!(rederived, typed_again);
+    assert!(rederived.starts_with(second.path().to_str().unwrap()));
+    assert_eq!(
+        field_text(&rig),
+        rederived,
+        "the field shows the new default"
+    );
+
+    type_into(&rig.app, "x");
+    assert_eq!(
+        field_text(&rig),
+        destination(&rig),
+        "typing after a push still edits the field"
+    );
 }

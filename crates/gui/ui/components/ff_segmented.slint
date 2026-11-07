@@ -9,6 +9,8 @@ import { Theme } from "../theme.slint";
 export component FFSegmented inherits Rectangle {
     in property <[string]> segments: [];
     in property <string> selected: "";
+    // Segment text in the section role (small, uppercase) instead of the body role.
+    in property <bool> section: false;
     callback segment-selected(string);
 
     height: 28px;
@@ -22,9 +24,10 @@ export component FFSegmented inherits Rectangle {
             background: label == root.selected ? Theme.accent-subtle : transparent;
 
             Text {
-                text: label;
+                text: root.section ? label.to-uppercase() : label;
                 color: label == root.selected ? Theme.accent-default : Theme.text-muted;
-                font-size: Theme.text-body.size;
+                font-size: root.section ? Theme.text-section.size : Theme.text-body.size;
+                letter-spacing: root.section ? Theme.text-section.letter-spacing : 0px;
                 font-weight: label == root.selected ? Theme.text-section.weight : Theme.text-body.weight;
                 horizontal-alignment: center;
                 vertical-alignment: center;

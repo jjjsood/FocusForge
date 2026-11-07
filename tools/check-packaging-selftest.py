@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import struct
@@ -243,7 +244,7 @@ def cli_asset_helper_cases() -> None:
         shutil.copytree(ROOT / "assets/man", source / "assets/man")
         shutil.copytree(ROOT / "assets/completions", source / "assets/completions")
         expected = helper.sources(source)
-        assert len(expected) == 19
+        assert len(expected) == 22
         staged = []
         for destination in (
             directory / "appimage/usr",
@@ -613,8 +614,8 @@ def native_boundaries() -> None:
         and any(file.attrib.get("Source", "").startswith("$(var.CliAssets)") for file in component if file.tag.endswith("File"))
     ]
     assert wix.tag.endswith("Wix") and "UpgradeCode" in package.attrib and root_files == {("focusforge-cli.exe", "$(var.Cli)", "yes"), ("focusforge-gui.exe", "$(var.Gui)", "yes"), ("LICENSE", "$(var.License)", "yes"), ("NOTICE", "$(var.Notice)", "yes"), ("focusforge.ico", "$(var.Icon)", "yes")}
-    assert len(asset_sources) == 19 and "$(var.CliAssets)\\powershell\\completions\\_focusforge-cli.ps1" in asset_sources
-    assert len(asset_components) == 19 and all(
+    assert len(asset_sources) == 22 and "$(var.CliAssets)\\powershell\\completions\\_focusforge-cli.ps1" in asset_sources
+    assert len(asset_components) == 22 and all(
         len([file for file in component if file.tag.endswith("File")]) == 1
         and next(file for file in component if file.tag.endswith("File")).attrib.get("KeyPath") == "yes"
         for component in asset_components
@@ -903,7 +904,8 @@ def source_privacy_cases() -> None:
         else: raise AssertionError(f"private dependency source accepted: {source}")
     assert module.safe_source_less_cu("crates/cli/src/main.rs/@/focusforge_cli.fixture")
     assert module.safe_source_less_cu("/root/.cargo/registry/src/index.crates.io/example/src/lib.rs/@/example.fixture")
-    for value in ("../private/checkout/@/fixture", "private checkout/src/main.rs/@/fixture", "/private/checkout/src/main.rs/@/fixture", "crates/cli/src/main.rs"):
+    assert module.safe_source_less_cu("vendor/minidump-writer/src/lib.rs/@/minidump_writer.fixture")
+    for value in ("../private/checkout/@/fixture", "private checkout/src/main.rs/@/fixture", "/private/checkout/src/main.rs/@/fixture", "crates/cli/src/main.rs", "vendors/x/src/lib.rs/@/fixture", "other/x/src/lib.rs/@/fixture"):
         assert not module.safe_source_less_cu(value)
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -1078,7 +1080,19 @@ def hosted_runner_path_cases() -> None:
         (windows, r"D:\a\_work\1\s\src\vctools\crt\vcstartup\src\startup\exe_main.cpp", "dependency/exe_main.cpp"),
         (windows, r"C:\Users\runneradmin\.rustup\toolchains\1.95.0-x86_64-pc-windows-msvc\lib\rustlib\etc\intrinsic.natvis", "dependency/intrinsic.natvis"),
         (windows, r"\\?\D:\a\FocusForge\FocusForge\crates\cli\src\main.rs", "crates/cli/src/main.rs"),
+        ("C:/src", r"\\?\C:\src\vendor\minidump-writer\src\windows\errors.rs", "dependency/errors.rs"),
+        ("/work", "/work/vendor/minidump-writer/src/lib.rs", "dependency/lib.rs"),
+        (windows, r"D:\a\FocusForge\FocusForge\vendor\minidump-writer\src\lib.rs", "dependency/lib.rs"),
         (windows, r"\\?\C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\slint-1.17.1\ui\lib.rs", "dependency/lib.rs"),
+        (windows, r"minkernel\crts\ucrt\src\appcrt\tran\amd64\fmod.asm", "dependency/fmod.asm"),
+        (windows, r"MinKernel\CRTs\ucrt\inc\corecrt_internal.h", "dependency/corecrt_internal.h"),
+        (windows, r"VCCRT\vcruntime\inc\internal_shared.h", "dependency/internal_shared.h"),
+        (windows, r"OSS\ARM-software\optimized-routines\20.05.00\src\math\pow.c", "dependency/pow.c"),
+        (windows, r"onecore\internal\sdk\inc\nxamd64.h", "dependency/nxamd64.h"),
+        (windows, r"OneCore\Internal\MinWin\Priv_Sdk\Inc\ntrtl.h", "dependency/ntrtl.h"),
+        (windows, r"onecore\external\sdk\inc\minwindef.h", "dependency/minwindef.h"),
+        (windows, r"onecore\internal\private\notes.h", "dependency/notes.h"),
+        (windows, r"shared\inc\winapifamily.h", "dependency/winapifamily.h"),
         (macos, f"{macos}/crates/cli/src/main.rs", "crates/cli/src/main.rs"),
         (macos, "/Users/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/clap-4.6.6/src/lib.rs", "dependency/lib.rs"),
         (macos, "/Applications/Xcode_16.4.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk/usr/include/stdio.h", "dependency/stdio.h"),
@@ -1090,7 +1104,17 @@ def hosted_runner_path_cases() -> None:
         (windows, r"D:\a\FocusForge\FocusForge-other\crates\cli\src\main.rs"),
         (windows, r"D:\a\FocusForge\FocusForge\..\secret\main.rs"),
         (windows, r"D:\a\FocusForge\FocusForge\private\main.rs"),
+        (windows, r"D:\a\FocusForge\FocusForge\other\x.rs"),
+        ("/work", "/work/other/x.rs"),
+        ("/work", "/work/vendors/x.rs"),
         (windows, r"C:\Program Files\Microsoft Visual Studio\..\..\Users\runneradmin\secret.h"),
+        (windows, r"private\notes.h"),
+        (windows, r"minkernel\other\notes.h"),
+        (windows, r"minkernel\crts\..\..\secret.h"),
+        (windows, r"OSS\other\notes.h"),
+        (windows, r"onecorex\notes.h"),
+        (windows, r"shared\notes.h"),
+        (windows, r"secret\notes.c"),
         (macos, "/Users/runner/Documents/secret.rs"),
         (macos, f"{macos}/../private/main.rs"),
         (macos, "/Users/runner/.cargo/registry/src/../../../private/main.rs"),
@@ -1120,6 +1144,15 @@ def hosted_runner_path_cases() -> None:
             symbol.write_text(f"MODULE windows x86_64 {'A' * 33} app.pdb\nFILE 0 {good}\nFUNC 1 1 0 f\n")
             module.canonicalize_symbol_sources(symbol)
         assert "FILE 0 crates/gui/src/main.rs\n" in symbol.read_text()
+        many = [rf"C:\Users\runneradmin\private\{n}.rs" for n in range(7)]
+        symbol.write_text("MODULE windows x86_64 " + "A" * 33 + " app.pdb\n" + "".join(f"FILE {n} {p}\n" for n, p in enumerate(many)))
+        with hosted_runner(module, windows):
+            try: module.canonicalize_symbol_sources(symbol)
+            except ValueError as error: assert all(p in str(error) for p in many) and "more)" not in str(error), str(error)
+            else: raise AssertionError("private FILE records accepted")
+        try: module.reject_private_native(many)
+        except ValueError as error: assert all(p.replace("\\", "/") in str(error) for p in many) and str(error).startswith("private source path in native symbols: "), str(error)
+        else: raise AssertionError("private native paths accepted")
     pdb_source = r"D:\a\FocusForge\FocusForge\crates\cli\src\main.rs"
     with tempfile.TemporaryDirectory() as temporary:
         pdb = Path(temporary) / "runner.pdb"; pdb.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, pdb_source))
@@ -1131,6 +1164,43 @@ def hosted_runner_path_cases() -> None:
             else: raise AssertionError("builder checkout accepted outside a hosted runner")
         backslash = Path(temporary) / "backslash.pdb"; backslash.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"C:\work\crates\cli\src\main.rs", ("/work", "/work/crates/cli")))
         assert "C:/work/crates/cli/src/main.rs" in module.inspect_windows_native(backslash)["source_paths"]
+        vendored = Path(temporary) / "vendored.pdb"; vendored.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"D:\a\FocusForge\FocusForge\vendor\minidump-writer\src\lib.rs"))
+        with hosted_runner(module, windows):
+            assert "/work/vendor/minidump-writer/src/lib.rs" in module.inspect_windows_native(vendored)["source_paths"]
+        other = Path(temporary) / "other.pdb"; other.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"D:\a\FocusForge\FocusForge\other\x.rs"))
+        with hosted_runner(module, windows):
+            try: module.inspect_windows_native(other)
+            except ValueError as error: assert "D:/a/FocusForge/FocusForge/other/x.rs" in str(error) or "/work/other/x.rs" in str(error), str(error)
+            else: raise AssertionError("checkout path outside crates and vendor accepted")
+        # Modules of the statically linked C runtime name sources relatively and carry no compilation directory.
+        crt = Path(temporary) / "crt.pdb"; crt.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"minkernel\crts\ucrt\src\appcrt\misc\invalid_parameter.cpp", ()))
+        with hosted_runner(module, windows):
+            assert "/usr/include/minkernel/crts/ucrt/src/appcrt/misc/invalid_parameter.cpp" in module.inspect_windows_native(crt)["source_paths"]
+        secret = Path(temporary) / "secret.pdb"; secret.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, "secret\\notes.c", ()))
+        with hosted_runner(module, windows):
+            try: module.inspect_windows_native(secret)
+            except ValueError as error: assert str(error).startswith("private source path in native symbols: ") and "secret/notes.c" in str(error), str(error)
+            else: raise AssertionError("relative source without a compilation directory accepted")
+        relative = Path(temporary) / "relative.pdb"; relative.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"crates\cli\src\main.rs"))
+        with hosted_runner(module, windows):
+            assert "/work/crates/cli/src/main.rs" in module.inspect_windows_native(relative)["source_paths"]
+        dbi_only = Path(temporary) / "dbi-only.pdb"; dbi_only.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"VCCRT\vcruntime\inc\internal_shared.h", (), module_sources=False))
+        with hosted_runner(module, windows):
+            assert "/usr/include/VCCRT/vcruntime/inc/internal_shared.h" in module.inspect_windows_native(dbi_only)["source_paths"]
+        dbi_cwds = ("/work", "/work/crates/cli", r"minkernel\crts\ucrt\src\appcrt\string\mt")
+        dbi_ambiguous = Path(temporary) / "dbi-ambiguous.pdb"; dbi_ambiguous.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"OneCore\Internal\MinWin\Priv_Sdk\Inc\ntrtl.h", dbi_cwds, module_sources=False))
+        with hosted_runner(module, windows):
+            found = module.inspect_windows_native(dbi_ambiguous)["source_paths"]
+        assert "/usr/include/OneCore/Internal/MinWin/Priv_Sdk/Inc/ntrtl.h" in found and "/usr/include/minkernel/crts/ucrt/src/appcrt/string/mt" in found, found
+        dbi_private = Path(temporary) / "dbi-private.pdb"; dbi_private.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, "secret\\notes.c", dbi_cwds, module_sources=False))
+        with hosted_runner(module, windows):
+            try: module.inspect_windows_native(dbi_private)
+            except ValueError as error: assert str(error).startswith("private source path in native symbols: ") and "secret/notes.c" in str(error), str(error)
+            else: raise AssertionError("private relative DBI source with several compilation directories accepted")
+        ambiguous = Path(temporary) / "ambiguous.pdb"; ambiguous.write_bytes(msf_pdb_with_source(bytes(range(16)), 0x20, r"crates\cli\src\main.rs", ("/work", "/other")))
+        try: module.inspect_windows_native(ambiguous)
+        except ValueError as error: assert "unresolved relative C13 source path" in str(error), str(error)
+        else: raise AssertionError("relative source with several compilation directories accepted")
 
 
 def macos_source_cases() -> None:
@@ -1446,10 +1516,11 @@ def macos_checker_mock() -> None:
         symbols = directory / "symbols"
         write_macos_symbols(symbols / "aarch64-apple-darwin", "aarch64-apple-darwin")
         (app / "Info.plist").write_text("stub")
+        (app / "_CodeSignature").mkdir(); (app / "_CodeSignature/CodeResources").write_text("sealed\n")
         template = directory / "template"; shutil.copytree(mount / "FocusForge.app", template / "FocusForge.app")
         stackwalk = directory / "stackwalk"; stackwalk.write_text("#!/bin/sh\nexit 0\n"); stackwalk.chmod(0o755)
         bridge = directory / "symbolicate-bridge.py"; bridge.write_text("import importlib.util, json, os, subprocess, sys\nfrom pathlib import Path\nsource = Path(__file__).with_name('tools') / 'symbolicate.py'\nspec = importlib.util.spec_from_file_location('symbolicate_fixture', source); module = importlib.util.module_from_spec(spec); assert spec and spec.loader; spec.loader.exec_module(module)\nmodule._module.install = lambda *_: Path(os.environ['MOCK_STACKWALK'])\nreport = {'modules': [{'filename': 'focusforge-cli', 'debug_file': 'focusforge-cli', 'debug_id': '000000000000000000000000000000010', 'loaded_symbols': True}], 'crashing_thread': {'frames': [{'function': 'focusforge_cli::main', 'module': 'focusforge-cli', 'file': 'crates/cli/src/main.rs', 'line': 1}]}}\nmodule.subprocess.run = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, json.dumps(report), '')\nsys.argv = [str(source), *sys.argv[1:]]; module.main()\n")
-        commands = {"hdiutil": f"#!/bin/sh\necho \"$1\" >> {log}\nif [ \"$1\" = attach ]; then cp -R {template}/FocusForge.app \"$5\"/; fi\n", "lipo": "#!/bin/sh\necho \"${MOCK_ARCHES:-arm64}\"\n", "file": "#!/bin/sh\necho 'Mach-O 64-bit executable arm64'\n", "otool": "#!/bin/sh\nexit 0\n", "dwarfdump": "#!/bin/sh\nprintf 'UUID: 00000000-0000-0000-0000-000000000001 (arm64) %s\\n' \"$2\"\n", "python3": f"#!/bin/sh\nif [ \"$1\" = '{directory}/tools/symbolicate.py' ]; then shift; exec /usr/bin/python3 '{bridge}' \"$@\"; fi\nexec /usr/bin/python3 \"$@\"\n", "PlistBuddy": "#!/bin/sh\ncase \"$2\" in *Executable*) echo focusforge-gui;; *ShortVersion*|*BundleVersion*) echo \"${MOCK_PLIST_VERSION:-" + NUMERIC + "}\";; *IconFile*) echo focusforge;; *Identifier*) echo \"${MOCK_BUNDLE_ID-org.focusforge.FocusForge}\";; esac\n"}
+        commands = {"codesign": "#!/usr/bin/env bash\napp=${!#}\n[[ -f $app/Contents/_CodeSignature/CodeResources ]] || { echo \"$app: code object is not signed at all\" >&2; exit 1; }\nif [[ $1 == --verify ]]; then printf '%s: valid on disk\\n%s: satisfies its Designated Requirement\\n' \"$app\" \"$app\" >&2; else printf 'Executable=%s/Contents/MacOS/focusforge-gui\\nSignature=adhoc\\nSealed Resources%s\\n' \"$app\" \"${MOCK_SEALED- version=2 rules=13 files=40}\" >&2; fi\n", "hdiutil": f"#!/bin/sh\necho \"$1\" >> {log}\nif [ \"$1\" = attach ]; then cp -R {template}/FocusForge.app \"$5\"/; fi\n", "lipo": "#!/bin/sh\necho \"${MOCK_ARCHES:-arm64}\"\n", "file": "#!/bin/sh\necho 'Mach-O 64-bit executable arm64'\n", "otool": "#!/bin/sh\nexit 0\n", "dwarfdump": "#!/bin/sh\nprintf 'UUID: 00000000-0000-0000-0000-000000000001 (arm64) %s\\n' \"$2\"\n", "python3": f"#!/bin/sh\nif [ \"$1\" = '{directory}/tools/symbolicate.py' ]; then shift; exec /usr/bin/python3 '{bridge}' \"$@\"; fi\nexec /usr/bin/python3 \"$@\"\n", "PlistBuddy": "#!/bin/sh\ncase \"$2\" in *Executable*) echo focusforge-gui;; *ShortVersion*|*BundleVersion*) echo \"${MOCK_PLIST_VERSION:-" + NUMERIC + "}\";; *IconFile*) echo focusforge;; *Identifier*) echo \"${MOCK_BUNDLE_ID-org.focusforge.FocusForge}\";; esac\n"}
         for name, body in commands.items(): path = mock / name; path.write_text(body); path.chmod(0o755)
         info_file.write_text(info)
         checker_copy = directory / "tools/check-package-macos.sh"
@@ -1500,9 +1571,14 @@ def macos_checker_mock() -> None:
         version_file.write_text(f"{PRERELEASE}\n")
         (directory / "Cargo.toml").write_text(with_prerelease((directory / "Cargo.toml").read_text()))
         result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
-        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert result.returncode == 0 and "Signature=adhoc" in result.stdout, (result.stdout, result.stderr)
         result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env | {"MOCK_PLIST_VERSION": PRERELEASE})
         assert result.returncode != 0
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env | {"MOCK_SEALED": "=none"})
+        assert result.returncode != 0 and "unsealed bundle resources: FocusForge.app" in result.stderr, (result.stdout, result.stderr)
+        shutil.rmtree(template / "FocusForge.app/Contents/_CodeSignature")
+        result = subprocess.run(["bash", str(checker_copy), "dummy.dmg", str(symbols)], text=True, capture_output=True, env=env)
+        assert result.returncode != 0 and "invalid code signature: FocusForge.app" in result.stderr, (result.stdout, result.stderr)
 
 
 def macos_producer_mock() -> None:
@@ -1522,7 +1598,8 @@ def macos_producer_mock() -> None:
         commands = {
             "cargo": "#!/usr/bin/env bash\ntarget=; while (($#)); do if [[ $1 == --target ]]; then target=$2; shift 2; else shift; fi; done; mkdir -p \"target/$target/release\"; cp \"$MOCK_MACHO\" \"target/$target/release/focusforge-cli\"; cp \"$MOCK_MACHO\" \"target/$target/release/focusforge-gui\"\n",
             "lipo": "#!/usr/bin/env bash\necho \"${MOCK_ARCHES:-arm64}\"\n",
-            "hdiutil": "#!/usr/bin/env bash\ncount=$(( $(cat \"$MOCK_HDIUTIL_COUNT\" 2>/dev/null || echo 0) + 1 )); echo \"$count\" > \"$MOCK_HDIUTIL_COUNT\"\nargs=(\"$@\"); for ((i = 0; i < $#; i++)); do [[ ${args[i]} == -srcfolder ]] && src=${args[i + 1]}; done; echo \"$(du -sm \"$src\" | cut -f1) $*\" >> \"$MOCK_HDIUTIL_ARGS\"\n[[ -z ${MOCK_PLIST_OUT:-} ]] || cp \"$src/Contents/Info.plist\" \"$MOCK_PLIST_OUT\"\nif (( count <= ${MOCK_HDIUTIL_FAIL:-0} )); then echo \"hdiutil: create failed - mock reason $count\" >&2; exit 77; fi\ntouch \"${!#}\"\n",
+            "hdiutil": "#!/usr/bin/env bash\ncount=$(( $(cat \"$MOCK_HDIUTIL_COUNT\" 2>/dev/null || echo 0) + 1 )); echo \"$count\" > \"$MOCK_HDIUTIL_COUNT\"\nargs=(\"$@\"); for ((i = 0; i < $#; i++)); do [[ ${args[i]} == -srcfolder ]] && src=${args[i + 1]}; done; echo \"$(du -sm \"$src\" | cut -f1) $*\" >> \"$MOCK_HDIUTIL_ARGS\"\n[[ -z ${MOCK_PLIST_OUT:-} ]] || cp \"$src/Contents/Info.plist\" \"$MOCK_PLIST_OUT\"\nif ! diff <(cd \"$src\" && find . -type f ! -path './Contents/_CodeSignature/*' -exec sha256sum {} + | sort) \"$src/Contents/_CodeSignature/CodeResources\" >/dev/null 2>&1; then echo 'hdiutil: mock source folder does not match its seal' >&2; exit 78; fi\nif (( count <= ${MOCK_HDIUTIL_FAIL:-0} )); then echo \"hdiutil: create failed - mock reason $count\" >&2; exit 77; fi\ntouch \"${!#}\"\n",
+            "codesign": "#!/usr/bin/env bash\nif [[ -n ${MOCK_CODESIGN_FAIL:-} ]]; then echo 'codesign: mock signing error' >&2; exit 9; fi\napp=${!#}; mkdir -p \"$app/Contents/_CodeSignature\"\n(cd \"$app\" && find . -type f ! -path './Contents/_CodeSignature/*' -exec sha256sum {} + | sort) > \"$app/Contents/_CodeSignature/CodeResources\"\n",
             "sleep": "#!/usr/bin/env bash\nexit 0\n",
             "plutil": "#!/usr/bin/env bash\nexit 0\n",
             "shasum": "#!/usr/bin/env bash\nif [[ -n ${MOCK_SHASUM_FAIL:-} ]]; then echo 'shasum: mock read error' >&2; exit 5; fi\nsha256sum \"${!#}\"\n",
@@ -1581,6 +1658,18 @@ def macos_producer_mock() -> None:
         assert any("shasum" in line and "failed with exit status 5" in line for line in result.stderr.splitlines()), result.stderr
         assert "failed with exit status 5" in diagnostics.read_text()
         env.pop("MOCK_SHASUM_FAIL")
+        counter.unlink(missing_ok=True)
+        env["MOCK_CODESIGN_FAIL"] = "1"
+        result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+        assert result.returncode == 9 and not counter.exists() and (artifact.read_bytes(), receipt.read_bytes()) == original, result.stderr
+        assert any("codesign" in line and "failed with exit status 9" in line for line in result.stderr.splitlines()), result.stderr
+        assert "failed with exit status 9" in diagnostics.read_text()
+        env.pop("MOCK_CODESIGN_FAIL")
+        if shutil.which("codesign") is None:
+            (mock / "codesign").rename(mock / "codesign.aside")
+            result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+            (mock / "codesign.aside").rename(mock / "codesign")
+            assert result.returncode == 1 and "missing codesign" in result.stderr, result.stderr
         env["MOCK_MV_PROMOTION_FAIL"] = "1"
         result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
         assert result.returncode != 0 and (artifact.read_bytes(), receipt.read_bytes()) == original
@@ -1593,6 +1682,15 @@ def macos_producer_mock() -> None:
         assert "mock reason 1" in logged and "exit status 77" in logged, logged
         assert len(hdiutil_sizes()[1]) == 2, arg_log.read_text()
         env.pop("MOCK_HDIUTIL_FAIL")
+        script = producer_copy.read_text()
+        sign = 'codesign --force --deep --sign - "$app"\n'
+        stage = 'python3 "$root/tools/package-cli-assets.py" stage "$root" "$app/Contents/Resources"\n'
+        for mutated in (script.replace(sign, ""), script.replace(sign, "").replace(stage, sign + stage)):
+            assert mutated != script
+            producer_copy.write_text(mutated); counter.unlink(missing_ok=True)
+            result = subprocess.run(["bash", str(producer_copy)], cwd=root, text=True, capture_output=True, env=env)
+            assert result.returncode == 78 and "does not match its seal" in result.stderr and (artifact.read_bytes(), receipt.read_bytes()) == original, result.stderr
+        producer_copy.write_text(script)
         counter.unlink(missing_ok=True)
         cargo_toml = root / "Cargo.toml"
         cargo_toml.write_text(with_prerelease(cargo_toml.read_text()))
@@ -1604,6 +1702,33 @@ def macos_producer_mock() -> None:
         receipt_text = (output / "native-receipt.json").read_text()
         assert f'"version":"{PRERELEASE}"' in receipt_text and f'"artifact":"{full}"' in receipt_text, receipt_text
         assert list((output / "symbols/aarch64-apple-darwin").glob(f"FocusForge-{PRERELEASE}-aarch64-apple-darwin-symbols.tar.gz"))
+
+
+def linux_producer_fresh_root() -> None:
+    creator = 'mkdir -p "$root/.scratch"\n'
+    script = (ROOT / "tools/package-linux.sh").read_text()
+    def run(text: str) -> tuple[subprocess.CompletedProcess, Path, str]:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp); root, mock, log = base / "root", base / "mock", base / "docker.log"
+            (root / "tools").mkdir(parents=True); (root / "packaging").mkdir(); mock.mkdir()
+            shutil.copy(ROOT / "Cargo.toml", root / "Cargo.toml")
+            shutil.copy(ROOT / "packaging/linux-tools.toml", root / "packaging/linux-tools.toml")
+            (root / "tools/package-linux.sh").write_text(text)
+            (mock / "git").write_text("#!/usr/bin/env bash\ncase \"$*\" in *rev-parse*) echo 0123456789abcdef0123456789abcdef01234567;; *ls-files*) printf 'Cargo.toml\\0packaging/linux-tools.toml\\0';; *) exit 64;; esac\n")
+            (mock / "docker").write_text(f"#!/usr/bin/env bash\necho \"$*\" >> '{log}'\nexit 97\n")
+            for name in ("git", "docker"): (mock / name).chmod(0o755)
+            env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "LC_ALL": "C"}
+            env.pop("FOCUSFORGE_PACKAGE_REUSE", None)
+            assert sorted(path.name for path in root.iterdir()) == ["Cargo.toml", "packaging", "tools"]
+            result = subprocess.run(["bash", str(root / "tools/package-linux.sh")], cwd=root, text=True, capture_output=True, env=env)
+            return result, root, log.read_text() if log.exists() else ""
+    result, root, docker = run(script)
+    assert result.returncode == 97 and "mktemp" not in result.stderr, (result.returncode, result.stderr)
+    assert docker.count("\n") == 1 and f"-v {root}:/src:ro" in docker, docker
+    mutated = script.replace(creator, "", 1)
+    assert mutated != script
+    result, _, docker = run(mutated)
+    assert result.returncode != 0 and "mktemp: failed to create file" in result.stderr and not docker, (result.returncode, result.stderr, docker)
 
 
 def windows_checker_mock() -> None:
@@ -1655,19 +1780,30 @@ function global:msiexec.exe {
   $shortcut = Join-Path $env:ProgramData 'Microsoft/Windows/Start Menu/Programs/FocusForge/FocusForge.lnk'
   if ($Arguments[0] -eq '/i') {
     New-Item -ItemType Directory -Force -Path $product, (Split-Path $shortcut) | Out-Null
-    @('#!/bin/sh', 'exec bash -c "$(tail -n +4 "$0")" "$0" "$@"', ('#' + 'x' * 400), 'if [[ -n $FF_FORCE_CRASH ]]; then name=$(basename "$0"); if [[ $name == focusforge-cli.exe && ${1:-} != algorithms ]]; then exit 64; fi; if [[ $name == focusforge-gui.exe && $# -ne 0 ]]; then exit 65; fi; printf "%s:%s:%s\\n" "$name" "$#" "${1:-}" >> "$MOCK_INVOCATIONS"; mkdir -p "$FOCUSFORGE_DATA_DIR/focusforge/crashes"; case "${MOCK_CRASH_ARTIFACT:-complete}" in missing_metadata|complete) printf MDMP > "$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.dmp";; esac; case "${MOCK_CRASH_ARTIFACT:-complete}" in missing_dump|complete) printf "{\"binary\":\"$name\",\"minidump\":\"crash.dmp\",\"pid\":%s,\"version\":\"__VERSION__\",\"timestamp\":\"%s\"}" "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.json";; esac; exit 1; elif [[ $1 == --version ]]; then echo focusforge-cli __VERSION__; elif [[ $1 == info ]]; then printf "%s\n" "$MOCK_INFO"; fi') | Set-Content (Join-Path $product 'focusforge-cli.exe')
-    # Line 3 of the mock script (bash rejects NUL bytes in its first 80, hence the sh trampoline) carries a PE header: e_lfanew at 0x3C, 'PE' at 0x80, optional-header Subsystem at 0xDC.
-    function Set-MockSubsystem([string]$Path, [byte]$Subsystem) {
+    @('#!/bin/sh', 'exec bash -c "$(tail -n +4 "$0")" "$0" "$@"', ('#' + 'x' * 1000), 'if [[ -n $FF_FORCE_CRASH ]]; then name=$(basename "$0"); if [[ $name == focusforge-cli.exe && ${1:-} != algorithms ]]; then exit 64; fi; if [[ $name == focusforge-gui.exe && $# -ne 0 ]]; then exit 65; fi; printf "%s:%s:%s\\n" "$name" "$#" "${1:-}" >> "$MOCK_INVOCATIONS"; mkdir -p "$FOCUSFORGE_DATA_DIR/focusforge/crashes"; case "${MOCK_CRASH_ARTIFACT:-complete}" in missing_metadata|complete) printf MDMP > "$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.dmp";; esac; case "${MOCK_CRASH_ARTIFACT:-complete}" in missing_dump|complete) printf "{\"binary\":\"$name\",\"minidump\":\"crash.dmp\",\"pid\":%s,\"version\":\"__VERSION__\",\"timestamp\":\"%s\"}" "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$FOCUSFORGE_DATA_DIR/focusforge/crashes/crash.json";; esac; exit 1; elif [[ $1 == --version ]]; then echo focusforge-cli __VERSION__; elif [[ $1 == info ]]; then printf "%s\n" "$MOCK_INFO"; fi') | Set-Content (Join-Path $product 'focusforge-cli.exe')
+    # Line 3 of the mock script (bash rejects NUL bytes in its first 80, hence the sh trampoline) carries a PE32+ header: e_lfanew at 0x3C, 'PE' at 0x80, one section (table at 0x188) mapping RVA 0x3000 to file offset 0x200, Subsystem at 0xDC, and an import directory with one descriptor per DLL at 0x200 and the names from 0x280.
+    function Set-MockPe([string]$Path, [byte]$Subsystem, [string[]]$Imports) {
       $bytes = [IO.File]::ReadAllBytes($Path)
-      $bytes[0x3C] = 0x80; $bytes[0x3D] = 0; $bytes[0x3E] = 0; $bytes[0x3F] = 0
-      $bytes[0x80] = 0x50; $bytes[0x81] = 0x45; $bytes[0x82] = 0; $bytes[0x83] = 0
-      $bytes[0xDC] = $Subsystem; $bytes[0xDD] = 0
+      function Put([int]$Offset, [uint32]$Value, [int]$Width) { for ($i = 0; $i -lt $Width; $i++) { $bytes[$Offset + $i] = [byte](($Value -shr (8 * $i)) -band 0xFF) } }
+      Put 0x3C 0x80 4; Put 0x80 0x4550 4
+      Put 0x86 1 2; Put 0x94 0xF0 2; Put 0x98 0x20B 2; Put 0xDC $Subsystem 2
+      Put 0x104 16 4; Put 0x110 0x3000 4; Put 0x114 (20 * ($Imports.Count + 1)) 4
+      Put 0x190 0x200 4; Put 0x194 0x3000 4; Put 0x198 0x200 4; Put 0x19C 0x200 4
+      for ($n = 0; $n -lt $Imports.Count; $n++) {
+        $descriptor = 0x200 + 20 * $n
+        foreach ($field in 0, 4, 8, 16) { Put ($descriptor + $field) 0 4 }
+        Put ($descriptor + 12) (0x3080 + 0x30 * $n) 4
+        $name = [Text.Encoding]::ASCII.GetBytes($Imports[$n] + [char]0)
+        [Array]::Copy($name, 0, $bytes, 0x280 + 0x30 * $n, $name.Length)
+      }
+      for ($i = 0; $i -lt 20; $i++) { $bytes[0x200 + 20 * $Imports.Count + $i] = 0 }
       [IO.File]::WriteAllBytes($Path, $bytes)
     }
-    Set-MockSubsystem (Join-Path $product 'focusforge-cli.exe') 3
+    $imports = @('KERNEL32.dll', 'api-ms-win-crt-runtime-l1-1-0.dll')
+    Set-MockPe (Join-Path $product 'focusforge-cli.exe') 3 ($imports + @(if ($env:MOCK_CRT_IMPORT) { $env:MOCK_CRT_IMPORT }))
     & chmod +x (Join-Path $product 'focusforge-cli.exe')
     Copy-Item (Join-Path $product 'focusforge-cli.exe') (Join-Path $product 'focusforge-gui.exe')
-    Set-MockSubsystem (Join-Path $product 'focusforge-gui.exe') $(if ($env:MOCK_GUI_CONSOLE) { 3 } else { 2 })
+    Set-MockPe (Join-Path $product 'focusforge-gui.exe') $(if ($env:MOCK_GUI_CONSOLE) { 3 } else { 2 }) $imports
     & chmod +x (Join-Path $product 'focusforge-gui.exe')
     @('if [[ $1 == --exit-after ]]; then while (($#)); do if [[ $1 == --screenshot ]]; then printf "\211PNG\r\n\032\n\000\000\000\rIHDR\000\000\000\001\000\000\000\001" > "$2"; exit 0; fi; shift; done; exit 64; fi') | Add-Content (Join-Path $product 'focusforge-gui.exe')
     Copy-Item (Join-Path $PSScriptRoot 'LICENSE') $product
@@ -1721,7 +1857,7 @@ if ($env:MOCK_BAD_ARCHIVE) { Add-Content (Get-ChildItem (Join-Path $PSScriptRoot
         info = '{"frame_count":3,"unreadable_count":0,"files":[{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]},{"width":64,"height":64,"samples_per_pixel":3,"bits_per_sample":[16,16,16]}]}'
         invocations = root / "invocations"
         env = {**os.environ, "PATH": f"{mock}:{os.environ['PATH']}", "ProgramFiles": str(root / "program-files"), "ProgramData": str(root / "program-data"), "MOCK_INFO": info, "MOCK_STACKWALK": str(stackwalk), "MOCK_INVOCATIONS": str(invocations)}
-        for mutation, success in (({}, True), ({"MOCK_SMOKE_FAIL": "1"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_dump"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_metadata"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_both"}, False), ({"MOCK_INFO": '{"frame_count":3,"unreadable_count":0,"files":[]}'}, False), ({"MOCK_ICON_INDEX": "99"}, False), ({"MOCK_BAD_PDB": "1"}, False), ({"MOCK_BAD_ID": "1"}, False), ({"MOCK_MISSING_PAYLOAD": "1"}, False), ({"MOCK_BAD_ARCHIVE": "1"}, False), ({"MOCK_AUMID": "org.focusforge.app"}, False), ({"MOCK_AUMID": "absent"}, False), ({"MOCK_GUI_CONSOLE": "1"}, False)):
+        for mutation, success in (({}, True), ({"MOCK_SMOKE_FAIL": "1"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_dump"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_metadata"}, False), ({"MOCK_CRASH_ARTIFACT": "missing_both"}, False), ({"MOCK_INFO": '{"frame_count":3,"unreadable_count":0,"files":[]}'}, False), ({"MOCK_ICON_INDEX": "99"}, False), ({"MOCK_BAD_PDB": "1"}, False), ({"MOCK_BAD_ID": "1"}, False), ({"MOCK_MISSING_PAYLOAD": "1"}, False), ({"MOCK_BAD_ARCHIVE": "1"}, False), ({"MOCK_AUMID": "org.focusforge.app"}, False), ({"MOCK_AUMID": "absent"}, False), ({"MOCK_GUI_CONSOLE": "1"}, False), ({"MOCK_CRT_IMPORT": "VCRUNTIME140.dll"}, False)):
             shutil.rmtree(root / "symbols", ignore_errors=True)
             shutil.copytree(template, root / "symbols")
             case_env = env | mutation
@@ -1734,6 +1870,11 @@ if ($env:MOCK_BAD_ARCHIVE) { Add-Content (Get-ChildItem (Join-Path $PSScriptRoot
                 assert "invalid Start-menu shortcut AppUserModelID:" in result.stderr, result.stderr
             if "MOCK_GUI_CONSOLE" in mutation:
                 assert "focusforge-gui.exe must be a windowed binary (PE subsystem 2)" in result.stderr, result.stderr
+            if not mutation:
+                assert "focusforge-cli.exe imports: KERNEL32.dll, api-ms-win-crt-runtime-l1-1-0.dll" in result.stdout, result.stdout
+                assert "focusforge-gui.exe imports: KERNEL32.dll, api-ms-win-crt-runtime-l1-1-0.dll" in result.stdout, result.stdout
+            if "MOCK_CRT_IMPORT" in mutation:
+                assert "focusforge-cli.exe links the dynamic C runtime: VCRUNTIME140.dll" in result.stderr, result.stderr
             assert not (root / "program-files/FocusForge").exists()
             assert not (root / "program-data/Microsoft/Windows/Start Menu/Programs/FocusForge/FocusForge.lnk").exists()
         assert invocations.read_text().splitlines()[:2] == ["focusforge-cli.exe:1:algorithms", "focusforge-gui.exe:0:"]
@@ -1774,6 +1915,7 @@ def smoke_callers() -> None:
         paths = {line.strip() for line in block.split("path: |\n", 1)[1].split("          include-hidden-files: true", 1)[0].splitlines() if line.strip()}
         expected_paths = {f"{root}/{suffix}" for root in roots for suffix in suffixes}
         if launch: expected_paths |= {f"{root.rsplit('/smoke', 1)[0]}/launch.png" for root in roots}
+        if name == "package-smoke-receipts-macos": expected_paths |= {".scratch/check-package-macos.*/crashes/*/data/focusforge/crashes/*", ".scratch/check-package-macos.*/crashes/*/stderr"}
         assert paths == expected_paths
     diagnostics_path = ".scratch/package-macos-diagnostics/"
     macos_job = jobs["package-macos"]
@@ -1788,5 +1930,27 @@ def smoke_callers() -> None:
     assert diagnostics_path.rstrip("/") in (ROOT / "tools/package-macos.sh").read_text()
 
 
+def main(argv: list[str]) -> int:
+    if argv not in ([], ["--no-pwsh"]):
+        print("usage: check-packaging-selftest.py [--no-pwsh]", file=sys.stderr)
+        return 2
+    no_pwsh = argv == ["--no-pwsh"]
+    if not no_pwsh and not shutil.which("pwsh"):
+        print("PowerShell 7+ is required on PATH; pass --no-pwsh to run the cases that do not need it", file=sys.stderr)
+        return 1
+    pwsh_groups = (wix_version_cases, windows_checker_mock)
+    groups = (
+        producer, producer_cleanup_mock, checker, cli_asset_helper_cases, gate_checks, gate_retry_cases, graph,
+        native_boundaries, symbol_tool_cases, linux_known_main_cases, linux_crash_roundtrip_cases, source_privacy_cases,
+        hosted_runner_path_cases, macos_source_cases, windows_identity_cases, wix_version_cases, macos_checker_mock,
+        macos_producer_mock, linux_producer_fresh_root, windows_checker_mock, smoke_callers,
+    )
+    for group in groups:
+        if not (no_pwsh and group in pwsh_groups):
+            group()
+    print("packaging selftest: PASS" + (" (without PowerShell cases)" if no_pwsh else ""))
+    return 0
+
+
 if __name__ == "__main__":
-    producer(); producer_cleanup_mock(); checker(); cli_asset_helper_cases(); gate_checks(); gate_retry_cases(); graph(); native_boundaries(); symbol_tool_cases(); linux_known_main_cases(); linux_crash_roundtrip_cases(); source_privacy_cases(); hosted_runner_path_cases(); macos_source_cases(); windows_identity_cases(); wix_version_cases(); macos_checker_mock(); macos_producer_mock(); windows_checker_mock(); smoke_callers(); print("packaging selftest: PASS")
+    sys.exit(main(sys.argv[1:]))

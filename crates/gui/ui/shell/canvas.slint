@@ -8,6 +8,7 @@ import { ShellGeometry } from "../geometry.slint";
 import { FFEmptyState } from "empty_state.slint";
 import { FFPane } from "../components/ff_pane.slint";
 import { FFPanePlaceholder } from "../components/ff_pane_placeholder.slint";
+import { FFStageView, StageTile } from "../components/ff_stage_view.slint";
 import { FFBrushCursor } from "../components/ff_brush_cursor.slint";
 
 export component FFCanvas inherits Rectangle {
@@ -27,6 +28,23 @@ export component FFCanvas inherits Rectangle {
     // Whether the active tab has a composite -- governs the right pane's
     // not-yet-fused placeholder.
     in property <bool> composite-ready: false;
+    // The right pane's label and the live stage view of a fuse run.
+    in property <string> composite-label: "Composite";
+    in property <bool> stage-visible: false;
+    in property <image> stage-source;
+    in property <length> stage-image-x;
+    in property <length> stage-image-y;
+    in property <length> stage-image-w;
+    in property <length> stage-image-h;
+    in property <[StageTile]> stage-tiles: [];
+    in property <bool> stage-inset-visible: false;
+    in property <bool> stage-inset-only: false;
+    in property <bool> stage-mosaic-fading: false;
+    in property <bool> stage-inset-fading: false;
+    in property <image> stage-heat;
+    // The card shown while a run has no image yet; empty for none.
+    in property <string> stage-card-title: "";
+    in property <string> stage-card-body: "";
     // The one shared viewport's placement -- forwarded identically to
     // both panes below, which is what makes "one viewport
     // over two panes" structural rather than a synchronisation. The right
@@ -87,12 +105,10 @@ export component FFCanvas inherits Rectangle {
     callback pane-hover-changed();
     callback frame-undock-requested();
     callback composite-undock-requested();
-    // The one input dispatch point's gesture forwards. No other `.slint`
-    // file in the crate declares `scroll-event`, `pointer-event` or
-    // `moved`. The two extra `length`s carry the wheel's own cursor
-    // position (`self.mouse-x`/`mouse-y` are written before `scroll-event`
-    // is invoked), since `moved` only fires while the pointer is pressed
-    // and cannot track a hovering cursor.
+    // Forwards the rebindable canvas gestures. The two extra `length`s carry
+    // the wheel's own cursor position (`self.mouse-x`/`mouse-y` are written
+    // before `scroll-event` is invoked), since `moved` only fires while the
+    // pointer is pressed and cannot track a hovering cursor.
     callback canvas-scrolled(length, length, length, length, bool, bool, bool);
     // The `int` is `event.kind` folded to 0 = Down, 1 = Up or Cancel,
     // 2 = Move -- `PointerEventKind` itself is not publicly nameable from
@@ -220,7 +236,7 @@ export component FFCanvas inherits Rectangle {
         height: pane-left.height;
         visible: root.detached-pane != "composite";
         source: root.composite-source;
-        label: "Composite";
+        label: root.composite-label;
         message-lines: root.composite-message-lines;
         undock-enabled: root.undock-enabled;
         project-loaded: root.project-loaded;
@@ -239,12 +255,39 @@ export component FFCanvas inherits Rectangle {
         crop-h: root.crop-h;
         pixelated: root.pixelated;
         undock-requested => { root.composite-undock-requested(); }
+
+        FFStageView {
+            width: parent.width;
+            height: parent.height;
+            visible: root.stage-visible;
+            source: root.stage-source;
+            image-x: root.stage-image-x;
+            image-y: root.stage-image-y;
+            image-w: root.stage-image-w;
+            image-h: root.stage-image-h;
+            tiles: root.stage-tiles;
+            inset-visible: root.stage-inset-visible;
+            inset-only: root.stage-inset-only;
+            mosaic-fading: root.stage-mosaic-fading;
+            inset-fading: root.stage-inset-fading;
+            heat: root.stage-heat;
+        }
     }
 
     pane-placeholder := FFPanePlaceholder {
         x: pane-right.x + (pane-right.width - self.width) / 2;
         y: pane-right.y + (pane-right.height - self.height) / 2;
-        visible: root.project-loaded && !root.composite-ready && root.detached-pane != "composite";
+        visible: root.project-loaded && !root.composite-ready
+            && !(root.stage-visible && !root.stage-inset-only) && root.stage-card-title == "" && root.detached-pane != "composite";
+    }
+
+    stage-card := FFPanePlaceholder {
+        x: pane-right.x + (pane-right.width - self.width) / 2;
+        y: pane-right.y + (pane-right.height - self.height) / 2;
+        title: root.stage-card-title;
+        body: root.stage-card-body;
+        visible: root.project-loaded && root.stage-card-title != ""
+            && root.detached-pane != "composite";
     }
 
     brush-cursor-left-clip := Rectangle {

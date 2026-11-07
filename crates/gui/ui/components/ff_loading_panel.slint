@@ -1,28 +1,35 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// A rounded surface panel holding a spinner and a caption, cast with a drop
-// shadow so it reads as floating above whatever sits behind it.
+// A centred message: an optional spinner, an optional bold title and a
+// caption. Framed, it is a rounded surface panel cast with a drop shadow so
+// it reads as floating; unframed, it is the bare text.
 
 import { Theme } from "../theme.slint";
 import { FFSpinner } from "ff_spinner.slint";
 
 export component FFLoadingPanel inherits Rectangle {
     in property <string> caption: "";
+    in property <string> title: "";
+    in property <bool> show-spinner: true;
+    // false drops the surface, the shadow and the padding.
+    in property <bool> framed: true;
+    // "normal" | "failed"; `failed` colours the title as a failure.
+    in property <string> tone: "normal";
 
     // Sized from its own padded content, so it self-sizes correctly
     // whether its parent is a layout or not.
     width: content.preferred-width;
     height: content.preferred-height;
-    background: Theme.surface-raised;
+    background: root.framed ? Theme.surface-raised : transparent;
     border-radius: Theme.radius-lg;
     // Lifts the panel off whatever is behind it -- the same recipe
     // `FFImageRow`'s own floating state uses.
-    drop-shadow-color: Theme.surface-canvas.with-alpha(0.5);
+    drop-shadow-color: root.framed ? Theme.surface-canvas.with-alpha(0.5) : transparent;
     drop-shadow-offset-y: Theme.space-1;
     drop-shadow-blur: Theme.space-2;
 
     content := VerticalLayout {
-        padding: Theme.space-4;
+        padding: root.framed ? Theme.space-4 : 0px;
         spacing: Theme.space-2;
         alignment: center;
         // The spinner has a fixed width, so it does not stretch to the
@@ -30,13 +37,23 @@ export component FFLoadingPanel inherits Rectangle {
         // explicitly, or it sits at the layout's left edge instead.
         cross-axis-alignment: center;
 
-        FFSpinner {}
+        if root.show-spinner: FFSpinner {}
+
+        if root.title != "": Text {
+            text: root.title;
+            color: root.tone == "failed" ? Theme.status-failure : Theme.text-primary;
+            font-size: Theme.text-title.size;
+            font-weight: Theme.text-title.weight;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
 
         Text {
             text: root.caption;
-            color: Theme.text-secondary;
+            color: root.title != "" ? Theme.text-muted : Theme.text-secondary;
             font-size: Theme.text-body.size;
             horizontal-alignment: center;
+            wrap: word-wrap;
         }
     }
 }

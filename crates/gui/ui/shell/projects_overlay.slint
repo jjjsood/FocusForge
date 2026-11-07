@@ -5,11 +5,12 @@
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
+import { FFAppear } from "../components/ff_appear.slint";
 import { FFProjectsGallery, ProjectCardView } from "projects_overlay/gallery.slint";
 import { FFProjectsRail, RecentRowView } from "projects_overlay/rail.slint";
 export { ProjectCardView, RecentRowView }
 
-export component FFProjectsOverlay inherits Rectangle {
+export component FFProjectsOverlay inherits FFAppear {
     in property <bool> overlay-open: false;
     in property <string> gallery-heading: "Open projects";
     in property <string> gallery-count-text: "";
@@ -35,7 +36,8 @@ export component FFProjectsOverlay inherits Rectangle {
     out property <length> gallery-x: gallery.x;
     out property <length> gallery-y: gallery.y;
 
-    visible: root.overlay-open;
+    shown: root.overlay-open;
+    fade-out: true;
     background: Theme.surface-base;
 
     // Swallows a click or scroll over any background left exposed by the

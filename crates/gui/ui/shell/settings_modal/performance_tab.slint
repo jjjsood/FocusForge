@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The Performance section's content: GPU processing, the two budget caps
-// and the budgets they lower.
+// The Performance section's content: GPU processing and the two memory
+// limits, each a number beside a unit.
 
 import { Theme } from "../../theme.slint";
 import { ShellGeometry } from "../../geometry.slint";
 import { FFToggle } from "../../components/ff_toggle.slint";
-import { FFTextField } from "../../components/ff_text_field.slint";
+import { FFSizeField } from "../../components/ff_size_field.slint";
+import { FFMenuList } from "../../components/ff_menu_list.slint";
+import { FFErrorRow } from "../../components/ff_error_row.slint";
+import { FFDivider } from "../../components/ff_divider.slint";
 import { FFSettingsSection } from "../../components/ff_settings_section.slint";
 import { FFSettingsRow } from "../../components/ff_settings_row.slint";
 import { FFRowText } from "../../components/ff_row_text.slint";
@@ -15,9 +18,12 @@ import { FFStatusText } from "../../components/ff_status_text.slint";
 export struct PerformanceCap {
     text: string,
     placeholder: string,
+    unit: string,
     invalid: bool,
     enabled: bool,
     scroll-offset: length,
+    limit: string,
+    unit-open: bool,
 }
 
 export struct PerformanceState {
@@ -26,9 +32,6 @@ export struct PerformanceState {
     backend: string,
     host-cap: PerformanceCap,
     vram-cap: PerformanceCap,
-    host-budget: string,
-    vram-budget: string,
-    vram-budget-known: bool,
     note: string,
 }
 
@@ -37,8 +40,30 @@ export component FFPerformanceTab inherits Rectangle {
     callback gpu-toggled(bool);
     callback host-cap-edited(string);
     callback vram-cap-edited(string);
+    callback cap-committed();
     callback host-cap-cursor-moved(length, length);
     callback vram-cap-cursor-moved(length, length);
+    callback host-unit-toggled();
+    callback vram-unit-toggled();
+    callback host-unit-selected(string);
+    callback vram-unit-selected(string);
+    callback unit-dismissed();
+
+    // The unit a keyboard user has moved to in an open list: 0 MiB, 1 GiB.
+    property <int> host-pending-index: 1;
+    property <int> vram-pending-index: 1;
+    property <bool> host-unit-open: root.performance.host-cap.unit-open;
+    property <bool> vram-unit-open: root.performance.vram-cap.unit-open;
+    changed host-unit-open => {
+        if root.host-unit-open {
+            root.host-pending-index = root.performance.host-cap.unit == "MiB" ? 0 : 1;
+        }
+    }
+    changed vram-unit-open => {
+        if root.vram-unit-open {
+            root.vram-pending-index = root.performance.vram-cap.unit == "MiB" ? 0 : 1;
+        }
+    }
 
     VerticalLayout {
         padding-left: ShellGeometry.settings-content-inset-left;
@@ -80,66 +105,93 @@ export component FFPerformanceTab inherits Rectangle {
                 heading: "LIMITS";
 
                 FFSettingsRow {
-                    label: "Host memory cap";
+                    label: "Host memory";
                     align-end: true;
+                    divider: root.performance.host-cap.limit == "";
 
-                    // The field grows by 2 px on every edge when emphasised;
-                    // its slot keeps the unemphasised size.
-                    Rectangle {
-                        width: ShellGeometry.settings-field-width;
-                        height: ShellGeometry.field-height;
-
-                        FFTextField {
-                            x: (parent.width - self.width) / 2;
-                            y: (parent.height - self.height) / 2;
-                            text: root.performance.host-cap.text;
-                            placeholder: root.performance.host-cap.placeholder;
-                            tone: root.performance.host-cap.invalid ? "failure" : "neutral";
-                            enabled: root.performance.host-cap.enabled;
-                            field-width: parent.width;
-                            scroll-offset: root.performance.host-cap.scroll-offset;
-                            edited(text) => { root.host-cap-edited(text); }
-                            cursor-moved(x, w) => { root.host-cap-cursor-moved(x, w); }
+                    host-size := FFSizeField {
+                        text: root.performance.host-cap.text;
+                        placeholder: root.performance.host-cap.placeholder;
+                        unit: root.performance.host-cap.unit;
+                        tone: root.performance.host-cap.invalid ? "failure" : "neutral";
+                        unavailable: !root.performance.host-cap.enabled;
+                        scroll-offset: root.performance.host-cap.scroll-offset;
+                        unit-name: "Host memory unit";
+                        unit-open: root.host-unit-open;
+                        unit-focused-index: root.host-pending-index;
+                        external-list: true;
+                        edited(text) => { root.host-cap-edited(text); }
+                        committed => { root.cap-committed(); }
+                        cursor-moved(x, w) => { root.host-cap-cursor-moved(x, w); }
+                        unit-toggled => { root.host-unit-toggled(); }
+                        unit-selected(unit) => { root.host-unit-selected(unit); }
+                        unit-previous-requested => {
+                            if root.host-unit-open { root.host-pending-index = max(0, root.host-pending-index - 1); }
+                            else { root.host-unit-toggled(); }
                         }
+                        unit-next-requested => {
+                            if root.host-unit-open { root.host-pending-index = min(1, root.host-pending-index + 1); }
+                            else { root.host-unit-toggled(); }
+                        }
+                        unit-accepted => {
+                            if root.host-unit-open { root.host-unit-selected(root.host-pending-index == 0 ? "MiB" : "GiB"); }
+                            else { root.host-unit-toggled(); }
+                        }
+                        unit-dismissed => { if root.host-unit-open { root.unit-dismissed(); } }
                     }
                 }
 
+                if root.performance.host-cap.limit != "": VerticalLayout {
+                    FFErrorRow {
+                        horizontal-alignment: right;
+                        message: root.performance.host-cap.limit;
+                    }
+                    FFDivider { }
+                }
+
                 FFSettingsRow {
-                    label: "VRAM cap";
+                    label: "VRAM";
                     align-end: true;
+                    divider: root.performance.vram-cap.limit == "";
 
-                    Rectangle {
-                        width: ShellGeometry.settings-field-width;
-                        height: ShellGeometry.field-height;
-
-                        FFTextField {
-                            x: (parent.width - self.width) / 2;
-                            y: (parent.height - self.height) / 2;
-                            text: root.performance.vram-cap.text;
-                            placeholder: root.performance.vram-cap.placeholder;
-                            tone: root.performance.vram-cap.invalid ? "failure" : "neutral";
-                            enabled: root.performance.vram-cap.enabled;
-                            field-width: parent.width;
-                            scroll-offset: root.performance.vram-cap.scroll-offset;
-                            edited(text) => { root.vram-cap-edited(text); }
-                            cursor-moved(x, w) => { root.vram-cap-cursor-moved(x, w); }
+                    vram-size := FFSizeField {
+                        text: root.performance.vram-cap.text;
+                        placeholder: root.performance.vram-cap.placeholder;
+                        unit: root.performance.vram-cap.unit;
+                        tone: root.performance.vram-cap.invalid ? "failure" : "neutral";
+                        unavailable: !root.performance.vram-cap.enabled;
+                        scroll-offset: root.performance.vram-cap.scroll-offset;
+                        unit-name: "VRAM unit";
+                        unit-open: root.vram-unit-open;
+                        unit-focused-index: root.vram-pending-index;
+                        external-list: true;
+                        edited(text) => { root.vram-cap-edited(text); }
+                        committed => { root.cap-committed(); }
+                        cursor-moved(x, w) => { root.vram-cap-cursor-moved(x, w); }
+                        unit-toggled => { root.vram-unit-toggled(); }
+                        unit-selected(unit) => { root.vram-unit-selected(unit); }
+                        unit-previous-requested => {
+                            if root.vram-unit-open { root.vram-pending-index = max(0, root.vram-pending-index - 1); }
+                            else { root.vram-unit-toggled(); }
                         }
+                        unit-next-requested => {
+                            if root.vram-unit-open { root.vram-pending-index = min(1, root.vram-pending-index + 1); }
+                            else { root.vram-unit-toggled(); }
+                        }
+                        unit-accepted => {
+                            if root.vram-unit-open { root.vram-unit-selected(root.vram-pending-index == 0 ? "MiB" : "GiB"); }
+                            else { root.vram-unit-toggled(); }
+                        }
+                        unit-dismissed => { if root.vram-unit-open { root.unit-dismissed(); } }
                     }
                 }
 
-                FFSettingsRow {
-                    label: "Host budget";
-
-                    FFRowText { text: root.performance.host-budget; }
-                }
-
-                FFSettingsRow {
-                    label: "VRAM budget";
-
-                    FFRowText {
-                        text: root.performance.vram-budget;
-                        muted: !root.performance.vram-budget-known;
+                if root.performance.vram-cap.limit != "": VerticalLayout {
+                    FFErrorRow {
+                        horizontal-alignment: right;
+                        message: root.performance.vram-cap.limit;
                     }
+                    FFDivider { }
                 }
             }
 
@@ -147,6 +199,36 @@ export component FFPerformanceTab inherits Rectangle {
                 height: ShellGeometry.settings-status-height;
                 text: root.performance.note;
             }
+        }
+    }
+
+    // Drawn last so an open list covers the row below its field.
+    if root.host-unit-open: FFMenuList {
+        x: host-size.absolute-position.x - root.absolute-position.x + host-size.unit-x;
+        y: host-size.absolute-position.y - root.absolute-position.y + host-size.height;
+        width: host-size.unit-width;
+        choices: ["MiB", "GiB"];
+        choice-ids: ["MiB", "GiB"];
+        show-choice-ids: false;
+        selected: root.performance.host-cap.unit;
+        focused-index: root.host-pending-index;
+        option-selected(unit) => {
+            root.host-unit-selected(unit);
+            host-size.take-pushed-text();
+        }
+    }
+    if root.vram-unit-open: FFMenuList {
+        x: vram-size.absolute-position.x - root.absolute-position.x + vram-size.unit-x;
+        y: vram-size.absolute-position.y - root.absolute-position.y + vram-size.height;
+        width: vram-size.unit-width;
+        choices: ["MiB", "GiB"];
+        choice-ids: ["MiB", "GiB"];
+        show-choice-ids: false;
+        selected: root.performance.vram-cap.unit;
+        focused-index: root.vram-pending-index;
+        option-selected(unit) => {
+            root.vram-unit-selected(unit);
+            vram-size.take-pushed-text();
         }
     }
 }

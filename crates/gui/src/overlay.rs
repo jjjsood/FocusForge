@@ -80,6 +80,27 @@ pub fn sources_missing_body(missing: usize, total: usize) -> String {
     )
 }
 
+/// The grouping question's body: one sentence naming each stack's frame
+/// count -- "2 stacks of 3 frames each." when all sizes match, otherwise
+/// "2 stacks (3 and 4 frames)." and, from three stacks on, "(3, 4 and 5
+/// frames)".
+pub fn grouping_body(stack_sizes: &[usize]) -> String {
+    let stacks = stack_sizes.len();
+    let Some((&last, head)) = stack_sizes.split_last() else {
+        return "This folder holds no stacks.".to_owned();
+    };
+    if head.iter().all(|&size| size == last) {
+        let word = if last == 1 { "frame" } else { "frames" };
+        return format!("This folder holds {stacks} stacks of {last} {word} each.");
+    }
+    let head = head
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("This folder holds {stacks} stacks ({head} and {last} frames).")
+}
+
 /// The fingerprint-mismatch dialog's own title.
 pub const MISMATCH_TITLE: &str = "The source frames are not the same";
 
@@ -242,12 +263,12 @@ pub(crate) fn render_thumbnail_from_file(path: &Path) -> Option<Thumbnail> {
     render_thumbnail_from_project(&mut project)
 }
 
-/// A loose TIFF -- an unfused tab's first frame or a held composite --
-/// downsampled and tone-mapped the same way, read band by band via
-/// [`TiffStack::read_tile_into`], never as a whole image. `None` on any read
-/// failure.
+/// A loose TIFF -- an unfused tab's first frame or a held composite, 16-bit or
+/// 32-bit float -- downsampled and tone-mapped the same way, read band by band
+/// via [`TiffStack::read_tile_into`], never as a whole image. `None` on any
+/// read failure.
 pub(crate) fn render_thumbnail_from_frame(first_frame: &Path) -> Option<Thumbnail> {
-    let stack = TiffStack::open_files(std::slice::from_ref(&first_frame.to_path_buf())).ok()?;
+    let stack = TiffStack::open_staged(first_frame).ok()?;
     let (width, height) = stack.dimensions();
     let samples_per_pixel = stack.header(0).samples_per_pixel;
     let mut accumulator = Downsampler::new(
@@ -286,5 +307,60 @@ pub fn render_thumbnail(project: &mut GuiProject, frames: &[PathBuf]) -> Option<
     match project {
         GuiProject::Opened(project) => render_thumbnail_from_project(project),
         GuiProject::Unsaved(_) => render_thumbnail_from_frame(frames.first()?),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use focusforge_core::io::{TiffSpec, TiffWriter};
+    use focusforge_core::tile::Sample;
+
+    const WIDTH: u32 = 48;
+    const HEIGHT: u32 = 32;
+
+    fn spec() -> TiffSpec {
+        TiffSpec {
+            width: WIDTH,
+            height: HEIGHT,
+            samples_per_pixel: 3,
+            description: None,
+        }
+    }
+
+    fn whole() -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: WIDTH,
+            height: HEIGHT,
+        }
+    }
+
+    /// A float composite and the 16-bit one holding the same samples clipped.
+    #[test]
+    fn a_float_composite_has_the_thumbnail_of_its_clipped_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored: Vec<f32> = (0..WIDTH * HEIGHT * 3)
+            .map(|i| i as f32 * 20.0 - 3000.0)
+            .collect();
+        assert!(stored.iter().any(|&v| v < 0.0) && stored.iter().any(|&v| v > 65535.0));
+        let float_path = dir.path().join("float.tif");
+        let mut writer = TiffWriter::create_f32(&float_path, spec()).unwrap();
+        writer.write_tile_f32(whole(), &stored).unwrap();
+        writer.finish().unwrap();
+        let clipped_path = dir.path().join("clipped.tif");
+        let clipped: Vec<u16> = stored.iter().map(|&v| u16::narrow(v)).collect();
+        let mut writer = TiffWriter::create(&clipped_path, spec()).unwrap();
+        writer.write_tile(whole(), &clipped).unwrap();
+        writer.finish().unwrap();
+
+        let from_float =
+            render_thumbnail_from_frame(&float_path).expect("a float composite has a thumbnail");
+        assert_eq!(
+            Some(from_float),
+            render_thumbnail_from_frame(&clipped_path),
+            "the float composite reads as its samples clipped to 16 bits"
+        );
     }
 }

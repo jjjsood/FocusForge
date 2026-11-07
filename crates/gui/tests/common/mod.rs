@@ -4,15 +4,16 @@
 //! from `CARGO_MANIFEST_DIR`, the idiom `crates/core/tests/common/mod.rs`
 //! already established -- never a literal `../..` string.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use focusforge_core::params::ParamValue;
 use focusforge_gui::job::Op;
-use focusforge_gui::{AppController, OpenAs, OpenOutcome, ShellMode};
+use focusforge_gui::{AppController, OpenAs, OpenOutcome, ShellEvent, ShellMode};
 
 #[path = "../../../core/tests/common/reference_stack.rs"]
 mod reference_stack;
@@ -105,25 +106,87 @@ fn find_files_with_extension(dir: &Path, ext: &str) -> Vec<PathBuf> {
 
 /// `fixtures/<set>/frames/<index>.tif` -- `set` names a fixture directory
 /// under `fixtures/` (`"mantis-64"`, `"mantis-512"`), `index` the frame's own
-/// two-digit position in it.
+/// two-digit position in it. Panics, naming the path, when that frame does
+/// not exist.
 #[allow(dead_code)]
 pub fn fixture_frame(set: &str, index: usize) -> PathBuf {
-    workspace_root()
+    let path = workspace_root()
         .join("fixtures")
         .join(set)
         .join("frames")
-        .join(format!("{index:02}.tif"))
+        .join(format!("{index:02}.tif"));
+    assert!(path.is_file(), "no fixture frame at {}", path.display());
+    path
 }
 
-/// Copies `mantis-512` fixture frame `source_index` into `dest_dir` as `name`.
+/// Copies `mantis-64` fixture frame `source_index` into `dest_dir` as `name`.
 #[allow(dead_code)]
 pub fn copy_frame(dest_dir: &Path, name: &str, source_index: usize) {
+    copy_frame_from("mantis-64", dest_dir, name, source_index);
+}
+
+/// A `width` x `height` classic little-endian TIFF of 8-bit RGBA samples
+/// (`ExtraSamples` = unassociated alpha): one uncompressed strip, chunky.
+#[allow(dead_code)]
+pub fn write_rgba8_frame(path: &Path, width: u32, height: u32) {
+    const ENTRIES: u16 = 11;
+    let bits_at = 8 + 2 + u32::from(ENTRIES) * 12 + 4;
+    let strip_at = bits_at + 8;
+    let strip_len = width * height * 4;
+    let mut bytes = b"II*\0".to_vec();
+    bytes.extend(8u32.to_le_bytes());
+    bytes.extend(ENTRIES.to_le_bytes());
+    // (tag, type, count, value): type 3 = SHORT, 4 = LONG.
+    for (tag, kind, count, value) in [
+        (256u16, 4u16, 1u32, width),
+        (257, 4, 1, height),
+        (258, 3, 4, bits_at),
+        (259, 3, 1, 1),
+        (262, 3, 1, 2),
+        (273, 4, 1, strip_at),
+        (277, 3, 1, 4),
+        (278, 4, 1, height),
+        (279, 4, 1, strip_len),
+        (284, 3, 1, 1),
+        (338, 3, 1, 2),
+    ] {
+        bytes.extend(tag.to_le_bytes());
+        bytes.extend(kind.to_le_bytes());
+        bytes.extend(count.to_le_bytes());
+        bytes.extend(value.to_le_bytes());
+    }
+    bytes.extend(0u32.to_le_bytes());
+    for _ in 0..4 {
+        bytes.extend(8u16.to_le_bytes());
+    }
+    bytes.extend((0..strip_len).map(|i| (i % 251) as u8));
+    std::fs::write(path, bytes).expect("the RGBA frame must write");
+}
+
+/// [`copy_frame`] from the fixture set `set`.
+#[allow(dead_code)]
+pub fn copy_frame_from(set: &str, dest_dir: &Path, name: &str, source_index: usize) {
     std::fs::create_dir_all(dest_dir).unwrap();
-    std::fs::copy(
-        fixture_frame("mantis-512", source_index),
-        dest_dir.join(name),
-    )
-    .expect("fixture frame must copy");
+    std::fs::copy(fixture_frame(set, source_index), dest_dir.join(name))
+        .expect("fixture frame must copy");
+}
+
+/// Runs the calling test again alone in a child process -- timing
+/// accounting is process-global. Returns true in the parent, which is done.
+#[allow(dead_code)]
+pub fn ran_in_child(test: &str) -> bool {
+    const CHILD: &str = "FOCUSFORGE_GUI_ISOLATED_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return false;
+    }
+    let status =
+        std::process::Command::new(std::env::current_exe().expect("the test binary has a path"))
+            .args(["--exact", test, "--test-threads=1"])
+            .env(CHILD, "1")
+            .status()
+            .expect("the isolated test starts");
+    assert!(status.success(), "the isolated test passes: {status}");
+    true
 }
 
 /// A fresh, empty renderer cell for `bridge::install`, with no project's
@@ -143,23 +206,226 @@ pub fn tree(name: &str) -> PathBuf {
     dir
 }
 
-/// A controller with one unsaved project open over `count` copied
-/// `mantis-512` frames (`00.tif`, `01.tif`, ... in fixture order), its own
-/// scratch root under `CARGO_TARGET_TMPDIR`.
+/// A controller with nothing open whose ledger, staging and held checkpoints
+/// live under a fresh directory named for `name`.
 #[allow(dead_code)]
-pub fn controller_with_frames(name: &str, count: usize) -> AppController {
-    let root = tree(&format!("{name}_frames"));
-    for i in 0..count {
-        copy_frame(&root, &format!("{i:02}.tif"), i);
-    }
+pub fn scratch_controller(name: &str) -> AppController {
     let mut controller = AppController::new();
-    assert!(matches!(
-        open_and_settle(&mut controller, &[root]),
-        OpenOutcome::Opened(_)
-    ));
     controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
     controller
 }
+
+/// `controller_with_frames` plus a second unsaved project of two frames, so
+/// the window has two tabs and the second one is active.
+#[allow(dead_code)]
+pub fn controller_with_two_stacks(name: &str) -> AppController {
+    let mut controller = controller_with_frames(name, 3);
+    let second = tree(&format!("{name}_second_frames"));
+    for i in 0..2 {
+        copy_frame(&second, &format!("s{i}.tif"), i + 1);
+    }
+    assert!(matches!(
+        open_and_settle(&mut controller, &[second]),
+        OpenOutcome::Opened(_)
+    ));
+    controller
+}
+
+/// The project tab at `index`, found by role and its `tab-<index>` label.
+#[allow(dead_code)]
+pub fn tab(
+    app: &focusforge_gui::AppWindow,
+    index: usize,
+) -> i_slint_backend_testing::ElementHandle {
+    use i_slint_backend_testing::{AccessibleRole, ElementQuery};
+    let label = format!("tab-{index}");
+    ElementQuery::from_root(app)
+        .match_accessible_role(AccessibleRole::Tab)
+        .find_all()
+        .into_iter()
+        .find(|t| t.accessible_label().as_deref() == Some(label.as_str()))
+        .unwrap_or_else(|| panic!("no tab labelled {label:?}"))
+}
+
+/// The `index`-th image row of the images pane, counted from the top.
+#[allow(dead_code)]
+pub fn image_row(
+    app: &focusforge_gui::AppWindow,
+    index: usize,
+) -> i_slint_backend_testing::ElementHandle {
+    let mut rows: Vec<_> = i_slint_backend_testing::ElementQuery::from_root(app)
+        .match_id("FFImageRow::area")
+        .find_all()
+        .into_iter()
+        .filter(|r| r.size().width > 0.0)
+        .collect();
+    rows.sort_by(|a, b| {
+        a.absolute_position()
+            .y
+            .partial_cmp(&b.absolute_position().y)
+            .unwrap()
+    });
+    assert!(
+        index < rows.len(),
+        "no image row {index}, {} mounted",
+        rows.len()
+    );
+    rows.remove(index)
+}
+
+/// The "+" box at the end of the tab strip.
+#[allow(dead_code)]
+pub fn plus_button(app: &focusforge_gui::AppWindow) -> i_slint_backend_testing::ElementHandle {
+    i_slint_backend_testing::ElementQuery::from_root(app)
+        .match_id("FFTabStrip::plus-button")
+        .find_first()
+        .expect("the tab strip has a plus button")
+}
+
+/// A controller with one unsaved project open over `count` copied
+/// `mantis-64` frames (`00.tif`, `01.tif`, ... in fixture order), its own
+/// scratch root under `CARGO_TARGET_TMPDIR`, aligning with `dummy-align`,
+/// which always converges.
+#[allow(dead_code)]
+pub fn controller_with_frames(name: &str, count: usize) -> AppController {
+    let mut controller = controller_with_frames_from("mantis-64", name, count);
+    controller.set_align_algorithm("dummy-align");
+    controller
+}
+
+/// [`controller_with_frames`] over the fixture set `set`, on the default
+/// aligner.
+#[allow(dead_code)]
+pub fn controller_with_frames_from(set: &str, name: &str, count: usize) -> AppController {
+    let mut controller = AppController::new();
+    open_frames_from(&mut controller, set, name, count);
+    controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
+    controller
+}
+
+/// Copies the first `count` frames of fixture set `set` into a fresh
+/// `{name}_frames` directory and opens it as a new active tab on the default
+/// aligner. Returns that directory.
+#[allow(dead_code)]
+pub fn open_frames_from(
+    controller: &mut AppController,
+    set: &str,
+    name: &str,
+    count: usize,
+) -> PathBuf {
+    let root = tree(&format!("{name}_frames"));
+    for i in 0..count {
+        copy_frame_from(set, &root, &format!("{i:02}.tif"), i);
+    }
+    assert!(matches!(
+        open_and_settle(controller, std::slice::from_ref(&root)),
+        OpenOutcome::Opened(_)
+    ));
+    root
+}
+
+/// [`open_frames_from`] over `mantis-64`, then `dummy-align`: an algorithm
+/// that always converges keeps every run clean, so a test that is not about
+/// alignment never parks on an unaligned frame.
+#[allow(dead_code)]
+pub fn open_mantis64_tab(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
+    let root = open_frames_from(controller, "mantis-64", name, count);
+    controller.set_align_algorithm("dummy-align");
+    root
+}
+
+/// [`open_frames_from`] over `set` into `{name}_{set}_frames`, then
+/// `dummy-align`. The set is part of the directory so one `name` opens on two
+/// sets.
+#[allow(dead_code)]
+pub fn open_fixture_tab(
+    controller: &mut AppController,
+    name: &str,
+    set: &str,
+    count: usize,
+) -> PathBuf {
+    let root = open_frames_from(controller, set, &format!("{name}_{set}"), count);
+    controller.set_align_algorithm("dummy-align");
+    root
+}
+
+/// An unsaved tab over three copied `mantis-64` frames with `fuses` in-memory
+/// fused checkpoints, the newest one current.
+#[allow(dead_code)]
+pub fn fused_tab(name: &str, fuses: usize) -> AppController {
+    let mut controller = controller_with_frames(name, 3);
+    for _ in 0..fuses {
+        assert!(controller.start_fuse());
+        settle_all(&mut controller);
+    }
+    assert_eq!(controller.checkpoint_count(), Some(fuses));
+    controller
+}
+
+/// A controller over three `mantis-64` frames, brightness equalization on
+/// with target 0.5 and max gain 1.25 (so every frame clamps), `excluded`
+/// frame left out, and one fuse started and settled.
+#[allow(dead_code)]
+pub fn every_frame_clamps(name: &str, excluded: Option<usize>) -> AppController {
+    let mut controller = controller_with_frames(name, 3);
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
+    controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.5));
+    controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.25));
+    if let Some(index) = excluded {
+        controller.toggle_frame_excluded(index);
+    }
+    assert!(controller.start_fuse());
+    wait_for_settle(&mut controller, SETTLE);
+    controller
+}
+
+/// Settles every run, the live one and each one promoted from the queue.
+#[allow(dead_code)]
+pub fn settle_all(controller: &mut AppController) {
+    while wait_for_settle(controller, SETTLE).is_some() {}
+}
+
+/// Saves the active, never-saved tab to the path the save dialog proposes.
+#[allow(dead_code)]
+pub fn save_to_proposed(controller: &mut AppController) -> PathBuf {
+    let mut target = None;
+    assert!(save_and_settle(controller, |proposed| {
+        target = Some(proposed.to_path_buf());
+        target.clone()
+    }));
+    target.expect("a never-saved tab asks where to save")
+}
+
+/// Every event the controller emits from here on.
+#[allow(dead_code)]
+pub fn record_events(controller: &mut AppController) -> Arc<Mutex<Vec<ShellEvent>>> {
+    let events: Arc<Mutex<Vec<ShellEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_events = events.clone();
+    controller.set_sink(Arc::new(move |event| {
+        sink_events.lock().unwrap().push(event)
+    }));
+    events
+}
+
+/// Installs the headless testing backend on this thread once; a second
+/// `init_no_event_loop` call on one thread panics.
+#[allow(dead_code)]
+pub fn init_window_backend() {
+    thread_local! {
+        static INIT: Cell<bool> = const { Cell::new(false) };
+    }
+    INIT.with(|done| {
+        if !done.get() {
+            i_slint_backend_testing::init_no_event_loop();
+            done.set(true);
+        }
+    });
+}
+
+/// Upper bound on a hang for [`settle_all`] and [`every_frame_clamps`]: a debug
+/// build on a loaded runner needs well over a minute to fuse the 512 px
+/// fixture, and a settled run returns at once.
+const SETTLE: Duration = Duration::from_secs(300);
 
 /// Polls `settle_job` until it returns or no work is pending any more,
 /// returning the materialized plane paths from the call that actually
@@ -573,4 +839,12 @@ pub fn enter_editor(controller: &mut AppController) {
         controller.settle_edit_session();
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// The centre of `handle` in window coordinates.
+#[allow(dead_code)]
+pub fn element_center(handle: &i_slint_backend_testing::ElementHandle) -> slint::LogicalPosition {
+    let pos = handle.absolute_position();
+    let size = handle.size();
+    slint::LogicalPosition::new(pos.x + size.width / 2.0, pos.y + size.height / 2.0)
 }

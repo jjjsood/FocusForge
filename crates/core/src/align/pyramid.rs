@@ -28,7 +28,7 @@ use crate::align::error::AlignError;
 use crate::fuse::PyramidError;
 pub use crate::fuse::pyramid::max_levels;
 use crate::fuse::pyramid::{Plane, gaussian_levels, reduce};
-use crate::tile::{Rect, Tile};
+use crate::tile::{Rect, Sample, Tile};
 use crate::timing::{TimingCounter, record_timing};
 
 /// Assembles a single-channel luminance [`Plane`] out of tiles pushed in
@@ -54,7 +54,17 @@ impl LumaAssembler {
     /// absolute position. [`AlignError::TileOutsideFrame`] when `tile.rect`
     /// is not fully inside `(width, height)` -- never clamped.
     pub fn push_tile(&mut self, tile: &Tile) -> Result<(), AlignError> {
-        let rect = tile.rect;
+        self.push_samples(tile.rect, tile.samples_per_pixel, &tile.samples)
+    }
+
+    /// [`Self::push_tile`] for the interleaved `samples` of `rect`, in any
+    /// [`Sample`] type.
+    pub fn push_samples<S: Sample>(
+        &mut self,
+        rect: Rect,
+        samples_per_pixel: u32,
+        samples: &[S],
+    ) -> Result<(), AlignError> {
         let in_bounds = rect.width > 0
             && rect.height > 0
             && rect
@@ -72,12 +82,12 @@ impl LumaAssembler {
             });
         }
 
-        let spp = tile.samples_per_pixel as usize;
+        let spp = samples_per_pixel as usize;
         for y in 0..rect.height {
             for x in 0..rect.width {
                 let pixel_start = (y as usize * rect.width as usize + x as usize) * spp;
-                let pixel = &tile.samples[pixel_start..pixel_start + spp];
-                let v = crate::fuse::metrics::luma(pixel, tile.samples_per_pixel) as f32;
+                let pixel = &samples[pixel_start..pixel_start + spp];
+                let v = crate::fuse::metrics::luma(pixel, samples_per_pixel) as f32;
                 let out_x = rect.x + x;
                 let out_y = rect.y + y;
                 self.data[out_y as usize * self.width as usize + out_x as usize] = v;
@@ -113,16 +123,16 @@ pub struct AlignPyramid {
 
 impl AlignPyramid {
     /// Builds levels `1..=depth` of a `width x height`, `spp`-sample frame
-    /// from `read`, which fills a full-width rect of `u16` samples. Level 1
+    /// from `read`, which fills a full-width rect of `S` samples. Level 1
     /// is reduced from row bands of `band_rows` output rows, each read with
     /// a 2-row top and 3-row bottom halo; levels 2.. follow with
     /// [`gaussian_levels`]. Each level is bit-identical to a whole-frame
     /// `reduce` chain's. `depth == 0` reads nothing.
-    pub fn stream<E>(
+    pub fn stream<S: Sample, E>(
         (width, height, spp): (u32, u32, u32),
         depth: u32,
         band_rows: u32,
-        mut read: impl FnMut(Rect, &mut [u16]) -> Result<(), E>,
+        mut read: impl FnMut(Rect, &mut [S]) -> Result<(), E>,
     ) -> Result<Self, StreamError<E>> {
         if width == 0 || height == 0 {
             return Err(StreamError::Pyramid(PyramidError::EmptyExtent {
@@ -153,19 +163,10 @@ impl AlignPyramid {
 
         let band_len = |rows: u32| width as usize * rows as usize * spp as usize;
         let tallest = (2 * band_rows + 5).min(height);
-        let mut tile = Tile {
-            rect: Rect {
-                x: 0,
-                y: 0,
-                width,
-                height: tallest,
-            },
-            samples_per_pixel: spp,
-            samples: vec![0u16; band_len(tallest)],
-        };
+        let mut band = vec![S::default(); band_len(tallest)];
         record_timing(
             TimingCounter::AllocationBytes,
-            (tile.samples.capacity() * std::mem::size_of::<u16>()) as u64,
+            (band.capacity() * std::mem::size_of::<S>()) as u64,
         );
         record_timing(TimingCounter::AllocationOperations, 1);
 
@@ -175,13 +176,7 @@ impl AlignPyramid {
             let in0 = (2 * r0).saturating_sub(2);
             let in1 = (2 * r1 + 3).min(height);
             let rows = in1 - in0;
-            tile.rect = Rect {
-                x: 0,
-                y: 0,
-                width,
-                height: rows,
-            };
-            tile.samples.resize(band_len(rows), 0);
+            band.resize(band_len(rows), S::default());
             read(
                 Rect {
                     x: 0,
@@ -189,16 +184,25 @@ impl AlignPyramid {
                     width,
                     height: rows,
                 },
-                &mut tile.samples,
+                &mut band,
             )
             .map_err(StreamError::Read)?;
 
             let mut assembler = LumaAssembler::new(width, rows);
             assembler
-                .push_tile(&tile)
-                .expect("the band tile lies inside the band assembler");
-            let band = assembler.finish().map_err(StreamError::Pyramid)?;
-            let reduced = reduce(&band);
+                .push_samples(
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height: rows,
+                    },
+                    spp,
+                    &band,
+                )
+                .expect("the band lies inside the band assembler");
+            let luma = assembler.finish().map_err(StreamError::Pyramid)?;
+            let reduced = reduce(&luma);
 
             // Output row 1 of a band that starts below the frame top is the
             // band's first own row: its input halo is two rows.
@@ -467,5 +471,52 @@ mod tests {
             }
             other => panic!("expected TileOutsideFrame, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stream_of_f32_equals_the_u16_stream_on_integral_input() {
+        let (width, height, spp) = (37u32, 23u32, 3u32);
+        let samples = noise(width, height, spp, 11);
+        let wide: Vec<f32> = samples.iter().map(|s| f32::from(*s)).collect();
+        let source = |rect: Rect| {
+            let mut rows = Vec::new();
+            for y in rect.y..rect.y + rect.height {
+                let start = (y * width + rect.x) as usize * spp as usize;
+                rows.push(start..start + rect.width as usize * spp as usize);
+            }
+            rows
+        };
+        let narrow = AlignPyramid::stream::<_, ()>((width, height, spp), 2, 3, |rect, out| {
+            let mut at = 0;
+            for range in source(rect) {
+                out[at..at + range.len()].copy_from_slice(&samples[range.clone()]);
+                at += range.len();
+            }
+            Ok(())
+        })
+        .unwrap_or_else(|_| panic!("u16 stream"));
+        let widened =
+            AlignPyramid::stream::<_, ()>((width, height, spp), 2, 3, |rect, out: &mut [f32]| {
+                let mut at = 0;
+                for range in source(rect) {
+                    out[at..at + range.len()].copy_from_slice(&wide[range.clone()]);
+                    at += range.len();
+                }
+                Ok(())
+            })
+            .unwrap_or_else(|_| panic!("f32 stream"));
+        for k in 1..=2 {
+            assert_eq!(narrow.level(k), widened.level(k), "level {k}");
+        }
+    }
+
+    #[test]
+    fn stream_of_f32_keeps_values_above_65535() {
+        let pyramid = AlignPyramid::stream::<_, ()>((16, 12, 1), 1, 2, |_, out: &mut [f32]| {
+            out.fill(98_304.0);
+            Ok(())
+        })
+        .unwrap_or_else(|_| panic!("f32 stream"));
+        assert!(pyramid.level(1).data().iter().all(|v| *v == 98_304.0));
     }
 }

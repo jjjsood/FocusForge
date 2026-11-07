@@ -7,16 +7,19 @@ use super::{TiffError, is_frame_path};
 pub const TIFF_EXTENSIONS: &[&str] = &["tif", "tiff"];
 pub const PNG_EXTENSIONS: &[&str] = &["png"];
 pub const JPEG_EXTENSIONS: &[&str] = &["jpg", "jpeg"];
+pub const DNG_EXTENSIONS: &[&str] = &["dng"];
 pub const RAW_EXTENSIONS: &[&str] = &[
     "ari", "arw", "cr2", "cr3", "crm", "crw", "dcr", "dcs", "dng", "erf", "iiq", "kdc", "mef",
     "mos", "mrw", "nef", "nrw", "orf", "ori", "pef", "raf", "raw", "rw2", "rwl", "srw", "3fr",
     "fff", "x3f", "qtk",
 ];
 
-/// List TIFF and RAW frames using the same shallow `frames/` convention.
+/// List TIFF, JPEG and RAW frames using the same shallow `frames/` convention.
 pub fn all_frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
-    let mut extensions = Vec::with_capacity(TIFF_EXTENSIONS.len() + RAW_EXTENSIONS.len());
+    let mut extensions =
+        Vec::with_capacity(TIFF_EXTENSIONS.len() + JPEG_EXTENSIONS.len() + RAW_EXTENSIONS.len());
     extensions.extend_from_slice(TIFF_EXTENSIONS);
+    extensions.extend_from_slice(JPEG_EXTENSIONS);
     extensions.extend_from_slice(RAW_EXTENSIONS);
     scan_frames(dir, &extensions, |path| {
         !has_extension(path, TIFF_EXTENSIONS) || is_frame_path(path)
@@ -153,6 +156,35 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["a.TIFF", "z.DNG"]);
+    }
+
+    #[test]
+    fn all_frames_lists_jpeg_frames() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let frames = dir.path().join("frames");
+        std::fs::create_dir(&frames).expect("frames directory");
+        for name in [
+            "c.JPG",
+            "a.TIFF",
+            "b.Jpeg",
+            "d.jpg",
+            "composite.tif",
+            "zmap.tif",
+        ] {
+            std::fs::write(frames.join(name), b"frame").expect("frame file");
+        }
+
+        let paths = all_frame_paths(dir.path()).expect("recognized source frames");
+        let names: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .expect("file name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names, ["a.TIFF", "b.Jpeg", "c.JPG", "d.jpg"]);
     }
 
     #[test]

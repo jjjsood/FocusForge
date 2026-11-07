@@ -431,7 +431,7 @@ fn seal_fused(name: &str, width: u32, height: u32, spp: u32, frames: u32) -> (Pa
 }
 
 #[test]
-#[ignore]
+#[ignore = "minutes-long: builds a reference-scale project and encodes its JPEG export"]
 fn jpeg_export_peak_at_reference_scale() {
     let (project_path, root_id) = seal_fused(
         "checkpoint_render_memory_jpeg_reference",

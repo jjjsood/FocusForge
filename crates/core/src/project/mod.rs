@@ -79,6 +79,7 @@ pub use manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
     SourceResolution,
 };
+use manifest::{FORMAT_VERSION, FormatProbe};
 pub use render::{CheckpointImage, PendingState, render_checkpoint};
 pub use review::ReviewMetrics;
 pub use seal::{
@@ -251,7 +252,7 @@ pub(super) fn full_blob<'a>(
 use crate::algorithm::StackAlgorithm;
 use crate::equalize::EqualizeSettings;
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues, validate};
-use crate::tile::Rect;
+use crate::tile::{Rect, Sample, SampleFormat};
 
 /// The alignment switch: `align`. The settings panel's align section renders
 /// exactly this schema, ahead of the algorithm's own parameters.
@@ -267,6 +268,7 @@ pub static ALIGN_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         advanced: false,
         auto: None,
         host_default: None,
+        stack_max: None,
     }]
 });
 
@@ -284,6 +286,7 @@ pub static FINISH_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         advanced: false,
         auto: None,
         host_default: None,
+        stack_max: None,
     }]
 });
 
@@ -295,24 +298,24 @@ pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         ParamDesc {
             id: "equalize".to_string(),
             label: "Equalize brightness".to_string(),
-            help: "Gives every frame one gain, the same on every channel, \
-                   bringing its mean brightness to one target shared by all \
-                   frames before they are aligned; scales encoded code values \
-                   as delivered and is not a linear-light correction."
+            help: "Evens out brightness between frames before they are \
+                   aligned by giving each frame one gain, the same on every \
+                   channel, that brings its average brightness to a target \
+                   shared by all frames, leaving the source files unchanged."
                 .to_string(),
             kind: ParamKind::Bool,
             default: ParamValue::Bool(true),
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "equalize-max-gain".to_string(),
             label: "Max brightness gain".to_string(),
-            help: "Only used when brightness equalization is on; limits a \
-                   frame's gain on both sides, so 1.25 allows gains from 0.8 \
-                   to 1.25; scales encoded code values as delivered and is \
-                   not a linear-light correction."
+            help: "Only used when brightness equalization is on: the largest \
+                   change in brightness a frame may get in either direction, \
+                   so 1.25 allows gains from 0.8 to 1.25."
                 .to_string(),
             kind: ParamKind::Float {
                 min: 1.01,
@@ -324,16 +327,15 @@ pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "equalize-target".to_string(),
             label: "Target brightness (stops)".to_string(),
-            help: "Only used when brightness equalization is on; 0.0 keeps the \
-                   mean encoded brightness of the stacked sources and this \
-                   value scales that shared target in stops (one stop doubles \
-                   it), the same for every source; scales encoded code values \
-                   as delivered and is not a linear-light correction, and \
-                   source files stay unchanged."
+            help: "Only used when brightness equalization is on: 0.0 keeps \
+                   the average brightness of the stacked sources, and each \
+                   stop up or down doubles or halves that shared target for \
+                   every frame, leaving the source files unchanged."
                 .to_string(),
             kind: ParamKind::Float {
                 min: -0.5,
@@ -345,6 +347,7 @@ pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
     ]
 });
@@ -470,7 +473,25 @@ impl Project {
                 path: path.to_path_buf(),
             });
         }
-        let manifest: Manifest = read_json(&file, &index, path, "manifest.json")?;
+        let manifest_bytes = read_entry_bytes(&file, &index, path, "manifest.json")?;
+        let probe: FormatProbe = serde_json::from_slice(&manifest_bytes).map_err(|err| {
+            let field = if err.classify() == serde_json::error::Category::Data {
+                "format_version: "
+            } else {
+                ""
+            };
+            ProjectError::container(path, format!("manifest.json: {field}{err}"))
+        })?;
+        let found = probe.format_version.unwrap_or(1);
+        if found > FORMAT_VERSION {
+            return Err(ProjectError::NewerFormat {
+                path: path.to_path_buf(),
+                found,
+                supported: FORMAT_VERSION,
+            });
+        }
+        let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|err| ProjectError::container(path, format!("manifest.json: {err}")))?;
 
         let mut checkpoints = Vec::new();
         for name in index.names() {
@@ -502,10 +523,26 @@ impl Project {
             full_blob(&manifest.blobs, &c.zmap_blob, path)?;
             match &c.fuse {
                 Some(fuse) => {
-                    if !manifest.blobs.iter().any(|b| b.hash == fuse.composite.blob) {
+                    let Some(composite) = manifest
+                        .blobs
+                        .iter()
+                        .find(|b| b.hash == fuse.composite.blob)
+                    else {
                         return Err(ProjectError::MissingEntry {
                             path: path.to_path_buf(),
                             entry: format!("blobs/{}.zst", fuse.composite.blob),
+                        });
+                    };
+                    if composite.kind == BlobKind::Full
+                        && fuse.sources.first().is_some_and(|source| {
+                            crate::io::has_extension(
+                                Path::new(&source.path),
+                                crate::io::RAW_EXTENSIONS,
+                            )
+                        })
+                    {
+                        return Err(ProjectError::ClippedRawResult {
+                            path: path.to_path_buf(),
                         });
                     }
                     if c.stack_fingerprint != blob::stack_fingerprint(&fuse.sources) {
@@ -817,14 +854,62 @@ impl Project {
     /// [`Self::read_plane_into`]'s body, over an arbitrary [`PlaneRef`]
     /// rather than one of `self.manifest`'s own two -- what
     /// [`materialize_zmap`] uses to read a non-head checkpoint's own Z-Map
-    /// blob under the manifest's declared shape.
+    /// blob under the manifest's declared shape. A blob of `f32` samples is
+    /// narrowed with `u16::narrow`.
     fn read_plane_ref_into(
         &mut self,
         plane: &PlaneRef,
         sink: &mut impl FnMut(&[u16], Rect),
     ) -> Result<(), ProjectError> {
-        let expected_len =
-            plane.width as u64 * plane.height as u64 * plane.samples_per_pixel as u64 * 2;
+        match self.plane_format(plane)? {
+            SampleFormat::U16 => self.read_plane_ref_as::<u16>(plane, sink),
+            SampleFormat::F32 => {
+                let mut narrowed: Vec<u16> = Vec::new();
+                self.read_plane_ref_as::<f32>(plane, &mut |band, rect| {
+                    narrowed.clear();
+                    narrowed.extend(band.iter().map(|&v| u16::narrow(v)));
+                    sink(&narrowed, rect);
+                })
+            }
+        }
+    }
+
+    /// The sample type of the blob `plane` names, from its manifest record.
+    pub(super) fn plane_format(&self, plane: &PlaneRef) -> Result<SampleFormat, ProjectError> {
+        self.manifest
+            .blobs
+            .iter()
+            .find(|b| b.hash == plane.blob)
+            .map(|b| b.kind.sample_format())
+            .ok_or_else(|| ProjectError::MissingEntry {
+                path: self.path.clone(),
+                entry: blob_entry(&plane.blob),
+            })
+    }
+
+    /// [`Self::read_plane_ref_into`] in the blob's own sample type `S`;
+    /// a blob that holds the other type is refused.
+    pub(super) fn read_plane_ref_as<S: LeSample>(
+        &mut self,
+        plane: &PlaneRef,
+        sink: &mut impl FnMut(&[S], Rect),
+    ) -> Result<(), ProjectError> {
+        let held = self.plane_format(plane)?;
+        if held != S::FORMAT {
+            return Err(ProjectError::container(
+                &self.path,
+                format!(
+                    "blob {} holds {held:?} samples, not the {:?} asked for",
+                    plane.blob,
+                    S::FORMAT
+                ),
+            ));
+        }
+        let width = S::FORMAT.bytes() as usize;
+        let expected_len = plane.width as u64
+            * plane.height as u64
+            * plane.samples_per_pixel as u64
+            * width as u64;
 
         let file = container::record_reader(
             &self.file,
@@ -836,11 +921,11 @@ impl Project {
             .map_err(|source| ProjectError::io(&self.path, source))?;
 
         let row_samples = plane.width as usize * plane.samples_per_pixel as usize;
-        let rows = (READ_BAND_BYTES / (row_samples * 2)).clamp(1, plane.height as usize) as u32;
+        let rows = (READ_BAND_BYTES / (row_samples * width)).clamp(1, plane.height as usize) as u32;
 
         let mut hasher = blake3::Hasher::new();
-        let mut bytes = vec![0u8; row_samples * rows as usize * 2];
-        let mut samples = vec![0u16; row_samples * rows as usize];
+        let mut bytes = vec![0u8; row_samples * rows as usize * width];
+        let mut samples = vec![S::default(); row_samples * rows as usize];
         let mut total = 0u64;
 
         let mut y = 0;
@@ -848,15 +933,15 @@ impl Project {
             let band_rows = rows.min(plane.height - y);
             let len = row_samples * band_rows as usize;
             decoder
-                .read_exact(&mut bytes[..len * 2])
+                .read_exact(&mut bytes[..len * width])
                 .map_err(|source| ProjectError::io(&self.path, source))?;
-            hasher.update(&bytes[..len * 2]);
-            total += (len * 2) as u64;
+            hasher.update(&bytes[..len * width]);
+            total += (len * width) as u64;
             for (sample, chunk) in samples[..len]
                 .iter_mut()
-                .zip(bytes[..len * 2].chunks_exact(2))
+                .zip(bytes[..len * width].chunks_exact(width))
             {
-                *sample = u16::from_le_bytes([chunk[0], chunk[1]]);
+                *sample = S::from_le(chunk);
             }
             sink(
                 &samples[..len],
@@ -892,6 +977,23 @@ impl Project {
     }
 }
 
+/// A sample type a blob stores as little-endian bytes.
+pub(super) trait LeSample: Sample {
+    fn from_le(bytes: &[u8]) -> Self;
+}
+
+impl LeSample for u16 {
+    fn from_le(bytes: &[u8]) -> Self {
+        u16::from_le_bytes([bytes[0], bytes[1]])
+    }
+}
+
+impl LeSample for f32 {
+    fn from_le(bytes: &[u8]) -> Self {
+        f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+}
+
 /// The record name of the blob with content hash `hash`.
 pub(super) fn blob_entry(hash: &str) -> String {
     format!("blobs/{hash}.zst")
@@ -901,16 +1003,26 @@ pub(super) fn checkpoint_entry(id: &str) -> String {
     format!("checkpoints/{id}.json")
 }
 
+fn read_entry_bytes(
+    file: &File,
+    index: &Index,
+    path: &Path,
+    entry: &str,
+) -> Result<Vec<u8>, ProjectError> {
+    let mut bytes = Vec::new();
+    container::record_reader(file, index, path, entry)?
+        .read_to_end(&mut bytes)
+        .map_err(|source| ProjectError::io(path, source))?;
+    Ok(bytes)
+}
+
 fn read_json<T: serde::de::DeserializeOwned>(
     file: &File,
     index: &Index,
     path: &Path,
     entry: &str,
 ) -> Result<T, ProjectError> {
-    let mut bytes = Vec::new();
-    container::record_reader(file, index, path, entry)?
-        .read_to_end(&mut bytes)
-        .map_err(|source| ProjectError::io(path, source))?;
+    let bytes = read_entry_bytes(file, index, path, entry)?;
     serde_json::from_slice(&bytes)
         .map_err(|err| ProjectError::container(path, format!("{entry}: {err}")))
 }
@@ -1009,26 +1121,31 @@ mod tests {
     fn the_equalization_help_states_what_it_is_and_is_not() {
         for id in ["equalize", "equalize-max-gain", "equalize-target"] {
             let help = desc(id).help.to_lowercase();
-            assert!(help.contains("encoded code values"), "{id}: {help}");
-            assert!(
-                help.contains("not a linear-light correction"),
-                "{id}: {help}"
-            );
+            assert!(!help.contains("linear-light"), "{id}: {help}");
+            assert!(!help.contains("code values"), "{id}: {help}");
         }
         let switch = desc("equalize").help.to_lowercase();
+        assert!(
+            switch.contains("one gain")
+                && switch.contains("same on every channel")
+                && switch.contains("shared by all frames")
+                && switch.contains("before they are aligned")
+                && switch.contains("source files unchanged"),
+            "{switch}"
+        );
         assert!(!switch.contains("depends on the fusion method"), "{switch}");
+        assert!(
+            !switch.contains("reference") && !switch.contains("mid-tone"),
+            "{switch}"
+        );
         let bound = &desc("equalize-max-gain").help;
         assert!(bound.contains("0.8") && bound.contains("1.25"), "{bound}");
         let target = &desc("equalize-target").help;
         assert!(
-            target.contains("0.0 keeps the mean encoded brightness of the stacked sources")
-                && target.contains("stops")
-                && target.contains("source files stay unchanged"),
+            target.contains("0.0 keeps the average brightness of the stacked sources")
+                && target.contains("stop")
+                && target.contains("source files unchanged"),
             "{target}"
-        );
-        assert!(
-            !switch.contains("reference") && !switch.contains("mid-tone"),
-            "{switch}"
         );
     }
 

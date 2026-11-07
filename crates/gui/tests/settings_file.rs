@@ -47,22 +47,25 @@ fn appearance_presentation_loads_defaults_and_round_trips_saved_choice() {
         appearance_settings::load(dir.path()),
         AppearanceSettings {
             presentation: SourcePresentation::List,
+            ..AppearanceSettings::default()
         }
     );
     appearance_settings::save(
         dir.path(),
         AppearanceSettings {
             presentation: SourcePresentation::Large,
+            ..AppearanceSettings::default()
         },
     )
     .unwrap();
     let saved = fs::read_to_string(path).unwrap();
     assert!(saved.contains("[recent]\nkeep = \"yes\""));
-    assert!(saved.contains("[appearance]\npresentation = \"large\""));
+    assert!(saved.contains("[appearance]\npresentation = \"large\"\nsharpness_heatmap = true"));
     assert_eq!(
         appearance_settings::load(dir.path()),
         AppearanceSettings {
             presentation: SourcePresentation::Large,
+            ..AppearanceSettings::default()
         },
         "the saved appearance choice survives a fresh load"
     );
@@ -278,6 +281,7 @@ fn unparseable_file_is_never_overwritten() {
                 dir.path(),
                 AppearanceSettings {
                     presentation: SourcePresentation::Large,
+                    ..AppearanceSettings::default()
                 },
             )
             .is_err()
@@ -323,6 +327,7 @@ fn non_utf8_file_is_never_overwritten() {
             dir.path(),
             AppearanceSettings {
                 presentation: SourcePresentation::Large,
+                ..AppearanceSettings::default()
             },
         )
         .is_err()
@@ -445,4 +450,83 @@ fn recent_row_without_path_reads_as_empty() {
         Some(focusforge_gui::input_map::Action::Pan)
     );
     assert_eq!(fs::read_to_string(&path).unwrap(), src);
+}
+
+#[test]
+fn updates_load_falls_back_per_key() {
+    use focusforge_gui::update_settings::{self, UpdateSettings};
+
+    let absent = tempfile::tempdir().unwrap();
+    assert_eq!(
+        update_settings::load(absent.path()),
+        UpdateSettings::default(),
+        "no file reads as on / none"
+    );
+    assert!(UpdateSettings::default().check_on_start);
+
+    let on_none = UpdateSettings::default();
+    let cases = [
+        ("[recent]\nkeep = 5\n", on_none.clone()),
+        ("[updates]\ncheck_on_start = \"yes\"\n", on_none.clone()),
+        ("[updates]\nskipped_version = 3\n", on_none.clone()),
+        (
+            "[updates]\ncheck_on_start = false\nskipped_version = 3\n",
+            UpdateSettings {
+                check_on_start: false,
+                skipped_version: None,
+            },
+        ),
+        (
+            "[updates]\ncheck_on_start = \"yes\"\nskipped_version = \"0.4.0\"\n",
+            UpdateSettings {
+                check_on_start: true,
+                skipped_version: Some("0.4.0".into()),
+            },
+        ),
+    ];
+    for (source, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("settings.toml"), source).unwrap();
+        assert_eq!(
+            update_settings::load(dir.path()),
+            expected,
+            "{source:?} must keep each key independent of the other"
+        );
+    }
+}
+
+#[test]
+fn updates_save_round_trips_and_keeps_siblings() {
+    use focusforge_gui::update_settings::{self, UpdateSettings};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.toml");
+    let sibling = "# my notes\n[recent]\nkeep = \"yes\" # hand edited\n";
+    fs::write(&path, sibling).unwrap();
+
+    let unset = UpdateSettings {
+        check_on_start: false,
+        skipped_version: None,
+    };
+    update_settings::save(dir.path(), &unset).unwrap();
+    let saved = fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("check_on_start = false"), "{saved}");
+    assert!(
+        !saved.contains("skipped_version"),
+        "an unset skip is omitted: {saved}"
+    );
+    assert_eq!(update_settings::load(dir.path()), unset);
+
+    let set = UpdateSettings {
+        check_on_start: true,
+        skipped_version: Some("1.2.3".into()),
+    };
+    update_settings::save(dir.path(), &set).unwrap();
+    let saved = fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("skipped_version = \"1.2.3\""), "{saved}");
+    assert_eq!(update_settings::load(dir.path()), set);
+    assert!(
+        saved.starts_with(sibling),
+        "the hand-edited sibling table stays byte-identical: {saved}"
+    );
 }

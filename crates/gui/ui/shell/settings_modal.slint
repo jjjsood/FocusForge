@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The settings modal: reachable only through the bottom bar's gear. The
+// The settings modal: opened from the left icon bar's Settings button. The
 // frame -- header, nav rail and content host -- over one tab per section.
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
+import { FFAppear } from "../components/ff_appear.slint";
 import { FFModalPanel } from "../components/ff_modal_panel.slint";
 import { FFHeading } from "../components/ff_heading.slint";
 import { FFDivider } from "../components/ff_divider.slint";
@@ -15,13 +16,15 @@ import { FFDiagnosticsPanel, FFManifestRow } from "settings_modal/diagnostics_pa
 import { FFInputMapTab, InputRow } from "settings_modal/input_map_tab.slint";
 import { FFPerformanceTab, PerformanceCap, PerformanceState } from "settings_modal/performance_tab.slint";
 import { FFStorageTab, StoragePathState, StorageState } from "settings_modal/storage_tab.slint";
-import { AboutState, FFAboutTab } from "settings_modal/about_tab.slint";
+import { AboutState, FFAboutTab, UpdateControlsState } from "settings_modal/about_tab.slint";
 import { FFAppearanceTab } from "settings_modal/appearance_tab.slint";
-export { AboutState, FFManifestRow, InputRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
+export { AboutState, UpdateControlsState, FFManifestRow, InputRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
 
 export component FFSettingsModal inherits FFModalPanel {
     in property <bool> settings-open: false;
     in property <[InputRow]> input-rows: [];
+    in property <string> input-source: "";
+    in property <[string]> input-problems: [];
     in property <string> settings-section: "performance";
     callback settings-close-requested();
     callback settings-section-selected(string);
@@ -30,21 +33,36 @@ export component FFSettingsModal inherits FFModalPanel {
     callback performance-gpu-toggled(bool);
     callback performance-host-cap-edited(string);
     callback performance-vram-cap-edited(string);
+    callback performance-cap-committed();
     callback performance-host-cap-cursor-moved(length, length);
     callback performance-vram-cap-cursor-moved(length, length);
+    callback performance-host-unit-toggled();
+    callback performance-vram-unit-toggled();
+    callback performance-host-unit-selected(string);
+    callback performance-vram-unit-selected(string);
+    callback performance-unit-dismissed();
 
     in property <string> appearance-presentation: "image-list";
     in property <bool> appearance-menu-open: false;
     in property <bool> appearance-menu-focused: false;
     in property <bool> appearance-menu-disabled: false;
     in property <string> appearance-save-error: "";
+    in property <bool> appearance-sharpness-heatmap: true;
+    in property <bool> appearance-reduce-motion: false;
     callback appearance-presentation-selected(string);
+    callback appearance-sharpness-heatmap-toggled(bool);
+    callback appearance-reduce-motion-toggled(bool);
     callback appearance-menu-toggled();
 
     in property <StorageState> storage;
     callback storage-clear-requested();
 
     in property <AboutState> about;
+    in property <UpdateControlsState> update-controls;
+    callback update-check-on-start-toggled(bool);
+    callback update-check-now-requested();
+    callback update-skip-requested();
+    callback update-page-requested();
 
     in property <[FFManifestRow]> diagnostics-rows: [];
     in property <string> diagnostics-note: "";
@@ -161,78 +179,129 @@ export component FFSettingsModal inherits FFModalPanel {
 
         key-pressed(event) => {
             if event.text == Key.Escape {
-                root.settings-close-requested();
+                if root.performance.host-cap.unit-open || root.performance.vram-cap.unit-open {
+                    root.performance-unit-dismissed();
+                } else {
+                    root.settings-close-requested();
+                }
                 return accept;
             }
             return reject;
         }
 
-        if root.settings-section == "diagnostics": FFDiagnosticsPanel {
+        if root.settings-section == "diagnostics": FFAppear {
             width: 100%;
             height: 100%;
-            rows: root.diagnostics-rows;
-            note: root.diagnostics-note;
-            include-minidumps: root.diagnostics-include-minidumps;
-            destination: root.diagnostics-destination;
-            status: root.diagnostics-status;
-            message: root.diagnostics-message;
-            primary-label: root.diagnostics-primary-label;
-            busy: root.diagnostics-busy;
-            loading: root.diagnostics-loading;
-            manifest-scroll-offset: root.diagnostics-manifest-scroll-offset;
-            manifest-content-height: root.diagnostics-manifest-content-height;
-            destination-scroll-offset: root.diagnostics-destination-scroll-offset;
 
-            minidumps-toggled(v) => { root.diagnostics-minidumps-toggled(v); }
-            destination-edited(t) => { root.diagnostics-destination-edited(t); }
-            destination-cursor-moved(x, w) => { root.diagnostics-destination-cursor-moved(x, w); }
-            primary-clicked => { root.diagnostics-primary-clicked(); }
-            manifest-scrollbar-pointer(kind, y) => { root.diagnostics-manifest-scrollbar-pointer(kind, y); }
-            manifest-scrollbar-dragged(y) => { root.diagnostics-manifest-scrollbar-dragged(y); }
-            manifest-viewport-height-changed(h) => { root.diagnostics-manifest-viewport-height-changed(h); }
-            manifest-scrolled(delta) => { root.diagnostics-manifest-scrolled(delta); }
+            FFDiagnosticsPanel {
+                width: 100%;
+                height: 100%;
+                rows: root.diagnostics-rows;
+                note: root.diagnostics-note;
+                include-minidumps: root.diagnostics-include-minidumps;
+                destination: root.diagnostics-destination;
+                status: root.diagnostics-status;
+                message: root.diagnostics-message;
+                primary-label: root.diagnostics-primary-label;
+                busy: root.diagnostics-busy;
+                loading: root.diagnostics-loading;
+                manifest-scroll-offset: root.diagnostics-manifest-scroll-offset;
+                manifest-content-height: root.diagnostics-manifest-content-height;
+                destination-scroll-offset: root.diagnostics-destination-scroll-offset;
+
+                minidumps-toggled(v) => { root.diagnostics-minidumps-toggled(v); }
+                destination-edited(t) => { root.diagnostics-destination-edited(t); }
+                destination-cursor-moved(x, w) => { root.diagnostics-destination-cursor-moved(x, w); }
+                primary-clicked => { root.diagnostics-primary-clicked(); }
+                manifest-scrollbar-pointer(kind, y) => { root.diagnostics-manifest-scrollbar-pointer(kind, y); }
+                manifest-scrollbar-dragged(y) => { root.diagnostics-manifest-scrollbar-dragged(y); }
+                manifest-viewport-height-changed(h) => { root.diagnostics-manifest-viewport-height-changed(h); }
+                manifest-scrolled(delta) => { root.diagnostics-manifest-scrolled(delta); }
+            }
         }
 
-        if root.settings-section == "performance": FFPerformanceTab {
+        if root.settings-section == "performance": FFAppear {
             width: 100%;
             height: 100%;
-            performance: root.performance;
 
-            gpu-toggled(on) => { root.performance-gpu-toggled(on); }
-            host-cap-edited(t) => { root.performance-host-cap-edited(t); }
-            vram-cap-edited(t) => { root.performance-vram-cap-edited(t); }
-            host-cap-cursor-moved(x, w) => { root.performance-host-cap-cursor-moved(x, w); }
-            vram-cap-cursor-moved(x, w) => { root.performance-vram-cap-cursor-moved(x, w); }
+            FFPerformanceTab {
+                width: 100%;
+                height: 100%;
+                performance: root.performance;
+
+                gpu-toggled(on) => { root.performance-gpu-toggled(on); }
+                host-cap-edited(t) => { root.performance-host-cap-edited(t); }
+                vram-cap-edited(t) => { root.performance-vram-cap-edited(t); }
+                cap-committed => { root.performance-cap-committed(); }
+                host-cap-cursor-moved(x, w) => { root.performance-host-cap-cursor-moved(x, w); }
+                vram-cap-cursor-moved(x, w) => { root.performance-vram-cap-cursor-moved(x, w); }
+                host-unit-toggled => { root.performance-host-unit-toggled(); }
+                vram-unit-toggled => { root.performance-vram-unit-toggled(); }
+                host-unit-selected(u) => { root.performance-host-unit-selected(u); }
+                vram-unit-selected(u) => { root.performance-vram-unit-selected(u); }
+                unit-dismissed => { root.performance-unit-dismissed(); }
+            }
         }
 
-        if root.settings-section == "appearance": FFAppearanceTab {
+        if root.settings-section == "appearance": FFAppear {
             width: 100%;
             height: 100%;
-            presentation: root.appearance-presentation;
-            menu-open: root.appearance-menu-open;
-            menu-focused: root.appearance-menu-focused;
-            menu-disabled: root.appearance-menu-disabled;
-            save-error: root.appearance-save-error;
-            presentation-selected(choice) => { root.appearance-presentation-selected(choice); }
-            menu-toggled => { root.appearance-menu-toggled(); }
+
+            FFAppearanceTab {
+                width: 100%;
+                height: 100%;
+                presentation: root.appearance-presentation;
+                menu-open: root.appearance-menu-open;
+                menu-focused: root.appearance-menu-focused;
+                menu-disabled: root.appearance-menu-disabled;
+                save-error: root.appearance-save-error;
+                sharpness-heatmap: root.appearance-sharpness-heatmap;
+                reduce-motion: root.appearance-reduce-motion;
+                presentation-selected(choice) => { root.appearance-presentation-selected(choice); }
+                sharpness-heatmap-toggled(on) => { root.appearance-sharpness-heatmap-toggled(on); }
+                reduce-motion-toggled(on) => { root.appearance-reduce-motion-toggled(on); }
+                menu-toggled => { root.appearance-menu-toggled(); }
+            }
         }
 
-        if root.settings-section == "storage": FFStorageTab {
+        if root.settings-section == "storage": FFAppear {
             width: 100%;
             height: 100%;
-            storage: root.storage;
 
-            clear-requested => { root.storage-clear-requested(); }
+            FFStorageTab {
+                width: 100%;
+                height: 100%;
+                storage: root.storage;
+
+                clear-requested => { root.storage-clear-requested(); }
+            }
         }
 
-        if root.settings-section == "input-map": FFInputMapTab {
-            input-rows: root.input-rows;
-        }
-
-        if root.settings-section == "about": FFAboutTab {
+        if root.settings-section == "input-map": FFAppear {
             width: 100%;
             height: 100%;
-            about: root.about;
+
+            FFInputMapTab {
+                input-rows: root.input-rows;
+                input-source: root.input-source;
+                input-problems: root.input-problems;
+            }
+        }
+
+        if root.settings-section == "about": FFAppear {
+            width: 100%;
+            height: 100%;
+
+            FFAboutTab {
+                width: 100%;
+                height: 100%;
+                about: root.about;
+                update-controls: root.update-controls;
+                check-on-start-toggled(on) => { root.update-check-on-start-toggled(on); }
+                check-now-requested => { root.update-check-now-requested(); }
+                skip-requested => { root.update-skip-requested(); }
+                page-requested => { root.update-page-requested(); }
+            }
         }
     }
 }

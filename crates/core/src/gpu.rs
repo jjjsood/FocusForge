@@ -17,8 +17,8 @@ use rayon::prelude::*;
 
 use crate::algorithm::{AlgorithmError, TileOutput, TileReader};
 use crate::align::warp::WarpedTile;
-use crate::align::{AlignError, Transform};
-use crate::tile::{Rect, Tile};
+use crate::align::{AlignError, ECC_BACKEND_MIN_REGION_PX, Transform};
+use crate::tile::{Rect, SampleFormat, Tile};
 
 /// The adapter facts a [`TileBackend`] implementation was built on: plain
 /// `String`s, so no `wgpu` type crosses into `crates/core`. `crates/gpu`
@@ -65,11 +65,12 @@ pub trait TileBackend: Send + Sync {
     }
 
     /// Why one `width` x `height` tile at `samples_per_pixel`, pyramid depth
-    /// `levels` and `transforms` (the shape [`Self::warp_fuse_tile`] takes)
-    /// cannot run on this backend's device, as a message naming the host
-    /// path the run continues on; `None` when it fits. A caller that gets
-    /// `Some` fuses on the host instead of calling this backend. Defaults to
-    /// `None`, for a backend with no budget of its own.
+    /// `levels`, `transforms` and the reader's `sample_format` (the shape
+    /// [`Self::warp_fuse_tile`] takes) cannot run on this backend's device, as
+    /// a message naming the host path the run continues on; `None` when it
+    /// fits. A caller that gets `Some` fuses on the host instead of calling
+    /// this backend. Defaults to `None`, for a backend with no budget of its
+    /// own.
     fn tile_budget_shortfall(
         &self,
         _width: u32,
@@ -77,6 +78,7 @@ pub trait TileBackend: Send + Sync {
         _samples_per_pixel: u32,
         _levels: u32,
         _transforms: &[Transform],
+        _sample_format: SampleFormat,
     ) -> Option<String> {
         None
     }
@@ -157,6 +159,23 @@ pub trait TileBackend: Send + Sync {
         samples_per_pixel: u32,
         levels: u32,
     ) -> Result<TileOutput, AlgorithmError>;
+
+    /// [`Self::warp_fuse_tile`] with the fused tile read back as `f32`,
+    /// nothing clamped to 16 bits. A backend without an `f32` output refuses.
+    fn warp_fuse_tile_f32(
+        &self,
+        _reader: &dyn TileReader,
+        _frame: (u32, u32),
+        _transforms: &[Transform],
+        _rect: Rect,
+        _samples_per_pixel: u32,
+        _levels: u32,
+    ) -> Result<TileOutput<f32>, AlgorithmError> {
+        Err(AlgorithmError::Failed {
+            algorithm: "warp".to_string(),
+            detail: "this backend has no f32 output".to_string(),
+        })
+    }
 }
 
 /// Length of the moment vector an [`EccMomentSession`] returns.
@@ -201,6 +220,12 @@ pub trait EccMomentSession: Send {
 /// An optional accelerator for the ECC alignment solver. Object-safe and
 /// `Send + Sync` for the same reason as [`TileBackend`].
 pub trait AlignBackend: Send + Sync {
+    /// The fewest solve-region pixels at which a level is worth handing to
+    /// this backend; a smaller level runs on the CPU without being offered.
+    fn min_ecc_region_px(&self) -> u64 {
+        ECC_BACKEND_MIN_REGION_PX
+    }
+
     /// Opens a session for one level, or `Ok(None)` to decline it, in which
     /// case the level runs on the CPU. An error fails the whole alignment.
     fn open_ecc(

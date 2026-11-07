@@ -2,6 +2,7 @@
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
+import { FFTooltip } from "ff_tooltip.slint";
 
 export component FFUndockControl inherits Rectangle {
     in property <bool> enabled: true;
@@ -9,13 +10,15 @@ export component FFUndockControl inherits Rectangle {
     in property <bool> dock-back: false;
     callback triggered();
 
+    property <string> label: root.dock-back ? "Dock pane" : "Undock pane";
+
     width: ShellGeometry.undock-control-width;
     height: ShellGeometry.undock-control-height;
     background: (root.hovered || area.has-hover) && root.enabled ? Theme.surface-hover : Theme.surface-overlay;
     border-radius: Theme.radius-sm;
     opacity: root.enabled ? 1.0 : 0.5;
     accessible-role: button;
-    accessible-label: root.dock-back ? "Dock pane" : "Undock pane";
+    accessible-label: root.label;
     accessible-enabled: root.enabled;
 
     area := TouchArea {
@@ -29,5 +32,8 @@ export component FFUndockControl inherits Rectangle {
         colorize: Theme.text-secondary;
         width: Theme.icon-sm;
         height: Theme.icon-sm;
+    }
+    Tooltip {
+        FFTooltip { text: root.label; }
     }
 }

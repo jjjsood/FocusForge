@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! The `Images` dock panel, driven through `AppController` -- fast, no
-//! window: the model over `fixtures/mantis-512` and small synthetic timed
+//! window: the model over `fixtures/mantis-64` and small synthetic timed
 //! frame sets, mirroring `tests/job.rs`'s own fixture-copy shape.
 
 mod common;
@@ -19,7 +19,10 @@ use focusforge_gui::job;
 use focusforge_gui::source_previews::{self, PreviewError};
 use focusforge_gui::{AppController, OpenAs, OpenOutcome, ShellMode};
 
-use common::{controller_with_frames, copy_frame, tree};
+use common::{
+    controller_with_frames, controller_with_frames_from, copy_frame, element_center,
+    save_to_proposed, tree,
+};
 
 fn write_timed(dir: &Path, name: &str, when: Option<&str>) -> PathBuf {
     let path = dir.join(name);
@@ -49,6 +52,7 @@ fn controller_with_list_frames(name: &str, count: usize) -> AppController {
     let mut controller = controller_with_timed_frames(name, count);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::List,
+        ..AppearanceSettings::default()
     });
     controller
 }
@@ -84,6 +88,7 @@ fn image_list_queues_only_the_visible_window_plus_two_rows() {
     let mut controller = controller_with_timed_frames("preview_visible_window", 8);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
     });
     controller.set_images_viewport_height(120.0);
     let snapshot = controller.source_preview_snapshot();
@@ -101,6 +106,7 @@ fn image_list_keeps_a_fractional_thousand_row_viewport_to_the_two_row_margin() {
     let mut controller = controller_with_timed_frames("preview_fractional_thousand", 1000);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
     });
 
     controller.set_images_viewport_height(120.5);
@@ -172,6 +178,19 @@ fn every_directed_source_presentation_transition_preserves_identity_and_tab_stat
             controller.source_preview_row_visible(selected_index),
             "{from:?} -> {to:?} keeps the selected source visible"
         );
+        // Scrolling past the end lands on the last offset the row height allows:
+        // five rows in a 120 px viewport.
+        let row_height = match to {
+            SourcePresentation::List => ROW_HEIGHT,
+            SourcePresentation::ImageList => 120.0,
+            SourcePresentation::Large => 200.0,
+        };
+        controller.images_viewport_scrolled(1.0e6);
+        assert_eq!(
+            controller.images_scroll_y(),
+            5.0 * row_height - 120.0,
+            "{from:?} -> {to:?} row height"
+        );
     }
 
     let other = tree("presentation_transition_second_tab");
@@ -193,6 +212,7 @@ fn source_preview_cap_change_replaces_an_unchanged_visible_set() {
     let mut controller = controller_with_timed_frames("preview_cap_change", 8);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
     });
     controller.set_images_viewport_height(120.0);
     let before = controller.source_preview_snapshot();
@@ -233,6 +253,7 @@ fn live_processing_reserves_cached_native_preview_growth_during_resize() {
     let mut controller = controller_with_timed_frames("preview_live_resize_reserve", 4);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
     });
     controller.set_host_memory_cap("1MiB");
     controller.set_images_viewport_height(120.0);
@@ -246,7 +267,7 @@ fn live_processing_reserves_cached_native_preview_growth_during_resize() {
         std::thread::yield_now();
     }
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller));
@@ -297,6 +318,7 @@ fn an_idle_tab_cannot_schedule_source_previews_while_another_tab_processes() {
     let mut controller = controller_with_timed_frames("preview_global_job_guard", 4);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
     });
     controller.set_images_viewport_height(120.0);
 
@@ -325,7 +347,7 @@ fn an_idle_tab_cannot_schedule_source_previews_while_another_tab_processes() {
     assert_eq!(snapshot.admission_bytes, 0);
 }
 
-fn wait_for_settle(controller: &mut AppController, timeout: Duration) {
+fn settle_to_stacking(controller: &mut AppController, timeout: Duration) {
     let start = Instant::now();
     loop {
         if controller.settle_job().is_some() {
@@ -345,17 +367,6 @@ fn wait_for_settle(controller: &mut AppController, timeout: Duration) {
     // baseline (`controller_in_editor_mode` still enters Editor itself,
     // right after this call, for the few tests that want it).
     controller.set_mode(ShellMode::Stacking);
-}
-
-/// Saves the active, never-saved tab to the path the save dialog proposes,
-/// and returns that path.
-fn save_to_proposed(controller: &mut AppController) -> PathBuf {
-    let mut target = None;
-    assert!(common::save_and_settle(controller, |proposed| {
-        target = Some(proposed.to_path_buf());
-        target.clone()
-    }));
-    target.expect("a never-saved tab asks where to save")
 }
 
 /// Seals a project directly (no real fuse) over `sources`, returning its
@@ -550,29 +561,12 @@ fn rows_carry_no_index() {
 // identity, driving the left canvas pane.
 // ---------------------------------------------------------------------
 
-fn mantis64_frame(index: usize) -> PathBuf {
-    common::fixture_frame("mantis-64", index)
-}
-
-fn controller_with_mantis64_frames(name: &str) -> AppController {
-    let root = tree(&format!("{name}_frames"));
-    for i in 0..3 {
-        std::fs::copy(mantis64_frame(i), root.join(format!("{i:02}.tif")))
-            .expect("fixture frame must copy");
-    }
-    let mut controller = AppController::new();
-    assert!(matches!(
-        common::open_and_settle(&mut controller, &[root]),
-        OpenOutcome::Opened(_)
-    ));
-    controller
-}
-
 /// The selected position, the path the canvas is fed and the panel's own
 /// `selected` flags are one value -- never index 0, the last row instead.
 #[test]
 fn frame_selection_drives_left_pane() {
-    let mut controller = controller_with_mantis64_frames("frame_selection_drives_left_pane");
+    let mut controller =
+        controller_with_frames_from("mantis-64", "frame_selection_drives_left_pane", 3);
     let last = 2;
     controller.select_frame(last);
 
@@ -638,13 +632,11 @@ fn selection_is_always_exactly_one() {
     // The post-run re-seed: a second fuse must land exactly one selected
     // row again, regardless of what was selected before it started.
     let mut controller = controller_with_frames("selection_always_one_run", 3);
-    // An algorithm that always converges keeps the fuse out of the test.
-    controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     controller.select_frame(2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(selected_count(&controller), 1, "after the post-run re-seed");
     assert!(
         controller.images_panel().rows[0].selected,
@@ -689,9 +681,8 @@ fn selection_survives_reorder_and_remove() {
 #[test]
 fn confirming_a_reorder_keeps_the_selected_source_visible() {
     let mut controller = controller_with_frames("confirmed_reorder_selection_visibility", 3);
-    controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     controller.set_images_viewport_height(10.0);
     controller.select_frame(0);
     controller.images_viewport_scrolled(0.0);
@@ -710,7 +701,7 @@ fn confirming_a_reorder_keeps_the_selected_source_visible() {
         controller.source_preview_row_visible(2),
         "confirmation keeps the moved selected source visible"
     );
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
 }
 
 // ---------------------------------------------------------------------
@@ -785,7 +776,7 @@ fn curating_is_free_before_the_first_fuse() {
 fn frame_set_change_warns_with_a_count() {
     let mut controller = controller_with_frames("frame_set_change_warns", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     controller.remove_frame(0);
@@ -804,7 +795,7 @@ fn frame_set_change_warns_with_a_count() {
 fn add_and_reorder_offer_a_new_project_with_the_same_settings() {
     let mut controller = controller_with_frames("add_reorder_new_project", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
 
     let extra = write_timed(&tree("add_reorder_extra"), "extra.tif", None);
     common::add_and_settle(&mut controller, &[extra]).expect("the add must not refuse");
@@ -819,24 +810,38 @@ fn add_and_reorder_offer_a_new_project_with_the_same_settings() {
     assert!(!move_warning.exclude_instead_button);
 }
 
+// tier: mantis-64; layer: GUI controller
 #[test]
-fn remove_offers_exclude_instead_and_mentions_a_new_project() {
-    let mut controller = controller_with_frames("remove_offers_exclude", 2);
+fn sorting_by_name_after_a_checkpoint_asks_about_name() {
+    let mut controller = controller_with_frames("sort_by_name_asks_about_name", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
+    let names = |controller: &AppController| -> Vec<String> {
+        controller
+            .images_panel()
+            .rows
+            .iter()
+            .map(|row| row.name.clone())
+            .collect()
+    };
+    let before = names(&controller);
 
-    controller.remove_frame(0);
-    let warning = controller.pending_frame_change().unwrap();
-    assert!(warning.exclude_instead_button);
-    assert!(!warning.new_project_button);
-    assert!(warning.info.contains("new project"));
+    controller.set_frame_sort(FrameSort::Name);
+    let warning = controller
+        .pending_frame_change()
+        .expect("sorting a checkpointed project raises the question");
+    assert_eq!(warning.title, "Sort by name and fuse again?");
+
+    controller.cancel_frame_change();
+    assert!(controller.pending_frame_change().is_none());
+    assert_eq!(names(&controller), before);
 }
 
 #[test]
 fn confirm_button_is_not_the_default() {
     let mut controller = controller_with_frames("confirm_not_default", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
 
     controller.remove_frame(0);
     let warning = controller.pending_frame_change().unwrap();
@@ -856,7 +861,7 @@ fn confirm_button_is_not_the_default() {
 fn confirming_a_pending_change_applies_it_and_re_fuses() {
     let mut controller = controller_with_frames("confirm_applies", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     controller.remove_frame(0);
@@ -864,7 +869,7 @@ fn confirming_a_pending_change_applies_it_and_re_fuses() {
     assert!(controller.confirm_frame_change());
     assert!(controller.pending_frame_change().is_none());
     assert_eq!(controller.images_panel().rows.len(), 1);
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(
         controller.checkpoint_count(),
         Some(2),
@@ -876,7 +881,7 @@ fn confirming_a_pending_change_applies_it_and_re_fuses() {
 // Additive import: duplicate identity by content, replace/keep/cancel.
 // ---------------------------------------------------------------------
 
-/// [`controller_with_frames`], opened twice over two fresh trees, both
+/// [`controller_with_frames_from`], opened twice over two fresh trees, both
 /// stacking-mode tabs -- the second one active, as any newly opened tab is.
 fn controller_with_two_projects(name: &str) -> AppController {
     let root_a = tree(&format!("{name}_a"));
@@ -926,7 +931,7 @@ fn import_of_a_renamed_copy_is_a_conflict_by_content() {
 fn import_of_a_different_frame_under_an_existing_name_is_not_a_conflict() {
     let mut controller = controller_with_frames("import_same_name_diff_content", 2);
     let extra_dir = tree("import_same_name_diff_content_extra");
-    copy_frame(&extra_dir, "00.tif", 5);
+    copy_frame(&extra_dir, "00.tif", 2);
 
     common::add_and_settle(&mut controller, &[extra_dir.join("00.tif")])
         .expect("the add must not refuse");
@@ -946,8 +951,8 @@ fn import_of_a_different_frame_under_an_existing_name_is_not_a_conflict() {
 fn import_collapses_identical_incoming_copies_into_one_row() {
     let mut controller = controller_with_frames("import_collapse_incoming", 2);
     let extra_dir = tree("import_collapse_incoming_extra");
-    copy_frame(&extra_dir, "copy-a.tif", 6);
-    copy_frame(&extra_dir, "copy-b.tif", 6);
+    copy_frame(&extra_dir, "copy-a.tif", 2);
+    copy_frame(&extra_dir, "copy-b.tif", 2);
 
     common::add_and_settle(
         &mut controller,
@@ -965,17 +970,17 @@ fn import_collapses_identical_incoming_copies_into_one_row() {
 
 #[test]
 fn import_replace_puts_the_new_file_at_the_same_position_and_keeps_exclusion() {
-    let mut controller = controller_with_frames("import_replace_position", 3);
-    controller.toggle_frame_excluded(1);
-    assert!(controller.images_panel().rows[1].excluded);
+    let mut controller = controller_with_frames("import_replace_position", 2);
+    controller.toggle_frame_excluded(0);
+    assert!(controller.images_panel().rows[0].excluded);
 
     let extra_dir = tree("import_replace_position_extra");
-    copy_frame(&extra_dir, "renamed-01.tif", 1);
-    copy_frame(&extra_dir, "new.tif", 6);
+    copy_frame(&extra_dir, "renamed-00.tif", 0);
+    copy_frame(&extra_dir, "new.tif", 2);
 
     common::add_and_settle(
         &mut controller,
-        &[extra_dir.join("renamed-01.tif"), extra_dir.join("new.tif")],
+        &[extra_dir.join("renamed-00.tif"), extra_dir.join("new.tif")],
     )
     .expect("the add must not refuse");
     assert!(controller.pending_frame_change().is_some());
@@ -987,13 +992,13 @@ fn import_replace_puts_the_new_file_at_the_same_position_and_keeps_exclusion() {
     assert!(controller.pending_frame_change().is_none());
 
     let panel = controller.images_panel();
-    assert_eq!(panel.rows.len(), 4, "one replace in place, one new row");
+    assert_eq!(panel.rows.len(), 3, "one replace in place, one new row");
     assert_eq!(
-        panel.rows[1].name, "renamed-01.tif",
+        panel.rows[0].name, "renamed-00.tif",
         "the replacement lands at the same position"
     );
     assert!(
-        panel.rows[1].excluded,
+        panel.rows[0].excluded,
         "a replaced excluded frame stays excluded"
     );
 }
@@ -1003,7 +1008,7 @@ fn import_keep_existing_retains_the_conflict_and_still_adds_new_frames() {
     let mut controller = controller_with_frames("import_keep_existing", 2);
     let extra_dir = tree("import_keep_existing_extra");
     copy_frame(&extra_dir, "renamed.tif", 0);
-    copy_frame(&extra_dir, "new.tif", 6);
+    copy_frame(&extra_dir, "new.tif", 2);
 
     common::add_and_settle(
         &mut controller,
@@ -1034,7 +1039,7 @@ fn import_cancel_leaves_the_project_unchanged() {
 
     let extra_dir = tree("import_cancel_extra");
     copy_frame(&extra_dir, "renamed.tif", 0);
-    copy_frame(&extra_dir, "new.tif", 6);
+    copy_frame(&extra_dir, "new.tif", 2);
 
     common::add_and_settle(
         &mut controller,
@@ -1056,7 +1061,7 @@ fn import_cancel_leaves_the_project_unchanged() {
 fn import_all_declined_opens_no_checkpoint_warning_and_starts_no_run() {
     let mut controller = controller_with_frames("import_all_declined", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     let extra_dir = tree("import_all_declined_extra");
@@ -1081,7 +1086,7 @@ fn import_all_declined_opens_no_checkpoint_warning_and_starts_no_run() {
 fn import_of_the_same_paths_accepted_resolves_to_nothing_and_never_re_fuses() {
     let mut controller = controller_with_frames("import_same_paths_accepted", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     let same_path = controller
@@ -1107,12 +1112,12 @@ fn import_of_the_same_paths_accepted_resolves_to_nothing_and_never_re_fuses() {
 fn import_with_a_checkpoint_shows_the_duplicate_question_before_the_add_warning() {
     let mut controller = controller_with_frames("import_checkpoint_order", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     let extra_dir = tree("import_checkpoint_order_extra");
     copy_frame(&extra_dir, "renamed.tif", 0);
-    copy_frame(&extra_dir, "new.tif", 6);
+    copy_frame(&extra_dir, "new.tif", 2);
 
     common::add_and_settle(
         &mut controller,
@@ -1148,7 +1153,7 @@ fn import_settled_after_a_tab_switch_lands_on_neither_tab() {
     assert_eq!(controller.active_project(), Some(1));
 
     let extra_dir = tree("import_after_tab_switch_extra");
-    copy_frame(&extra_dir, "new.tif", 6);
+    copy_frame(&extra_dir, "new.tif", 2);
     let handle = controller
         .add_frames(&[extra_dir.join("new.tif")])
         .expect("the add must not refuse")
@@ -1174,10 +1179,10 @@ fn import_settled_after_a_tab_switch_lands_on_neither_tab() {
 
 #[test]
 fn import_settled_after_a_frame_was_removed_meanwhile_changes_nothing() {
-    let mut controller = controller_with_frames("import_after_frame_removed", 3);
+    let mut controller = controller_with_frames("import_after_frame_removed", 2);
 
     let extra_dir = tree("import_after_frame_removed_extra");
-    copy_frame(&extra_dir, "new.tif", 6);
+    copy_frame(&extra_dir, "new.tif", 2);
     let handle = controller
         .add_frames(&[extra_dir.join("new.tif")])
         .expect("the add must not refuse")
@@ -1186,13 +1191,13 @@ fn import_settled_after_a_frame_was_removed_meanwhile_changes_nothing() {
 
     // The frame set moved on while the scan was in flight.
     controller.remove_frame(0);
-    assert_eq!(controller.images_panel().rows.len(), 2);
+    assert_eq!(controller.images_panel().rows.len(), 1);
 
     controller.settle_import();
 
     assert_eq!(
         controller.images_panel().rows.len(),
-        2,
+        1,
         "a scan over a since-changed frame list is discarded, not applied on top of it"
     );
     assert!(controller.pending_frame_change().is_none());
@@ -1202,7 +1207,7 @@ fn import_settled_after_a_frame_was_removed_meanwhile_changes_nothing() {
 fn import_wiring_shows_the_duplicate_question_and_keep_existing_button() {
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
 
     let mut controller = controller_with_frames("import_wiring_duplicate", 2);
@@ -1268,14 +1273,14 @@ fn import_wiring_keep_existing_click_adds_the_new_frame_and_closes_the_question(
     use slint::{ComponentHandle, Model};
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
     let mut controller = controller_with_frames("import_wiring_keep_click", 2);
     let extra_dir = tree("import_wiring_keep_click_extra");
     copy_frame(&extra_dir, "renamed.tif", 0);
-    copy_frame(&extra_dir, "new.tif", 6);
+    copy_frame(&extra_dir, "new.tif", 2);
     common::add_and_settle(
         &mut controller,
         &[extra_dir.join("renamed.tif"), extra_dir.join("new.tif")],
@@ -1363,15 +1368,14 @@ fn manual_order_clears_the_sort_selection() {
 // Stacking-mode-only.
 // ---------------------------------------------------------------------
 
-/// [`controller_with_mantis64_frames`], fused once and switched into editor
-/// mode through `set_mode`, the same path the mode switch takes.
+/// [`controller_with_frames_from`] over `mantis-64`, fused once and switched
+/// into editor mode through `set_mode`, the same path the mode switch takes.
 fn controller_in_editor_mode(name: &str) -> AppController {
-    let mut controller = controller_with_mantis64_frames(name);
-    controller.set_scratch_root_for_test(tree(&format!("{name}_scratch")));
+    let mut controller = controller_with_frames_from("mantis-64", name, 3);
     // An algorithm that always converges keeps the fuse out of the test.
     controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert!(
         controller.set_mode(ShellMode::Editor),
         "a fused tab enters editor mode"
@@ -1422,7 +1426,9 @@ fn mutations_are_refused_while_this_tabs_job_is_running() {
         "a drag must not even start while the job is running"
     );
 
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    controller.cancel_fuse();
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
+    assert!(!controller.work_pending(), "the cancelled run left no work");
 }
 
 // ---------------------------------------------------------------------
@@ -1496,7 +1502,7 @@ fn a_sealed_tab_reads_as_having_a_checkpoint() {
     // fused -- the point already made above is that `Some(0)` gates nothing.
     let mut controller = controller_with_frames("sealed_tab_checkpoint_gate", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     controller.remove_frame(0);
     let warning = controller
         .pending_frame_change()
@@ -1578,6 +1584,7 @@ fn metadata_follows_the_source_through_reorder_and_remove() {
     ));
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::List,
+        ..AppearanceSettings::default()
     });
     std::fs::remove_dir_all(&root).unwrap();
 
@@ -1785,6 +1792,7 @@ fn presentation_switches_drag_and_scroll_geometry_without_reusing_list_height() 
 
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
     });
     controller.frame_drag_pointer(0, PointerKind::Down, 10.0);
     controller.frame_drag_pointer(0, PointerKind::Move, 190.0);
@@ -1875,24 +1883,6 @@ fn sort_menu_and_drag_are_stacking_mode_only() {
 // pointer capture outlive the row it started on.
 // ---------------------------------------------------------------------
 
-fn init_window_backend() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
-}
-
-fn element_center(handle: &i_slint_backend_testing::ElementHandle) -> slint::LogicalPosition {
-    let pos = handle.absolute_position();
-    let size = handle.size();
-    slint::LogicalPosition::new(pos.x + size.width / 2.0, pos.y + size.height / 2.0)
-}
-
 /// A point inside the first row's source-name region at window height `y`.
 fn source_drag_point(app: &focusforge_gui::AppWindow, y: f32) -> slint::LogicalPosition {
     let area = i_slint_backend_testing::ElementQuery::from_root(app)
@@ -1908,7 +1898,7 @@ fn row_hover_survives_image_name_timestamp_and_action_surfaces_in_every_presenta
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_list_preview_active(true);
@@ -2024,13 +2014,16 @@ fn row_hover_survives_image_name_timestamp_and_action_surfaces_in_every_presenta
 
 #[test]
 fn source_rows_take_keyboard_focus_and_select_the_next_resolved_source() {
+    if common::ran_in_child("source_rows_take_keyboard_focus_and_select_the_next_resolved_source") {
+        return;
+    }
     use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
     use slint::platform::{Key, PointerEventButton, WindowEvent};
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller_with_list_frames(
@@ -2217,6 +2210,7 @@ fn keyboard_selection_skips_missing_reanchors_at_edges_and_stays_read_only_in_ed
     let mut editor = controller_in_editor_mode("keyboard_visible_selection_editor");
     editor.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
     });
     editor.set_images_viewport_height(10.0);
     editor.select_frame(0);
@@ -2238,7 +2232,10 @@ fn editor_source_list_follows_appearance_presentation() {
         (SourcePresentation::ImageList, 120.0, true),
         (SourcePresentation::Large, 200.0, true),
     ] {
-        editor.install_appearance(AppearanceSettings { presentation });
+        editor.install_appearance(AppearanceSettings {
+            presentation,
+            ..AppearanceSettings::default()
+        });
         editor.set_images_viewport_height(10.0);
         assert_eq!(editor.source_presentation(), presentation);
 
@@ -2280,7 +2277,7 @@ fn editor_legend_rows_stay_read_only_in_every_presentation() {
     use slint::platform::{PointerEventButton, WindowEvent};
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller_in_editor_mode(
@@ -2415,7 +2412,7 @@ fn selecting_a_hovered_source_keeps_its_hover_actions_mounted() {
     use slint::platform::{PointerEventButton, WindowEvent};
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller_with_list_frames(
@@ -2526,7 +2523,7 @@ fn elided_filename_tooltip_uses_available_window_width_before_wrapping() {
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(720, 480));
     app.set_list_preview_active(true);
@@ -2589,7 +2586,7 @@ fn constrained_filename_tooltip_balances_wrapped_lines_within_the_viewport() {
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(360, 480));
     app.set_list_preview_active(true);
@@ -2651,7 +2648,7 @@ fn dragging_a_row_by_its_source_reorders_it_through_the_real_window() {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -2738,7 +2735,7 @@ fn installed_drag_callback_publishes_capture_before_the_next_motion() {
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller_with_list_frames(
@@ -2785,7 +2782,7 @@ fn dragging_a_row_by_its_source_floats_a_copy_that_follows_the_cursor() {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
@@ -2963,7 +2960,7 @@ fn dragging_at_images_viewport_edges_auto_scrolls_and_keeps_the_selected_source_
     use slint::platform::{PointerEventButton, WindowEvent};
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     for (presentation, at_bottom) in [
         (SourcePresentation::List, false),
         (SourcePresentation::List, true),
@@ -3177,7 +3174,7 @@ fn a_stationary_source_press_near_an_edge_does_not_auto_scroll_or_reorder() {
     use slint::platform::{PointerEventButton, WindowEvent};
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let loaded = controller_with_list_frames("images_stationary_edge_press", 40);
@@ -3346,7 +3343,7 @@ fn source_drag_retirement_paths_leave_no_stale_edge_scroll() {
     running.set_align_algorithm("dummy-align");
     assert!(running.start_fuse());
     assert_retired(&mut running, "starting a job retires the drag");
-    wait_for_settle(&mut running, Duration::from_secs(120));
+    settle_to_stacking(&mut running, Duration::from_secs(120));
 }
 
 #[test]
@@ -3354,7 +3351,7 @@ fn images_panel_disable_is_whole_panel() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_project_loaded(true);
@@ -3387,9 +3384,10 @@ fn images_panel_disable_is_whole_panel() {
     app.set_images_enabled(true);
     assert_eq!(panel_opacity(), 1.0, "re-enabling restores full opacity");
 
-    let mut controller = controller_with_frames("images_panel_disable_is_whole_panel", 4);
+    let mut controller = controller_with_frames("images_panel_disable_is_whole_panel", 3);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::List,
+        ..AppearanceSettings::default()
     });
     focusforge_gui::bridge::push_images_panel(&app, &controller);
     assert!(
@@ -3423,7 +3421,7 @@ fn images_panel_editor_mode_is_read_only_not_dimmed() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_project_loaded(true);
@@ -3468,13 +3466,14 @@ fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
     let mut loaded = controller_with_frames("job_disables_images_and_settings", 3);
     loaded.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::List,
+        ..AppearanceSettings::default()
     });
     let controller = Arc::new(Mutex::new(loaded));
     let _installed = focusforge_gui::bridge::install(
@@ -3562,6 +3561,7 @@ fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
         "the settings panel reads as one whole-panel disable while this tab's own job runs"
     );
 
+    controller.lock().unwrap().cancel_fuse();
     let start = std::time::Instant::now();
     loop {
         if controller.lock().unwrap().settle_job().is_some() {
@@ -3576,6 +3576,10 @@ fn a_running_job_makes_its_own_tabs_images_and_settings_non_interactive() {
         );
         std::thread::sleep(Duration::from_millis(5));
     }
+    assert!(
+        !controller.lock().unwrap().work_pending(),
+        "the cancelled run left no work"
+    );
     push(&controller.lock().unwrap());
     app.set_dock_tab("images".into());
     let images_opacity = ElementQuery::from_root(&app)
@@ -3610,35 +3614,18 @@ fn labelled(app: &focusforge_gui::AppWindow, label: &str) -> usize {
 
 #[test]
 fn scrolling_reads_nothing_and_selection_notifies_only_changed_rows() {
+    // Timing accounting is process-global, so this runs alone in a child.
+    if common::ran_in_child("scrolling_reads_nothing_and_selection_notifies_only_changed_rows") {
+        return;
+    }
     use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
     use focusforge_gui::ShellEvent;
     use slint::ComponentHandle;
     use slint::platform::{PointerEventButton, WindowEvent};
     use std::sync::{Arc, Mutex};
 
-    // Timing accounting is process-global, so this runs alone in a child.
-    const CHILD: &str = "FOCUSFORGE_GUI_IMAGES_SCROLL_ACCOUNTING_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let status = std::process::Command::new(
-            std::env::current_exe().expect("the test binary has a path"),
-        )
-        .args([
-            "--exact",
-            "scrolling_reads_nothing_and_selection_notifies_only_changed_rows",
-            "--test-threads=1",
-        ])
-        .env(CHILD, "1")
-        .status()
-        .expect("the isolated accounting test starts");
-        assert!(
-            status.success(),
-            "the isolated accounting test passes: {status}"
-        );
-        return;
-    }
-
     enable_trace_accounting();
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller_with_timed_frames(
@@ -3650,6 +3637,7 @@ fn scrolling_reads_nothing_and_selection_notifies_only_changed_rows() {
         .unwrap()
         .install_appearance(AppearanceSettings {
             presentation: SourcePresentation::List,
+            ..AppearanceSettings::default()
         });
     let _installed = focusforge_gui::bridge::install(
         &app,
@@ -3925,7 +3913,7 @@ fn a_thousand_rows_instantiate_only_the_visible_window() {
         .name
         .clone();
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller));
@@ -3987,7 +3975,7 @@ fn a_source_drag_survives_leaving_the_viewport_and_row_recycling() {
     use slint::platform::{PointerEventButton, WindowEvent};
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let controller = Arc::new(Mutex::new(controller_with_list_frames(
@@ -4109,7 +4097,7 @@ fn a_source_drag_survives_leaving_the_viewport_and_row_recycling() {
 fn exclude_instead_excludes_the_frame_and_clears_the_warning() {
     let mut controller = controller_with_frames("exclude_instead_excludes", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
 
     controller.remove_frame(0);
     assert!(controller.pending_frame_change().is_some());
@@ -4134,7 +4122,7 @@ fn exclude_instead_excludes_the_frame_and_clears_the_warning() {
 fn exclude_instead_is_a_no_op_off_a_remove_warning() {
     let mut controller = controller_with_frames("exclude_instead_wrong_kind", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
 
     let extra = write_timed(&tree("exclude_instead_wrong_kind_extra"), "extra.tif", None);
     common::add_and_settle(&mut controller, &[extra]).expect("the add must not refuse");
@@ -4150,7 +4138,7 @@ fn exclude_instead_is_a_no_op_off_a_remove_warning() {
 fn new_project_instead_opens_a_second_tab_and_leaves_the_first_alone() {
     let mut controller = controller_with_frames("new_project_instead", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     controller.remove_frame(0);
@@ -4181,7 +4169,7 @@ fn new_project_instead_opens_a_second_tab_and_leaves_the_first_alone() {
 fn switching_tabs_dismisses_a_stale_frame_set_warning() {
     let mut controller = controller_with_frames("switching_tabs_dismisses_warning", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     assert_eq!(controller.checkpoint_count(), Some(1));
 
     controller.remove_frame(0);
@@ -4215,19 +4203,143 @@ fn switching_tabs_dismisses_a_stale_frame_set_warning() {
     );
 }
 
+/// `(x, y, width, height)` in window coordinates.
+type Rect = (f32, f32, f32, f32);
+
+/// `FFModalPanel::panel` and every `FFButton` of the open warning's footer.
+fn frame_warning_rects(app: &focusforge_gui::AppWindow) -> (Rect, Vec<Rect>) {
+    use i_slint_backend_testing::{ElementHandle, ElementQuery};
+
+    let rect = |element: &ElementHandle| {
+        let position = element.absolute_position();
+        let size = element.size();
+        (position.x, position.y, size.width, size.height)
+    };
+    let panel = ElementQuery::from_root(app)
+        .match_id("FFModalPanel::panel")
+        .find_first()
+        .expect("the open warning's panel is in the tree");
+    let footer = ElementQuery::from_root(app)
+        .match_type_name("FFDialogFooter")
+        .find_first()
+        .expect("the open warning shows its footer");
+    let buttons = footer
+        .query_descendants()
+        .match_type_name("FFButton")
+        .find_all();
+    (rect(&panel), buttons.iter().map(rect).collect())
+}
+
+// tier: synthetic; layer: GUI view
+#[test]
+fn frame_set_warning_footer_fits_every_button() {
+    use slint::ComponentHandle;
+
+    common::init_window_backend();
+    // (secondary, tertiary, confirm, expected panel width)
+    let cases = [
+        (
+            "Exclude instead",
+            "New project instead",
+            "Remove and re-fuse",
+            640.0,
+        ),
+        ("Keep existing", "", "Replace", 480.0),
+    ];
+    for (secondary, tertiary, confirm, panel_width) in cases {
+        let app = focusforge_gui::AppWindow::new().unwrap();
+        app.window().set_size(slint::PhysicalSize::new(1440, 900));
+        app.set_frame_warning_title("A frame-set question".into());
+        app.set_frame_warning_body("Body".into());
+        app.set_frame_warning_info("Info".into());
+        app.set_frame_warning_secondary_label(secondary.into());
+        app.set_frame_warning_tertiary_label(tertiary.into());
+        app.set_frame_warning_confirm_label(confirm.into());
+        app.set_frame_warning_open(true);
+
+        let (panel, buttons) = frame_warning_rects(&app);
+        assert_eq!(panel.2, panel_width, "{secondary}: the panel's width");
+        let expected = if tertiary.is_empty() { 3 } else { 4 };
+        assert_eq!(
+            buttons.len(),
+            expected,
+            "{secondary}: Cancel plus the labels set"
+        );
+        for (i, button) in buttons.iter().enumerate() {
+            assert!(
+                button.0 >= panel.0
+                    && button.0 + button.2 <= panel.0 + panel.2
+                    && button.1 >= panel.1
+                    && button.1 + button.3 <= panel.1 + panel.3,
+                "{secondary}: button {i} {button:?} lies inside the panel {panel:?}"
+            );
+            if let Some(next) = buttons.get(i + 1) {
+                assert!(
+                    button.0 + button.2 <= next.0,
+                    "{secondary}: button {i} {button:?} ends before button {} {next:?}",
+                    i + 1
+                );
+            }
+        }
+    }
+}
+
+// tier: mantis-64; layer: GUI view
+#[test]
+fn remove_question_new_project_button_opens_a_second_tab() {
+    use slint::ComponentHandle;
+    use std::sync::{Arc, Mutex};
+
+    common::init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+
+    let mut controller = controller_with_frames("remove_question_new_project_button", 2);
+    assert!(controller.start_fuse());
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
+    controller.remove_frame(0);
+    assert!(controller.pending_frame_change().is_some());
+
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+    focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
+    assert_eq!(app.get_frame_warning_secondary_label(), "Exclude instead");
+    assert_eq!(
+        app.get_frame_warning_tertiary_label(),
+        "New project instead"
+    );
+
+    app.invoke_frame_warning_tertiary_pressed();
+
+    let mut controller = controller.lock().unwrap();
+    assert!(controller.pending_frame_change().is_none());
+    assert_eq!(controller.project_tabs().len(), 2, "a second tab opened");
+    controller.select_project(0);
+    assert_eq!(controller.images_panel().rows.len(), 2);
+    assert_eq!(controller.checkpoint_count(), Some(1));
+    controller.select_project(1);
+    assert_eq!(controller.checkpoint_count(), Some(0));
+}
+
 #[test]
 fn the_frame_set_warnings_footer_sits_at_the_panels_bottom_edge() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
 
     let mut controller = controller_with_frames("dialog_footer_pinned", 2);
     assert!(controller.start_fuse());
-    wait_for_settle(&mut controller, Duration::from_secs(120));
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
     controller.remove_frame(0);
     assert!(controller.pending_frame_change().is_some());
 
@@ -4268,7 +4380,7 @@ fn the_frame_set_warnings_footer_sits_at_the_panels_bottom_edge() {
 // ---------------------------------------------------------------------
 
 #[test]
-#[ignore]
+#[ignore = "writes the 61-frame manual-evidence tree under .scratch/timed-61"]
 fn write_the_61_frame_manual_evidence_tree() {
     let dir = common::workspace_root().join(".scratch").join("timed-61");
     let _ = std::fs::remove_dir_all(&dir);
@@ -4305,10 +4417,9 @@ fn write_the_61_frame_manual_evidence_tree() {
 fn confirming_a_frame_change_in_the_window_settles_its_refuse() {
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     let mut controller = controller_with_frames("frame_change_refuse_window", 3);
-    controller.set_align_algorithm("dummy-align");
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, Duration::from_secs(120)).expect("the fuse settles");
     controller.set_mode(ShellMode::Stacking);
@@ -4345,7 +4456,7 @@ fn source_row_actions_and_panel_header_buttons_carry_their_names() {
     use i_slint_backend_testing::{AccessibleRole, ElementQuery};
     use slint::ComponentHandle;
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_list_preview_active(true);

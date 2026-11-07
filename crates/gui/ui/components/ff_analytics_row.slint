@@ -1,0 +1,83 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// One analytics row: a colour chip, the name, an optional rail position, a
+// bar filled to `fraction`, and the right-aligned count. A value that is not
+// final shows a spinner in the count column instead of the number.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFProgressBar } from "ff_progress_bar.slint";
+import { FFSpinner } from "ff_spinner.slint";
+
+export component FFAnalyticsRow inherits Rectangle {
+    in property <color> chip;
+    in property <string> name: "";
+    // The rail position; its column is reserved in every row, so the bar
+    // starts at the same x whether or not a row has one.
+    in property <string> mm-text: "";
+    in property <float> fraction: 0.0;
+    in property <int> count: 0;
+    // "pending" (no report yet: sweeping bar), "partial" (bar filled from the
+    // counts so far) or "final". Pending and partial rows carry the spinner.
+    in property <string> value-state: "final";
+
+    property <length> name-x: ShellGeometry.analytics-row-inset + ShellGeometry.image-chip-size + Theme.space-2;
+    property <length> bar-x: root.name-x + ShellGeometry.analytics-name-width + ShellGeometry.analytics-mm-width;
+
+    height: ShellGeometry.analytics-row-height;
+
+    Rectangle {
+        x: ShellGeometry.analytics-row-inset;
+        y: (parent.height - self.height) / 2;
+        width: ShellGeometry.image-chip-size;
+        height: ShellGeometry.image-chip-size;
+        border-radius: Theme.radius-sm;
+        background: root.chip;
+    }
+    Text {
+        x: root.name-x;
+        width: ShellGeometry.analytics-name-width - Theme.space-2;
+        height: 100%;
+        text: root.name;
+        color: Theme.text-primary;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    if root.mm-text != "": Text {
+        x: root.name-x + ShellGeometry.analytics-name-width;
+        width: ShellGeometry.analytics-mm-width - ShellGeometry.analytics-row-inset;
+        height: 100%;
+        text: root.mm-text;
+        color: Theme.text-muted;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+    FFProgressBar {
+        x: root.bar-x;
+        y: (parent.height - self.height) / 2;
+        width: root.width - root.bar-x - ShellGeometry.analytics-row-inset - ShellGeometry.analytics-count-width;
+        thickness: ShellGeometry.analytics-bar-height;
+        corner-radius: Theme.radius-xs;
+        fraction: root.fraction;
+        indeterminate: root.value-state == "pending";
+    }
+    if root.value-state != "final": FFSpinner {
+        x: root.width - ShellGeometry.analytics-row-inset - self.width;
+        y: (parent.height - self.height) / 2;
+    }
+    if root.value-state == "final": Text {
+        x: root.width - ShellGeometry.analytics-row-inset - ShellGeometry.analytics-count-width;
+        width: ShellGeometry.analytics-count-width;
+        height: 100%;
+        text: root.count;
+        color: Theme.text-primary;
+        font-size: Theme.text-value.size;
+        font-weight: Theme.text-value.weight;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+}

@@ -1,0 +1,534 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* FocusForge manual theme: the window's neutral ramp, its orange accent and
+   Inter. "light" is the light theme, "coal" the dark one; "rust" follows
+   light and "navy"/"ayu" follow dark for readers who stored an old choice. */
+
+:root {
+    --ff-orange-400: #F08A55;
+    --ff-orange-500: #E8763A;
+    --ff-orange-600: #C85F28;
+    --ff-ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+    --ff-radius: 6px;
+    --ff-logo: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2323303B'/%3E%3Cg fill='%23F2F4F6'%3E%3Crect x='4' y='18' width='24' height='2'/%3E%3Crect x='8' y='22' width='16' height='2'/%3E%3Crect x='4' y='26' width='24' height='2'/%3E%3C/g%3E%3Cg fill='%23E8763A' transform='rotate(-21.801 13 11.4)'%3E%3Crect x='10.5' y='7.4' width='5' height='8'/%3E%3Crect x='15.5' y='10.4' width='8' height='2'/%3E%3C/g%3E%3C/svg%3E");
+
+    --sidebar-target-width: 290px;
+    --content-max-width: 780px;
+    --menu-bar-height: 56px;
+    --mono-font: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, Menlo, "DejaVu Sans Mono", monospace;
+}
+
+/* ---- Light ------------------------------------------------------------ */
+
+.light,
+.rust {
+    --bg: #FCFCFB;
+    --fg: #2A2A2A;
+    --ff-heading: #121212;
+    --ff-muted: #6B6B6B;
+    --ff-border: #E6E6E2;
+    --ff-hover-bg: rgba(232, 118, 58, 0.08);
+    --ff-active-bg: rgba(232, 118, 58, 0.14);
+    --ff-code-bg: #F2F1EE;
+    --ff-shadow: 0 1px 2px rgba(0, 0, 0, 0.06), 0 4px 14px rgba(0, 0, 0, 0.06);
+
+    --sidebar-bg: #F4F4F2;
+    --sidebar-fg: #3A3A3A;
+    --sidebar-non-existant: #9A9A9A;
+    --sidebar-active: #B3511D;
+    --sidebar-spacer: #E4E4E1;
+    --sidebar-header-border-color: var(--ff-orange-500);
+
+    --scrollbar: #C4C4C0;
+    --icons: #6B6B6B;
+    --icons-hover: #121212;
+    --links: #B3511D;
+    --inline-code-color: #8A3A12;
+
+    --theme-popup-bg: #FFFFFF;
+    --theme-popup-border: #E0E0DC;
+    --theme-hover: #F6EEE8;
+
+    --quote-bg: #FBF5F0;
+    --quote-border: #F0DCCD;
+    --warning-border: #D9A441;
+
+    --table-border-color: #E6E6E2;
+    --table-header-bg: #EFEFEC;
+    --table-alternate-bg: #F7F7F5;
+
+    --searchbar-border-color: #D6D6D2;
+    --searchbar-bg: #FFFFFF;
+    --searchbar-fg: #121212;
+    --searchbar-shadow-color: rgba(232, 118, 58, 0.35);
+    --searchresults-header-fg: #6B6B6B;
+    --searchresults-border-color: #E0E0DC;
+    --searchresults-li-bg: #FBF1EA;
+    --search-mark-bg: #F7C9AE;
+
+    --footnote-highlight: var(--ff-orange-500);
+    --overlay-bg: rgba(20, 20, 20, 0.25);
+    --color-scheme: light;
+}
+
+/* ---- Dark (the window's own palette) ---------------------------------- */
+
+.coal,
+.navy,
+.ayu {
+    --bg: #121212;
+    --fg: #C8C8C8;
+    --ff-heading: #F2F2F2;
+    --ff-muted: #9A9A9A;
+    --ff-border: #242424;
+    --ff-hover-bg: rgba(240, 138, 85, 0.07);
+    --ff-active-bg: rgba(240, 138, 85, 0.14);
+    --ff-code-bg: #1A1A1A;
+    --ff-shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 18px rgba(0, 0, 0, 0.35);
+
+    --sidebar-bg: #0E0E0E;
+    --sidebar-fg: #A8A8A8;
+    --sidebar-non-existant: #5A5A5A;
+    --sidebar-active: var(--ff-orange-400);
+    --sidebar-spacer: #1F1F1F;
+    --sidebar-header-border-color: var(--ff-orange-500);
+
+    --scrollbar: #3A3A3A;
+    --icons: #7A7A7A;
+    --icons-hover: #F2F2F2;
+    --links: var(--ff-orange-400);
+    --inline-code-color: #F2B48F;
+
+    --theme-popup-bg: #1A1A1A;
+    --theme-popup-border: #2E2E2E;
+    --theme-hover: #242424;
+
+    --quote-bg: #18140F;
+    --quote-border: #2A1810;
+    --warning-border: #D9A441;
+
+    --table-border-color: #242424;
+    --table-header-bg: #1A1A1A;
+    --table-alternate-bg: #161616;
+
+    --searchbar-border-color: #2E2E2E;
+    --searchbar-bg: #1A1A1A;
+    --searchbar-fg: #F2F2F2;
+    --searchbar-shadow-color: rgba(232, 118, 58, 0.4);
+    --searchresults-header-fg: #9A9A9A;
+    --searchresults-border-color: #2E2E2E;
+    --searchresults-li-bg: #1F1712;
+    --search-mark-bg: #7A3E1E;
+
+    --footnote-highlight: var(--ff-orange-600);
+    --overlay-bg: rgba(0, 0, 0, 0.5);
+    --color-scheme: dark;
+}
+
+/* ---- Type ------------------------------------------------------------- */
+
+html {
+    font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-feature-settings: "cv11", "ss01";
+    -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+    background: rgba(232, 118, 58, 0.28);
+}
+
+.content {
+    line-height: 1.7;
+}
+
+.content main h1,
+.content main h2,
+.content main h3,
+.content main h4 {
+    color: var(--ff-heading);
+    font-weight: 600;
+    letter-spacing: -0.015em;
+    line-height: 1.25;
+}
+
+.content main h1 {
+    font-size: 2.4em;
+    margin-block-end: 0.6em;
+}
+
+.content main h2 {
+    margin-block-start: 2.2em;
+    padding-block-end: 0.35em;
+    border-block-end: 1px solid var(--ff-border);
+}
+
+.content main h3 {
+    margin-block-start: 1.8em;
+}
+
+.content a:link,
+.content a:visited {
+    text-decoration: none;
+    transition: color 0.15s ease;
+}
+
+.content main a:hover {
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+}
+
+.content :not(pre) > code {
+    background: var(--ff-code-bg);
+    border-radius: 4px;
+    padding: 0.12em 0.38em;
+    font-size: 0.86em;
+}
+
+.content pre {
+    border: 1px solid var(--ff-border);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.content pre > code {
+    padding: 1rem 1.2rem;
+}
+
+.content main img {
+    border-radius: 8px;
+    border: 1px solid var(--ff-border);
+    box-shadow: var(--ff-shadow);
+}
+
+.content blockquote {
+    border: none;
+    border-inline-start: 3px solid var(--ff-orange-500);
+    border-radius: 0 8px 8px 0;
+    padding: 0.2em 1.2em;
+}
+
+.content table {
+    border-collapse: separate;
+    border-spacing: 0;
+    border: 1px solid var(--ff-border);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.content table thead th,
+.content table thead td {
+    font-weight: 600;
+    color: var(--ff-heading);
+}
+
+.content table td,
+.content table th {
+    border: none;
+    border-block-start: 1px solid var(--ff-border);
+    padding: 0.55em 0.9em;
+}
+
+.content table thead td,
+.content table thead th {
+    border-block-start: none;
+}
+
+/* ---- Menu bar --------------------------------------------------------- */
+
+#mdbook-menu-bar {
+    background-color: color-mix(in srgb, var(--bg) 86%, transparent);
+    -webkit-backdrop-filter: saturate(140%) blur(10px);
+    backdrop-filter: saturate(140%) blur(10px);
+}
+
+.menu-bar.bordered {
+    border-block-end-color: var(--ff-border);
+}
+
+.menu-title {
+    font-weight: 600;
+    font-size: 1.7rem;
+    letter-spacing: -0.01em;
+    color: var(--ff-heading);
+}
+
+/* The logo joins the title only while the sidebar, which carries it, is closed. */
+.menu-title::before {
+    content: "";
+    display: inline-block;
+    width: 0;
+    height: 22px;
+    margin-inline-end: 0;
+    vertical-align: -5px;
+    background: var(--ff-logo) center / contain no-repeat;
+    transition: width 0.3s var(--ff-ease), margin 0.3s var(--ff-ease);
+}
+
+#mdbook-sidebar-toggle-anchor:not(:checked) ~ .page-wrapper .menu-title::before {
+    width: 22px;
+    margin-inline-end: 10px;
+}
+
+.menu-bar .icon-button {
+    border-radius: var(--ff-radius);
+    transition: color 0.15s ease, background-color 0.15s ease;
+}
+
+.menu-bar .icon-button:hover {
+    background-color: var(--ff-hover-bg);
+}
+
+.theme-popup {
+    border-radius: 8px;
+    padding: 4px;
+    box-shadow: var(--ff-shadow);
+    font-size: 0.8em;
+}
+
+.theme-popup .theme {
+    border-radius: 5px;
+    padding: 4px 18px;
+}
+
+.theme-popup .theme-selected::before {
+    color: var(--ff-orange-500);
+}
+
+#mdbook-searchbar {
+    border-radius: 8px;
+    padding: 10px 14px;
+}
+
+/* ---- Sidebar ---------------------------------------------------------- */
+
+.sidebar {
+    font-size: 0.9em;
+    border-inline-end: 1px solid var(--ff-border);
+}
+
+.sidebar .sidebar-scrollbox {
+    padding: 0 14px 32px;
+}
+
+/* Brand row, the height of the menu bar, stays put while the list scrolls. */
+.sidebar .sidebar-scrollbox::before {
+    content: "FocusForge";
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    display: block;
+    height: var(--menu-bar-height);
+    line-height: var(--menu-bar-height);
+    margin: 0 -14px 6px;
+    padding-inline-start: 50px;
+    font-size: 1.15em;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--ff-heading);
+    background: var(--ff-logo) 16px center / 24px 24px no-repeat, var(--sidebar-bg);
+    border-block-end: 1px solid var(--ff-border);
+}
+
+.chapter {
+    line-height: 1.45;
+    margin: 0;
+}
+
+.chapter li.chapter-item {
+    margin-block-start: 1px;
+    line-height: 1.45;
+}
+
+.chapter li.part-title {
+    margin: 22px 0 6px;
+    padding-inline-start: 10px;
+    font-size: 0.74em;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ff-muted);
+}
+
+.chapter-link-wrapper {
+    align-items: center;
+    border-radius: var(--ff-radius);
+    transition: background-color 0.15s ease;
+}
+
+.chapter-link-wrapper:hover {
+    background-color: var(--ff-hover-bg);
+}
+
+.chapter li a {
+    flex: 1;
+    display: block;
+    padding: 6px 10px;
+    border-radius: var(--ff-radius);
+    transition: color 0.15s ease, background-color 0.15s ease, box-shadow 0.2s ease;
+}
+
+.chapter li a.active {
+    font-weight: 600;
+    background-color: var(--ff-active-bg);
+}
+
+/* Fold chevron: a drawn arrow that turns, instead of the ❱ glyph. */
+.chapter li a.chapter-fold-toggle {
+    flex: 0 0 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    align-self: stretch;
+    width: 28px;
+    padding: 0;
+    opacity: 1;
+    color: var(--ff-muted);
+    border-radius: var(--ff-radius);
+    transition: color 0.15s ease, background-color 0.15s ease;
+}
+
+.chapter li a.chapter-fold-toggle:hover {
+    color: var(--sidebar-active);
+    background-color: var(--ff-active-bg);
+}
+
+.chapter-fold-toggle div {
+    width: 6px;
+    height: 6px;
+    font-size: 0;
+    border-inline-end: 1.6px solid currentColor;
+    border-block-end: 1.6px solid currentColor;
+    transform: translateX(-1px) rotate(-45deg);
+    transition: transform 0.3s var(--ff-ease);
+}
+
+.chapter li.expanded > span > .chapter-fold-toggle div {
+    transform: translateY(-2px) rotate(45deg);
+}
+
+/* Sub-chapters hang off a guide line and slide open instead of popping. */
+.section {
+    margin-inline-start: 16px;
+    padding-inline-start: 8px;
+    border-inline-start: 1px solid var(--ff-border);
+    line-height: 1.45;
+}
+
+.chapter li > ol {
+    display: block;
+    overflow: hidden;
+    max-height: 60em;
+    opacity: 1;
+    transform: translateY(0);
+    transition:
+        max-height 0.4s var(--ff-ease),
+        opacity 0.25s ease 0.05s,
+        transform 0.3s var(--ff-ease),
+        visibility 0s;
+}
+
+.chapter li:not(.expanded) > ol {
+    display: block;
+    max-height: 0;
+    opacity: 0;
+    transform: translateY(-4px);
+    visibility: hidden;
+    transition:
+        max-height 0.3s var(--ff-ease),
+        opacity 0.15s ease,
+        transform 0.2s ease,
+        visibility 0s linear 0.3s;
+}
+
+/* Where the browser can animate to the content's real height, do that. */
+@supports (interpolate-size: allow-keywords) {
+    .sidebar {
+        interpolate-size: allow-keywords;
+    }
+
+    .chapter li > ol {
+        max-height: none;
+        height: auto;
+        transition:
+            height 0.35s var(--ff-ease),
+            opacity 0.25s ease 0.05s,
+            transform 0.3s var(--ff-ease),
+            visibility 0s;
+    }
+
+    .chapter li:not(.expanded) > ol {
+        max-height: none;
+        height: 0;
+        transition:
+            height 0.28s var(--ff-ease),
+            opacity 0.15s ease,
+            transform 0.2s ease,
+            visibility 0s linear 0.28s;
+    }
+}
+
+.on-this-page {
+    margin: 2px 0 6px 16px;
+    padding-inline-start: 6px;
+    border-inline-start: 1px solid var(--ff-border);
+}
+
+.chapter li.header-item {
+    margin: 0;
+    line-height: 1.4;
+}
+
+.chapter li.header-item a {
+    padding: 4px 10px;
+    border-radius: 0 4px 4px 0;
+    font-size: 0.95em;
+    color: var(--ff-muted);
+}
+
+.chapter li.header-item a:hover {
+    color: var(--sidebar-active);
+}
+
+.on-this-page > ol.section {
+    margin: 0;
+    padding: 0;
+    border: none;
+}
+
+/* The open page lists its sections one level deep; sub-sections stay out. */
+.on-this-page .header-item > ol {
+    display: none;
+}
+
+.chapter li.header-item a.current-header {
+    color: var(--sidebar-active);
+    font-weight: 500;
+    box-shadow: inset 2px 0 0 var(--ff-orange-500);
+}
+
+/* ---- Page navigation, focus, motion ----------------------------------- */
+
+.nav-chapters {
+    transition: color 0.15s ease, background-color 0.15s ease;
+}
+
+.nav-chapters:hover {
+    background-color: var(--ff-hover-bg);
+}
+
+a:focus-visible,
+button:focus-visible,
+label:focus-visible {
+    outline: 2px solid var(--ff-orange-500);
+    outline-offset: 2px;
+    border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        transition-duration: 0s !important;
+        transition-delay: 0s !important;
+    }
+}

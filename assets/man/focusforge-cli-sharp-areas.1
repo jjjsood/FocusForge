@@ -1,0 +1,49 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH focusforge-cli-sharp-areas 1  "sharp-areas 0.2.0-rc.1" 
+.SH NAME
+focusforge\-cli\-sharp\-areas \- Count the areas of the image that are sharpest in each frame of a stack
+.SH SYNOPSIS
+\fBfocusforge\-cli sharp\-areas\fR [\fB\-\-set\fR] [\fB\-\-json\fR] [\fB\-\-priority\fR] [\fB\-v \fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDIR\fR> 
+.SH DESCRIPTION
+Count the areas of the image that are sharpest in each frame of a stack.
+.PP
+The image is divided into square cells. A cell is counted in the frame where its mean focus score peaks, when that peak exceeds the contrast times the cell\*(Aqs lowest score over the stack; a cell without that contrast is counted in no frame. Frames are counted as read, without alignment.
+.SH OPTIONS
+.TP
+\fB\-\-set\fR \fI<KEY=VALUE>\fR
+Set a parameter: `\-\-set key=value`, repeatable. A repeated key is last\-wins
+.TP
+\fB\-\-json\fR
+Print the counts as one JSON object
+.TP
+\fB\-\-priority\fR \fI<PRIORITY>\fR [default: normal]
+How many frames are read at once; the counts are the same at either value
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+low: One frame at a time, leaving the other cores to other work
+.IP \(bu 2
+normal: As many frames at once as the host has threads
+.RE
+.TP
+\fB\-v\fR
+Increase log detail (repeatable)
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Log errors only
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIDIR\fR>
+Directory of frames to count (non\-recursive, descending into a `frames` subdirectory)
+.SH EXTRA
+Parameters (\-\-set KEY=VALUE):
+  cell\-size      Area size (px) (default 64, 16 to 512)
+  contrast       Peak\-to\-floor contrast (default 2, 1 to 10)
+.SH VERSION
+v0.2.0\-rc.1

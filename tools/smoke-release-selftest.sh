@@ -12,11 +12,16 @@ mkdir -p "$product/tools"
 cp "$root/tools/smoke-release.sh" "$product/tools/"
 helper="$product/tools/smoke-release.sh"
 
-expect_fail() {
-  local label=$1
-  shift
+expect_fail() {  # expect_fail <label> <stderr fragment> <command...>
+  local label=$1 fragment=$2
+  shift 2
   if "$@" >"$work/$label.stdout" 2>"$work/$label.stderr"; then
     echo "expected failure: $label" >&2
+    return 1
+  fi
+  if ! grep -qF -- "$fragment" "$work/$label.stderr"; then
+    echo "expected failure $label to say \"$fragment\"; stderr was:" >&2
+    sed 's/^/    /' "$work/$label.stderr" >&2
     return 1
   fi
 }
@@ -112,21 +117,21 @@ cli="$work/focusforge-cli.exe"
 make_fixtures "$fixtures"
 make_cli "$cli"
 "$helper" "$cli" "$work/valid output"
-expect_fail missing-cli "$helper" "$work/missing" "$work/out"
+expect_fail missing-cli "installed CLI is not executable" "$helper" "$work/missing" "$work/out"
 missing_product="$work/missing product"
 mkdir -p "$missing_product/tools"
 cp "$root/tools/smoke-release.sh" "$missing_product/tools/"
-expect_fail missing-fixtures "$missing_product/tools/smoke-release.sh" "$cli" "$work/out"
-MOCK_SMOKE_MODE=malformed expect_fail malformed "$helper" "$cli" "$work/malformed"
-MOCK_SMOKE_MODE=dry-wrong-count expect_fail dry-wrong-count "$helper" "$cli" "$work/dry-wrong-count"
-MOCK_SMOKE_MODE=missing-project expect_fail missing-project "$helper" "$cli" "$work/missing-project"
-MOCK_SMOKE_MODE=wrong-count expect_fail wrong-count "$helper" "$cli" "$work/wrong-count"
-MOCK_SMOKE_MODE=duplicate-identity expect_fail duplicate-identity "$helper" "$cli" "$work/duplicate-identity"
-MOCK_SMOKE_MODE=mismatched-identity expect_fail mismatched-identity "$helper" "$cli" "$work/mismatched-identity"
-MOCK_SMOKE_MODE=dropped-failed expect_fail dropped-failed "$helper" "$cli" "$work/dropped-failed"
-MOCK_SMOKE_MODE=swapped-outcomes expect_fail swapped-outcomes "$helper" "$cli" "$work/swapped-outcomes"
-MOCK_SMOKE_MODE=cancelled-outcome expect_fail cancelled-outcome "$helper" "$cli" "$work/cancelled-outcome"
-MOCK_SMOKE_MODE=mismatched-export-extent expect_fail mismatched-export-extent "$helper" "$cli" "$work/mismatched-export-extent"
-MOCK_SMOKE_MODE=unreadable-info expect_fail unreadable-info "$helper" "$cli" "$work/unreadable-info"
-MOCK_SMOKE_MODE=missing-export-tiff expect_fail missing-export-tiff "$helper" "$cli" "$work/missing-export-tiff"
+expect_fail missing-fixtures "missing smoke fixtures under" "$missing_product/tools/smoke-release.sh" "$cli" "$work/out"
+MOCK_SMOKE_MODE=malformed expect_fail malformed "JSONDecodeError" "$helper" "$cli" "$work/malformed"
+MOCK_SMOKE_MODE=dry-wrong-count expect_fail dry-wrong-count "dry run: the report does not plan exactly two groups" "$helper" "$cli" "$work/dry-wrong-count"
+MOCK_SMOKE_MODE=missing-project expect_fail missing-project "stack run: a group has no project file" "$helper" "$cli" "$work/missing-project"
+MOCK_SMOKE_MODE=wrong-count expect_fail wrong-count "stack run: manifest, status and review do not each report two groups" "$helper" "$cli" "$work/wrong-count"
+MOCK_SMOKE_MODE=duplicate-identity expect_fail duplicate-identity "stack run: group identities are not distinct" "$helper" "$cli" "$work/duplicate-identity"
+MOCK_SMOKE_MODE=mismatched-identity expect_fail mismatched-identity "stack run: group identities differ between manifest, status and review" "$helper" "$cli" "$work/mismatched-identity"
+MOCK_SMOKE_MODE=dropped-failed expect_fail dropped-failed "mixed run: manifest, status and review do not each report two groups" "$helper" "$cli" "$work/dropped-failed"
+MOCK_SMOKE_MODE=swapped-outcomes expect_fail swapped-outcomes "mixed run: outcomes differ between manifest, status and review" "$helper" "$cli" "$work/swapped-outcomes"
+MOCK_SMOKE_MODE=cancelled-outcome expect_fail cancelled-outcome "mixed run: the groups are not one completed and one failed" "$helper" "$cli" "$work/cancelled-outcome"
+MOCK_SMOKE_MODE=mismatched-export-extent expect_fail mismatched-export-extent "export: the TIFF size differs from the stack report output size" "$helper" "$cli" "$work/mismatched-export-extent"
+MOCK_SMOKE_MODE=unreadable-info expect_fail unreadable-info "export: the info report is not one readable frame" "$helper" "$cli" "$work/unreadable-info"
+MOCK_SMOKE_MODE=missing-export-tiff expect_fail missing-export-tiff "missing TIFF export" "$helper" "$cli" "$work/missing-export-tiff"
 echo "smoke release selftest: PASS"

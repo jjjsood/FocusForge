@@ -8,11 +8,7 @@
 
 mod common;
 
-use std::process::Command;
-
-fn bin() -> Command {
-    common::cli_bin("set_args")
-}
+use common::bin;
 
 #[test]
 fn accepts_valid_settings() {

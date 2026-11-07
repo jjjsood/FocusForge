@@ -1,12 +1,12 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH focusforge-cli-stack 1  "stack 0.1.0" 
+.TH focusforge-cli-stack 1  "stack 0.2.0-rc.1" 
 .SH NAME
-focusforge\-cli\-stack \- Fuse supported TIFF or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images \-\- run `focusforge\-cli export` for that
+focusforge\-cli\-stack \- Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images \-\- run `focusforge\-cli export` for that
 .SH SYNOPSIS
-\fBfocusforge\-cli stack\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-algorithm\fR] [\fB\-\-json\fR] [\fB\-\-set\fR] [\fB\-\-groups\fR] [\fB\-\-write\-groups\fR] [\fB\-\-only\fR] [\fB\-\-no\-align\fR] [\fB\-\-no\-crop\fR] [\fB\-\-strict\fR] [\fB\-\-align\-algorithm\fR] [\fB\-v \fR]... [\fB\-\-align\-set\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-resume\fR] [\fB\-\-no\-progress\fR] [\fB\-\-tile\-size\fR] [\fB\-\-max\-host\-memory\fR] [\fB\-\-max\-vram\fR] [\fB\-\-preset\fR] [\fB\-\-write\-preset\fR] [\fB\-\-status\fR] [\fB\-\-dry\-run\fR] [\fB\-\-cpu\fR] [\fB\-\-no\-cache\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDIR\fR> 
+\fBfocusforge\-cli stack\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-algorithm\fR] [\fB\-\-json\fR] [\fB\-\-set\fR] [\fB\-\-groups\fR] [\fB\-\-write\-groups\fR] [\fB\-\-only\fR] [\fB\-\-no\-align\fR] [\fB\-\-no\-crop\fR] [\fB\-\-strict\fR] [\fB\-\-align\-algorithm\fR] [\fB\-\-align\-set\fR] [\fB\-\-resume\fR] [\fB\-\-no\-progress\fR] [\fB\-v \fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-tile\-size\fR] [\fB\-\-max\-host\-memory\fR] [\fB\-\-max\-vram\fR] [\fB\-\-preset\fR] [\fB\-\-write\-preset\fR] [\fB\-\-status\fR] [\fB\-\-dry\-run\fR] [\fB\-\-cpu\fR] [\fB\-\-no\-cache\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDIR\fR> 
 .SH DESCRIPTION
-Fuse supported TIFF or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images \-\- run `focusforge\-cli export` for that
+Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images \-\- run `focusforge\-cli export` for that
 .SH OPTIONS
 .TP
 \fB\-o\fR, \fB\-\-output\fR \fI<DIR>\fR
@@ -42,20 +42,20 @@ Refuse the run when an alignment fails. Meaningless with `\-\-no\-align`
 \fB\-\-align\-algorithm\fR \fI<ALIGN_ALGO>\fR
 Alignment algorithm id. Optional: defaults to the sole registered alignment algorithm, refusing (and listing the choices) when more than one is registered
 .TP
-\fB\-v\fR
-Increase log detail (repeatable)
-.TP
 \fB\-\-align\-set\fR \fI<KEY=VALUE>\fR
 Set an alignment parameter: `\-\-align\-set key=value`, repeatable. A repeated key is last\-wins
-.TP
-\fB\-q\fR, \fB\-\-quiet\fR
-Log errors only
 .TP
 \fB\-\-resume\fR
 Resume a previously cancelled run of this same stack, found by stack fingerprint under `.scratch/resume/` \-\- no argument. Refuses at exit 1 when no matching scratch state exists or it disagrees with this invocation\*(Aqs inputs
 .TP
 \fB\-\-no\-progress\fR
 Print no stage progress
+.TP
+\fB\-v\fR
+Increase log detail (repeatable)
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Log errors only
 .TP
 \fB\-\-tile\-size\fR \fI<PX>\fR
 Override the scheduler\*(Aqs outer tile size, in pixels. Omit to use the scheduler\*(Aqs own default
@@ -88,6 +88,6 @@ Skip the stage cache: recompute the alignment even when a valid entry exists, an
 Print help
 .TP
 <\fIDIR\fR>
-Directory of TIFF or supported RAW frames to fuse (non\-recursive, descending into `<dir>/frames` when that subdirectory exists)
+Directory of TIFF, 8\-bit JPEG or supported RAW frames to fuse (non\-recursive, descending into `<dir>/frames` when that subdirectory exists)
 .SH VERSION
-v0.1.0
+v0.2.0\-rc.1

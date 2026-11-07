@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! The Z-Map: one `u16` per pixel naming the source frame that contributed
-//! the detail there. **The Z-Map is the document**: fusion emits the composite image *and* this
-//! map, retouching paints indices, not pixels, and no edit path writes one directly.
-//! [`crate::project`] already snapshots it into a checkpoint -- one content-addressed blob, named
-//! by [`crate::project::Checkpoint::zmap_blob`].
+//! the detail there. It is analysis, not the document: fusion emits the composite image *and*
+//! this map, retouching blends pixels into the image and never writes the map, and no edit path
+//! writes one directly. [`crate::project`] snapshots it into a checkpoint -- one
+//! content-addressed blob, named by [`crate::project::Checkpoint::zmap_blob`].
 //!
 //! [`NO_SOURCE`] is legal everywhere and every consumer must *handle* it --
 //! forgetting it is a silent wrong-pixel bug, not a compile error: the

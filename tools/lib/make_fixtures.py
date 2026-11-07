@@ -26,6 +26,7 @@ import filecmp
 import os
 import re
 import shutil
+import struct
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -79,6 +80,7 @@ class CompressedFixtureSet:
     predictor: int
     layout: str
     byte_order: str
+    bits: int = 16
 
 
 def _compressed_sets() -> tuple[CompressedFixtureSet, ...]:
@@ -99,7 +101,18 @@ def _compressed_sets() -> tuple[CompressedFixtureSet, ...]:
     )
 
 
-COMPRESSED_SETS = _compressed_sets()
+# 8-bit RGB re-encodings of mantis-64 (high byte of each sample): the
+# uncompressed twin plus four sets that between them cover every codec,
+# predictor, layout and byte order once. Names avoid the `mantis-64-` prefix
+# that counts the 16-bit matrix.
+EIGHT_BIT_SETS = (
+    CompressedFixtureSet("mantis8-64", 1, "none", 1, "strip", "II", bits=8),
+    CompressedFixtureSet("mantis8-64-deflate-p2-strip-ii", 8, "deflate", 2, "strip", "II", bits=8),
+    CompressedFixtureSet("mantis8-64-lzw-p1-tile-mm", 5, "lzw", 1, "tile", "MM", bits=8),
+    CompressedFixtureSet("mantis8-64-old-deflate-p1-strip-mm", 32946, "old-deflate", 1, "strip", "MM", bits=8),
+    CompressedFixtureSet("mantis8-64-lzw-p2-tile-ii", 5, "lzw", 2, "tile", "II", bits=8),
+)
+COMPRESSED_SETS = _compressed_sets() + EIGHT_BIT_SETS
 COMPRESSED_ROWS_PER_STRIP = 11
 COMPRESSED_TILE = (48, 48)
 
@@ -168,16 +181,23 @@ def _crop(
     compression: int = 1,
     predictor: int = 1,
     tile: tuple[int, int] | None = None,
+    bits: int | None = None,
 ) -> None:
     x, y, w, h = rect
     info = rawtiff.read_info(src)
     pixels = rawtiff.read_rect(src, x, y, w, h, info=info)
+    source_bits = info.bits_per_sample[0]
+    bits = bits or source_bits
+    if (source_bits, bits) == (16, 8):
+        pixels = pixels[1::2]  # high byte of each native little-endian sample
+    elif bits != source_bits:
+        raise FixtureError(f"cannot derive {bits}-bit samples from {source_bits}-bit {src}")
     rawtiff.write_tiff(
         dst,
         w,
         h,
         pixels,
-        bits=info.bits_per_sample[0],
+        bits=bits,
         spp=info.samples_per_pixel,
         description=description,
         byte_order=byte_order,
@@ -286,7 +306,9 @@ def _root_readme(stack_dir: str, frame_names: list, date: str) -> str:
         "`README.md` naming the source frame behind every `NN`. Outputs are "
         "little-endian, uncompressed, chunky, one strip per row. The `mantis-64-` "
         "sets add LZW and deflate encodings in both byte orders, with strips or "
-        "zero-padded tiles and Predictor 1 or 2.",
+        "zero-padded tiles and Predictor 1 or 2. The `mantis8-64` sets hold the "
+        "same crop as 8-bit RGB: the high byte of each `mantis-64` sample, "
+        "uncompressed or in one of four encodings.",
         "",
         "`blackmagic-micro-dng` is one lossless-JPEG DNG camera frame with its own "
         "README; it has no `frames/` directory or `reference.tif`.",
@@ -386,12 +408,14 @@ def _compressed_readme(fset: CompressedFixtureSet) -> str:
                 "Re-encoding of `mantis-64`: `frames/00.tif`, `frames/01.tif`, and "
                 "`frames/02.tif` map directly to the same source files; `reference.tif` maps "
                 "to `mantis-64/reference.tif`."
+                + (" Samples are the high byte of each 16-bit source sample." if fset.bits == 8 else "")
             ),
             "",
             (
                 f"TIFF Compression tag: **{fset.compression}** ({fset.codec}). Predictor: "
                 f"**{fset.predictor}**. Byte order: **{fset.byte_order}**. Layout: "
                 f"**{fset.layout}**."
+                + (f" Bit depth: **{fset.bits}**." if fset.bits != 16 else "")
             ),
             "",
             layout,
@@ -426,6 +450,7 @@ def _generate_compressed(source_fixtures: str, out_dir: str) -> list:
                 compression=fset.compression,
                 predictor=fset.predictor,
                 tile=COMPRESSED_TILE if fset.layout == "tile" else None,
+                bits=fset.bits,
             )
             produced.append(rel)
         rel = f"{fset.name}/reference.tif"
@@ -439,10 +464,11 @@ def _generate_compressed(source_fixtures: str, out_dir: str) -> list:
             compression=fset.compression,
             predictor=fset.predictor,
             tile=COMPRESSED_TILE if fset.layout == "tile" else None,
+            bits=fset.bits,
         )
         produced.append(rel)
         rel = f"{fset.name}/README.md"
-        with open(os.path.join(out_dir, rel), "w", encoding="utf-8") as fh:
+        with open(os.path.join(out_dir, rel), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(_compressed_readme(fset))
         produced.append(rel)
     return produced
@@ -514,13 +540,13 @@ def _generate_folder_sets(source_fixtures: str, out_dir: str) -> list:
 
     skipped_dir_file = os.path.join(out_dir, "open-root-and-subfolder", "notes", "readme.txt")
     os.makedirs(os.path.dirname(skipped_dir_file), exist_ok=True)
-    with open(skipped_dir_file, "w", encoding="utf-8") as fh:
+    with open(skipped_dir_file, "w", encoding="utf-8", newline="\n") as fh:
         fh.write("Not a frame: a folder with no TIFF images.\n")
     produced.append("open-root-and-subfolder/notes/readme.txt")
 
     for name in FOLDER_SET_NAMES:
         rel = f"{name}/README.md"
-        with open(os.path.join(out_dir, rel), "w", encoding="utf-8") as fh:
+        with open(os.path.join(out_dir, rel), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(_folder_set_readme(name))
         produced.append(rel)
     return produced
@@ -585,7 +611,7 @@ def generate(stack_dir: str, out_dir: str, date: str) -> list:
             produced.append(rel)
 
         rel = f"{fset.name}/README.md"
-        with open(os.path.join(out_dir, rel), "w", encoding="utf-8") as fh:
+        with open(os.path.join(out_dir, rel), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(_set_readme(fset, stack_dir, frame_names))
         produced.append(rel)
 
@@ -593,7 +619,7 @@ def generate(stack_dir: str, out_dir: str, date: str) -> list:
     produced += _generate_folder_sets(out_dir, out_dir)
 
     rel = "README.md"
-    with open(os.path.join(out_dir, rel), "w", encoding="utf-8") as fh:
+    with open(os.path.join(out_dir, rel), "w", encoding="utf-8", newline="\n") as fh:
         fh.write(_root_readme(stack_dir, frame_names, date))
     produced.append(rel)
 
@@ -608,7 +634,7 @@ def generate_compressed(source_fixtures: str, out_dir: str, date: str) -> list:
     produced = _generate_compressed(source_fixtures, out_dir)
     produced += _generate_folder_sets(source_fixtures, out_dir)
     frame_names = ["00.tif", "01.tif", "02.tif"]
-    with open(os.path.join(out_dir, "README.md"), "w", encoding="utf-8") as fh:
+    with open(os.path.join(out_dir, "README.md"), "w", encoding="utf-8", newline="\n") as fh:
         fh.write(_root_readme(source_fixtures, frame_names, date))
     produced.append("README.md")
     write_manifest(out_dir)
@@ -633,7 +659,7 @@ def write_manifest(out_dir: str) -> list:
             entries.append((rel.replace(os.sep, "/"), os.path.join(root, name)))
     entries.sort(key=lambda e: e[0].encode("utf-8"))
     lines = [f"{rawtiff.sha256_file(path)}  {rel}\n" for rel, path in entries]
-    with open(os.path.join(out_dir, "MANIFEST.sha256"), "w", encoding="utf-8") as fh:
+    with open(os.path.join(out_dir, "MANIFEST.sha256"), "w", encoding="utf-8", newline="\n") as fh:
         fh.writelines(lines)
     return [rel for rel, _ in entries]
 
@@ -713,6 +739,13 @@ def check(stack_dir: str, out_dir: str) -> int:
     return 0
 
 
+def _compare_compressed(expected_dir: str, produced: list, out_dir: str) -> list:
+    """Differences between `out_dir` and the compressed tree the generator produced in `expected_dir`."""
+    differences = _check_generated(produced, out_dir, expected_dir)
+    differences += _find_orphans(out_dir, set(produced), COMPRESSED_SETS, FOLDER_SET_NAMES)
+    return differences
+
+
 def check_compressed(source_fixtures: str, out_dir: str) -> int:
     if not os.path.isdir(out_dir):
         print(f"FAIL: no fixture tree at {out_dir}")
@@ -720,14 +753,132 @@ def check_compressed(source_fixtures: str, out_dir: str) -> int:
     with tempfile.TemporaryDirectory(prefix="focusforge-compressed-fixtures-") as tmp:
         shutil.copytree(source_fixtures, tmp, dirs_exist_ok=True)
         produced = generate_compressed(source_fixtures, tmp, date="<date>")
-        differences = _check_generated(produced, out_dir, tmp)
-        differences += _find_orphans(out_dir, set(produced), COMPRESSED_SETS, FOLDER_SET_NAMES)
+        differences = _compare_compressed(tmp, produced, out_dir)
     if differences:
         print(f"FAIL: {out_dir} compressed fixtures do not match the generator")
         for line in differences:
             print(f"  - {line}")
         return 1
     print("OK: compressed fixtures match the generator")
+    return 0
+
+
+def _tag_values(path: str) -> dict:
+    with open(path, "rb") as fh:
+        data = fh.read()
+    endian = "<" if data[:2] == b"II" else ">"
+    _magic, offset = struct.unpack_from(endian + "HI", data, 2)
+    (count,) = struct.unpack_from(endian + "H", data, offset)
+    tags = {}
+    for index in range(count):
+        pos = offset + 2 + index * 12
+        tag, kind, length = struct.unpack_from(endian + "HHI", data, pos)
+        tags[tag] = (kind, length, data[pos + 8 : pos + 12], endian)
+    return tags
+
+
+def _scalar(entry: tuple) -> int:
+    kind, count, payload, endian = entry
+    assert count == 1
+    return struct.unpack(endian + ({3: "H", 4: "I"}[kind]), payload[: {3: 2, 4: 4}[kind]])[0]
+
+
+def _selftest(source: str) -> int:
+    """Checks the compressed writer and the comparison against the fixture tree at `source`."""
+    failures = []
+    with tempfile.TemporaryDirectory(prefix="focusforge-compressed-selftest-") as tmp:
+        pixels = b"".join(
+            struct.pack("<H", (65530 + x + y * 7 + channel) & 0xFFFF)
+            for y in range(13)
+            for x in range(17)
+            for channel in range(3)
+        )
+        path = os.path.join(tmp, "strip.tif")
+        rawtiff.write_tiff(path, 17, 13, pixels, compression=5, predictor=2, rows_per_strip=11)
+        tags = _tag_values(path)
+        if _scalar(tags[259]) != 5:
+            failures.append("compressed strip has wrong Compression tag")
+        if _scalar(tags[317]) != 2:
+            failures.append("compressed strip has wrong Predictor tag")
+        if _scalar(tags[278]) != 11:
+            failures.append("compressed strip has wrong RowsPerStrip tag")
+        if len(tags[273][2]) != 4:
+            failures.append("compressed strip lacks StripOffsets")
+
+        legacy = os.path.join(tmp, "legacy.tif")
+        rawtiff.write_tiff(legacy, 17, 13, pixels)
+        if rawtiff.sha256_file(legacy) != "fbcebd3cd407f176433130a94c83d23af2dfccc6cd387f48cb728d0d0a19307a":
+            failures.append("legacy default TIFF bytes changed")
+
+        tiled = os.path.join(tmp, "tile.tif")
+        rawtiff.write_tiff(tiled, 17, 13, pixels, compression=8, predictor=1, tile=(16, 16), byte_order="MM")
+        tile_tags = _tag_values(tiled)
+        if _scalar(tile_tags[259]) != 8:
+            failures.append("compressed tile has wrong Compression tag")
+        if _scalar(tile_tags[322]) != 16 or _scalar(tile_tags[323]) != 16:
+            failures.append("compressed tile has wrong geometry")
+        if 324 not in tile_tags or 325 not in tile_tags:
+            failures.append("compressed tile lacks tile offsets/counts")
+
+        if not os.path.isdir(source):
+            failures.append(f"missing fixture source: {source}")
+        else:
+            out = os.path.join(tmp, "fixtures")
+            shutil.copytree(source, out)
+            produced = generate_compressed(source, out, "<date>")
+            # 147 compressed-set paths (24 16-bit sets, five 8-bit `mantis8-64` sets)
+            # plus 16 folder-set files (7 + 5 + 4).
+            if len(produced) != 163:
+                failures.append(f"compressed generation produced {len(produced)} paths, want 163")
+            if len(FOLDER_SET_NAMES) != 3:
+                failures.append(f"folder sets {len(FOLDER_SET_NAMES)}, want 3")
+            names = {item.name for item in COMPRESSED_SETS}
+            if len(names) != 29:
+                failures.append(f"compressed matrix has {len(names)} sets, want 29")
+
+            def compare() -> list:
+                return _compare_compressed(source, produced, out)
+
+            if compare():
+                failures.append("compressed check rejected generated fixtures")
+
+            frames = os.path.join(out, "mantis-64-lzw-p1-strip-ii", "frames")
+            changed = os.path.join(frames, "00.tif")
+            with open(changed, "r+b") as fh:
+                fh.seek(-1, os.SEEK_END)
+                original = fh.read(1)
+                fh.seek(-1, os.SEEK_END)
+                fh.write(bytes([original[0] ^ 0xFF]))
+            if compare() != ["differs: mantis-64-lzw-p1-strip-ii/frames/00.tif"]:
+                failures.append("compressed check accepted changed TIFF")
+            with open(changed, "r+b") as fh:
+                fh.seek(-1, os.SEEK_END)
+                fh.write(original)
+
+            os.unlink(os.path.join(frames, "01.tif"))
+            if compare() != ["missing: mantis-64-lzw-p1-strip-ii/frames/01.tif"]:
+                failures.append("compressed check accepted missing TIFF")
+            shutil.copyfile(os.path.join(source, "mantis-64-lzw-p1-strip-ii", "frames", "01.tif"), os.path.join(frames, "01.tif"))
+
+            shutil.copyfile(changed, os.path.join(frames, "99.tif"))
+            orphan = "orphan: mantis-64-lzw-p1-strip-ii/frames/99.tif is not produced by the generator"
+            if compare() != [orphan]:
+                failures.append("compressed check accepted orphan TIFF")
+
+        legacy_orphan_dir = os.path.join(tmp, "legacy-orphan", "mantis-64", "frames")
+        os.makedirs(legacy_orphan_dir)
+        legacy_orphan = "mantis-64/frames/99.tif"
+        with open(os.path.join(tmp, "legacy-orphan", legacy_orphan), "wb") as fh:
+            fh.write(b"orphan")
+        legacy_differences = _find_orphans(os.path.join(tmp, "legacy-orphan"), set(), (*SETS, *COMPRESSED_SETS))
+        if not any(legacy_orphan in difference for difference in legacy_differences):
+            failures.append("full fixture check accepted legacy orphan TIFF")
+
+    for failure in failures:
+        print(f"FAIL: {failure}")
+    if failures:
+        return 1
+    print("OK: make_fixtures selftest")
     return 0
 
 
@@ -758,8 +909,16 @@ def main(argv=None) -> int:
         help="re-hash --out in place (e.g. after adding a golden/ file by hand) without "
         "touching the reference stack or regenerating any fixture",
     )
+    parser.add_argument(
+        "--selftest",
+        action="store_true",
+        help="check the compressed writer and the fixture comparison against --source-fixtures "
+        "(default: the committed fixtures); exit 1 on any failure",
+    )
     args = parser.parse_args(argv)
 
+    if args.selftest:
+        return _selftest(args.source_fixtures or DEFAULT_OUT)
     try:
         if args.compressed_only and args.manifest_only:
             raise FixtureError("--compressed-only and --manifest-only cannot be combined")

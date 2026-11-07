@@ -9,7 +9,9 @@ crates/core/   TIFF and RAW I/O, tiles, stacking and alignment algorithms, the
                over tile-sized work units), the stage cache, grouping
                proposals, the `.ffp` project container and its
                checkpoint history (op log, render from the stored
-               composite, image export in TIFF, PNG and JPEG)
+               composite, image export in TIFF, PNG and JPEG), the update check
+               (`update`: version comparison and one HTTPS GET through `ureq`;
+               tests and `FOCUSFORGE_RELEASE_URL` point it at a local server)
 crates/gpu/    the shared wgpu device, WGSL fusion/warp/blend kernels and the
                tile-scheduler pipeline that runs them, behind the `gpu`
                feature (on by default). An allocate-and-back-off probe at
@@ -38,9 +40,14 @@ fixtures/      small checked-in TIFF crops, a RAW DNG fixture, folders that open
                or are refused, and `.ffp` projects (valid, corrupt, mismatched,
                missing frames) used by the test suite and the UI journeys
 tests/ui/      end-to-end window journeys written as numbered steps
+docs/          the user manual, an mdBook (`book.toml` at the root); its
+               images live in `docs/assets/manual/`
 ```
 
 ## Tech stack
+
+- The Windows programs link the C runtime statically (`.cargo/config.toml`),
+  and the macOS app bundle is signed ad hoc by `tools/package-macos.sh`.
 
 - Rust, edition 2024, toolchain pinned to `1.95.0` (`rust-toolchain.toml`).
 - `focusforge-core`: `memmap2`, `thiserror`, `inventory` (algorithm
@@ -131,11 +138,14 @@ report and flight recording, and the crash-notice bookkeeping and
 diagnostics bundle's redaction and manifest, each writing into its own
 temporary directory rather than a shared one.
 
-Under `cargo nextest` (`.config/nextest.toml`) each test is killed after 15
-minutes and reported as a named TIMEOUT; the `hit_cap_behaviour` binary gets
-40.
+Under `cargo nextest` (`.config/nextest.toml`) the default profile kills each
+test after 15 minutes (30 for `stack_cli`) and reports a named TIMEOUT. The
+`quick` profile, used by `tools/check-all.sh --quick`, skips four memory and
+reference-cache binaries and kills any test after 180 s. The
+`hit_cap_behaviour` tests are `measurement:` ignores, run by hand with
+`--ignored`.
 
-`tests/ui/` holds 18 journeys, each one whole path through the window as
+`tests/ui/` holds 22 journeys, each one whole path through the window as
 numbered clicks, keys and hovers with an `Expect:` line per step, plus
 `features/` files listing which journey covers which feature. They are run by
 hand or by a script against `focusforge-gui`; `tests/ui/README.md` gives the
@@ -152,7 +162,10 @@ behavioural check
 (`cargo test -p focusforge-cli --no-default-features --test cli
 no_gpu_flag_absent_without_the_feature`) is run by hand, not in the standing
 gate. `cargo clippy --workspace --all-targets -- -D warnings` lints the
-default feature set on every gate pass. The device tests that need
+default feature set on every gate pass; the gate also lints the `gpu-tests`
+trees (`--features focusforge-gpu/gpu-tests,focusforge-gui/gpu-tests,focusforge-cli/gpu-tests`)
+without running them. Clippy denies `#[ignore]` without a reason
+(`ignore_without_reason`), so every ignored test states why. The device tests that need
 a real GPU adapter sit behind a separate, non-default `gpu-tests` feature and
 run as `cargo test --workspace --features gpu-tests -- --test-threads=1` —
 run by hand, deliberately, once per change to that code, never inside the
@@ -195,16 +208,70 @@ attaches: start the binary, then connect Tracy from the same machine — the
 client listens on localhost and announces itself nowhere. Stage and tile
 zones appear live, named by their fields.
 
-`focusforge-gui` takes the same feature and reads the same variable; its
-`gui_`-prefixed spans draw on their own admission budget, apart from the
-processing spans, and the closing `timing_summary` span reports both. Add
-`SLINT_DEBUG_PERFORMANCE=refresh_lazy,console` to see Slint's frame timing.
+### Profiling the window
+
+`focusforge-gui` takes the same feature and reads the same variable. Its
+trace covers the window's own activity — input, redraws, canvas
+publication, saves and stroke renders — beside the processing spans of any
+fuse run in the same session:
+
+```
+cargo build --release -p focusforge-gui --features trace
+FOCUSFORGE_TRACE_FILE=gui-trace.json target/release/focusforge-gui
+```
+
+The window's `gui_`-prefixed spans draw on their own admission budget, so a
+long session cannot starve the processing spans of a fuse running in the
+same process. The closing `timing_summary` span records each budget, how
+many spans it admitted and how many it refused.
+
+To see Slint's own frame timing as well, set
+`SLINT_DEBUG_PERFORMANCE=refresh_lazy,console` in the same environment.
+Slint collects and prints refresh statistics when a frame is rendered;
+`refresh_lazy` does not force frames while the window is idle.
+
+## The user manual
+
+`docs/` is an mdBook: `docs/SUMMARY.md` is its table of contents and
+`book.toml` at the repository root configures it. The `book` workflow builds it
+with a pinned mdBook on every push and pull request and publishes it to GitHub
+Pages from `main`. To build it locally, fetch the same mdBook release the
+workflow pins (checking its SHA-256), run `mdbook build` from the repository
+root and check the links with `python3 -I tools/check-book-links.py book`.
+
+Each feature file in `tests/ui/features/` has a `Book:` line naming the manual sections that show the feature; `python3 tools/check-manual-coverage.py` fails when one is missing, has no image, or points at a renamed heading.
+
+Every image in `docs/assets/manual/` is generated, never hand-taken:
+
+- Window screenshots: `python3 tools/manual-screenshots.py run` drives the
+  real window over Slint's MCP server for every entry in
+  `tools/manual-screenshots/*.toml`, each launch on its own Xvfb display at
+  1280x800, scale 1, with scratch config, data and save folders under
+  `.scratch/` and a free port. It needs the GUI built with
+  `cargo build -p focusforge-gui --features mcp`, Xvfb and Pillow; without a
+  GPU, Mesa's software Vulkan driver is enough. `--only NAME` redoes one shot;
+  `start`/`tree`/`click-id`/`shot` explore a state before you add an entry.
+  `--selftest` checks the shot lists without a display.
+- Part I example crops: `python3 -I tools/manual-examples.py` (standard
+  library, through `focusforge-cli`, byte for byte; `--check` compares).
+- The fusion-method comparison: `python3 -I tools/manual-fusion-compare.py`.
+
+A change to the window that moves a documented control or changes its text
+should come with the matching page edit and regenerated screenshots.
 
 ## Before you send a change
 
+Branch from `develop` and open the pull request against `develop`. `main` holds released versions only; a pull request from `develop` to `main` is a release.
+
 `tools/check-all.sh` runs every gate (formatting, licenses, SPDX headers, NOTICE, fixtures, build,
 clippy, tests, rustdoc, advisories, and the synthetic-ground-truth alignment
-check) in one command; `--static` is the fast subset a pre-commit hook runs.
+check) in one command; `--static` is the fast subset a pre-commit hook runs,
+including `tools/check-test-bodies.py`, which flags tests without an assertion
+(exempt one with `// assertion-free: <reason>`) and tests that write the fixed
+workspace `.scratch` path. `--quick` swaps the full test run for the nextest
+`quick` profile and skips the trace and advisories stages, a working check
+while editing; `--log-dir DIR` writes the gate logs to `DIR` instead of
+`.logs/gate/`.
 Run this local gate before acceptance and merge. GitHub Actions calls the same
 gate on Linux, macOS and Windows as additional evidence; a green hosted run
 does not replace a required local run.
@@ -225,7 +292,7 @@ memory, so tiling is the default path everywhere, not a fallback.
 
 ## Releases
 
-A human starts a release by pushing a version tag such as `v0.1.0`;
+A release is a pull request from `develop` to `main`. Candidate tags go on the `develop` snapshot and the final tag on the promoted `main`. A human starts a build by pushing a version tag such as `v0.1.0`;
 `.github/workflows/release.yml` builds the Linux, macOS and Windows packages and
 creates the release only after its same-commit checks pass. The release holds
 the installers (AppImage, `.deb`, DMG, MSI), one command-line archive per

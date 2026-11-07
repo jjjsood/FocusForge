@@ -13,13 +13,8 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use common::{CliOutput, mantis_512_dir, tmp_dir};
-
-fn bin() -> Command {
-    common::cli_bin("preset_cli")
-}
+use common::{CliOutput, bin, export_composite, mantis_512_dir, read_pixels, tmp_dir};
 
 fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
     common::run_in(&mut bin(), dir, args)
@@ -29,27 +24,6 @@ fn write_preset(dir: &Path, name: &str, text: &str) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, text).expect("preset must be writable");
     path
-}
-
-fn read_bytes(path: &Path) -> Vec<u8> {
-    std::fs::read(path).expect("output file must be readable")
-}
-
-/// The composite of `project`, exported beside it. Two containers of the
-/// same stack differ in `created_at`, so byte comparisons go through `export`.
-fn export_composite(cwd: &Path, project: &Path) -> PathBuf {
-    let exported = project.with_extension("exported.tif");
-    let out = run_cli_in(
-        cwd,
-        &[
-            "export",
-            project.to_str().unwrap(),
-            "-o",
-            exported.to_str().unwrap(),
-        ],
-    );
-    assert!(out.success, "export stderr: {}", out.stderr);
-    exported
 }
 
 #[test]
@@ -99,8 +73,8 @@ fn preset_file_matches_equivalent_set_flags() {
     assert!(out.success, "stderr: {}", out.stderr);
 
     assert_eq!(
-        read_bytes(&export_composite(&dir, &from_preset)),
-        read_bytes(&export_composite(&dir, &from_flags)),
+        read_pixels(&export_composite(&dir, &from_preset)),
+        read_pixels(&export_composite(&dir, &from_flags)),
         "a preset value must produce the same composite as the equivalent --set"
     );
 }
@@ -357,41 +331,49 @@ fn preset_supplies_the_algorithm_id() {
     );
 }
 
+/// `--write-preset` under `--dry-run` writes the explicit values, and a run
+/// from that preset resolves exactly the parameters of the `--set` run it came
+/// from. No stack runs: `--write-preset` is applied before the dry run exits.
+/// A project parameter (`equalize`) is not part of the resolved plan, so only
+/// the written file shows it.
 #[test]
 fn written_preset_round_trips() {
     let mantis = mantis_512_dir();
-    // Each method with a value off its default, one of them with equalization on.
-    let cases: [(&str, &[&str]); 3] = [
-        ("laplacian", &["levels=3"]),
+    // Each method with an algorithm value off its default; the second case
+    // also carries a project parameter.
+    let cases: [(&str, &[&str], &[&str]); 3] = [
+        ("laplacian", &["levels=3"], &[]),
         (
             "weighted-average",
-            &["weight-exponent=3.5", "equalize=true"],
+            &["weight-exponent=3.5"],
+            &["equalize=true"],
         ),
-        ("depth-map", &["score-radius=2"]),
+        ("depth-map", &["score-radius=2"], &[]),
     ];
-    for (algo, sets) in cases {
+    for (algo, sets, project_sets) in cases {
         let dir = tmp_dir(&format!("preset_cli_write_round_trip_{algo}"));
         let written = dir.join("written.toml");
-        let first_dir = dir.join("first-out");
-        std::fs::create_dir_all(&first_dir).unwrap();
-        let first = first_dir.join("mantis-512.ffp");
         let mut args = vec![
             "stack",
             mantis.to_str().unwrap(),
             "-o",
-            first_dir.to_str().unwrap(),
+            dir.to_str().unwrap(),
             "--algorithm",
             algo,
             "--write-preset",
             written.to_str().unwrap(),
+            "--dry-run",
+            "--json",
             "--no-align",
             "--no-crop",
         ];
-        for set in sets {
+        for set in sets.iter().chain(project_sets) {
             args.extend(["--set", set]);
         }
         let out = run_cli_in(&dir, &common::push_no_gpu(args));
         assert!(out.success, "{algo}: stderr: {}", out.stderr);
+        let from_set: serde_json::Value =
+            serde_json::from_str(&out.stdout).expect("--dry-run --json must parse");
 
         let text = std::fs::read_to_string(&written).expect("--write-preset must write the file");
         let algo_line = text.find("algo =").expect("algo must be written");
@@ -400,33 +382,47 @@ fn written_preset_round_trips() {
             algo_line < first_table,
             "{algo}: the scalar keys must precede the table headers:\n{text}"
         );
-        for set in sets {
+        for set in sets.iter().chain(project_sets) {
             let line = set.replace('=', " = ");
             assert!(text.contains(&line), "{algo}: written preset:\n{text}");
         }
 
-        let second_dir = dir.join("second-out");
-        std::fs::create_dir_all(&second_dir).unwrap();
-        let second = second_dir.join("mantis-512.ffp");
         let out = run_cli_in(
             &dir,
             &common::push_no_gpu(vec![
                 "stack",
                 mantis.to_str().unwrap(),
                 "-o",
-                second_dir.to_str().unwrap(),
+                dir.to_str().unwrap(),
                 "--preset",
                 written.to_str().unwrap(),
+                "--dry-run",
+                "--json",
                 "--no-align",
                 "--no-crop",
             ]),
         );
         assert!(out.success, "{algo}: stderr: {}", out.stderr);
+        let from_preset: serde_json::Value =
+            serde_json::from_str(&out.stdout).expect("--dry-run --json must parse");
         assert_eq!(
-            read_bytes(&export_composite(&dir, &first)),
-            read_bytes(&export_composite(&dir, &second)),
-            "{algo}: a written preset must reproduce the composite it came from"
+            from_preset["params"], from_set["params"],
+            "{algo}: a written preset must resolve the parameters it came from"
         );
+        for set in sets {
+            let (id, value) = set.split_once('=').unwrap();
+            let param = from_preset["params"]
+                .as_array()
+                .expect("params must be an array")
+                .iter()
+                .find(|p| p["id"] == id)
+                .unwrap_or_else(|| panic!("{algo}: {id} must be reported"));
+            assert_eq!(
+                param["value"].to_string(),
+                value,
+                "{algo}: the preset run must carry the --set value of {id}"
+            );
+        }
     }
 }
 
@@ -496,6 +492,69 @@ fn dry_run_writes_nothing_and_succeeds() {
     let records = read_records(&status);
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0]["outcome"], "dry-run");
+    assert!(
+        !dir.join("manifest.json").exists(),
+        "a dry run writes no run manifest"
+    );
+}
+
+/// `stack` over a small synthetic folder, no alignment or crop, working in
+/// `cwd`; `extra` is appended.
+fn run_synthetic_stack(cwd: &Path, frames: &Path, extra: &[&str]) -> CliOutput {
+    let mut args = vec![
+        "stack",
+        frames.to_str().unwrap(),
+        "--algorithm",
+        "dummy-stack",
+        "--no-align",
+        "--no-crop",
+    ];
+    args.extend_from_slice(extra);
+    run_cli_in(cwd, &args)
+}
+
+#[test]
+fn dry_run_writes_no_run_manifest() {
+    let frames = common::synthetic_frames("preset_cli_dry_run_no_manifest_frames");
+    let cwd = tmp_dir("preset_cli_dry_run_no_manifest_cwd");
+    let status = cwd.join("status.ndjson");
+    let out = run_synthetic_stack(
+        &cwd,
+        &frames,
+        &["--dry-run", "--status", status.to_str().unwrap()],
+    );
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert!(out.stdout.contains("tile_size="), "stdout: {}", out.stdout);
+
+    let manifest = frames.join(format!(
+        "{}-run.json",
+        frames.file_name().unwrap().to_string_lossy()
+    ));
+    assert!(!manifest.exists(), "a dry run writes no run manifest");
+    let records = read_records(&status);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["outcome"], "dry-run");
+}
+
+#[test]
+fn dry_run_leaves_an_existing_manifest_untouched() {
+    let frames = common::synthetic_frames("preset_cli_dry_run_keeps_manifest_frames");
+    let cwd = tmp_dir("preset_cli_dry_run_keeps_manifest_cwd");
+    let real = run_synthetic_stack(&cwd, &frames, &[]);
+    assert_eq!(real.code, Some(0), "stderr: {}", real.stderr);
+    let manifest = frames.join(format!(
+        "{}-run.json",
+        frames.file_name().unwrap().to_string_lossy()
+    ));
+    let before = std::fs::read_to_string(&manifest).unwrap();
+
+    let dry = run_synthetic_stack(&cwd, &frames, &["--dry-run"]);
+    assert_eq!(dry.code, Some(0), "stderr: {}", dry.stderr);
+    assert_eq!(
+        std::fs::read_to_string(&manifest).unwrap(),
+        before,
+        "a dry run leaves the earlier run's manifest byte-identical"
+    );
 }
 
 #[test]
@@ -611,17 +670,20 @@ fn dry_run_refuses_to_resume() {
 #[test]
 fn preset_align_uses_only_the_align_half() {
     let dir = tmp_dir("preset_cli_align_half");
+    let frames = dir.join("frames");
+    std::fs::create_dir_all(&frames).unwrap();
+    common::write_synthetic_stack(&frames, 32, 32, &[(0.0, 0.0), (1.0, 0.0)]);
     let preset = write_preset(
         &dir,
         "shared.toml",
-        "algo = \"laplacian\"\nalign-algo = \"pyramidal-ecc\"\n\n\
-         [stack]\nlevels = 4\n\n[align]\nmax-iterations = 40\n",
+        "algo = \"laplacian\"\nalign-algo = \"dummy-align\"\n\n\
+         [stack]\nlevels = 4\n\n[align]\nmax-shift = 40\n",
     );
     let out = run_cli_in(
         &dir,
         &[
             "align",
-            mantis_512_dir().to_str().unwrap(),
+            frames.to_str().unwrap(),
             "--preset",
             preset.to_str().unwrap(),
             "--json",
@@ -641,16 +703,16 @@ fn preset_align_uses_only_the_align_half() {
     );
 
     let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("--json must parse");
-    assert_eq!(report["algorithm"], "pyramidal-ecc");
-    let iterations = report["params"]
+    assert_eq!(report["algorithm"], "dummy-align");
+    let max_shift = report["params"]
         .as_array()
         .expect("params must be an array")
         .iter()
-        .find(|p| p["id"] == "max-iterations")
-        .expect("max-iterations must be reported")
+        .find(|p| p["id"] == "max-shift")
+        .expect("max-shift must be reported")
         .clone();
-    assert_eq!(iterations["value"], 40);
-    assert_eq!(iterations["provenance"], "Explicit");
+    assert_eq!(max_shift["value"], 40);
+    assert_eq!(max_shift["provenance"], "Explicit");
 }
 
 fn read_records(path: &Path) -> Vec<serde_json::Value> {

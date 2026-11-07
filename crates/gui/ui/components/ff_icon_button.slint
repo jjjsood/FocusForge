@@ -23,6 +23,9 @@ export component FFIconButton inherits Rectangle {
     in property <bool> filled: false;
     // An armed toggle: accent fill, glyph in `Theme.text-on-accent`.
     in property <bool> selected: false;
+    // The icon bar's open-surface look: hover ground, accent glyph and a 2 px
+    // accent bar on the bar's left edge.
+    in property <bool> current: false;
     // The accessible name; an icon carries no text of its own.
     in property <string> name: "";
     // A count disc on the top-right corner, hidden at 0. While it shows, the
@@ -43,7 +46,7 @@ export component FFIconButton inherits Rectangle {
     width: root.glyph-size + 2 * root.pad;
     height: self.width;
     background: root.selected ? Theme.accent-default
-        : root.enabled && area.has-hover ? Theme.surface-hover
+        : (root.enabled && area.has-hover) || root.current ? Theme.surface-hover
         : root.enabled && root.filled ? Theme.surface-overlay
         : transparent;
     border-radius: Theme.radius-sm;
@@ -73,6 +76,7 @@ export component FFIconButton inherits Rectangle {
     Image {
         source: root.icon;
         colorize: root.selected ? Theme.text-on-accent
+            : root.current ? Theme.accent-default
             : !root.enabled && root.filled ? Theme.text-disabled
             : root.recolor-on-hover && area.has-hover && root.enabled ? Theme.text-primary
             : root.badge > 0 ? Theme.text-primary
@@ -80,6 +84,12 @@ export component FFIconButton inherits Rectangle {
             : root.glyph-color;
         width: root.glyph-size;
         height: root.glyph-size;
+    }
+    if root.current: Rectangle {
+        x: -Theme.space-2;
+        width: 2px;
+        height: 100%;
+        background: Theme.accent-default;
     }
     if root.focused || key.has-focus: ring := Rectangle {
         width: 100%;

@@ -18,9 +18,8 @@ export component FFSpinner inherits Rectangle {
         source: @image-url("../../../../assets/icons/loader-circle.svg");
         colorize: Theme.accent-default;
 
-        // Reads `animation-tick()` on every repaint -- the same driver
-        // `FFProgressBar`'s own sweep uses -- so the ring keeps turning for
-        // as long as it is on screen, one full turn per second.
-        transform-rotation: mod(animation-tick() / 1ms, 1000.0) / 1000.0 * 360deg;
+        // One full turn per second; with Reduce motion on the ring stays
+        // drawn and stands still.
+        transform-rotation: Theme.spinner-angle;
     }
 }

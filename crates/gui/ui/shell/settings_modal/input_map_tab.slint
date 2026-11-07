@@ -2,8 +2,10 @@
 //
 // The Input map section's content: the read-only three-column table.
 
+import { Theme } from "../../theme.slint";
 import { ShellGeometry } from "../../geometry.slint";
 import { FFSettingsSection } from "../../components/ff_settings_section.slint";
+import { FFStatusText } from "../../components/ff_status_text.slint";
 import { FFInputTableRow } from "../../components/ff_input_table_row.slint";
 
 export struct InputRow {
@@ -14,6 +16,8 @@ export struct InputRow {
 
 export component FFInputMapTab inherits Rectangle {
     in property <[InputRow]> input-rows: [];
+    in property <string> input-source: "";
+    in property <[string]> input-problems: [];
 
     VerticalLayout {
         padding-left: ShellGeometry.settings-content-inset-left;
@@ -24,6 +28,22 @@ export component FFInputMapTab inherits Rectangle {
 
         FFSettingsSection {
             heading: "BINDINGS";
+
+            VerticalLayout {
+                spacing: ShellGeometry.settings-paragraph-gap;
+                padding-bottom: Theme.space-3;
+
+                FFStatusText {
+                    text: root.input-source;
+                    wrap: word-wrap;
+                }
+
+                for problem in root.input-problems: FFStatusText {
+                    text: problem;
+                    tone: "failure";
+                    wrap: word-wrap;
+                }
+            }
 
             FFInputTableRow {
                 header: true;

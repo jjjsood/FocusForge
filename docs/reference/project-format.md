@@ -1,5 +1,11 @@
 # The project container (`.ffp`)
 
+This appendix is for people who script FocusForge, archive projects or want
+to know exactly what a project file holds and when it is refused. To save,
+reopen and manage projects in the window, you do not need it: see
+[Checkpoints and saving](../guide/history.md) and
+[Damaged or moved projects](../guide/first-stack.md#damaged-or-moved-projects).
+
 `focusforge-cli stack` writes one `.ffp` file per detected stack instead
 of an image. It is a zip archive holding exactly three kinds of entry:
 
@@ -20,7 +26,9 @@ identical archives.
 
 The container carries no format version. A project written by an older
 build that lacks a field the current reader needs is refused when opened
-(see [Refusals](#refusals)); re-stack the frames to get a current one.
+(see [Refusals](#refusals)); re-stack the frames to get a current one. A RAW project holds its composite
+as unclipped 32-bit float samples, so a RAW project saved before that is
+refused on open and must be stacked again.
 
 - `manifest.json` — the algorithm, its resolved parameters, the source frame
   paths with each file's content hash, dimensions, each frame's solved
@@ -70,7 +78,8 @@ the content hash recorded when the project was written:
 
 - A frame that cannot be found makes a retouched `export -o` refuse, naming
   every missing frame. An unretouched `export -o`, `export --zmap` alone and
-  the `history` subcommands need no frames.
+  the `history` subcommands need no frames. Retouch strokes are not
+  included in an exported Z-Map.
 - A frame whose content changed makes a retouched `export -o` refuse, naming
   it. The strokes would blend frames the project was not stacked from.
   `history list` and `history delete` refuse the same way with exit code 9
@@ -95,6 +104,9 @@ name rather than opened partially:
 | a referenced entry is missing | 6 |
 | a blob fails its hash check | 7 |
 | a dangling parent, a parent cycle, a stack fingerprint that disagrees with the recorded sources, or a checkpoint with ops but no parent | 8 |
+| a RAW project saved by an earlier version, which stored a clipped 16-bit result | 1 |
+
+The last row reads `<path>: is a RAW project saved by an older version, which stored a clipped 16-bit result; stack its source frames again to open it`.
 
 A checkpoint with no ops must carry the record of its own fuse; one without
 it is refused as a damaged container. Any other failure exits 1. The

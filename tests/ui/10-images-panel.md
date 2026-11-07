@@ -40,37 +40,35 @@ Start: --open fixtures/mantis-512/frames --settings-section appearance
    Expect: the menu opens with the lines "Name" and "Capture time" and the "Capture time" line has no check mark.
 18. Click "Name" (`FFMenuList::option-area` 0).
    Expect: the menu is gone and the first three rows read 00.tif, 01.tif, 02.tif from top to bottom.
-## Fuse, then the read-only list in the editor
+## Fuse and keep a first checkpoint
 19. Click **Fuse stack** (`FFToolbar::fuse-button`).
    Expect: the "Keep this fused result?" dialog is shown (within 60 s).
 20. Click **Keep** (`AppWindow::divergence-warning`).
    Expect: the dialog is gone; the toolbar row shows the captions "Size" and "Soft"; the CHECKPOINTS list shows 1 row (within 60 s).
-21. Click the second frame row (`FFImageRow::area` 1).
-   Expect: the left pane label (`FFCanvas::pane-left`) reads "01.tif"; the dock header ends with "frames" and shows no add or sort icon at its right end; row 1 shows its position "2" at the right end and no eye or trash icon.
 ## Exclude and remove with a checkpoint
-22. Click **STACKING** (`FFModeSwitch::stacking-half`).
+21. Click **STACKING** (`FFModeSwitch::stacking-half`).
    Expect: the toolbar shows the **Fuse stack** button; the dock header ends with "· 0 excluded" and the add and sort icons are shown at its right end.
-23. Click the second frame row (`FFImageRow::area` 1).
+22. Click the second frame row (`FFImageRow::area` 1).
    Expect: the left pane label (`FFCanvas::pane-left`) reads "01.tif"; row 1 shows the eye icon and the red trash icon.
-24. Click **Exclude**, the eye icon (`FFImageRow::list-exclude-button` 0).
+23. Click **Exclude**, the eye icon (`FFImageRow::list-exclude-button` 0).
    Expect: no dialog opens and the dock header ends with "· 1 excluded".
-25. Click **Include**, the crossed-out eye icon (`FFImageRow::list-exclude-button` 0).
+24. Click **Include**, the crossed-out eye icon (`FFImageRow::list-exclude-button` 0). The icons show only while the pointer is on row 1: when they are gone, hover the row (`FFImageRow::area` 1) first.
    Expect: no dialog opens and the dock header ends with "· 0 excluded".
-26. Click **Remove**, the red trash icon (`FFImageRow::list-remove-button` 0) on the second row.
-   Expect: a dialog titled "Remove and fuse again?" opens with the line "The whole stack is fused from scratch. This project already holds 1 checkpoint, and confirming keeps every one of them." and the buttons **Cancel**, **Exclude instead** and **Remove and re-fuse**, beside a **Close dialog** icon button at its top-right corner.
-27. Click **Cancel** (`AppWindow::frame-warning`).
+25. Click **Remove**, the red trash icon (`FFImageRow::list-remove-button` 0) on the second row, hovering the row first (`FFImageRow::area` 1) when its icons are gone.
+   Expect: a dialog titled "Remove and fuse again?" opens with the line "The whole stack is fused from scratch. This project already holds 1 checkpoint, and confirming keeps every one of them." and the buttons **Cancel**, **New project instead**, **Exclude instead** and **Remove and re-fuse**, beside a **Close dialog** icon button at its top-right corner.
+26. Click **Cancel** (`AppWindow::frame-warning`).
    Expect: Must not: the "01.tif" row is removed or a second checkpoint is added; the dialog is gone, the row "01.tif" is still listed and the CHECKPOINTS list shows 1 row.
-28. Click the second frame row (`FFImageRow::area` 1).
+27. Click the second frame row (`FFImageRow::area` 1).
    Expect: the left pane label (`FFCanvas::pane-left`) reads "01.tif"; row 1 shows the eye icon and the red trash icon.
-29. Click **Remove**, the red trash icon (`FFImageRow::list-remove-button` 0) on the second row.
-   Expect: the dialog titled "Remove and fuse again?" is shown with the buttons **Cancel**, **Exclude instead** and **Remove and re-fuse** and the **Close dialog** icon button at its top-right corner.
-30. Click **Close dialog** (`AppWindow::frame-warning`), the icon button at the dialog's top-right corner.
+28. Click **Remove**, the red trash icon (`FFImageRow::list-remove-button` 0) on the second row.
+   Expect: the dialog titled "Remove and fuse again?" is shown with the buttons **Cancel**, **New project instead**, **Exclude instead** and **Remove and re-fuse** and the **Close dialog** icon button at its top-right corner.
+29. Click **Close dialog** (`AppWindow::frame-warning`), the icon button at the dialog's top-right corner.
    Expect: Must not: the "01.tif" row is removed or a second checkpoint is added; the dialog is gone, the row "01.tif" is still listed and the CHECKPOINTS list shows 1 row.
-31. Click the second frame row (`FFImageRow::area` 1).
+30. Click the second frame row (`FFImageRow::area` 1).
    Expect: the left pane label (`FFCanvas::pane-left`) reads "01.tif"; row 1 shows the eye icon and the red trash icon.
-32. Click **Remove**, the red trash icon (`FFImageRow::list-remove-button` 0) on the second row.
-   Expect: the dialog titled "Remove and fuse again?" is shown with the buttons **Cancel**, **Exclude instead** and **Remove and re-fuse**.
-33. Click **Remove and re-fuse** (`AppWindow::frame-warning`).
+31. Click **Remove**, the red trash icon (`FFImageRow::list-remove-button` 0) on the second row.
+   Expect: the dialog titled "Remove and fuse again?" is shown with the buttons **Cancel**, **New project instead**, **Exclude instead** and **Remove and re-fuse**.
+32. Click **Remove and re-fuse** (`AppWindow::frame-warning`).
    Expect: the "Remove and fuse again?" dialog is gone and the "Keep this fused result?" dialog is shown (within 60 s).
-34. Click **Keep** (`AppWindow::divergence-warning`).
+33. Click **Keep** (`AppWindow::divergence-warning`).
    Expect: the dialog is gone; the CHECKPOINTS list shows 2 rows; the dock list no longer has "01.tif" and its second row reads "02.tif" (within 60 s).

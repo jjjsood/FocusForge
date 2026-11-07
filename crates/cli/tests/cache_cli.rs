@@ -9,26 +9,20 @@
 //! concurrent test runs sharing one `target/` must never share a cache
 //! directory either.
 //!
-//! `--algorithm laplacian --align-algorithm dummy-align` is the one recipe here that
-//! pays for a real fusion (a few seconds over `fixtures/mantis-512`);
-//! `dummy-align` reaches [`AlignStatus::Converged`] by construction, so no
-//! Default fallback keeps the run from refusing. Every other test drives
-//! `dummy-stack --no-align`, milliseconds only.
+//! Every stack run here fuses with `dummy-stack`; the align stage is either
+//! skipped (`--no-align`) or `dummy-align`, which reaches
+//! [`AlignStatus::Converged`] by construction, so no fallback keeps the run
+//! from refusing.
 
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use focusforge_core::io::test_frames::write_frame_with_capture_time;
 use focusforge_core::job::{JobRecord, ResumeStore, StackFingerprint};
 use focusforge_core::params::ParamValues;
 
-use common::{CliOutput, mantis_512_dir, tmp_dir};
-
-fn bin() -> Command {
-    common::cli_bin("cache_cli")
-}
+use common::{CliOutput, bin, export_composite, mantis_512_dir, read_pixels, tmp_dir};
 
 fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
     common::run_in(&mut bin(), dir, args)
@@ -55,29 +49,6 @@ fn three_group_dump(dir: &Path) -> PathBuf {
         frame(dir, file, Some(when));
     }
     dir.to_path_buf()
-}
-
-/// The composite of `project`, exported to `<project>.exported.tif` inside
-/// `cwd`. Two containers of the same stack are not byte-identical -- they
-/// carry different `created_at` stamps -- so a byte comparison always goes
-/// through `export`, `job_cli.rs`'s `export_composite` idiom.
-fn export_composite(cwd: &Path, project: &Path) -> PathBuf {
-    let exported = project.with_extension("exported.tif");
-    let out = run_cli_in(
-        cwd,
-        &[
-            "export",
-            project.to_str().unwrap(),
-            "-o",
-            exported.to_str().unwrap(),
-        ],
-    );
-    assert!(out.success, "export stderr: {}", out.stderr);
-    exported
-}
-
-fn read_pixels(path: &Path) -> Vec<u8> {
-    std::fs::read(path).expect("output file must be readable")
 }
 
 /// The number of entries the align stage cache holds under
@@ -158,42 +129,36 @@ fn leave_a_cancelled_run_ledger(cwd: &Path) -> PathBuf {
 
 // --- reuse ------------------------------------------------------------
 
-/// Two `stack` runs over `fixtures/mantis-512` differing only in a fusion
-/// parameter (`--set levels=…`): the second reuses the cached alignment
-/// (`align_cached: true`, no computed `align … frames` stage line), and the
-/// reused alignment fuses to a composite byte-identical to
-/// what a cold `--no-cache` recompute of the very same parameters produces
-/// -- the correctness half of "reuses the cached alignment", since a cache
-/// hit that merely runs fast but fuses wrong is still a bug.
+/// Two `dummy-stack` runs differing only in a fusion parameter (`--set
+/// threshold=…`): the second reuses the cached alignment, reports a number
+/// (not `null`) for the align stage it still enters, and yields a composite
+/// byte-identical to a cold `--no-cache` recompute.
 #[test]
 fn fusion_parameter_change_reuses_alignment() {
     let cwd = tmp_dir("cache_cli_fusion_reuse");
     let input = mantis_512_dir();
-    let out_a = cwd.join("out_a");
-    let out_b = cwd.join("out_b");
-    let out_c = cwd.join("out_c");
-    for dir in [&out_a, &out_b, &out_c] {
-        std::fs::create_dir_all(dir).unwrap();
-    }
-
-    let a = run_cli_in(
-        &cwd,
-        &common::push_no_gpu(vec![
+    let stack = |label: &str, extra: &[&str]| -> (CliOutput, serde_json::Value) {
+        let out = cwd.join(format!("out_{label}"));
+        std::fs::create_dir_all(&out).unwrap();
+        let mut args = vec![
             "stack",
             input.to_str().unwrap(),
             "-o",
-            out_a.to_str().unwrap(),
+            out.to_str().unwrap(),
             "--algorithm",
-            "laplacian",
+            "dummy-stack",
             "--align-algorithm",
             "dummy-align",
-            "--set",
-            "levels=3",
             "--json",
-        ]),
-    );
-    assert!(a.success, "stderr: {}", a.stderr);
-    let a_report: serde_json::Value = serde_json::from_str(&a.stdout).expect("--json");
+        ];
+        args.extend_from_slice(extra);
+        let run = run_cli_in(&cwd, &common::push_no_gpu(args));
+        assert!(run.success, "{label} stderr: {}", run.stderr);
+        let report = serde_json::from_str(&run.stdout).expect("--json");
+        (run, report)
+    };
+
+    let (a, a_report) = stack("a", &["--set", "threshold=0.2"]);
     assert_eq!(
         a_report["align_cached"], false,
         "the first run must compute, not reuse"
@@ -204,24 +169,7 @@ fn fusion_parameter_change_reuses_alignment() {
         a.stderr
     );
 
-    let b = run_cli_in(
-        &cwd,
-        &common::push_no_gpu(vec![
-            "stack",
-            input.to_str().unwrap(),
-            "-o",
-            out_b.to_str().unwrap(),
-            "--algorithm",
-            "laplacian",
-            "--align-algorithm",
-            "dummy-align",
-            "--set",
-            "levels=5",
-            "--json",
-        ]),
-    );
-    assert!(b.success, "stderr: {}", b.stderr);
-    let b_report: serde_json::Value = serde_json::from_str(&b.stdout).expect("--json");
+    let (b, b_report) = stack("b", &["--set", "threshold=0.7"]);
     assert_eq!(
         b_report["align_cached"], true,
         "changing only a fusion parameter must reuse the cached alignment: {b_report}"
@@ -237,31 +185,21 @@ fn fusion_parameter_change_reuses_alignment() {
         "a cache hit must state the reuse, not merely omit the other line: {}",
         b.stderr
     );
+    assert!(
+        b_report["stages"]["align"].is_number(),
+        "a cache hit still enters the align stage, and must report a number, not null: {b_report}"
+    );
+    assert_eq!(
+        b_report["align_source"], "cached",
+        "align_source is what explains the small number: {b_report}"
+    );
 
     // Control: the same parameters as `b`, forced to a cold recompute.
-    let c = run_cli_in(
-        &cwd,
-        &common::push_no_gpu(vec![
-            "stack",
-            input.to_str().unwrap(),
-            "-o",
-            out_c.to_str().unwrap(),
-            "--algorithm",
-            "laplacian",
-            "--align-algorithm",
-            "dummy-align",
-            "--set",
-            "levels=5",
-            "--no-cache",
-            "--json",
-        ]),
-    );
-    assert!(c.success, "stderr: {}", c.stderr);
-    let c_report: serde_json::Value = serde_json::from_str(&c.stdout).expect("--json");
+    let (_, c_report) = stack("c", &["--set", "threshold=0.7", "--no-cache"]);
     assert_eq!(c_report["align_cached"], false);
 
-    let b_composite = export_composite(&cwd, &out_b.join("mantis-512.ffp"));
-    let c_composite = export_composite(&cwd, &out_c.join("mantis-512.ffp"));
+    let b_composite = export_composite(&cwd, &cwd.join("out_b").join("mantis-512.ffp"));
+    let c_composite = export_composite(&cwd, &cwd.join("out_c").join("mantis-512.ffp"));
     assert_eq!(
         read_pixels(&b_composite),
         read_pixels(&c_composite),
@@ -297,7 +235,7 @@ fn an_alignment_input_change_misses_the_cache() {
             "-o",
             out.to_str().unwrap(),
             "--algorithm",
-            "laplacian",
+            "dummy-stack",
             "--align-algorithm",
             "dummy-align",
             "--json",
@@ -323,71 +261,6 @@ fn an_alignment_input_change_misses_the_cache() {
     );
     std::fs::remove_file(frames.join(sources.last().unwrap().file_name().unwrap())).unwrap();
     assert!(!cached("fewer", &frames, &[]), "a changed frame set misses");
-}
-
-/// A stage-cache hit still *enters* the align stage (a fingerprint lookup
-/// and a JSON decode of the cached transforms), so it must still report a
-/// number there -- never `null`, which would read as "alignment was
-/// skipped" rather than "alignment was reused". `align_source` is what
-/// tells the two apart from a genuine (slow) compute.
-#[test]
-fn stage_timings_survive_a_cache_hit() {
-    let cwd = tmp_dir("cache_cli_stage_timings_survive_hit");
-    let input = mantis_512_dir();
-    let out_a = cwd.join("out_a");
-    let out_b = cwd.join("out_b");
-    for dir in [&out_a, &out_b] {
-        std::fs::create_dir_all(dir).unwrap();
-    }
-
-    let a = run_cli_in(
-        &cwd,
-        &common::push_no_gpu(vec![
-            "stack",
-            input.to_str().unwrap(),
-            "-o",
-            out_a.to_str().unwrap(),
-            "--algorithm",
-            "laplacian",
-            "--align-algorithm",
-            "dummy-align",
-            "--set",
-            "levels=3",
-            "--json",
-        ]),
-    );
-    assert!(a.success, "stderr: {}", a.stderr);
-
-    let b = run_cli_in(
-        &cwd,
-        &common::push_no_gpu(vec![
-            "stack",
-            input.to_str().unwrap(),
-            "-o",
-            out_b.to_str().unwrap(),
-            "--algorithm",
-            "laplacian",
-            "--align-algorithm",
-            "dummy-align",
-            "--set",
-            "levels=5",
-            "--json",
-        ]),
-    );
-    assert!(b.success, "stderr: {}", b.stderr);
-    let b_report: serde_json::Value = serde_json::from_str(&b.stdout).expect("--json");
-    assert_eq!(
-        b_report["align_cached"], true,
-        "this run must be the cache hit: {b_report}"
-    );
-    assert!(
-        b_report["stages"]["align"].is_number(),
-        "a cache hit still enters the align stage, and must report a number, not null: {b_report}"
-    );
-    assert_eq!(
-        b_report["align_source"], "cached",
-        "align_source is what explains the small number: {b_report}"
-    );
 }
 
 /// `--no-cache` recomputes even when a valid entry exists, and leaves no

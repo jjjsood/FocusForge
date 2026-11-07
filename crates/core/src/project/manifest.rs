@@ -9,13 +9,29 @@
 //! **Open refuses, it does not default.** A manifest missing a required
 //! field fails deserialization.
 //! `deny_unknown_fields` is deliberately absent.
+//!
+//! The one exception to that rule is `format_version`: a manifest without it
+//! (or with `null`) is read as format 1, and 0 opens too. A version above
+//! `FORMAT_VERSION` (1) is refused before the rest of the manifest is decoded,
+//! so a newer manifest whose other fields changed still gets the version
+//! message. Nothing in this build writes the field.
 
 use serde::{Deserialize, Serialize};
 
 use super::blob::FileStamp;
 use crate::align::Registration;
 use crate::params::ParamValues;
-use crate::tile::Rect;
+use crate::tile::{Rect, SampleFormat};
+
+/// The highest project format version this build reads.
+pub(crate) const FORMAT_VERSION: u32 = 1;
+
+/// Only the version of a `manifest.json`, read before the full decode.
+#[derive(Deserialize)]
+pub(super) struct FormatProbe {
+    #[serde(default)]
+    pub format_version: Option<u32>,
+}
 
 /// A project's `manifest.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -113,7 +129,20 @@ pub struct BlobRecord {
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum BlobKind {
+    /// Little-endian `u16` samples.
     Full,
+    /// Little-endian `f32` samples on the 16-bit scale, unclipped.
+    FullF32,
+}
+
+impl BlobKind {
+    /// The sample type the blob's bytes hold.
+    pub fn sample_format(self) -> SampleFormat {
+        match self {
+            BlobKind::Full => SampleFormat::U16,
+            BlobKind::FullF32 => SampleFormat::F32,
+        }
+    }
 }
 
 /// One source frame, referenced -- never embedded.

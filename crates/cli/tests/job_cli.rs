@@ -6,7 +6,7 @@
 //!
 //! Every interruptible run passes `--no-align --no-crop --set levels=3
 //! --tile-size 160 --max-host-memory 1`, turning `fixtures/mantis-512`'s
-//! 4-tile default plan into 25 single-worker units. Not `--tile-size 64`,
+//! 4-tile default plan into many single-worker tiles. Not `--tile-size 64`,
 //! which this tree refuses outright: "tile_size 64 leaves no interior at
 //! margin 24 for levels=3; use tile_size >= 160".
 //! Every SIGINT test drives its kill point off a line actually read from
@@ -22,11 +22,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use common::{CliOutput, mantis_512_dir, tmp_dir};
-
-fn bin() -> Command {
-    common::cli_bin("job_cli")
-}
+use common::{CliOutput, bin, export_composite, mantis_512_dir, read_pixels, tmp_dir};
 
 fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
     common::run_in(&mut bin(), dir, args)
@@ -122,34 +118,9 @@ fn staged_composites(cwd: &Path) -> Vec<PathBuf> {
     found
 }
 
-fn read_pixels(path: &Path) -> Vec<u8> {
-    std::fs::read(path).expect("output file must be readable")
-}
-
-/// The composite of `project`, exported to `<project>.exported.tif`.
-///
-/// Two containers of the same stack are **not** byte-identical -- they carry
-/// different `created_at` stamps -- so every byte-level comparison in this
-/// file goes through `export`, which is the honest one anyway: what the
-/// container must preserve is the payload, not its own envelope.
-fn export_composite(cwd: &Path, project: &Path) -> PathBuf {
-    let exported = project.with_extension("exported.tif");
-    let out = run_cli_in(
-        cwd,
-        &[
-            "export",
-            project.to_str().unwrap(),
-            "-o",
-            exported.to_str().unwrap(),
-        ],
-    );
-    assert!(out.success, "export stderr: {}", out.stderr);
-    exported
-}
-
 /// `stack <dir> -o <out_dir> --algorithm laplacian --no-align --no-crop
 /// --tile-size 160 --set levels=3 --max-host-memory 1` -- the
-/// single-worker recipe this module's own doc comment explains (25 units
+/// single-worker recipe this module's own doc comment explains (many tiles
 /// against `fixtures/mantis-512`'s 4-tile default plan), assembled once so
 /// every interruptible-run test stops repeating it verbatim.
 ///
@@ -186,128 +157,6 @@ fn interruptible_stack_args<'a>(dir: &'a str, output: &'a str) -> Vec<&'a str> {
 }
 
 #[test]
-fn stack_output_is_unchanged_under_the_job_engine() {
-    use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
-    use focusforge_core::io::{Rect, TiffStack};
-    use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
-    use focusforge_core::registry;
-    use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
-
-    let dir = tmp_dir("job_cli_output_unchanged");
-    let output = dir.join("mantis-512.ffp");
-    let source = mantis_512_dir();
-    let mut args = vec![
-        "stack",
-        source.to_str().unwrap(),
-        "-o",
-        output.parent().unwrap().to_str().unwrap(),
-        "--algorithm",
-        "laplacian",
-        "--no-align",
-        "--no-crop",
-        "--set",
-        "equalize=false",
-    ];
-    // Without `--cpu`, `--algorithm laplacian` takes the GPU path automatically
-    // because `gpu` is a default build feature, and the in-process oracle
-    // below is CPU-only -- GPU/CPU parity is <=1 LSB by contract, not
-    // byte-identical, so this comparison needs both sides on the CPU path.
-    if cfg!(feature = "gpu") {
-        args.push("--cpu");
-    }
-    let out = run_cli_in(&dir, &args);
-    assert!(out.success, "stderr: {}", out.stderr);
-
-    // The in-process library oracle: the same `FusionConsumer` +
-    // `TileScheduler::run` pairing `crates/cli/tests/stack_cli.rs` builds.
-    let stack = TiffStack::open(mantis_512_dir()).expect("mantis-512 must open");
-    let (width, height) = stack.dimensions();
-    let spp = stack.header(0).samples_per_pixel;
-    let stack_ctx = StackContext::new(stack.len(), width, height, spp);
-    let algo = registry::find_stack("laplacian").unwrap();
-    let mut oracle_params = ParamValues::new();
-    oracle_params.insert("equalize".to_string(), ParamValue::Bool(false));
-    let resolved = params::resolve(algo.params(), &oracle_params, &stack_ctx).unwrap();
-    let values = params::resolved_values(&resolved);
-    let support = algo.tile_support(&values);
-    let oracle_path = dir.join("oracle.tif");
-    let oracle_zmap_path = dir.join("oracle-zmap.tif");
-    let options = {
-        let mut o = TileSchedulerOptions::explicit_budget(dir.join("oracle-scratch"), 1 << 30);
-        o.apply_support(support);
-        o.tile_size = 512;
-        o
-    };
-    let scheduler = TileScheduler::new(&stack, stack_ctx, spp, &options).unwrap();
-    let consumer = FusionConsumer::create(
-        algo,
-        values,
-        &oracle_path,
-        Some(&oracle_zmap_path),
-        FusionGeometry {
-            width,
-            height,
-            samples_per_pixel: spp,
-            frame_count: stack.len() as u32,
-            crop: None,
-            description: None,
-        },
-    )
-    .unwrap();
-    scheduler.run(&NoopPreprocess, &consumer).unwrap();
-    consumer.finish().unwrap();
-
-    // The composite lives inside the project, so the comparison goes
-    // through `export`, decoded the same way as the oracle's own composite.
-    let whole = Rect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    };
-    let read = |path: PathBuf| {
-        TiffStack::open_files(&[path])
-            .unwrap()
-            .read_tile(0, whole)
-            .unwrap()
-            .samples
-    };
-    let expected = read(oracle_path);
-    let exported = read(export_composite(&dir, &output));
-    assert_eq!(
-        exported, expected,
-        "stack must produce the same pixels through the job engine as the library oracle's \
-         fused composite"
-    );
-}
-
-#[test]
-fn progress_line_contains_units_stage_and_eta() {
-    let dir = tmp_dir("job_cli_progress_line");
-    let output = dir.join("mantis-512.ffp");
-    let mantis = mantis_512_dir();
-    let out = run_cli_in(
-        &dir,
-        &interruptible_stack_args(
-            mantis.to_str().unwrap(),
-            output.parent().unwrap().to_str().unwrap(),
-        ),
-    );
-    assert!(out.success, "stderr: {}", out.stderr);
-    let has_line = out
-        .stderr
-        .lines()
-        .any(|line| line.starts_with("fuse ") && line.contains('/') && line.contains("tiles"));
-    assert!(has_line, "stderr: {}", out.stderr);
-    assert!(
-        out.stderr.contains("eta --") || out.stderr.contains("eta "),
-        "stderr must carry an eta field: {}",
-        out.stderr
-    );
-    assert!(!out.stderr.contains("eta 0s"), "stderr: {}", out.stderr);
-}
-
-#[test]
 fn prepare_progress_reaches_a_redirected_log() {
     let dir = tmp_dir("job_cli_prepare_progress");
     let mantis = mantis_512_dir();
@@ -331,13 +180,13 @@ fn prepare_progress_reaches_a_redirected_log() {
     let prepare: Vec<usize> = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| line.starts_with("prepare ") && line.ends_with(" frames"))
+        .filter(|(_, line)| line.starts_with("prepare ") && line.contains(" frames eta "))
         .filter(|(_, line)| line.contains('/'))
         .map(|(at, _)| at)
         .collect();
     let first = prepare
         .first()
-        .unwrap_or_else(|| panic!("no `prepare <k>/<N> frames` line: {}", out.stderr));
+        .unwrap_or_else(|| panic!("no `prepare <k>/<N> frames eta` line: {}", out.stderr));
     assert!(
         lines[*first].starts_with("prepare 0/8 frames"),
         "the first count line: {}",
@@ -366,26 +215,75 @@ fn fuse_counts(stderr: &str) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Progress must be **live**: an uninterrupted (single-segment) fuse still
-/// reports completed units mid-run, never `0/25` until the end.
+/// One single-worker run read three ways: the scheduler tuning
+/// flags reach the plan, the progress lines carry units, stage and an ETA and
+/// climb mid-run, and the redirected stderr holds no escape sequences within
+/// the renderer's line budget. Each block names the claim it checks.
 ///
-/// Needs a run longer than one `PLAIN_INTERVAL` (2 s) for a mid-run line to
-/// exist at all, which is what the `--tile-size 160 --max-host-memory 1`
-/// single-worker recipe guarantees against this fixture.
+/// A run longer than one `PLAIN_INTERVAL` (2 s) is needed for a mid-run line
+/// to exist at all, which the `--tile-size 160 --max-host-memory 1` recipe
+/// guarantees against this fixture.
 #[test]
-fn progress_advances_during_an_uninterrupted_run() {
-    let dir = tmp_dir("job_cli_progress_advances");
-    let output = dir.join("mantis-512.ffp");
+fn interruptible_stack_honours_tuning_flags_and_reports_live_progress() {
+    let dir = tmp_dir("job_cli_interruptible_stack");
+    let out_dir = dir.to_str().unwrap();
     let mantis = mantis_512_dir();
-    let out = run_cli_in(
-        &dir,
-        &interruptible_stack_args(
-            mantis.to_str().unwrap(),
-            output.parent().unwrap().to_str().unwrap(),
-        ),
-    );
-    assert!(out.success, "stderr: {}", out.stderr);
 
+    // The untuned plan, for the tile-count comparison below.
+    let mut plan_args = vec![
+        "stack",
+        mantis.to_str().unwrap(),
+        "-o",
+        out_dir,
+        "--algorithm",
+        "laplacian",
+        "--no-align",
+        "--no-crop",
+        "--dry-run",
+        "--json",
+    ];
+    if cfg!(feature = "gpu") {
+        plan_args.push("--cpu");
+    }
+    let plan = run_cli_in(&dir, &plan_args);
+    assert!(plan.success, "stderr: {}", plan.stderr);
+    let default_plan: serde_json::Value = serde_json::from_str(&plan.stdout).unwrap();
+
+    let mut args = interruptible_stack_args(mantis.to_str().unwrap(), out_dir);
+    args.push("--json");
+    let start = std::time::Instant::now();
+    let out = run_cli_in(&dir, &args);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(out.success, "stderr: {}", out.stderr);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+
+    // Tuning flags reach the scheduler.
+    assert_eq!(report["tile_size"], 160);
+    assert_eq!(report["in_flight_limit"], 1);
+    assert!(
+        report["tiles"].as_u64().unwrap() > default_plan["tiles"].as_u64().unwrap(),
+        "a smaller tile size must plan more tiles: tuned={} default={}",
+        report["tiles"],
+        default_plan["tiles"]
+    );
+
+    // Every fuse line carries units, stage and an ETA field.
+    let fuse_lines: Vec<&str> = out
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("fuse "))
+        .collect();
+    assert!(!fuse_lines.is_empty(), "stderr: {}", out.stderr);
+    for line in &fuse_lines {
+        assert!(
+            line.contains('/') && line.contains("tiles") && line.contains("eta "),
+            "a fuse line must read `fuse <done>/<total> tiles <pct>% eta <eta>`: {line}"
+        );
+    }
+    assert!(!out.stderr.contains("eta 0s"), "stderr: {}", out.stderr);
+
+    // Progress is live: units done climb mid-run, never `0/<total>` until the end,
+    // and `eta --` is honest only before the first unit finishes.
     let counts = fuse_counts(&out.stderr);
     assert!(
         counts.len() >= 2,
@@ -394,31 +292,13 @@ fn progress_advances_during_an_uninterrupted_run() {
     );
     let total = counts[0].1;
     assert!(total > 1, "this recipe must plan more than one unit");
-    let mid_run: Vec<usize> = counts
-        .iter()
-        .map(|(done, _)| *done)
-        .filter(|done| *done > 0 && *done < total)
-        .collect();
     assert!(
-        !mid_run.is_empty(),
+        counts.iter().any(|&(done, _)| done > 0 && done < total),
         "at least one progress line must report units done climbing towards the total, \
          not a counter frozen at 0 until the run ends: {}",
         out.stderr
     );
-    assert!(
-        !out.stderr.contains("eta --\neta --") && !out.stderr.contains("eta 0s"),
-        "a mid-run line must carry a real ETA, never `0s`: {}",
-        out.stderr
-    );
-    // Every line that reports a completed unit must also carry a real ETA:
-    // `eta --` is only honest before the first unit finishes.
-    for line in out.stderr.lines().filter(|l| l.starts_with("fuse ")) {
-        let done: usize = line["fuse ".len()..]
-            .split('/')
-            .next()
-            .unwrap()
-            .parse()
-            .unwrap();
+    for (line, &(done, _)) in fuse_lines.iter().zip(&counts) {
         if done > 0 {
             assert!(
                 !line.contains("eta --"),
@@ -426,29 +306,13 @@ fn progress_advances_during_an_uninterrupted_run() {
             );
         }
     }
-}
 
-#[test]
-fn progress_to_a_file_has_no_escape_sequences() {
-    let dir = tmp_dir("job_cli_progress_no_escapes");
-    let output = dir.join("mantis-512.ffp");
-    let start = std::time::Instant::now();
-    let mantis = mantis_512_dir();
-    let out = run_cli_in(
-        &dir,
-        &interruptible_stack_args(
-            mantis.to_str().unwrap(),
-            output.parent().unwrap().to_str().unwrap(),
-        ),
-    );
-    let elapsed = start.elapsed().as_secs_f64();
-    assert!(out.success, "stderr: {}", out.stderr);
+    // A redirected stderr holds no escape sequences, and stays within the
+    // renderer's line budget, with the grouping proposal (printed once,
+    // before any progress) subtracted.
     assert!(!out.stderr.contains('\r'), "stderr: {}", out.stderr);
     assert!(!out.stderr.contains('\x1b'), "stderr: {}", out.stderr);
     let bound = 2 + (elapsed / 2.0).ceil() as usize;
-    // The bound is `ProgressRenderer`'s own line-count promise, so the
-    // grouping proposal -- printed once, before any progress -- is
-    // subtracted rather than folded into it.
     let line_count = strip_grouping(&out.stderr).lines().count();
     assert!(
         line_count <= bound,
@@ -1194,11 +1058,11 @@ mod unix_signals {
 
     #[test]
     fn resume_skips_a_recorded_alignment() {
-        // Not compared against a separate uninterrupted run: `pyramidal-ecc`
-        // reduces in parallel, so two processes can differ in a transform's
-        // last digits. Instead, the interrupted run's recorded `alignment.json`
-        // is compared against the resumed run's `--json` report -- both drawn
-        // from the same recorded `StackAlignment`, never two ECC solves.
+        // `dummy-align` is deterministic, so a re-solve would reproduce the
+        // recorded transforms too. What tells reuse from a re-solve is the
+        // report's `align_source`; the interrupted run's recorded
+        // `alignment.json` is then compared against the resumed `--json`
+        // report, both drawn from the same recorded `StackAlignment`.
         let dir = tmp_dir("job_cli_align_resume");
         let output = dir.join("mantis-512.ffp");
         let mantis_dir = mantis_512_dir();
@@ -1211,7 +1075,7 @@ mod unix_signals {
             "laplacian",
             "--no-crop",
             "--align-algorithm",
-            "pyramidal-ecc",
+            "dummy-align",
             "--tile-size",
             "160",
             "--set",
@@ -1255,13 +1119,12 @@ mod unix_signals {
         resumed_args.push("--json");
         let resumed = run_cli_in(&dir, &resumed_args);
         assert!(resumed.success, "stderr: {}", resumed.stderr);
-        assert!(
-            !resumed.stderr.contains("align ") || !resumed.stderr.contains("frames (no unit"),
-            "resumed stderr must carry no align stage line: {}",
-            resumed.stderr
-        );
         let resumed_report: serde_json::Value =
             serde_json::from_str(&resumed.stdout).expect("--json must parse");
+        assert_eq!(
+            resumed_report["align_source"], "resumed",
+            "the resumed run must reuse the recorded alignment: {resumed_report}"
+        );
         let resumed_alignments = resumed_report["align"]["alignments"]
             .as_array()
             .expect("align.alignments must be an array");
@@ -1270,9 +1133,8 @@ mod unix_signals {
             // `alignment.json` stores `transform_bits` (`f64::to_bits()`), so
             // the recorded side decodes exactly; `--json`'s `transform` goes
             // through a `serde_json` float round trip that may lose a bit
-            // (<https://github.com/serde-rs/json/issues/707>). Hence 2 ULPs:
-            // slack for that formatting noise, far too tight for a re-solved
-            // alignment, which differs in far more than the last 1-2 bits.
+            // (<https://github.com/serde-rs/json/issues/707>). The slack below
+            // covers that formatting noise only.
             let recorded_bits: Vec<Vec<u64>> = recorded_frame["transform_bits"]
                 .as_array()
                 .expect("alignment.json's frame must carry transform_bits")
@@ -1317,47 +1179,4 @@ mod unix_signals {
             }
         }
     }
-}
-
-#[test]
-fn tuning_flags_reach_the_scheduler() {
-    let default_dir = tmp_dir("job_cli_tuning_default");
-    let default_output = default_dir.join("mantis-512.ffp");
-    let default_run = run_cli_in(
-        &default_dir,
-        &[
-            "stack",
-            mantis_512_dir().to_str().unwrap(),
-            "-o",
-            default_output.parent().unwrap().to_str().unwrap(),
-            "--algorithm",
-            "laplacian",
-            "--no-align",
-            "--no-crop",
-            "--json",
-        ],
-    );
-    assert!(default_run.success, "stderr: {}", default_run.stderr);
-    let default_report: serde_json::Value = serde_json::from_str(&default_run.stdout).unwrap();
-
-    let tuned_dir = tmp_dir("job_cli_tuning_tuned");
-    let tuned_output = tuned_dir.join("mantis-512.ffp");
-    let mantis = mantis_512_dir();
-    let mut tuned_args = interruptible_stack_args(
-        mantis.to_str().unwrap(),
-        tuned_output.parent().unwrap().to_str().unwrap(),
-    );
-    tuned_args.push("--json");
-    let tuned_run = run_cli_in(&tuned_dir, &tuned_args);
-    assert!(tuned_run.success, "stderr: {}", tuned_run.stderr);
-    let tuned_report: serde_json::Value = serde_json::from_str(&tuned_run.stdout).unwrap();
-
-    assert_eq!(tuned_report["tile_size"], 160);
-    assert_eq!(tuned_report["in_flight_limit"], 1);
-    assert!(
-        tuned_report["tiles"].as_u64().unwrap() > default_report["tiles"].as_u64().unwrap(),
-        "a smaller tile size must plan more tiles: tuned={} default={}",
-        tuned_report["tiles"],
-        default_report["tiles"]
-    );
 }

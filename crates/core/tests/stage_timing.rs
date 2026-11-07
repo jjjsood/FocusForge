@@ -25,6 +25,8 @@ fn stages_accumulate_independently() {
     tick();
     timer.mark(Stage::Setup);
     tick();
+    timer.mark(Stage::Develop);
+    tick();
     timer.mark(Stage::Align);
     tick();
     timer.mark(Stage::Fuse);
@@ -33,6 +35,7 @@ fn stages_accumulate_independently() {
 
     let timings = timer.finish();
     assert!(timings.setup.unwrap() > 0.0);
+    assert!(timings.develop.unwrap() > 0.0);
     assert!(timings.align.unwrap() > 0.0);
     assert!(timings.fuse.unwrap() > 0.0);
     assert!(timings.finalize.unwrap() > 0.0);
@@ -75,6 +78,7 @@ fn a_stage_never_entered_is_null_not_zero() {
         serde_json::Value::Null,
         "a stage never entered must serialize as null, not 0.0: {value}"
     );
+    assert_eq!(value["develop"], serde_json::Value::Null);
     assert_eq!(value["fuse"], serde_json::Value::Null);
     assert_eq!(value["warp_write"], serde_json::Value::Null);
     assert_eq!(value["finalize"], serde_json::Value::Null);
@@ -115,6 +119,8 @@ fn marked_stages_sum_to_the_timer_total() {
     tick();
     timer.mark(Stage::Setup);
     tick();
+    timer.mark(Stage::Develop);
+    tick();
     timer.mark(Stage::Align);
     tick();
     timer.mark(Stage::Fuse);
@@ -124,6 +130,7 @@ fn marked_stages_sum_to_the_timer_total() {
     let timings = timer.finish();
 
     let sum = timings.setup.unwrap()
+        + timings.develop.unwrap()
         + timings.align.unwrap()
         + timings.fuse.unwrap()
         + timings.finalize.unwrap();

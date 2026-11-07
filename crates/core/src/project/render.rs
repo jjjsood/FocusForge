@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use crate::align::{Registration, WarpingReader};
 use crate::equalize::GainReader;
 use crate::io::{FrameSet, TiffSpec, TiffStack, TiffWriter, open_frame_set};
-use crate::retouch::blend;
-use crate::tile::{HostBudget, Rect};
+use crate::retouch::blend::{self, Blend};
+use crate::tile::{HostBudget, Rect, Sample, SampleFormat};
 use crate::zmap::ZMapInfo;
 
 use super::checkpoint::{Checkpoint, FuseRecord, Op};
@@ -26,7 +26,7 @@ use super::error::ProjectError;
 use super::manifest::PlaneRef;
 use super::seal::HeldCheckpoint;
 use super::validate::check_sources;
-use super::{Project, READ_BAND_BYTES};
+use super::{LeSample, Project, READ_BAND_BYTES};
 
 /// A checkpoint's rendered image, resolved and shape-checked but not yet
 /// streamed: every refusal [`Self::prepare`] or [`Self::prepare_held`] can
@@ -38,6 +38,9 @@ pub struct CheckpointImage {
     pub height: u32,
     pub samples_per_pixel: u32,
     pub description: String,
+    /// What the image renders in: `U16` for a TIFF project, `F32` for one
+    /// whose document keeps values outside the 16-bit range.
+    pub sample_format: SampleFormat,
     body: Body,
 }
 
@@ -92,7 +95,11 @@ pub struct PendingState {
 
 /// The band sink every render path hands its bands to: samples plus the
 /// rect they cover, in image coordinates.
-pub(super) type RenderSink<'a> = dyn FnMut(&[u16], Rect) -> Result<(), ProjectError> + 'a;
+pub(super) type RenderSink<'a, S = u16> = dyn FnMut(&[S], Rect) -> Result<(), ProjectError> + 'a;
+
+/// A sample type the render function runs in.
+trait DocumentSample: Blend + LeSample {}
+impl<S: Blend + LeSample> DocumentSample for S {}
 
 /// Bound to whatever produced the [`CheckpointImage`] being written -- a
 /// live project or a [`PendingState`] -- so a writer function need not know
@@ -100,12 +107,13 @@ pub(super) type RenderSink<'a> = dyn FnMut(&[u16], Rect) -> Result<(), ProjectEr
 pub(super) type Renderer<'a> = dyn FnMut(&mut RenderSink<'_>) -> Result<(), ProjectError> + 'a;
 
 impl CheckpointImage {
-    fn shaped(composite: &PlaneRef, body: Body) -> Self {
+    fn shaped(composite: &PlaneRef, sample_format: SampleFormat, body: Body) -> Self {
         CheckpointImage {
             width: composite.width,
             height: composite.height,
             samples_per_pixel: composite.samples_per_pixel,
             description: composite.description.clone(),
+            sample_format,
             body,
         }
     }
@@ -123,9 +131,14 @@ impl CheckpointImage {
         let record = project.fuse_state(id)?;
 
         let composite = record.composite.clone();
+        let format = project.plane_format(&composite)?;
         let ops = project.history().op_chain(id)?;
         if ops.is_empty() {
-            return Ok(Self::shaped(&composite, Body::Fused(record.composite)));
+            return Ok(Self::shaped(
+                &composite,
+                format,
+                Body::Fused(record.composite),
+            ));
         }
 
         check_alignment(project, &checkpoint, &record)?;
@@ -138,6 +151,7 @@ impl CheckpointImage {
         let strokes = place_strokes(ops.into_iter(), info)?;
         Ok(Self::shaped(
             &composite,
+            format,
             Body::Ops {
                 checkpoint: Box::new(checkpoint),
                 ancestor: Box::new(record),
@@ -149,7 +163,7 @@ impl CheckpointImage {
     /// The render of a held result: its composite TIFF, with no project and
     /// no source frame.
     pub fn prepare_held(held: &HeldCheckpoint) -> Result<Self, ProjectError> {
-        let stack = TiffStack::open_files(std::slice::from_ref(&held.composite))
+        let stack = TiffStack::open_staged(&held.composite)
             .map_err(|err| ProjectError::container(&held.composite, err))?;
         if stack.dimensions() != (held.width, held.height) {
             let (width, height) = stack.dimensions();
@@ -166,6 +180,7 @@ impl CheckpointImage {
             height: held.height,
             samples_per_pixel: stack.header(0).samples_per_pixel,
             description: held.composite_description.clone(),
+            sample_format: stack.sample_format(),
             body: Body::Held(held.composite.clone()),
         })
     }
@@ -178,7 +193,7 @@ impl CheckpointImage {
     /// against, so a changed file is not detected.
     pub fn prepare_pending(state: &PendingState) -> Result<Self, ProjectError> {
         let composite = &state.composite;
-        let stack = TiffStack::open_files(std::slice::from_ref(composite))
+        let stack = TiffStack::open_staged(composite)
             .map_err(|err| ProjectError::container(composite, err))?;
         let (width, height) = stack.dimensions();
         let samples_per_pixel = stack.header(0).samples_per_pixel;
@@ -192,6 +207,7 @@ impl CheckpointImage {
             height,
             samples_per_pixel,
             description: state.description.clone(),
+            sample_format: stack.sample_format(),
             body: Body::Pending {
                 composite: composite.clone(),
                 sources: state.sources.clone(),
@@ -217,13 +233,62 @@ impl CheckpointImage {
     /// coordinates, always inside `tile`. A saved image reads its whole
     /// plane even for a small tile, so its stored hash is still verified;
     /// a held or pending image reads only the rows `tile` covers. `project`
-    /// is needed for a saved image and unused for the others.
+    /// is needed for a saved image and unused for the others. An `f32` image
+    /// is rendered in `f32` and each band narrowed with `u16::narrow`.
     pub fn render(
         &self,
         project: Option<&mut Project>,
         tile: Rect,
         sink: &mut RenderSink<'_>,
     ) -> Result<(), ProjectError> {
+        match self.sample_format {
+            SampleFormat::U16 => self.render_as::<u16>(project, tile, sink),
+            SampleFormat::F32 => {
+                let mut narrowed: Vec<u16> = Vec::new();
+                self.render_as::<f32>(project, tile, &mut |band, rect| {
+                    narrowed.clear();
+                    narrowed.extend(band.iter().map(|&v| u16::narrow(v)));
+                    sink(&narrowed, rect)
+                })
+            }
+        }
+    }
+
+    /// [`Self::render`] in `f32`, nothing clipped. Refuses an image that is
+    /// not `f32`: a 16-bit image is neither widened nor narrowed here.
+    pub fn render_f32(
+        &self,
+        project: Option<&mut Project>,
+        tile: Rect,
+        sink: &mut RenderSink<'_, f32>,
+    ) -> Result<(), ProjectError> {
+        if self.sample_format != SampleFormat::F32 {
+            let path = match &self.body {
+                Body::Held(path) => path.clone(),
+                Body::Pending { composite, .. } => composite.clone(),
+                Body::Fused(_) | Body::Ops { .. } => project
+                    .as_deref()
+                    .map_or_else(PathBuf::new, |p| p.path().to_path_buf()),
+            };
+            return Err(ProjectError::container(
+                &path,
+                "the image holds 16-bit samples, not f32",
+            ));
+        }
+        self.render_as::<f32>(project, tile, sink)
+    }
+
+    fn render_as<S: DocumentSample>(
+        &self,
+        project: Option<&mut Project>,
+        tile: Rect,
+        sink: &mut RenderSink<'_, S>,
+    ) -> Result<(), ProjectError> {
+        assert_eq!(
+            S::FORMAT,
+            self.sample_format,
+            "rendered in the image's own type"
+        );
         assert_eq!(
             self.full().intersect(tile),
             Some(tile),
@@ -427,13 +492,13 @@ fn warp<'a>(
 }
 
 /// A sink handing `sink` only the part of each band that lies inside `tile`.
-fn crop_bands<'a, 'b>(
+fn crop_bands<'a, 'b, S: Sample>(
     tile: Rect,
     samples_per_pixel: u32,
-    sink: &'a mut RenderSink<'b>,
-) -> impl FnMut(&[u16], Rect) -> Result<(), ProjectError> + 'a {
+    sink: &'a mut RenderSink<'b, S>,
+) -> impl FnMut(&[S], Rect) -> Result<(), ProjectError> + 'a {
     let spp = samples_per_pixel as usize;
-    let mut scratch: Vec<u16> = Vec::new();
+    let mut scratch: Vec<S> = Vec::new();
     move |band, rect| {
         let Some(part) = tile.intersect(rect) else {
             return Ok(());
@@ -456,17 +521,17 @@ fn crop_bands<'a, 'b>(
 
 /// Streams `tile` of the TIFF at `path` in bands of at most
 /// [`READ_BAND_BYTES`], reading only the rows the tile covers.
-fn render_held(
+fn render_held<S: DocumentSample>(
     path: &Path,
     samples_per_pixel: u32,
     tile: Rect,
-    sink: &mut RenderSink<'_>,
+    sink: &mut RenderSink<'_, S>,
 ) -> Result<(), ProjectError> {
-    let stack = TiffStack::open_files(&[path.to_path_buf()])
-        .map_err(|err| ProjectError::container(path, err))?;
+    let stack = TiffStack::open_staged(path).map_err(|err| ProjectError::container(path, err))?;
     let row_samples = tile.width as usize * samples_per_pixel as usize;
-    let rows = (READ_BAND_BYTES / (row_samples * 2)).clamp(1, tile.height as usize) as u32;
-    let mut band = vec![0u16; row_samples * rows as usize];
+    let bytes = S::FORMAT.bytes() as usize;
+    let rows = (READ_BAND_BYTES / (row_samples * bytes)).clamp(1, tile.height as usize) as u32;
+    let mut band = vec![S::default(); row_samples * rows as usize];
     let end = tile.y + tile.height;
     let mut y = tile.y;
     while y < end {
@@ -477,9 +542,7 @@ fn render_held(
             height: rows.min(end - y),
         };
         let samples = &mut band[..row_samples * rect.height as usize];
-        stack
-            .read_tile_into(0, rect, samples)
-            .map_err(|err| ProjectError::container(path, err))?;
+        S::read_tile(&stack, 0, rect, samples).map_err(|err| ProjectError::container(path, err))?;
         sink(samples, rect)?;
         y += rect.height;
     }
@@ -489,13 +552,13 @@ fn render_held(
 /// [`Project::read_plane_ref_into`], with a sink that can fail -- what the
 /// fused body streams into, and what the op-bearing body reads the
 /// ancestor's composite bands through.
-fn stream_plane_to_sink(
+fn stream_plane_to_sink<S: DocumentSample>(
     project: &mut Project,
     plane_ref: &PlaneRef,
-    sink: &mut RenderSink<'_>,
+    sink: &mut RenderSink<'_, S>,
 ) -> Result<(), ProjectError> {
     let mut failure: Option<ProjectError> = None;
-    project.read_plane_ref_into(plane_ref, &mut |band, rect| {
+    project.read_plane_ref_as::<S>(plane_ref, &mut |band, rect| {
         if failure.is_some() {
             return;
         }
@@ -512,16 +575,16 @@ fn stream_plane_to_sink(
 /// A sink blending each of `strokes` that meets a band over it, in log order,
 /// from its frame read through `warping` at the crop `origin`, then handing the
 /// band to `sink`. `context` names the error when a frame read fails.
-fn blend_bands<'a, 'b>(
+fn blend_bands<'a, 'b, S: DocumentSample>(
     strokes: &'a [&'a PlacedStroke],
     info: ZMapInfo,
     warping: &'a WarpingReader<'a>,
     origin: (u32, u32),
     samples_per_pixel: usize,
     context: &'a Path,
-    sink: &'a mut RenderSink<'b>,
-) -> impl FnMut(&[u16], Rect) -> Result<(), ProjectError> + 'a {
-    let mut blended: Vec<u16> = Vec::new();
+    sink: &'a mut RenderSink<'b, S>,
+) -> impl FnMut(&[S], Rect) -> Result<(), ProjectError> + 'a {
+    let mut blended: Vec<S> = Vec::new();
     move |band, rect| {
         let placed: Vec<blend::PlacedStroke> = strokes
             .iter()
@@ -545,7 +608,7 @@ fn blend_bands<'a, 'b>(
             warping,
             origin,
             samples_per_pixel,
-            blend::apply,
+            blend::apply::<S>,
         )
         .map_err(|err| ProjectError::container(context, err))?;
         sink(&blended, rect)
@@ -556,14 +619,14 @@ fn blend_bands<'a, 'b>(
 /// per pixel), each of `strokes` the tile meets blended in over it in log
 /// order from its frame, read through the gains and alignment of
 /// `registration`.
-fn render_pending(
+fn render_pending<S: DocumentSample>(
     composite: &Path,
     sources: &[PathBuf],
     registration: &Registration,
     (info, spp): (ZMapInfo, u32),
     strokes: &[PlacedStroke],
     tile: Rect,
-    sink: &mut RenderSink<'_>,
+    sink: &mut RenderSink<'_, S>,
 ) -> Result<(), ProjectError> {
     let touching: Vec<&PlacedStroke> = strokes
         .iter()
@@ -590,13 +653,13 @@ fn render_pending(
 /// `ancestor`'s stored composite over `tile`, each stroke the tile meets
 /// blended in over it in log order from its frame, read through the gains and
 /// alignment the fusion used.
-fn render_ops(
+fn render_ops<S: DocumentSample>(
     project: &mut Project,
     checkpoint: &Checkpoint,
     ancestor: &FuseRecord,
     strokes: &[PlacedStroke],
     tile: Rect,
-    sink: &mut RenderSink<'_>,
+    sink: &mut RenderSink<'_, S>,
 ) -> Result<(), ProjectError> {
     let spp = ancestor.composite.samples_per_pixel;
     let touching: Vec<&PlacedStroke> = strokes
@@ -643,21 +706,55 @@ fn render_ops(
     )
 }
 
-/// A saved checkpoint's image as a TIFF: [`CheckpointImage::prepare`] then
-/// [`CheckpointImage::render`] into a `.partial` sibling of `path`, renamed
-/// onto it only once every band has been written; removed instead on any
-/// error, so a refused or interrupted render leaves nothing behind.
+/// A saved checkpoint's image as a TIFF holding the image's own samples: a
+/// 16-bit file for a `u16` image, a 32-bit float file for an `f32` one, values
+/// above white included. [`CheckpointImage::prepare`] then the render, into a
+/// `.partial` sibling of `path`, renamed onto it only once every band has
+/// been written; removed instead on any error, so a refused or interrupted
+/// render leaves nothing behind.
 pub fn render_checkpoint(project: &mut Project, id: &str, path: &Path) -> Result<(), ProjectError> {
     let image = CheckpointImage::prepare(project, id)?;
-    write_tiff(
-        &image,
-        &mut |sink| image.render(Some(&mut *project), image.full(), sink),
-        path,
-    )
+    match image.sample_format {
+        SampleFormat::U16 => write_tiff(
+            &image,
+            &mut |sink| image.render(Some(&mut *project), image.full(), sink),
+            path,
+        ),
+        SampleFormat::F32 => write_tiff_f32(&image, project, path),
+    }
 }
 
-/// The default 16-bit uncompressed TIFF encoder: the view render's only
-/// encoder, and every export format's own `Tiff{Sixteen, None}` case.
+/// [`write_tiff`] for an `f32` image: its unclipped render as a 32-bit float
+/// TIFF.
+fn write_tiff_f32(
+    image: &CheckpointImage,
+    project: &mut Project,
+    path: &Path,
+) -> Result<(), ProjectError> {
+    write_via_partial(path, |partial| {
+        let mut writer = TiffWriter::create_f32(
+            partial,
+            TiffSpec {
+                width: image.width,
+                height: image.height,
+                samples_per_pixel: image.samples_per_pixel,
+                description: Some(image.description.clone()),
+            },
+        )
+        .map_err(|err| ProjectError::container(partial, err))?;
+        image.render_f32(Some(project), image.full(), &mut |band, rect| {
+            writer
+                .write_tile_f32(rect, band)
+                .map_err(|err| ProjectError::container(path, err))
+        })?;
+        writer
+            .finish()
+            .map_err(|err| ProjectError::container(path, err))
+    })
+}
+
+/// The default 16-bit uncompressed TIFF encoder: the view render's encoder
+/// for a `u16` image, and every export format's own `Tiff{Sixteen, None}` case.
 /// `render` streams `image`'s bands -- bound to whatever produced it, a
 /// live project or a caller-supplied Z-Map file.
 pub(super) fn write_tiff(

@@ -1,10 +1,10 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH focusforge-cli-align 1  "align 0.1.0" 
+.TH focusforge-cli-align 1  "align 0.2.0-rc.1" 
 .SH NAME
 focusforge\-cli\-align \- Compute and report the per\-frame transforms for a stack: readable text by default, a `\-\-json` document on request, and an optional per\-frame warped\-TIFF dump for a visual check
 .SH SYNOPSIS
-\fBfocusforge\-cli align\fR [\fB\-\-algorithm\fR] [\fB\-\-json\fR] [\fB\-\-strict\fR] [\fB\-\-write\-warped\fR] [\fB\-\-set\fR] [\fB\-\-max\-host\-memory\fR] [\fB\-\-max\-vram\fR] [\fB\-\-no\-progress\fR] [\fB\-\-preset\fR] [\fB\-\-write\-preset\fR] [\fB\-\-status\fR] [\fB\-v \fR]... [\fB\-\-cpu\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDIR\fR> 
+\fBfocusforge\-cli align\fR [\fB\-\-algorithm\fR] [\fB\-\-json\fR] [\fB\-\-strict\fR] [\fB\-\-write\-warped\fR] [\fB\-\-set\fR] [\fB\-\-max\-host\-memory\fR] [\fB\-\-max\-vram\fR] [\fB\-\-no\-progress\fR] [\fB\-\-preset\fR] [\fB\-\-write\-preset\fR] [\fB\-\-status\fR] [\fB\-\-cpu\fR] [\fB\-v \fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDIR\fR> 
 .SH DESCRIPTION
 Compute and report the per\-frame transforms for a stack: readable text by default, a `\-\-json` document on request, and an optional per\-frame warped\-TIFF dump for a visual check
 .SH OPTIONS
@@ -42,11 +42,11 @@ Write the preset that reproduces this run to this path: `align\-algo` plus the `
 \fB\-\-status\fR \fI<PATH>\fR
 Append one NDJSON status record for this run to this path
 .TP
-\fB\-v\fR
-Increase log detail (repeatable)
-.TP
 \fB\-\-cpu\fR
 Force the CPU path even when a usable GPU adapter is available: the alignment\*(Aqs large levels and the `\-\-write\-warped` fuse backend both stay on the CPU. Only present when the `gpu` feature is compiled in
+.TP
+\fB\-v\fR
+Increase log detail (repeatable)
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
 Log errors only
@@ -57,4 +57,4 @@ Print help
 <\fIDIR\fR>
 Directory of TIFF frames to align (non\-recursive, descending into `<dir>/frames` when that subdirectory exists)
 .SH VERSION
-v0.1.0
+v0.2.0\-rc.1

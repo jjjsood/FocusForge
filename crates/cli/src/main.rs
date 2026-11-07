@@ -12,13 +12,71 @@ use std::process::ExitCode;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use focusforge_core::io::{
-    ByteOrder, FrameDesc, RAW_EXTENSIONS, RawMetadata, RawStack, TiffError, TiffHeader,
-    all_frame_paths, classify_header, has_extension, is_frame_path,
+    ByteOrder, FrameDesc, FrameReader, JPEG_EXTENSIONS, JpegStack, RAW_EXTENSIONS, RawMetadata,
+    RawStack, ReaderKind, TiffError, TiffHeader, all_frame_paths, classify_header, has_extension,
+    is_frame_path,
 };
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::Project;
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
+
+/// Set once a write to stdout finds its reader gone.
+#[cfg(not(test))]
+static STDOUT_CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Shadows std's `println!` in every module below. Once stdout's reader has
+/// gone away, this and every later call drops its output, so the command
+/// runs on to its own exit status; any other write error panics as std's
+/// does.
+#[cfg(not(test))]
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        use std::sync::atomic::Ordering::Relaxed;
+        if !$crate::STDOUT_CLOSED.load(Relaxed) {
+            if let Err(err) = writeln!(std::io::stdout().lock(), $($arg)*) {
+                if err.kind() != std::io::ErrorKind::BrokenPipe {
+                    panic!("failed printing to stdout: {err}");
+                }
+                $crate::STDOUT_CLOSED.store(true, Relaxed);
+            }
+        }
+    }};
+}
+
+/// Set once a write to stderr finds its reader gone.
+#[cfg(not(test))]
+static STDERR_CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Shadows std's `eprintln!` and `eprint!` in every module below, the way
+/// `println!` is shadowed for stdout: output is dropped once stderr's reader
+/// has gone away, and any other write error panics as std's does.
+#[cfg(not(test))]
+macro_rules! write_stderr {
+    ($write:ident, $($arg:tt)*) => {{
+        use std::io::Write as _;
+        use std::sync::atomic::Ordering::Relaxed;
+        if !$crate::STDERR_CLOSED.load(Relaxed) {
+            if let Err(err) = $write!(std::io::stderr().lock(), $($arg)*) {
+                if err.kind() != std::io::ErrorKind::BrokenPipe {
+                    panic!("failed printing to stderr: {err}");
+                }
+                $crate::STDERR_CLOSED.store(true, Relaxed);
+            }
+        }
+    }};
+}
+
+#[cfg(not(test))]
+macro_rules! eprintln {
+    ($($arg:tt)*) => { write_stderr!(writeln, $($arg)*) };
+}
+
+#[cfg(not(test))]
+macro_rules! eprint {
+    ($($arg:tt)*) => { write_stderr!(write, $($arg)*) };
+}
 
 mod algorithms;
 mod align;
@@ -34,9 +92,11 @@ mod progress;
 mod retouch;
 mod review;
 mod set;
+mod sharp_areas;
 mod signals;
 mod stack;
 mod status;
+mod step_plan;
 
 /// Resolves whether this run takes the GPU path or the CPU one:
 /// `#[cfg(feature = "gpu")]` delegates to [`gpu::resolve_backend`]; with the
@@ -109,7 +169,7 @@ fn verbosity(cli: &Cli) -> i8 {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Print project, TIFF or RAW metadata for a file, or for every frame in a directory.
+    /// Print project, TIFF, JPEG or RAW metadata for a file, or for every frame in a directory.
     Info {
         /// Path to a file or directory.
         path: PathBuf,
@@ -128,12 +188,44 @@ enum Command {
         #[command(flatten)]
         set: set::SetArgs,
     },
-    /// Fuse supported TIFF or RAW frames of a directory into one **project** per
+    /// Compute the focus step, frame count, duration and disk need of a focus stack.
+    ///
+    /// Depth of field is DOF = 0.55 µm / NA². A lens has NA = 1 / (2 · N · (1 + m))
+    /// from its marked f-stop N and the magnification m; an objective states its
+    /// NA. The step is DOF · (1 − overlap).
+    #[command(after_help = set::parameter_help(&focusforge_core::step_plan::PLAN_PARAMS))]
+    StepPlan {
+        #[command(flatten)]
+        set: set::SetArgs,
+        /// Print the plan as one JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Count the areas of the image that are sharpest in each frame of a stack.
+    ///
+    /// The image is divided into square cells. A cell is counted in the frame where
+    /// its mean focus score peaks, when that peak exceeds the contrast times the cell's
+    /// lowest score over the stack; a cell without that contrast is counted in no frame.
+    /// Frames are counted as read, without alignment.
+    #[command(after_help = set::parameter_help(&focusforge_core::sharp_areas::SHARP_AREA_PARAMS))]
+    SharpAreas {
+        /// Directory of frames to count (non-recursive, descending into a `frames` subdirectory).
+        dir: PathBuf,
+        #[command(flatten)]
+        set: set::SetArgs,
+        /// Print the counts as one JSON object.
+        #[arg(long)]
+        json: bool,
+        /// How many frames are read at once; the counts are the same at either value.
+        #[arg(long, value_enum, default_value_t = sharp_areas::Priority::Normal)]
+        priority: sharp_areas::Priority,
+    },
+    /// Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per
     /// detected stack, through a registered stacking algorithm. A run
     /// prepares projects for review; it does not export images -- run
     /// `focusforge-cli export` for that.
     Stack {
-        /// Directory of TIFF or supported RAW frames to fuse (non-recursive, descending into
+        /// Directory of TIFF, 8-bit JPEG or supported RAW frames to fuse (non-recursive, descending into
         /// `<dir>/frames` when that subdirectory exists).
         dir: PathBuf,
         /// Directory to collect this run's projects into. Omit to write
@@ -420,6 +512,16 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Ask the release server whether a newer FocusForge release exists.
+    ///
+    /// Makes one request that carries only the program version. Exit status:
+    /// 0 when this version is up to date, 3 when a newer release is
+    /// available, 1 when the check failed.
+    CheckUpdate {
+        /// Emit the JSON report instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -433,6 +535,8 @@ fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Info { .. } => "info",
         Command::Algorithms { .. } => "algorithms",
+        Command::StepPlan { .. } => "step-plan",
+        Command::SharpAreas { .. } => "sharp-areas",
         Command::Stack { .. } => "stack",
         Command::Export { .. } => "export",
         Command::Retouch { .. } => "retouch",
@@ -441,13 +545,20 @@ fn command_name(command: &Command) -> &'static str {
         Command::Review { .. } => "review",
         Command::Cache { .. } => "cache",
         Command::Diagnostics { .. } => "diagnostics",
+        Command::CheckUpdate { .. } => "check-update",
     }
 }
 
 const ROOT_CATEGORIES: [(&str, &[&str]); 3] = [
     ("Processing", &["stack", "align", "retouch", "export"]),
-    ("Inspection", &["info", "review", "algorithms"]),
-    ("Maintenance", &["history", "cache", "diagnostics"]),
+    (
+        "Inspection",
+        &["info", "review", "algorithms", "step-plan", "sharp-areas"],
+    ),
+    (
+        "Maintenance",
+        &["history", "cache", "diagnostics", "check-update"],
+    ),
 ];
 
 fn categorized_root_help_template(
@@ -527,6 +638,13 @@ fn main() -> ExitCode {
     match cli.command {
         Command::Info { path, json } => info(&path, json),
         Command::Algorithms { id, json, set } => algorithms::run(id.as_deref(), json, &set),
+        Command::StepPlan { set, json } => step_plan::run(&set, json),
+        Command::SharpAreas {
+            dir,
+            set,
+            json,
+            priority,
+        } => sharp_areas::run(&dir, &set, json, priority),
         Command::Stack {
             dir,
             output,
@@ -672,6 +790,79 @@ fn main() -> ExitCode {
             include_minidumps,
             force,
         } => diagnostics::run(output.as_deref(), include_minidumps, force),
+        Command::CheckUpdate { json } => check_update(json),
+    }
+}
+
+/// The `check-update --json` report.
+#[derive(Serialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case")]
+enum CheckUpdateReport {
+    UpToDate {
+        running: &'static str,
+    },
+    Newer {
+        running: &'static str,
+        version: String,
+        url: String,
+    },
+    Failed {
+        running: &'static str,
+        reason: String,
+    },
+}
+
+/// The override value when it names an endpoint; unset and empty mean none.
+fn release_url_override(value: Option<String>) -> Option<String> {
+    value.filter(|url| !url.is_empty())
+}
+
+fn check_update(json: bool) -> ExitCode {
+    use focusforge_core::update::{HttpReleaseSource, UpdateCheck, check};
+
+    let running = env!("CARGO_PKG_VERSION");
+    let source = match release_url_override(std::env::var("FOCUSFORGE_RELEASE_URL").ok()) {
+        Some(url) => HttpReleaseSource::with_url(url),
+        None => HttpReleaseSource::new(),
+    };
+    let (report, text, code) = match check(&source, running, None) {
+        UpdateCheck::UpToDate => (
+            CheckUpdateReport::UpToDate { running },
+            format!("FocusForge {running} is up to date"),
+            0,
+        ),
+        UpdateCheck::Newer { version, url } => (
+            CheckUpdateReport::Newer {
+                running,
+                version: version.to_string(),
+                url: url.clone(),
+            },
+            format!("FocusForge {version} is available (running {running}): {url}"),
+            3,
+        ),
+        UpdateCheck::Failed(failure) => (
+            CheckUpdateReport::Failed {
+                running,
+                reason: failure.to_string(),
+            },
+            format!("update check failed: {failure}"),
+            1,
+        ),
+    };
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{text}"),
+            Err(err) => return fail(format!("failed to serialize JSON: {err}")),
+        }
+    }
+    match code {
+        1 => fail(text),
+        _ => {
+            if !json {
+                println!("{text}");
+            }
+            ExitCode::from(code)
+        }
     }
 }
 
@@ -712,6 +903,9 @@ struct FileReport {
     path: String,
     width: Option<u32>,
     height: Option<u32>,
+    /// EXIF Orientation of a TIFF frame; `width` and `height` are already
+    /// upright.
+    orientation: Option<u16>,
     bits_per_sample: Option<Vec<u16>>,
     samples_per_pixel: Option<u32>,
     byte_order: Option<String>,
@@ -821,11 +1015,12 @@ fn byte_order_str(order: ByteOrder) -> &'static str {
     }
 }
 
-/// `info`'s two report-don't-refuse exceptions: a single named file that
-/// fails to parse structurally, and a directory with zero frames. Both exit
-/// 1 with `error: <TiffError>`; every other case -- a member of a listing,
-/// a policy refusal like an unsupported compression -- stays exit 0,
-/// refusal or failure carried as data instead.
+/// `info` reports rather than refuses: a single named file that fails to
+/// parse structurally, and a directory with zero frames, exit 1 with
+/// `error: <TiffError>`. A directory listing prints every member, then exits
+/// 5 when any member could not be read (`unreadable_count`), so a script can
+/// tell a partial listing from a clean one. A policy refusal like an
+/// unsupported compression is carried as data and exits 0.
 fn info(path: &Path, json: bool) -> ExitCode {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -847,6 +1042,10 @@ fn info(path: &Path, json: bool) -> ExitCode {
             if let Err(err) = RawStack::open_files(&[path.to_path_buf()]) {
                 return fail(err);
             }
+        } else if is_jpeg_path(path) {
+            if let Err(err) = JpegStack::open_files(&[path.to_path_buf()]) {
+                return fail(err);
+            }
         } else if let Err(err) = TiffHeader::open(path) {
             return fail(err);
         }
@@ -864,6 +1063,9 @@ fn info(path: &Path, json: bool) -> ExitCode {
         print_human(&report);
     }
 
+    if is_directory && report.unreadable_count > 0 {
+        return ExitCode::from(5);
+    }
     ExitCode::SUCCESS
 }
 
@@ -941,11 +1143,15 @@ fn is_raw_path(path: &Path) -> bool {
     has_extension(path, RAW_EXTENSIONS)
 }
 
+fn is_jpeg_path(path: &Path) -> bool {
+    has_extension(path, JPEG_EXTENSIONS)
+}
+
 fn info_frame_paths(dir: &Path) -> Result<Vec<PathBuf>, TiffError> {
     let paths = all_frame_paths(dir)?;
     let paths: Vec<_> = paths
         .into_iter()
-        .filter(|path| is_raw_path(path) || is_frame_path(path))
+        .filter(|path| is_raw_path(path) || is_jpeg_path(path) || is_frame_path(path))
         .collect();
     if paths.is_empty() {
         return Err(TiffError::NoFrames {
@@ -962,13 +1168,14 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
     enum Probe {
         Tiff(Box<TiffHeader>),
         Raw(Box<RawMetadata>, Box<FrameDesc>),
+        Jpeg(Box<FrameDesc>),
     }
 
     impl Probe {
         fn desc(&self) -> FrameDesc {
             match self {
                 Self::Tiff(header) => FrameDesc::from(header.as_ref()),
-                Self::Raw(_, desc) => (**desc).clone(),
+                Self::Raw(_, desc) | Self::Jpeg(desc) => (**desc).clone(),
             }
         }
     }
@@ -998,6 +1205,10 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                         )?;
                         Ok(Probe::Raw(Box::new(metadata), Box::new(desc)))
                     })
+                    .map_err(|error| error.to_string())
+            } else if is_jpeg_path(p) {
+                JpegStack::open_files(std::slice::from_ref(p))
+                    .map(|stack| Probe::Jpeg(Box::new(stack.frame(0).clone())))
                     .map_err(|error| error.to_string())
             } else {
                 TiffHeader::open(p)
@@ -1034,8 +1245,9 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
             Ok(Probe::Tiff(h)) => FileReport {
                 name: p.name.clone(),
                 path: p.path.display().to_string(),
-                width: Some(h.width),
-                height: Some(h.height),
+                width: Some(h.upright_dimensions().0),
+                height: Some(h.upright_dimensions().1),
+                orientation: Some(h.orientation),
                 bits_per_sample: Some(h.bits_per_sample.to_vec()),
                 samples_per_pixel: Some(h.samples_per_pixel),
                 byte_order: Some(byte_order_str(h.byte_order).to_string()),
@@ -1057,6 +1269,7 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 path: p.path.display().to_string(),
                 width: None,
                 height: None,
+                orientation: None,
                 bits_per_sample: None,
                 samples_per_pixel: None,
                 byte_order: None,
@@ -1075,11 +1288,34 @@ fn build_report(display_path: &Path, is_directory: bool, paths: &[PathBuf]) -> I
                 raw: Some(RawRecord::from(metadata.as_ref())),
                 error: None,
             },
+            Ok(Probe::Jpeg(desc)) => FileReport {
+                name: p.name.clone(),
+                path: p.path.display().to_string(),
+                width: Some(desc.width),
+                height: Some(desc.height),
+                orientation: None,
+                bits_per_sample: Some(vec![8; desc.samples_per_pixel as usize]),
+                samples_per_pixel: Some(desc.samples_per_pixel),
+                byte_order: None,
+                compression: None,
+                photometric: None,
+                planar_config: None,
+                rows_per_strip: None,
+                strip_count: None,
+                file_size: Some(desc.file_size),
+                description: None,
+                mmap_fast_path: None,
+                reader: Some(ReaderKind::Jpeg.name().to_string()),
+                refusal: None,
+                raw: None,
+                error: None,
+            },
             Err(e) => FileReport {
                 name: p.name.clone(),
                 path: p.path.display().to_string(),
                 width: None,
                 height: None,
+                orientation: None,
                 bits_per_sample: None,
                 samples_per_pixel: None,
                 byte_order: None,
@@ -1152,6 +1388,17 @@ fn print_human(report: &InfoReport) {
             println!("  decoder: {}", raw.decoder);
             continue;
         }
+        if file.reader.as_deref() == Some(ReaderKind::Jpeg.name()) {
+            println!(
+                "  {}x{} {}ch 8-bit JPEG file_size={}",
+                file.width.unwrap_or(0),
+                file.height.unwrap_or(0),
+                file.samples_per_pixel.unwrap_or(0),
+                file.file_size.unwrap_or(0),
+            );
+            println!("  reader: {}", ReaderKind::Jpeg.name());
+            continue;
+        }
         println!(
             "  {}x{} {}ch {}-bit {} compression={} planar={} photometric={}",
             file.width.unwrap_or(0),
@@ -1172,6 +1419,9 @@ fn print_human(report: &InfoReport) {
             file.strip_count.unwrap_or(0),
             file.file_size.unwrap_or(0),
         );
+        if let Some(orientation) = file.orientation.filter(|&value| value != 1) {
+            println!("  orientation: {orientation}");
+        }
         if let Some(description) = &file.description {
             println!("  description: {description}");
         }
@@ -1186,22 +1436,34 @@ fn print_human(report: &InfoReport) {
 
     if report.is_directory {
         println!();
-        let raw_count = report
-            .files
-            .iter()
-            .filter(|file| is_raw_path(Path::new(&file.path)))
-            .count();
-        if raw_count == 0 {
+        let count = |is_format: fn(&Path) -> bool| {
+            report
+                .files
+                .iter()
+                .filter(|file| is_format(Path::new(&file.path)))
+                .count()
+        };
+        let (raw_count, jpeg_count) = (count(is_raw_path), count(is_jpeg_path));
+        if raw_count + jpeg_count == 0 {
             println!(
                 "{} TIFFs, {} bytes total",
                 report.frame_count, report.total_bytes
             );
         } else {
+            let mut formats = vec![format!(
+                "{} TIFF",
+                report.frame_count - raw_count - jpeg_count
+            )];
+            if jpeg_count > 0 {
+                formats.push(format!("{jpeg_count} JPEG"));
+            }
+            if raw_count > 0 {
+                formats.push(format!("{raw_count} RAW"));
+            }
             println!(
-                "{} frames ({} TIFF, {} RAW), {} bytes total",
+                "{} frames ({}), {} bytes total",
                 report.frame_count,
-                report.frame_count - raw_count,
-                raw_count,
+                formats.join(", "),
                 report.total_bytes
             );
         }
@@ -1231,11 +1493,22 @@ fn fail_with_code(message: impl std::fmt::Display, code: u8) -> ExitCode {
 mod tests {
     use super::*;
 
+    #[test]
+    fn release_url_override_ignores_unset_and_empty() {
+        assert_eq!(release_url_override(None), None);
+        assert_eq!(release_url_override(Some(String::new())), None);
+        assert_eq!(
+            release_url_override(Some("http://127.0.0.1:9/x".to_string())),
+            Some("http://127.0.0.1:9/x".to_string())
+        );
+    }
+
     fn desc(label: &str, signature: &[&str]) -> FrameDesc {
         FrameDesc {
             path: PathBuf::from(label),
             file_size: 0,
             image_description: None,
+            orientation: 1,
             width: 1,
             height: 1,
             samples_per_pixel: 1,
@@ -2178,7 +2451,7 @@ mod tests {
         assert_eq!(first, generated_cli_assets());
         assert_eq!(
             first.keys().filter(|path| path.starts_with("man")).count(),
-            15
+            18
         );
         let manuals = first
             .keys()
@@ -2191,6 +2464,8 @@ mod tests {
                 std::path::Path::new("man/focusforge-cli.1"),
                 std::path::Path::new("man/focusforge-cli-info.1"),
                 std::path::Path::new("man/focusforge-cli-algorithms.1"),
+                std::path::Path::new("man/focusforge-cli-step-plan.1"),
+                std::path::Path::new("man/focusforge-cli-sharp-areas.1"),
                 std::path::Path::new("man/focusforge-cli-stack.1"),
                 std::path::Path::new("man/focusforge-cli-export.1"),
                 std::path::Path::new("man/focusforge-cli-retouch.1"),
@@ -2199,6 +2474,7 @@ mod tests {
                 std::path::Path::new("man/focusforge-cli-review.1"),
                 std::path::Path::new("man/focusforge-cli-cache.1"),
                 std::path::Path::new("man/focusforge-cli-diagnostics.1"),
+                std::path::Path::new("man/focusforge-cli-check-update.1"),
                 std::path::Path::new("man/focusforge-cli-history-list.1"),
                 std::path::Path::new("man/focusforge-cli-history-delete.1"),
                 std::path::Path::new("man/focusforge-cli-history-compact.1"),
@@ -2289,7 +2565,7 @@ mod tests {
             .keys()
             .filter(|path| path.starts_with("man"))
             .collect::<Vec<_>>();
-        assert_eq!(manuals.len(), 16);
+        assert_eq!(manuals.len(), 19);
         assert!(assets.contains_key(std::path::Path::new("man/focusforge-cli-visible-test.1")));
         assert!(!assets.contains_key(std::path::Path::new("man/focusforge-cli-hidden-test.1")));
         assert!(manuals.iter().all(|path| {
@@ -2336,7 +2612,7 @@ mod tests {
         assert_eq!(first, generated_cli_assets());
         assert_eq!(
             first.keys().filter(|path| path.starts_with("man")).count(),
-            15
+            18
         );
         assert!(first.contains_key(std::path::Path::new("completions/_focusforge-cli.ps1")));
         #[cfg(not(feature = "gpu"))]

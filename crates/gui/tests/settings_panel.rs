@@ -6,6 +6,8 @@
 
 mod common;
 
+use common::element_center;
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -681,7 +683,7 @@ fn reopened_equalized_project_seeds_equalize_and_its_bound() {
     ));
     controller.toggle_section_more("prepare");
     assert_eq!(row(&controller, "equalize").selected, "true");
-    assert_eq!(row(&controller, "equalize-max-gain").value_text, "1.5");
+    assert_eq!(row(&controller, "equalize-max-gain").value_text, "1.50");
     assert_eq!(row(&controller, "equalize-target").value_text, "+0.3");
 
     let mut plain = AppController::new();
@@ -899,15 +901,7 @@ fn layout_survives_a_long_label() {
     use i_slint_backend_testing::ElementQuery;
     use slint::{ComponentHandle, Model as _};
 
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
 
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
@@ -972,29 +966,11 @@ fn panel_scrolls_and_the_heading_sticks() {
     );
 }
 
-fn init_window_backend() {
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
-}
-
 fn mounted(app: &focusforge_gui::AppWindow, id: &str) -> i_slint_backend_testing::ElementHandle {
     i_slint_backend_testing::ElementQuery::from_root(app)
         .match_id(id)
         .find_first()
         .unwrap_or_else(|| panic!("{id} is mounted"))
-}
-
-fn element_center(handle: &i_slint_backend_testing::ElementHandle) -> slint::LogicalPosition {
-    let pos = handle.absolute_position();
-    let size = handle.size();
-    slint::LogicalPosition::new(pos.x + size.width / 2.0, pos.y + size.height / 2.0)
 }
 
 /// Indices whose shown row differs between `old` and `new`, over the rows
@@ -1038,7 +1014,7 @@ fn settings_scrolling_notifies_no_row_and_edits_notify_only_changed_rows() {
     }
 
     enable_trace_accounting();
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let mut controller = AppController::new();
@@ -1213,6 +1189,63 @@ fn settings_scrolling_notifies_no_row_and_edits_notify_only_changed_rows() {
     assert!(resized, "some align algorithm changes the row count");
 }
 
+/// The Levels row and the row after it (`Some` only for an error row), as the
+/// panel shows them now.
+fn levels_row(controller: &AppController) -> (SettingsRow, Option<SettingsRow>) {
+    let rows = controller.settings_panel().rows;
+    let at = row_index(&rows, "fuse", "levels");
+    let error = rows.get(at + 1).filter(|r| r.kind == RowKind::Error);
+    (rows[at].clone(), error.cloned())
+}
+
+/// The Levels slider ends at the deepest level the open stack supports, whether
+/// dragged or stepped; a stored deeper value keeps its readout, shows the
+/// allowed range and refuses Fuse until the slider moves it.
+#[test]
+fn levels_slider_stops_at_the_planned_bound() {
+    let mut big = AppController::new();
+    open_mantis_512(&mut big);
+    big.toggle_section_more("fuse");
+    big.set_param_fraction("fuse", "levels", 1.0);
+    assert_eq!(fuse_value(&big, "levels"), "7", "a 512 px stack ends at 7");
+    big.step_param("fuse", "levels", 1);
+    assert_eq!(
+        fuse_value(&big, "levels"),
+        "7",
+        "Right at the end stores nothing new"
+    );
+    big.step_param("fuse", "levels", -1);
+    assert_eq!(fuse_value(&big, "levels"), "6");
+
+    big.set_param_value("fuse", "levels", ParamValue::Int(16));
+    let (row, error) = levels_row(&big);
+    assert_eq!(
+        row.value_text, "16",
+        "the stored value is shown, not clamped"
+    );
+    assert_eq!(row.fraction, 1.0, "the thumb sits at the end");
+    let error = error.expect("a stored value past the bound shows an error row");
+    assert_eq!(error.value_text, "Allowed range 1 to 7");
+    assert!(
+        !big.start_fuse(),
+        "Fuse is refused while the stored value is out of reach"
+    );
+
+    big.step_param("fuse", "levels", -1);
+    let (row, error) = levels_row(&big);
+    assert_eq!(
+        row.value_text, "7",
+        "moving the slider brings it inside the bound"
+    );
+    assert!(error.is_none(), "and clears the error row");
+
+    let mut small = AppController::new();
+    common::open_mantis64_tab(&mut small, "levels_bound_64", 3);
+    small.toggle_section_more("fuse");
+    small.set_param_fraction("fuse", "levels", 1.0);
+    assert_eq!(fuse_value(&small, "levels"), "4", "a 64 px stack ends at 4");
+}
+
 /// A slider drag keeps its grab across a panel push between two moves.
 #[test]
 fn a_slider_drag_survives_a_panel_push() {
@@ -1220,7 +1253,7 @@ fn a_slider_drag_survives_a_panel_push() {
     use slint::platform::{PointerEventButton, WindowEvent};
     use std::sync::{Arc, Mutex};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let mut controller = AppController::new();
@@ -1278,26 +1311,81 @@ fn a_slider_drag_survives_a_panel_push() {
     assert_ne!(second, first, "the move after the push still drags");
 }
 
+/// The non-compact slider reads its value as plain text, never as a field.
 #[test]
-fn scrollbar_is_a_shared_primitive() {
-    let contents = fs::read_to_string(
-        common::ui_dir()
-            .join("components")
-            .join("ff_scrollbar.slint"),
-    )
-    .unwrap();
-    let code = common::strip_line_comments(&contents);
-    assert_eq!(
-        code.matches("export component").count(),
-        1,
-        "ff_scrollbar.slint must export exactly one component"
+fn ff_slider_readout_is_plain_text() {
+    use slint::ComponentHandle;
+    use std::sync::{Arc, Mutex};
+
+    common::init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let mut controller = AppController::new();
+    common::open_mantis64_tab(&mut controller, "slider_readout", 3);
+    controller.set_fuse_algorithm("weighted-average");
+    controller.toggle_section_more("fuse");
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
     );
-    assert!(code.contains("export component FFScrollbar"));
-    for shell_import in ["shell/", "\"../shell"] {
+    app.set_project_loaded(true);
+    app.set_dock_tab("settings".into());
+    focusforge_gui::bridge::push_settings_panel(&app, &controller.lock().unwrap());
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(0));
+
+    let readouts: Vec<String> = i_slint_backend_testing::ElementQuery::from_root(&app)
+        .match_id("FFSlider::readout")
+        .find_all()
+        .iter()
+        .filter_map(|e| e.accessible_label().map(|l| l.to_string()))
+        .collect();
+    for shown in ["4.0", "16"] {
         assert!(
-            !code.contains(shell_import),
-            "a primitive must import no shell file"
+            readouts.iter().any(|r| r == shown),
+            "no slider readout reads {shown}: {readouts:?}"
         );
+    }
+    let inside_slider = i_slint_backend_testing::ElementQuery::from_root(&app)
+        .match_type_name("FFSlider")
+        .find_all()
+        .iter()
+        .flat_map(|s| s.query_descendants().match_type_name("FFField").find_all())
+        .count();
+    assert_eq!(inside_slider, 0, "a slider contains a field box");
+}
+
+#[test]
+fn scrollbar_and_more_toggle_are_shared_primitives() {
+    for (file, component, forbids_colour_literal) in [
+        ("ff_scrollbar.slint", "FFScrollbar", false),
+        ("ff_more_toggle.slint", "FFMoreToggle", true),
+    ] {
+        let contents = fs::read_to_string(common::ui_dir().join("components").join(file)).unwrap();
+        let code = common::strip_line_comments(&contents);
+        assert_eq!(
+            code.matches("export component").count(),
+            1,
+            "{file} must export exactly one component"
+        );
+        assert!(
+            code.contains(&format!("export component {component}")),
+            "{file} must export {component}"
+        );
+        for shell_import in ["shell/", "\"../shell"] {
+            assert!(
+                !code.contains(shell_import),
+                "{file}: a primitive must import no shell file"
+            );
+        }
+        if forbids_colour_literal {
+            assert!(
+                !code.contains('#'),
+                "{file}: a primitive holds no colour literal"
+            );
+        }
     }
 }
 
@@ -1334,30 +1422,15 @@ fn auto_crop_defaults_on_and_is_a_reversible_flag() {
     );
 }
 
-/// `job_running()` is currently hardcoded `false`, with no way to drive a
-/// real job; what matters here is the wiring from one bool to the *whole*
-/// panel -- opacity and the scroll/click hit-area together, not a per-field
-/// disable -- so the property is driven directly instead.
+/// The panel's disable is one bool for the *whole* panel -- opacity and the
+/// scroll/click hit-area together, not a per-field disable -- so the property
+/// is driven directly on the window.
 #[test]
 fn panel_disable_is_whole_panel() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
 
-    let controller = AppController::new();
-    assert!(
-        !controller.job_running(),
-        "job_running must read false with no job running -- the panel reads it as a whole-panel disable"
-    );
-
-    thread_local! {
-        static INIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_project_loaded(true);
@@ -1478,7 +1551,8 @@ fn fuse_value(controller: &AppController, id: &str) -> String {
         .clone()
 }
 
-/// A fuse parameter's declared default, as the row shows it.
+/// A fuse parameter's declared default, as the row shows it (a float at its
+/// 0.1 step).
 fn fuse_default_text(algorithm: &str, id: &str) -> String {
     let desc = registry::find(algorithm)
         .expect("registered")
@@ -1490,7 +1564,7 @@ fn fuse_default_text(algorithm: &str, id: &str) -> String {
         .clone();
     match desc {
         ParamValue::Int(v) => v.to_string(),
-        ParamValue::Float(v) => format!("{v}"),
+        ParamValue::Float(v) => format!("{v:.1}"),
         other => panic!("unexpected default {other:?}"),
     }
 }
@@ -1549,7 +1623,7 @@ fn switching_methods_remembers_each_methods_values() {
         controller.set_fuse_algorithm("laplacian");
         assert_eq!(fuse_value(&controller, "levels"), "3");
         controller.set_fuse_algorithm("weighted-average");
-        assert_eq!(fuse_value(&controller, "weight-exponent"), "3");
+        assert_eq!(fuse_value(&controller, "weight-exponent"), "3.0");
         assert_eq!(
             fuse_value(&controller, "radius"),
             fuse_default_text("weighted-average", "radius"),
@@ -1654,7 +1728,7 @@ fn reopened_project_remembers_only_its_sealed_method() {
 
     controller.toggle_section_more("fuse");
     assert_eq!(picked_ids(&controller).0, "weighted-average");
-    assert_eq!(fuse_value(&controller, "weight-exponent"), "5");
+    assert_eq!(fuse_value(&controller, "weight-exponent"), "5.0");
 
     controller.set_fuse_algorithm("laplacian");
     assert_eq!(
@@ -1670,7 +1744,7 @@ fn reopened_project_remembers_only_its_sealed_method() {
     controller.set_fuse_algorithm("weighted-average");
     assert_eq!(
         fuse_value(&controller, "weight-exponent"),
-        "5",
+        "5.0",
         "the sealed method's values come back"
     );
 }
@@ -1729,30 +1803,6 @@ fn schema_ids(method: &str) -> Vec<String> {
         .iter()
         .map(|d| d.id.clone())
         .collect()
-}
-
-#[test]
-fn more_toggle_is_a_shared_primitive() {
-    let contents = fs::read_to_string(
-        common::ui_dir()
-            .join("components")
-            .join("ff_more_toggle.slint"),
-    )
-    .unwrap();
-    let code = common::strip_line_comments(&contents);
-    assert_eq!(
-        code.matches("export component").count(),
-        1,
-        "ff_more_toggle.slint must export exactly one component"
-    );
-    assert!(code.contains("export component FFMoreToggle"));
-    for shell_import in ["shell/", "\"../shell"] {
-        assert!(
-            !code.contains(shell_import),
-            "a primitive must import no shell file"
-        );
-    }
-    assert!(!code.contains('#'), "a primitive holds no colour literal");
 }
 
 #[test]
@@ -2316,7 +2366,7 @@ impl MountedPanel {
         use slint::ComponentHandle;
         use std::sync::{Arc, Mutex};
 
-        init_window_backend();
+        common::init_window_backend();
         let app = focusforge_gui::AppWindow::new().unwrap();
         // Tall enough that every strip stays inside the panel's viewport with
         // the Prepare and Fuse sections open: a strip below the viewport's edge
@@ -2543,7 +2593,7 @@ fn reset_all_and_switches_report_their_state() {
     use i_slint_backend_testing::{AccessibleRole, ElementQuery};
     use slint::{ComponentHandle, Model as _};
 
-    init_window_backend();
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     // Tall enough that no row is clipped out of the panel's viewport, where
     // an element query does not look.
@@ -2685,7 +2735,7 @@ fn equalize_off_disables_target_and_max_gain_and_keeps_their_values() {
     );
     assert_eq!(
         prepare_row(&controller, "equalize-max-gain").value_text,
-        "1.5"
+        "1.50"
     );
 
     controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
@@ -2696,7 +2746,7 @@ fn equalize_off_disables_target_and_max_gain_and_keeps_their_values() {
     );
     assert_eq!(
         prepare_row(&controller, "equalize-max-gain").value_text,
-        "1.5"
+        "1.50"
     );
 }
 
@@ -2744,11 +2794,11 @@ fn signed_readout_formats_negative_zero_and_positive() {
         );
     }
 
-    // A range that stays non-negative keeps the plain number.
+    // A range that stays non-negative reads unsigned, at the step's decimals.
     controller.toggle_section_more("fuse");
     controller.set_fuse_algorithm("weighted-average");
     controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(3.0));
-    assert_eq!(fuse_value(&controller, "weight-exponent"), "3");
+    assert_eq!(fuse_value(&controller, "weight-exponent"), "3.0");
 }
 
 #[test]
@@ -2826,7 +2876,7 @@ fn keyboard_step_moves_the_target_by_one_step_and_clamps() {
 
 #[test]
 fn the_panel_is_disabled_without_a_project() {
-    init_window_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     let mut controller = AppController::new();
     focusforge_gui::bridge::push_settings_panel(&app, &controller);

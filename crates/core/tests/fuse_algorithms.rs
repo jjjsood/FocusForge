@@ -9,7 +9,8 @@
 mod common;
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+
+use common::align::stack_context;
 
 use focusforge_core::algorithm::{AlgorithmError, TileCtx, TileReader};
 use focusforge_core::align::{Transform, WarpingReader};
@@ -32,10 +33,10 @@ struct FusionResult {
     frame_count: usize,
 }
 
-/// Runs `algo_id` at `(tile_size, levels)` over `fixtures/mantis-512` into
-/// `.scratch/fuse/<label>.tif` + `-zmap.tif`, and reads both back. `levels`
-/// comes from `algo.tile_support(&values)` unless `levels_override` is
-/// given -- the seam demonstration's only reason to exist.
+/// Runs `algo_id` at `(tile_size, levels)` over `fixtures/mantis-512` into a
+/// per-call temporary directory (`<label>.tif` + `-zmap.tif`), and reads both
+/// back. `levels` comes from `algo.tile_support(&values)` unless
+/// `levels_override` is given, which only the seam demonstration uses.
 fn run_fusion(
     algo_id: &str,
     label: &str,
@@ -84,13 +85,12 @@ fn run_fusion_over(
         .map(TileSupport::from)
         .unwrap_or_else(|| algo.tile_support(&values));
 
-    let scratch_dir = common::workspace_root().join(".scratch").join("fuse");
-    std::fs::create_dir_all(&scratch_dir).expect("scratch dir must be creatable");
-    let composite_path = scratch_dir.join(format!("{label}.tif"));
-    let zmap_path = scratch_dir.join(format!("{label}-zmap.tif"));
+    // Unique per call, so concurrent test processes never share an output path.
+    let temp = common::target_tmp();
+    let composite_path = temp.path().join(format!("{label}.tif"));
+    let zmap_path = temp.path().join(format!("{label}-zmap.tif"));
 
-    let scheduler_scratch =
-        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("fuse_algorithms_{label}"));
+    let scheduler_scratch = temp.path().join("scheduler");
     let mut options = TileSchedulerOptions::explicit_budget(scheduler_scratch, 1 << 30);
     options.apply_support(support);
     options.tile_size = tile_size;
@@ -147,16 +147,6 @@ fn no_explicit() -> ParamValues {
     ParamValues::new()
 }
 
-fn stack_context(stack: &TiffStack) -> StackContext {
-    let (width, height) = stack.dimensions();
-    StackContext::new(
-        stack.len(),
-        width,
-        height,
-        stack.header(0).samples_per_pixel,
-    )
-}
-
 /// Full frames held in memory, served as a [`TileReader`].
 struct MemoryFrames {
     ctx: StackContext,
@@ -181,97 +171,80 @@ impl TileReader for MemoryFrames {
     }
 }
 
-fn weighted_average_tiled() -> &'static FusionResult {
-    static ONCE: OnceLock<FusionResult> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        run_fusion(
-            "weighted-average",
-            "weighted-average-256",
-            256,
-            &no_explicit(),
-            None,
-        )
-    })
+fn weighted_average_tiled() -> FusionResult {
+    run_fusion(
+        "weighted-average",
+        "weighted-average-256",
+        256,
+        &no_explicit(),
+        None,
+    )
 }
 
-fn weighted_average_single_tile() -> &'static FusionResult {
-    static ONCE: OnceLock<FusionResult> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        run_fusion(
-            "weighted-average",
-            "weighted-average-704",
-            704,
-            &no_explicit(),
-            None,
-        )
-    })
+fn weighted_average_single_tile() -> FusionResult {
+    run_fusion(
+        "weighted-average",
+        "weighted-average-704",
+        704,
+        &no_explicit(),
+        None,
+    )
 }
 
 /// The same tiled (256) run, but with the scheduler forced to the trait
 /// *default* `tile_support` would answer (`0`, i.e. no halo at all) --
 /// the halo-free comparison the rest of this suite checks against.
-fn weighted_average_forced_to_the_default_levels() -> &'static FusionResult {
-    static ONCE: OnceLock<FusionResult> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        run_fusion(
-            "weighted-average",
-            "weighted-average-256-levels0",
-            256,
-            &no_explicit(),
-            Some(0),
-        )
-    })
+fn weighted_average_forced_to_the_default_levels() -> FusionResult {
+    run_fusion(
+        "weighted-average",
+        "weighted-average-256-levels0",
+        256,
+        &no_explicit(),
+        Some(0),
+    )
 }
 
-fn depth_map_tiled() -> &'static FusionResult {
-    static ONCE: OnceLock<FusionResult> = OnceLock::new();
-    ONCE.get_or_init(|| run_fusion("depth-map", "depth-map-256", 256, &no_explicit(), None))
+fn depth_map_tiled() -> FusionResult {
+    run_fusion("depth-map", "depth-map-256", 256, &no_explicit(), None)
 }
 
-fn depth_map_single_tile() -> &'static FusionResult {
-    static ONCE: OnceLock<FusionResult> = OnceLock::new();
-    ONCE.get_or_init(|| run_fusion("depth-map", "depth-map-704", 704, &no_explicit(), None))
+fn depth_map_single_tile() -> FusionResult {
+    run_fusion("depth-map", "depth-map-704", 704, &no_explicit(), None)
 }
 
 /// `depth-map` at `(score-radius, smoothing-radius) = (0, 0)`, single-tile
 /// so the coherence comparison is not confounded by any tiling seam.
-fn depth_map_zero_radius() -> &'static FusionResult {
-    static ONCE: OnceLock<FusionResult> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let mut explicit = ParamValues::new();
-        explicit.insert("score-radius".to_string(), ParamValue::Int(0));
-        explicit.insert("smoothing-radius".to_string(), ParamValue::Int(0));
-        run_fusion(
-            "depth-map",
-            "depth-map-704-zero-radius",
-            704,
-            &explicit,
-            None,
-        )
-    })
+fn depth_map_zero_radius() -> FusionResult {
+    let mut explicit = ParamValues::new();
+    explicit.insert("score-radius".to_string(), ParamValue::Int(0));
+    explicit.insert("smoothing-radius".to_string(), ParamValue::Int(0));
+    run_fusion(
+        "depth-map",
+        "depth-map-704-zero-radius",
+        704,
+        &explicit,
+        None,
+    )
 }
 
-/// Every frame of `fixtures/mantis-512`, read once and shared -- the source
-/// data `depth_map_composite_is_its_zmap` and
-/// `weighted_average_zmap_follows_its_rule` both check the algorithms'
-/// outputs against.
-fn all_frames() -> &'static (Vec<Vec<u16>>, u32, u32, u32) {
-    static ONCE: OnceLock<(Vec<Vec<u16>>, u32, u32, u32)> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
-        let (width, height) = stack.dimensions();
-        let spp = stack.header(0).samples_per_pixel;
-        let rect = Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
-        let frames = (0..stack.len())
-            .map(|f| stack.read_tile(f, rect).expect("frame read").samples)
-            .collect();
-        (frames, width, height, spp)
-    })
+/// Every frame of `fixtures/mantis-512` with its width, height and samples
+/// per pixel -- the source data the output checks compare against.
+type SourceFrames = (Vec<Vec<u16>>, u32, u32, u32);
+
+fn all_frames() -> SourceFrames {
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let frames = (0..stack.len())
+        .map(|f| stack.read_tile(f, rect).expect("frame read").samples)
+        .collect();
+    (frames, width, height, spp)
 }
 
 fn open_frame(path: PathBuf) -> (Vec<u16>, u32, u32, u32) {
@@ -351,14 +324,8 @@ fn both_algorithms_are_registered() {
 
 #[test]
 fn every_parameter_is_declared() {
-    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
-    let (width, height) = stack.dimensions();
-    let stack_ctx = StackContext::new(
-        stack.len(),
-        width,
-        height,
-        stack.header(0).samples_per_pixel,
-    );
+    let (stack, stack_ctx) = common::align::open_stack_context("mantis-64");
+    let (width, height) = (stack_ctx.width, stack_ctx.height);
     let rect = Rect {
         x: 0,
         y: 0,
@@ -385,23 +352,34 @@ fn every_parameter_is_declared() {
     }
 }
 
-#[test]
-fn both_outputs_are_produced() {
-    for result in [weighted_average_tiled(), depth_map_tiled()] {
+fn assert_both_outputs_are_produced(weighted_average: &FusionResult, depth_map: &FusionResult) {
+    for (id, result) in [
+        ("weighted-average", weighted_average),
+        ("depth-map", depth_map),
+    ] {
         let pixel_count = (result.width * result.height) as usize;
-        assert_eq!(result.composite.len(), pixel_count * result.spp as usize);
-        assert_eq!(result.zmap.len(), pixel_count);
+        assert_eq!(
+            result.composite.len(),
+            pixel_count * result.spp as usize,
+            "{id} outputs: composite length"
+        );
+        assert_eq!(result.zmap.len(), pixel_count, "{id} outputs: Z-Map length");
         for &index in &result.zmap {
-            assert_ne!(index, NO_SOURCE, "neither algorithm may emit NO_SOURCE");
-            assert!((index as usize) < result.frame_count);
+            assert_ne!(
+                index, NO_SOURCE,
+                "{id} outputs: neither algorithm may emit NO_SOURCE"
+            );
+            assert!(
+                (index as usize) < result.frame_count,
+                "{id} outputs: Z-Map index {index} is out of range for frame_count {}",
+                result.frame_count
+            );
         }
     }
 }
 
-#[test]
-fn weighted_average_zmap_follows_its_rule() {
-    let (frames, width, height, spp) = all_frames();
-    let result = weighted_average_tiled();
+fn assert_weighted_average_zmap_follows_its_rule(source: &SourceFrames, result: &FusionResult) {
+    let (frames, width, height, spp) = source;
 
     let stack_ctx = StackContext::new(frames.len(), *width, *height, *spp);
     let algo = registry::find_stack("weighted-average").expect("weighted-average must resolve");
@@ -434,15 +412,13 @@ fn weighted_average_zmap_follows_its_rule() {
 
     assert_eq!(
         result.zmap, expected_winner,
-        "the recorded index must be the lowest-indexed frame attaining the maximum weight, \
+        "weighted-average Z-Map rule: the recorded index must be the lowest-indexed frame attaining the maximum weight, \
          recomputed from the published sharpness rule"
     );
 }
 
-#[test]
-fn depth_map_composite_is_its_zmap() {
-    let (frames, width, height, spp) = all_frames();
-    let result = depth_map_tiled();
+fn assert_depth_map_composite_is_its_zmap(source: &SourceFrames, result: &FusionResult) {
+    let (frames, width, height, spp) = source;
     let spp_usize = *spp as usize;
 
     for p in 0..(*width as usize * *height as usize) {
@@ -452,16 +428,18 @@ fn depth_map_composite_is_its_zmap() {
             assert_eq!(
                 result.composite[base + c],
                 frames[f][base + c],
-                "pixel {p} channel {c}: composite must equal frames[zmap[p]][p]"
+                "depth-map composite: pixel {p} channel {c}: composite must equal frames[zmap[p]][p]"
             );
         }
     }
 }
 
-#[test]
-fn tiled_matches_single_tile_for_each() {
-    let wa_tiled = weighted_average_tiled();
-    let wa_single = weighted_average_single_tile();
+fn assert_tiled_matches_single_tile_for_each(
+    wa_tiled: &FusionResult,
+    wa_single: &FusionResult,
+    dm_tiled: &FusionResult,
+    dm_single: &FusionResult,
+) {
     assert_eq!(
         wa_tiled.zmap, wa_single.zmap,
         "weighted-average: tiled (256) and single-tile (704) Z-Maps must be exactly equal"
@@ -472,8 +450,6 @@ fn tiled_matches_single_tile_for_each() {
          -- the margin covers the whole reach and no `collapse` follows it"
     );
 
-    let dm_tiled = depth_map_tiled();
-    let dm_single = depth_map_single_tile();
     assert_eq!(
         dm_tiled.zmap, dm_single.zmap,
         "depth-map: tiled (256) and single-tile (704) Z-Maps must be exactly equal"
@@ -486,31 +462,26 @@ fn tiled_matches_single_tile_for_each() {
     );
 }
 
-#[test]
-fn the_trait_default_would_have_seamed() {
-    let forced = weighted_average_forced_to_the_default_levels();
-    let single = weighted_average_single_tile();
-    let own_answer = weighted_average_tiled();
-
+fn assert_the_trait_default_would_have_seamed(
+    forced: &FusionResult,
+    single: &FusionResult,
+    own_answer: &FusionResult,
+) {
     assert_eq!(
         own_answer.composite, single.composite,
-        "weighted-average's own tile_support answer must still match the single-tile reference"
+        "weighted-average seam: its own tile_support answer must still match the single-tile reference"
     );
 
     let differs = forced.composite != single.composite || forced.zmap != single.zmap;
     assert!(
         differs,
-        "forcing the scheduler to the trait default's answer (levels = 0, no halo) must \
+        "weighted-average seam: forcing the scheduler to the trait default's answer (levels = 0, no halo) must \
          produce a composite or Z-Map that differs from the single-tile reference -- if it does \
          not, this is not evidence that the override is needed"
     );
 }
 
-#[test]
-fn depth_map_zmap_is_coherent() {
-    let default_run = depth_map_single_tile();
-    let zero_radius_run = depth_map_zero_radius();
-
+fn assert_depth_map_zmap_is_coherent(default_run: &FusionResult, zero_radius_run: &FusionResult) {
     let default_fraction =
         all_eight_identical_fraction(&default_run.zmap, default_run.width, default_run.height);
     let zero_fraction = all_eight_identical_fraction(
@@ -519,21 +490,18 @@ fn depth_map_zmap_is_coherent() {
         zero_radius_run.height,
     );
     println!(
-        "depth_map_zmap_is_coherent: all-8-identical default(4,8)={default_fraction:.4} \
+        "depth-map coherence: all-8-identical default(4,8)={default_fraction:.4} \
          (0,0)={zero_fraction:.4}"
     );
     assert!(
         default_fraction > zero_fraction,
-        "the default (score-radius 4, smoothing-radius 8) must be strictly more spatially \
+        "depth-map coherence: the default (score-radius 4, smoothing-radius 8) must be strictly more spatially \
          coherent than (0, 0) over the same input: default={default_fraction:.4}, \
          zero={zero_fraction:.4}"
     );
 }
 
-#[test]
-fn sharpness_is_recorded_for_each() {
-    let wa = weighted_average_tiled();
-    let dm = depth_map_tiled();
+fn assert_sharpness_is_recorded_for_each(wa: &FusionResult, dm: &FusionResult) {
     let (frame03, w, h, spp) = open_frame(common::mantis_512_dir().join("frames").join("03.tif"));
     let golden_dir = common::fixtures_dir().join("mantis-512").join("golden");
     let (laplacian_golden, ..) = open_frame(golden_dir.join("laplacian.tif"));
@@ -544,7 +512,7 @@ fn sharpness_is_recorded_for_each() {
     let lapvar_03 = metrics::laplacian_variance(&frame03, w, h, spp);
 
     println!(
-        "sharpness_is_recorded_for_each: weighted-average={lapvar_wa:.1} depth-map={lapvar_dm:.1} \
+        "sharpness: weighted-average={lapvar_wa:.1} depth-map={lapvar_dm:.1} \
          laplacian={lapvar_laplacian:.1} 03.tif={lapvar_03:.1}"
     );
 
@@ -552,9 +520,33 @@ fn sharpness_is_recorded_for_each() {
     // laplacian's, are recorded above and nowhere asserted against a floor.
     assert!(
         lapvar_dm > lapvar_wa,
-        "depth-map's composite must be strictly sharper than weighted-average's: \
+        "sharpness: depth-map's composite must be strictly sharper than weighted-average's: \
          depth-map={lapvar_dm:.1}, weighted-average={lapvar_wa:.1}"
     );
+}
+
+/// The six weighted-average and depth-map runs and the source frames, each
+/// computed once: both outputs exist, each Z-Map follows its algorithm's
+/// rule, tiling matches the single-tile run, the halo-free run seams, depth-map
+/// is more coherent at its default radii, and depth-map is sharper than
+/// weighted-average.
+#[test]
+fn weighted_average_and_depth_map_outputs_follow_their_rules() {
+    let source = all_frames();
+    let wa_tiled = weighted_average_tiled();
+    let wa_single = weighted_average_single_tile();
+    let wa_forced = weighted_average_forced_to_the_default_levels();
+    let dm_tiled = depth_map_tiled();
+    let dm_single = depth_map_single_tile();
+    let dm_zero_radius = depth_map_zero_radius();
+
+    assert_both_outputs_are_produced(&wa_tiled, &dm_tiled);
+    assert_weighted_average_zmap_follows_its_rule(&source, &wa_tiled);
+    assert_depth_map_composite_is_its_zmap(&source, &dm_tiled);
+    assert_tiled_matches_single_tile_for_each(&wa_tiled, &wa_single, &dm_tiled, &dm_single);
+    assert_the_trait_default_would_have_seamed(&wa_forced, &wa_single, &wa_tiled);
+    assert_depth_map_zmap_is_coherent(&dm_single, &dm_zero_radius);
+    assert_sharpness_is_recorded_for_each(&wa_tiled, &dm_tiled);
 }
 
 /// Frame 3 of `fixtures/mantis-512` translated by `(-12.5, 0)` through a
@@ -921,6 +913,144 @@ fn streamed_context_matches_the_resident_context() {
         assert!(
             actual.tile == expected.tile,
             "{algo_id}: composites differ between streamed and resident contexts"
+        );
+    }
+}
+
+/// Frames served as `f32` only; the `u16` read fails, so a fusion that
+/// still reads `u16` cannot pass.
+struct WideFrames<'a> {
+    inner: &'a dyn TileReader,
+}
+
+impl TileReader for WideFrames<'_> {
+    fn sample_format(&self) -> focusforge_core::tile::SampleFormat {
+        focusforge_core::tile::SampleFormat::F32
+    }
+
+    fn read_tile_into(&self, _: usize, _: Rect, _: &mut [u16]) -> Result<(), AlgorithmError> {
+        Err(AlgorithmError::Failed {
+            algorithm: "wide-frames".to_string(),
+            detail: "serves f32 only".to_string(),
+        })
+    }
+
+    fn read_tile_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        let mut narrow = vec![0u16; out.len()];
+        self.inner.read_tile_into(frame, rect, &mut narrow)?;
+        for (wide, narrow) in out.iter_mut().zip(narrow) {
+            *wide = f32::from(narrow);
+        }
+        Ok(())
+    }
+
+    fn read_tile_coverage_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<Option<Vec<bool>>, AlgorithmError> {
+        self.read_tile_f32_into(frame, rect, out).map(|()| None)
+    }
+}
+
+/// Flat `f32` frames, one value per frame.
+struct FlatWide(Vec<f32>);
+
+impl TileReader for FlatWide {
+    fn sample_format(&self) -> focusforge_core::tile::SampleFormat {
+        focusforge_core::tile::SampleFormat::F32
+    }
+
+    fn read_tile_into(&self, _: usize, _: Rect, _: &mut [u16]) -> Result<(), AlgorithmError> {
+        Err(AlgorithmError::Failed {
+            algorithm: "flat-wide".to_string(),
+            detail: "serves f32 only".to_string(),
+        })
+    }
+
+    fn read_tile_f32_into(
+        &self,
+        frame: usize,
+        _: Rect,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        out.fill(self.0[frame]);
+        Ok(())
+    }
+
+    fn read_tile_coverage_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<Option<Vec<bool>>, AlgorithmError> {
+        self.read_tile_f32_into(frame, rect, out).map(|()| None)
+    }
+}
+
+#[test]
+fn f32_fusion_matches_the_u16_run_on_widened_frames() {
+    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
+    let wide = WideFrames { inner: &stack };
+    for algo_id in ["laplacian", "depth-map", "weighted-average"] {
+        let narrow = run_fusion_over(
+            stack_context(&stack),
+            &stack,
+            algo_id,
+            &format!("{algo_id}-u16-480"),
+            480,
+            &no_explicit(),
+            None,
+        );
+        let widened = run_fusion_over(
+            stack_context(&stack),
+            &wide,
+            algo_id,
+            &format!("{algo_id}-f32-480"),
+            480,
+            &no_explicit(),
+            None,
+        );
+        assert_eq!(widened.zmap, narrow.zmap, "{algo_id}: Z-Maps differ");
+        assert_eq!(
+            widened.composite, narrow.composite,
+            "{algo_id}: composites differ"
+        );
+    }
+}
+
+#[test]
+fn f32_fusion_clips_once_at_the_output() {
+    let mut explicit = ParamValues::new();
+    explicit.insert("levels".to_string(), ParamValue::Int(2));
+    let flat = FlatWide(vec![70_000.0, 50_000.0]);
+    let context = StackContext::new(2, 128, 128, 3);
+    // Averaging methods mean the unclipped values (60000, not the 57768 of
+    // a mean of clipped reads); selection copies frame 0 and clips it.
+    for (algo_id, expected) in [
+        ("weighted-average", 60_000),
+        ("laplacian", 60_000),
+        ("depth-map", 65_535),
+    ] {
+        let result = run_fusion_over(
+            context,
+            &flat,
+            algo_id,
+            &format!("{algo_id}-f32-flat"),
+            112,
+            &explicit,
+            None,
+        );
+        assert!(
+            result.composite.iter().all(|v| v.abs_diff(expected) <= 1),
+            "{algo_id}: expected {expected}, got {:?}",
+            &result.composite[..3]
         );
     }
 }

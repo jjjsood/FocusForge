@@ -21,9 +21,12 @@ use focusforge_gui::appearance_settings::{AppearanceSettings, SourcePresentation
 use focusforge_gui::canvas::PaneSource;
 use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode, performance_settings};
 
+use common::{open_mantis64_tab, record_events, save_to_proposed, scratch_controller, settle_all};
+
 /// True when `body` (already trimmed) is exactly one statement of the form
-/// `root.<ident>(...)`, an optional trailing `accept`/`reject` (`scroll-event`
-/// and the key handlers return an `EventResult`), a bare `accept`/`reject`
+/// `root.<ident>(...)` (optionally behind a leading `return `), an optional
+/// trailing `accept`/`reject` (`scroll-event` and the key handlers return an
+/// `EventResult`), a bare `accept`/`reject`
 /// alone (a scrim swallowing the event with nothing to forward), a bare
 /// literal assignment (`self.<ident> = <literal>;` or
 /// `<child-id>.<ident> = <literal>;`), or one
@@ -40,7 +43,9 @@ fn is_single_root_call(body: &str) -> bool {
         return true;
     }
     let body = stripped.unwrap_or(body);
-    if body.starts_with("root.") && body.ends_with(");") && body.matches(';').count() == 1 {
+    let forward = body.strip_prefix("return ").unwrap_or(body);
+    if forward.starts_with("root.") && forward.ends_with(");") && forward.matches(';').count() == 1
+    {
         return true;
     }
     is_bare_literal_assignment(body) || is_conditional_literal_reset(body)
@@ -134,6 +139,14 @@ fn is_single_root_call_allows_one_trailing_accept_or_reject() {
         !is_single_root_call("let x = 1; root.foo(); accept"),
         "a non-forward statement before the trailing token must still fail"
     );
+}
+
+#[test]
+fn is_single_root_call_allows_a_leading_return() {
+    assert!(is_single_root_call("return root.x(event);"));
+    assert!(!is_single_root_call("return"));
+    assert!(!is_single_root_call("return 1;"));
+    assert!(!is_single_root_call("return root.x(a); b"));
 }
 
 #[test]
@@ -285,6 +298,10 @@ fn callbacks_are_one_line_forwards() {
 
     let mut violations = Vec::new();
     for path in files {
+        // The component sheet's demo toggles set its own display state.
+        if path.file_name().and_then(|name| name.to_str()) == Some("theme_sheet.slint") {
+            continue;
+        }
         let contents = fs::read_to_string(&path).unwrap();
         for (line, handler, body) in handler_bodies(&contents) {
             if !is_single_root_call(&body) && !is_local_event_seam(&path, &handler) {
@@ -319,8 +336,22 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("appearance_tab.slint"), "next-requested")
             | (Some("appearance_tab.slint"), "accepted")
             | (Some("appearance_tab.slint"), "dismissed")
+            | (Some("performance_tab.slint"), "changed host-unit-open")
+            | (Some("performance_tab.slint"), "changed vram-unit-open")
+            | (Some("performance_tab.slint"), "unit-previous-requested")
+            | (Some("performance_tab.slint"), "unit-next-requested")
+            | (Some("performance_tab.slint"), "unit-accepted")
+            | (Some("performance_tab.slint"), "unit-dismissed")
+            | (Some("performance_tab.slint"), "option-selected(unit)")
+            | (Some("diagnostics_panel.slint"), "changed destination")
+            | (Some("ff_size_field.slint"), "option-selected(picked)")
+            | (Some("ff_text_field.slint"), "accepted")
+            | (Some("ff_text_field.slint"), "changed has-focus")
             | (Some("app.slint"), "bell-activated")
             | (Some("app.slint"), "changed dialog-open")
+            | (Some("app.slint"), "changed notification-center-open")
+            | (Some("app.slint"), "changed calculator-open")
+            | (Some("app.slint"), "changed settings-open")
             | (Some("app.slint"), "close-requested")
             | (Some("app.slint"), "key-pressed(event)")
             | (Some("app.slint"), "link-activated")
@@ -331,6 +362,8 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("notification_center.slint"), "clicked")
             | (Some("notification_center.slint"), "changed selected")
             | (Some("notification_center.slint"), "key-pressed(event)")
+            | (Some("ff_field.slint"), "changed text")
+            | (Some("calculator_overlay.slint"), "key-pressed(event)")
     )
 }
 
@@ -382,40 +415,17 @@ fn controller_api_is_slint_free() {
 // needs well over a minute to fuse the 512 px fixture, and a settled run returns at once.
 const SETTLE: Duration = Duration::from_secs(300);
 
-/// A controller whose ledger, staging and held checkpoints live under a
-/// fresh directory named for `name`.
-fn controller_with_scratch(name: &str) -> AppController {
-    let mut controller = AppController::new();
-    controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
-    controller
+#[test]
+#[should_panic(expected = "no fixture frame at")]
+fn fixture_frame_refuses_a_missing_frame() {
+    // `mantis-64` holds frames 00 to 02 only.
+    common::fixture_frame("mantis-64", 3);
 }
 
-/// Opens the first `count` `fixtures/mantis-64` frames, copied under a fresh
-/// directory, as a new active tab with no checkpoint. Returns that directory.
-fn open_mantis64_tab(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
-    let root = open_mantis64_frames(controller, name, count);
-    // Editor entry is under test, not alignment quality; an algorithm that
-    // always converges keeps every run clean.
-    controller.set_align_algorithm("dummy-align");
-    root
-}
-
-/// [`open_mantis64_tab`] on the default aligner, which parks these frames
-/// at its Keep/Discard question.
-fn open_mantis64_frames(controller: &mut AppController, name: &str, count: usize) -> PathBuf {
-    let root = common::tree(&format!("{name}_frames"));
-    for i in 0..count {
-        fs::copy(
-            common::fixture_frame("mantis-64", i),
-            root.join(format!("{i:02}.tif")),
-        )
-        .expect("fixture frame must copy");
-    }
-    assert!(matches!(
-        common::open_and_settle(controller, std::slice::from_ref(&root)),
-        OpenOutcome::Opened(_)
-    ));
-    root
+#[test]
+#[should_panic(expected = "no fixture frame at")]
+fn fixture_frame_refuses_an_unknown_set() {
+    common::fixture_frame("no-such-set", 0);
 }
 
 fn open_many_timed_frames(controller: &mut AppController, name: &str, count: usize) {
@@ -435,11 +445,6 @@ fn open_many_timed_frames(controller: &mut AppController, name: &str, count: usi
         OpenOutcome::Opened(_)
     ));
     controller.set_align_algorithm("dummy-align");
-}
-
-/// Settles every run, the live one and each one promoted from the queue.
-fn settle_all(controller: &mut AppController) {
-    while common::wait_for_settle(controller, SETTLE).is_some() {}
 }
 
 /// [`open_mantis64_tab`], then fuses it into one held checkpoint.
@@ -472,7 +477,7 @@ fn open_fused_tab_on(
 
 #[test]
 fn alignment_off_and_crop_off_survive_save_and_reopen() {
-    let mut controller = controller_with_scratch("align_crop_off");
+    let mut controller = scratch_controller("align_crop_off");
     open_mantis64_tab(&mut controller, "align_crop_off", 3);
     controller.set_param_value(
         "align-switch",
@@ -499,7 +504,7 @@ fn alignment_off_and_crop_off_survive_save_and_reopen() {
     assert!(manifest.registration.crop.is_none(), "no crop applied");
     assert_eq!(manifest.composite.width, 64, "the full frame extent");
 
-    let mut reopened = controller_with_scratch("align_crop_off_reopened");
+    let mut reopened = scratch_controller("align_crop_off_reopened");
     assert!(matches!(
         common::open_and_settle(&mut reopened, std::slice::from_ref(&path)),
         OpenOutcome::Opened(_)
@@ -530,26 +535,6 @@ fn alignment_off_and_crop_off_survive_save_and_reopen() {
     let manifest = head(&path);
     assert!(manifest.align.is_none() && manifest.registration.crop.is_none());
     assert_eq!(manifest.composite.width, 64);
-}
-
-/// Saves the active, never-saved tab to the path the save dialog proposes.
-fn save_to_proposed(controller: &mut AppController) -> PathBuf {
-    let mut target = None;
-    assert!(common::save_and_settle(controller, |proposed| {
-        target = Some(proposed.to_path_buf());
-        target.clone()
-    }));
-    target.expect("a never-saved tab asks where to save")
-}
-
-/// Every event the controller emits from here on.
-fn record_events(controller: &mut AppController) -> Arc<Mutex<Vec<ShellEvent>>> {
-    let events: Arc<Mutex<Vec<ShellEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink_events = events.clone();
-    controller.set_sink(Arc::new(move |event| {
-        sink_events.lock().unwrap().push(event)
-    }));
-    events
 }
 
 /// Drains `events`, keeping only the modes each `ModeChanged` carried.
@@ -614,7 +599,7 @@ fn assert_editor_refused(controller: &mut AppController, case: &str) {
 
 #[test]
 fn editor_mode_enters_on_a_fused_tab() {
-    let mut controller = controller_with_scratch("editor_enters");
+    let mut controller = scratch_controller("editor_enters");
     open_fused_tab(&mut controller, "editor_enters_held", 2);
     let events = record_events(&mut controller);
     assert!(controller.editor_enabled(), "a held checkpoint is editable");
@@ -627,7 +612,7 @@ fn editor_mode_enters_on_a_fused_tab() {
 
     assert!(controller.set_mode(ShellMode::Stacking));
     let project_path = save_to_proposed(&mut controller);
-    let mut reopened = controller_with_scratch("editor_enters_reopened");
+    let mut reopened = scratch_controller("editor_enters_reopened");
     assert!(matches!(
         common::open_and_settle(&mut reopened, &[project_path]),
         OpenOutcome::Opened(_)
@@ -644,7 +629,7 @@ fn editor_mode_enters_on_a_fused_tab() {
 
 #[test]
 fn fuse_auto_enters_editor_on_the_viewed_tab() {
-    let mut controller = controller_with_scratch("fuse_auto_editor");
+    let mut controller = scratch_controller("fuse_auto_editor");
     open_fused_tab(&mut controller, "fuse_auto_editor", 3);
     assert_eq!(
         controller.mode(),
@@ -655,7 +640,7 @@ fn fuse_auto_enters_editor_on_the_viewed_tab() {
 
 #[test]
 fn editor_mode_is_refused_without_fused_planes() {
-    let mut controller = controller_with_scratch("editor_refused");
+    let mut controller = scratch_controller("editor_refused");
     assert!(!controller.editor_enabled(), "no active tab");
     assert_editor_refused(&mut controller, "no active tab");
 
@@ -671,7 +656,7 @@ fn editor_mode_is_refused_without_fused_planes() {
     assert!(controller.start_fuse());
     settle_all(&mut controller);
     let project_path = save_to_proposed(&mut controller);
-    let mut reopened = controller_with_scratch("editor_refused_reopened");
+    let mut reopened = scratch_controller("editor_refused_reopened");
     assert!(matches!(
         common::open_and_settle(&mut reopened, std::slice::from_ref(&project_path)),
         OpenOutcome::Opened(_)
@@ -682,7 +667,7 @@ fn editor_mode_is_refused_without_fused_planes() {
 
 #[test]
 fn editor_mode_requires_the_fused_frame_set() {
-    let mut controller = controller_with_scratch("editor_frame_set");
+    let mut controller = scratch_controller("editor_frame_set");
     let root = open_fused_tab(&mut controller, "editor_frame_set", 3);
     // A fuse now auto-enters Editor on the viewed tab; back out to Stacking
     // so this test's own frame-management calls below (Stacking-only) run.
@@ -731,7 +716,7 @@ fn editor_mode_requires_the_fused_frame_set() {
 
 #[test]
 fn editor_mode_refuses_during_the_tabs_own_run() {
-    let mut controller = controller_with_scratch("editor_own_run");
+    let mut controller = scratch_controller("editor_own_run");
     open_fused_tab(&mut controller, "editor_own_run_a", 2);
     open_fused_tab(&mut controller, "editor_own_run_b", 3);
 
@@ -775,7 +760,7 @@ fn editor_mode_refuses_during_the_tabs_own_run() {
 
 #[test]
 fn edit_session_is_per_tab_and_survives_mode_switches() {
-    let mut controller = controller_with_scratch("edit_session_per_tab");
+    let mut controller = scratch_controller("edit_session_per_tab");
     open_fused_tab(&mut controller, "edit_session_per_tab_a", 2);
     controller.set_mode(ShellMode::Stacking);
     open_fused_tab(&mut controller, "edit_session_per_tab_b", 3);
@@ -837,7 +822,7 @@ fn edit_session_is_per_tab_and_survives_mode_switches() {
 
 #[test]
 fn edit_session_follows_the_newest_planes() {
-    let mut controller = controller_with_scratch("edit_session_newest");
+    let mut controller = scratch_controller("edit_session_newest");
     open_fused_tab(&mut controller, "edit_session_newest", 3);
     assert!(controller.set_mode(ShellMode::Editor));
     controller
@@ -863,7 +848,7 @@ fn edit_session_follows_the_newest_planes() {
 
 #[test]
 fn brush_source_is_the_selected_frame() {
-    let mut controller = controller_with_scratch("brush_source");
+    let mut controller = scratch_controller("brush_source");
     assert_eq!(controller.brush_source(), None, "no active tab");
 
     open_mantis64_tab(&mut controller, "brush_source", 3);
@@ -877,7 +862,7 @@ fn brush_source_is_the_selected_frame() {
 
 #[test]
 fn editor_mode_falls_back_when_the_tab_cannot_edit() {
-    let mut controller = controller_with_scratch("editor_fallback");
+    let mut controller = scratch_controller("editor_fallback");
     open_fused_tab(&mut controller, "editor_fallback_a", 2);
     open_fused_tab(&mut controller, "editor_fallback_b", 3);
     open_mantis64_tab(&mut controller, "editor_fallback_unsaved", 3);
@@ -929,7 +914,6 @@ fn controller_events_reach_an_installed_sink() {
         sink_events.lock().unwrap().push(event)
     }));
 
-    controller.tab_strip_pressed();
     controller.window_minimize();
     controller.window_maximize_toggle();
     controller.select_dock_tab(DockTab::Settings);
@@ -943,13 +927,47 @@ fn controller_events_reach_an_installed_sink() {
     assert_eq!(
         got,
         vec![
-            ShellEvent::WindowDragRequested,
             ShellEvent::WindowMinimizeRequested,
             ShellEvent::WindowMaximizeToggled(true),
             ShellEvent::DockTabSelected(DockTab::Settings),
             ShellEvent::WindowCloseRequested,
         ],
         "events must reach the sink in the order they were raised"
+    );
+}
+
+#[test]
+fn window_drag_pointer_starts_only_on_a_left_press() {
+    use focusforge_gui::WindowTarget;
+    use focusforge_gui::input_map::Button;
+
+    let mut controller = AppController::new();
+    // No hook installed: every press is a no-op, not a panic.
+    controller.window_drag_pointer(WindowTarget::Main, Button::Left, true);
+
+    let calls: Arc<Mutex<Vec<WindowTarget>>> = Arc::new(Mutex::new(Vec::new()));
+    let hook_calls = calls.clone();
+    controller.set_native_drag(Arc::new(move |target| {
+        hook_calls.lock().unwrap().push(target)
+    }));
+
+    for target in [WindowTarget::Main, WindowTarget::Comparison] {
+        for button in [Button::Left, Button::Middle, Button::Right, Button::Other] {
+            for down in [true, false] {
+                let before = calls.lock().unwrap().len();
+                controller.window_drag_pointer(target, button, down);
+                let expected = usize::from(button == Button::Left && down);
+                assert_eq!(
+                    calls.lock().unwrap().len() - before,
+                    expected,
+                    "{target:?} {button:?} down={down}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![WindowTarget::Main, WindowTarget::Comparison]
     );
 }
 
@@ -1020,14 +1038,14 @@ fn every_successful_quit_path_closes_the_detached_pane_first() {
         assert_close_tail(&events);
     }
 
-    let mut discard = controller_with_scratch("detached_quit_without_saving");
+    let mut discard = scratch_controller("detached_quit_without_saving");
     open_fused_tab(&mut discard, "detached_quit_without_saving", 3);
     discard.undock_requested(PaneSource::Composite);
     let events = record_events(&mut discard);
     discard.quit_without_saving();
     assert_close_tail(&events);
 
-    let mut save = controller_with_scratch("detached_save_all_quit");
+    let mut save = scratch_controller("detached_save_all_quit");
     open_fused_tab(&mut save, "detached_save_all_quit", 3);
     save.undock_requested(PaneSource::Frame);
     let events = record_events(&mut save);
@@ -1036,7 +1054,7 @@ fn every_successful_quit_path_closes_the_detached_pane_first() {
     assert!(save.close_guard_secondary_pressed(|_| Some(target.clone())));
     assert_close_tail(&events);
 
-    let mut headless = controller_with_scratch("detached_save_all_quit_sync");
+    let mut headless = scratch_controller("detached_save_all_quit_sync");
     open_fused_tab(&mut headless, "detached_save_all_quit_sync", 3);
     headless.undock_requested(PaneSource::Composite);
     let events = record_events(&mut headless);
@@ -1049,7 +1067,7 @@ fn every_successful_quit_path_closes_the_detached_pane_first() {
 fn quit_asks_only_when_work_would_be_lost() {
     for tabs in 0..=2 {
         let name = format!("quit_asks_unfused_{tabs}");
-        let mut controller = controller_with_scratch(&name);
+        let mut controller = scratch_controller(&name);
         for tab in 0..tabs {
             open_mantis64_tab(&mut controller, &format!("{name}_{tab}"), 3);
         }
@@ -1063,7 +1081,7 @@ fn quit_asks_only_when_work_would_be_lost() {
         assert!(controller.pending_quit_copy().is_none(), "{tabs} tabs");
     }
 
-    let mut controller = controller_with_scratch("quit_asks_fused_added");
+    let mut controller = scratch_controller("quit_asks_fused_added");
     open_mantis64_tab(&mut controller, "quit_asks_fused_added_a", 3);
     open_fused_tab(&mut controller, "quit_asks_fused_added_b", 3);
     let events = record_events(&mut controller);
@@ -1083,7 +1101,7 @@ fn quit_asks_only_when_work_would_be_lost() {
 
 #[test]
 fn cancelling_a_guarded_quit_keeps_the_detached_pane() {
-    let mut controller = controller_with_scratch("detached_guarded_quit");
+    let mut controller = scratch_controller("detached_guarded_quit");
     open_mantis64_tab(&mut controller, "detached_guarded_quit", 3);
     assert!(controller.start_fuse());
     settle_all(&mut controller);
@@ -1104,7 +1122,7 @@ fn cancelling_a_guarded_quit_keeps_the_detached_pane() {
 
 #[test]
 fn cancelling_the_guarded_save_picker_keeps_the_detached_pane() {
-    let mut controller = controller_with_scratch("detached_save_picker_cancel");
+    let mut controller = scratch_controller("detached_save_picker_cancel");
     open_mantis64_tab(&mut controller, "detached_save_picker_cancel", 3);
     assert!(controller.start_fuse());
     settle_all(&mut controller);
@@ -1123,7 +1141,7 @@ fn cancelling_the_guarded_save_picker_keeps_the_detached_pane() {
 
 #[test]
 fn failed_guarded_quit_save_keeps_the_detached_pane() {
-    let mut controller = controller_with_scratch("detached_failed_quit_save");
+    let mut controller = scratch_controller("detached_failed_quit_save");
     open_mantis64_tab(&mut controller, "detached_failed_quit_save", 3);
     assert!(controller.start_fuse());
     settle_all(&mut controller);
@@ -1140,7 +1158,7 @@ fn failed_guarded_quit_save_keeps_the_detached_pane() {
 
 #[test]
 fn detached_geometry_updates_independently_and_rejects_invalid_sizes() {
-    let mut controller = controller_with_scratch("independent_detached_geometry");
+    let mut controller = scratch_controller("independent_detached_geometry");
     open_mantis64_tab(&mut controller, "independent_detached_geometry", 3);
     let left = PaneRect {
         x: 16.0,
@@ -1190,7 +1208,7 @@ fn detached_geometry_updates_independently_and_rejects_invalid_sizes() {
 #[test]
 fn main_resize_keeps_each_detached_panes_last_geometry() {
     for detached in [PaneSource::Frame, PaneSource::Composite] {
-        let mut controller = controller_with_scratch(&format!("preserve_detached_{detached:?}"));
+        let mut controller = scratch_controller(&format!("preserve_detached_{detached:?}"));
         open_mantis64_tab(
             &mut controller,
             &format!("preserve_detached_{detached:?}"),
@@ -1252,7 +1270,7 @@ fn main_resize_keeps_each_detached_panes_last_geometry() {
 
 #[test]
 fn detached_side_survives_resize_and_valid_mode_switches() {
-    let mut controller = controller_with_scratch("detached_mode_switch");
+    let mut controller = scratch_controller("detached_mode_switch");
     open_fused_tab(&mut controller, "detached_mode_switch", 3);
     let left = PaneRect {
         x: 0.0,
@@ -1292,7 +1310,7 @@ fn side_geometry_arrives_before_open_in_either_order() {
         (PaneSource::Composite, PaneSource::Frame),
     ] {
         let name = format!("geometry_order_{first:?}");
-        let mut controller = controller_with_scratch(&name);
+        let mut controller = scratch_controller(&name);
         let frame = PaneRect {
             x: 0.0,
             y: 0.0,
@@ -1325,7 +1343,7 @@ fn side_geometry_arrives_before_open_in_either_order() {
 
 #[test]
 fn detached_input_uses_its_own_local_coordinates() {
-    let mut controller = controller_with_scratch("detached_local_input");
+    let mut controller = scratch_controller("detached_local_input");
     open_mantis64_tab(&mut controller, "detached_local_input", 3);
     controller.set_pane_geometry(
         PaneRect {
@@ -1392,7 +1410,7 @@ fn detached_input_uses_its_own_local_coordinates() {
 
 #[test]
 fn detached_pan_uses_the_input_table_and_modal_guard() {
-    let mut controller = controller_with_scratch("detached_pan_modal_guard");
+    let mut controller = scratch_controller("detached_pan_modal_guard");
     open_mantis64_tab(&mut controller, "detached_pan_modal_guard", 3);
     let pane = PaneRect {
         x: 0.0,
@@ -1432,7 +1450,7 @@ fn detached_pan_uses_the_input_table_and_modal_guard() {
 
 #[test]
 fn detached_drag_ignores_another_windows_move_and_release() {
-    let mut controller = controller_with_scratch("detached_cross_window_drag");
+    let mut controller = scratch_controller("detached_cross_window_drag");
     open_mantis64_tab(&mut controller, "detached_cross_window_drag", 3);
     let pane = PaneRect {
         x: 0.0,
@@ -1868,8 +1886,8 @@ fn open_paths_returns_before_the_load_completes_and_lands_only_after_settle() {
     };
 
     let frames_dir = tree("controller_shape_frames");
-    copy_frame(&frames_dir, "00.tif", 2);
-    copy_frame(&frames_dir, "01.tif", 3);
+    copy_frame(&frames_dir, "00.tif", 0);
+    copy_frame(&frames_dir, "01.tif", 1);
     let frame_paths = vec![frames_dir.join("00.tif"), frames_dir.join("01.tif")];
 
     for paths in [vec![folder], vec![project_path], frame_paths] {
@@ -1908,7 +1926,8 @@ fn load_progress_ticks_report_frames_of_the_real_total_and_never_after_ready() {
     copy_frame(&two_subfolders.join("subject-a"), "00.tif", 0);
     copy_frame(&two_subfolders.join("subject-a"), "01.tif", 1);
     copy_frame(&two_subfolders.join("subject-a"), "02.tif", 2);
-    copy_frame(&two_subfolders.join("subject-b"), "00.tif", 3);
+    // Four distinct frames are the count claim, and mantis-64 has three.
+    common::copy_frame_from("mantis-512", &two_subfolders.join("subject-b"), "00.tif", 3);
 
     let mantis_512 = common::workspace_root().join("fixtures").join("mantis-512");
 
@@ -2298,7 +2317,7 @@ fn settle_fuse_only(controller: &mut AppController) {
 
 #[test]
 fn a_duplicated_tab_gets_its_picture_off_thread() {
-    let mut controller = controller_with_scratch("dup_picture");
+    let mut controller = scratch_controller("dup_picture");
     open_fused_tab(&mut controller, "dup_picture", 3);
     assert!(controller.set_mode(ShellMode::Stacking));
     controller.remove_frame(0);
@@ -2317,7 +2336,7 @@ fn a_duplicated_tab_gets_its_picture_off_thread() {
 
 #[test]
 fn a_fused_checkpoint_picture_is_dropped_for_a_closed_tab() {
-    let mut controller = controller_with_scratch("closed_picture");
+    let mut controller = scratch_controller("closed_picture");
     open_mantis64_tab(&mut controller, "closed_picture_a", 2);
     let before = last_open_card(&controller)
         .picture
@@ -2339,7 +2358,7 @@ fn a_fused_checkpoint_picture_is_dropped_for_a_closed_tab() {
 #[test]
 fn an_older_picture_never_replaces_a_newer_one() {
     let fused_picture = |name: &str, frames: usize| {
-        let mut controller = controller_with_scratch(name);
+        let mut controller = scratch_controller(name);
         open_fused_tab(&mut controller, name, frames);
         common::settle_thumbnails(&mut controller);
         last_open_card(&controller)
@@ -2350,7 +2369,7 @@ fn an_older_picture_never_replaces_a_newer_one() {
     let second = fused_picture("older_picture_second", 2);
     assert_ne!(first.rgba, second.rgba, "the two fuses must look different");
 
-    let mut controller = controller_with_scratch("older_picture");
+    let mut controller = scratch_controller("older_picture");
     open_mantis64_tab(&mut controller, "older_picture", 3);
     // The reference pictures above are fused without gains; fuse the same way.
     controller.set_param_value(
@@ -2490,7 +2509,7 @@ fn diagnostics_bundle_manifest() {
         for include_minidumps in [false, true] {
             let mut controller = AppController::new();
             let events = install_recording_sink(&mut controller);
-            controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+            controller.set_diagnostics_dirs(Some(data_dir.clone()));
             // Joined so its own scan report has already landed before
             // `run_scan` takes its "since here" snapshot below -- otherwise
             // a straggling report can land in an unrelated later window.
@@ -2538,11 +2557,61 @@ fn diagnostics_bundle_manifest() {
 
 #[test]
 fn diagnostics_bundle_manifest_value_column_units() {
-    assert_eq!(size_text(0), "0 KB");
+    assert_eq!(size_text(0), "0 B");
+    assert_eq!(size_text(312), "312 B");
+    assert_eq!(size_text(1023), "1023 B");
     assert_eq!(size_text(1024), "1 KB");
     assert_eq!(size_text(1024 * 1024 - 1), "1024 KB");
     assert_eq!(size_text(1024 * 1024), "1.0 MB");
     assert_eq!(size_text(1024 * 1024 + 1024 * 512), "1.5 MB");
+}
+
+/// The `input_map` entry of the `configuration.json` a bundle written by
+/// `controller` holds, as `(path, exists)`.
+fn bundle_input_map(
+    controller: &mut AppController,
+    events: &Arc<Mutex<Vec<ShellEvent>>>,
+    out: &Path,
+) -> (serde_json::Value, serde_json::Value) {
+    controller.set_destination(out.to_str().unwrap());
+    assert_eq!(run_write(controller, events), DiagnosticsStatus::Written);
+    let mut archive = zip::ZipArchive::new(fs::File::open(out).unwrap()).unwrap();
+    let configuration: serde_json::Value =
+        serde_json::from_reader(archive.by_name("configuration.json").unwrap()).unwrap();
+    let input_map = &configuration["input_map"];
+    (input_map["path"].clone(), input_map["exists"].clone())
+}
+
+#[test]
+fn diagnostics_bundle_records_the_installed_settings_file() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = seed_diagnostics_dir(root.path());
+    let config_dir = root.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+    let settings = config_dir.join("settings.toml");
+
+    let mut controller = AppController::new();
+    let events = install_recording_sink(&mut controller);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
+    let (path, _) = bundle_input_map(&mut controller, &events, &root.path().join("none.zip"));
+    assert!(path.is_null(), "no installed directory records no path");
+
+    controller.install_recent(vec![], config_dir.clone());
+    // A bundle replaces the user's home prefix with `[home]`, so the recorded
+    // path is compared by its tail.
+    let names_installed_file = |path: &serde_json::Value| {
+        Path::new(path.as_str().expect("a path string")).ends_with("config/settings.toml")
+    };
+    let (path, exists) =
+        bundle_input_map(&mut controller, &events, &root.path().join("absent.zip"));
+    assert!(names_installed_file(&path), "recorded path: {path}");
+    assert_eq!(exists, false, "the settings file is not there yet");
+
+    fs::write(&settings, "").unwrap();
+    let (path, exists) =
+        bundle_input_map(&mut controller, &events, &root.path().join("present.zip"));
+    assert!(names_installed_file(&path), "recorded path: {path}");
+    assert_eq!(exists, true);
 }
 
 #[test]
@@ -2553,7 +2622,7 @@ fn diagnostics_bundle_write() {
     for include_minidumps in [false, true] {
         let mut controller = AppController::new();
         let events = install_recording_sink(&mut controller);
-        controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+        controller.set_diagnostics_dirs(Some(data_dir.clone()));
         // Joined for the same reason as `diagnostics_bundle_manifest`: its
         // own scan must land before `run_scan`'s window, or `run_write`'s
         // later one can catch the straggler instead.
@@ -2594,7 +2663,7 @@ fn diagnostics_bundle_write_repeats_without_an_extra_click() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     // A destination outside `default_destination()`'s own
     // `<data_dir>/diagnostics/` tree, so the fresh path finish derives next
     // can never collide with it regardless of the clock's granularity.
@@ -2647,7 +2716,7 @@ fn diagnostics_bundle_destination() {
     fs::write(&existing, b"placeholder").unwrap();
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.set_destination(existing.to_str().unwrap());
     assert_eq!(
         controller.diagnostics_status(),
@@ -2669,7 +2738,7 @@ fn diagnostics_bundle_destination() {
     let unwritable = blocked_parent.join("bundle.zip");
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.set_destination(unwritable.to_str().unwrap());
     let status = run_write(&mut controller, &events);
     assert_eq!(status, DiagnosticsStatus::Failed);
@@ -2689,7 +2758,7 @@ fn diagnostics_bundle_marks_reported() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.set_destination(root.path().join("bundle.zip").to_str().unwrap());
     let status = run_write(&mut controller, &events);
     assert_eq!(status, DiagnosticsStatus::Written);
@@ -2727,7 +2796,7 @@ fn diagnostics_bundle_marks_reported() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir2.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir2.clone()));
     controller.set_destination(root2.path().join("bundle.zip").to_str().unwrap());
     let status = run_write(&mut controller, &events);
 
@@ -2766,7 +2835,7 @@ fn diagnostics_scan_off_the_main_thread() {
     for data_dir in [&seeded, &empty] {
         let mut controller = AppController::new();
         let start = std::time::Instant::now();
-        controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+        controller.set_diagnostics_dirs(Some(data_dir.clone()));
         let view = controller.diagnostics_view();
         let elapsed = start.elapsed();
         assert!(
@@ -2795,7 +2864,7 @@ fn diagnostics_scan_reports_through_the_sink() {
 
     for include_minidumps in [false, true] {
         let mut controller = AppController::new();
-        controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+        controller.set_diagnostics_dirs(Some(data_dir.clone()));
         // Sets the choice and lets its own scan finish unobserved, so the
         // sink installed below records only the scan this test starts.
         controller
@@ -2847,7 +2916,7 @@ fn diagnostics_rescan_on_minidump_choice() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     run_scan(&mut controller, &events);
     assert!(
         !controller.diagnostics_view().entries.is_empty(),
@@ -2897,7 +2966,7 @@ fn diagnostics_scan_unreadable_dir() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(unreadable), None);
+    controller.set_diagnostics_dirs(Some(unreadable));
     run_scan(&mut controller, &events);
     let view = controller.diagnostics_view();
 
@@ -2931,7 +3000,7 @@ fn diagnostics_scan_outlives_its_controller() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir), None);
+    controller.set_diagnostics_dirs(Some(data_dir));
     let handle = controller.start_manifest_scan();
     drop(controller);
 
@@ -3036,7 +3105,7 @@ fn crash_notice_counts_and_acknowledges() {
     let data_dir = seed_notice_crashes(root.path());
 
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.scan_crash_notice();
     let record = crash_record(&controller).expect("unreported evidence is announced");
     assert_eq!(record.title, "Previous session stopped");
@@ -3060,7 +3129,7 @@ fn crash_notice_counts_and_acknowledges() {
     assert_eq!(crash.reports, 2, "the count outlives the cleared ids");
 
     let mut after = AppController::new();
-    after.set_diagnostics_dirs(Some(data_dir), None);
+    after.set_diagnostics_dirs(Some(data_dir));
     after.scan_crash_notice();
     assert!(
         crash_record(&after).is_none(),
@@ -3070,7 +3139,7 @@ fn crash_notice_counts_and_acknowledges() {
     let empty_root = tempfile::tempdir().unwrap();
     fs::create_dir_all(empty_root.path().join("focusforge/crashes")).unwrap();
     let mut empty = AppController::new();
-    empty.set_diagnostics_dirs(Some(empty_root.path().join("focusforge")), None);
+    empty.set_diagnostics_dirs(Some(empty_root.path().join("focusforge")));
     empty.scan_crash_notice();
     assert!(empty.notifications().is_empty());
 }
@@ -3087,7 +3156,7 @@ fn crash_notice_unreadable_dir() {
     fs::set_permissions(&crashes, fs::Permissions::from_mode(0o000)).unwrap();
 
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(Some(data_dir), None);
+    controller.set_diagnostics_dirs(Some(data_dir));
     controller.scan_crash_notice();
 
     fs::set_permissions(&crashes, writable).unwrap();
@@ -3104,7 +3173,7 @@ fn crash_record_survives_expiry_and_reading() {
     let data_dir = seed_notice_crashes(root.path());
 
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.scan_crash_notice();
     assert!(controller.visible_toast().is_some(), "the crash is toasted");
 
@@ -3126,7 +3195,7 @@ fn crash_record_survives_expiry_and_reading() {
     );
 
     let mut after = AppController::new();
-    after.set_diagnostics_dirs(Some(data_dir), None);
+    after.set_diagnostics_dirs(Some(data_dir));
     after.scan_crash_notice();
     assert!(
         crash_record(&after).is_some(),
@@ -3145,7 +3214,7 @@ fn crash_failed_acknowledgement_keeps_evidence_and_its_error() {
     let writable = fs::metadata(&crashes).unwrap().permissions();
 
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(Some(data_dir), None);
+    controller.set_diagnostics_dirs(Some(data_dir));
     controller.scan_crash_notice();
     let id = crash_record(&controller).unwrap().id;
 
@@ -3178,7 +3247,7 @@ fn crash_failed_acknowledgement_keeps_evidence_and_its_error() {
 #[test]
 fn missing_crash_directory_keeps_the_center_usable() {
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(None, None);
+    controller.set_diagnostics_dirs(None);
     controller.scan_crash_notice();
     let record = crash_record(&controller).expect("the unavailable state is announced");
     assert!(record.crash.as_ref().unwrap().unavailable);
@@ -3237,7 +3306,7 @@ fn crash_notice_diagnostics_acknowledges_and_opens_settings() {
     let data_dir = seed_notice_crashes(root.path());
 
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.scan_crash_notice();
     let id = crash_record(&controller).unwrap().id;
 
@@ -3278,7 +3347,7 @@ fn crash_notice_cleared_by_a_bundle_write() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.scan_crash_notice();
     assert_eq!(
         crash_record(&controller).unwrap().crash.unwrap().ids.len(),
@@ -3299,7 +3368,7 @@ fn crash_notice_cleared_by_a_bundle_write() {
     let data_dir2 = seed_two_crashes(root2.path());
     let mut controller2 = AppController::new();
     let events2 = install_recording_sink(&mut controller2);
-    controller2.set_diagnostics_dirs(Some(data_dir2.clone()), None);
+    controller2.set_diagnostics_dirs(Some(data_dir2.clone()));
     controller2.scan_crash_notice();
 
     let blocked_parent = data_dir2.parent().unwrap().join("blocked");
@@ -3311,40 +3380,28 @@ fn crash_notice_cleared_by_a_bundle_write() {
     assert!(!crash2.acknowledged && crash2.ids.len() == 2);
 }
 
-/// A controller with `fixtures/mantis-512` open as one tab, its scratch root
-/// under `CARGO_TARGET_TMPDIR`. A first fuse writes nothing beside the frames.
-fn controller_on_mantis_512(name: &str) -> AppController {
-    let mut controller = AppController::new();
-    controller.set_scratch_root_for_test(common::tree(&format!("{name}_scratch")));
+// The unaligned names are the real-image content of `fixtures/mantis-512`
+// under the default aligner.
+#[test]
+fn a_default_fuse_of_mantis_512_parks_naming_the_unaligned_frames() {
+    let mut controller = scratch_controller("default_fuse_mantis_512");
     let mantis_512 = common::workspace_root().join("fixtures").join("mantis-512");
     assert!(matches!(
         common::open_and_settle(&mut controller, &[mantis_512]),
-        focusforge_gui::OpenOutcome::Opened(_)
+        OpenOutcome::Opened(_)
     ));
-    controller
-}
-
-/// [`controller_on_mantis_512`] with the default aligner's `anchor` reference
-/// policy, which parks the run at its Keep/Discard question at a fraction of
-/// the `chain` policy's cost.
-fn divergent_controller_on_mantis_512(name: &str) -> AppController {
-    let mut controller = controller_on_mantis_512(name);
-    controller.set_param_value(
-        "align",
-        "reference-policy",
-        focusforge_core::params::ParamValue::Enum("anchor".to_string()),
-    );
-    controller
-}
-
-#[test]
-fn a_default_fuse_of_mantis_512_parks_naming_the_unaligned_frames() {
-    let mut controller = controller_on_mantis_512("default_fuse_mantis_512");
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, std::time::Duration::from_secs(300));
     assert!(
         controller.job_failure_message().is_none(),
         "a default fuse completes rather than failing"
+    );
+    assert!(
+        controller
+            .notifications()
+            .iter()
+            .all(|n| !n.title.ends_with("unaligned")),
+        "nothing is recorded before Keep"
     );
     assert_eq!(controller.checkpoint_count(), Some(0));
     let names = ["00.tif", "01.tif"].map(String::from);
@@ -3366,7 +3423,9 @@ fn a_default_fuse_of_mantis_512_parks_naming_the_unaligned_frames() {
         .filter(|n| n.title == "2 frames unaligned")
         .collect();
     assert_eq!(kept.len(), 1, "keeping records the count once");
+    assert_eq!(kept[0].kind, focusforge_gui::notifications::Kind::Warning);
     assert!(kept[0].message.contains("2 frames unaligned"));
+    assert!(kept[0].project_title.is_some());
     let summary = controller.last_alignment().expect("a completed run");
     assert_eq!(
         (summary.source.as_str(), summary.backend.as_str()),
@@ -3382,35 +3441,35 @@ fn tab_run(controller: &mut AppController, index: usize) -> job::RunState {
     controller.job_view().state
 }
 
-/// Polls until some tab holds a parked run, within the budget a mantis-512
+/// Polls until some tab holds a parked run, within the budget a mantis-64
 /// fuse needs.
 fn settle_until_parked(controller: &mut AppController) {
     let start = Instant::now();
     while !controller.parked_run_waiting() {
         controller.settle_job();
         assert!(
-            start.elapsed() < Duration::from_secs(300),
+            start.elapsed() < Duration::from_secs(60),
             "no run parked within the budget"
         );
         std::thread::sleep(Duration::from_millis(5));
     }
 }
 
-const MANTIS_512_UNALIGNED: [&str; 2] = ["00.tif", "01.tif"];
 const MANTIS_64_UNALIGNED: [&str; 2] = ["00.tif", "02.tif"];
 
-/// Tab 0 (mantis-512) parks at its question; `tails` are the tabs queued
-/// behind it, each `true` for `dummy-align` and `false` for the default
-/// aligner. Checks the queue head runs while tab 0 waits and every tab
-/// settles to an outcome of its own, then answers each question.
+/// Tab 0 parks at its question on the default aligner; `tails` are the tabs
+/// queued behind it, each `true` for `dummy-align` and `false` for the
+/// default aligner. Checks the queue head runs while tab 0 waits and every
+/// tab settles to an outcome of its own, then answers each question.
 fn queue_behind_a_park(name: &str, tails: &[bool], keep_first: bool, answer_while_live: bool) {
-    let mut c = controller_on_mantis_512(name);
+    let mut c = scratch_controller(name);
+    common::open_frames_from(&mut c, "mantis-64", &format!("{name}_head"), 3);
     for (i, dummy) in tails.iter().enumerate() {
         let tab = format!("{name}_{i}");
         if *dummy {
             open_mantis64_tab(&mut c, &tab, 3);
         } else {
-            open_mantis64_frames(&mut c, &tab, 3);
+            common::open_frames_from(&mut c, "mantis-64", &tab, 3);
         }
     }
     c.set_slow_run(2, Duration::from_secs(3));
@@ -3434,7 +3493,7 @@ fn queue_behind_a_park(name: &str, tails: &[bool], keep_first: bool, answer_whil
     c.select_project(0);
     assert_eq!(
         c.pending_divergence(),
-        Some(&MANTIS_512_UNALIGNED.map(String::from)[..])
+        Some(&MANTIS_64_UNALIGNED.map(String::from)[..])
     );
     let answer_first = |c: &mut AppController| {
         c.select_project(0);
@@ -3473,7 +3532,7 @@ fn queue_behind_a_park(name: &str, tails: &[bool], keep_first: bool, answer_whil
         c.select_project(0);
         assert_eq!(
             c.pending_divergence(),
-            Some(&MANTIS_512_UNALIGNED.map(String::from)[..])
+            Some(&MANTIS_64_UNALIGNED.map(String::from)[..])
         );
         answer_first(&mut c);
     }
@@ -3501,7 +3560,8 @@ fn queued_tab_runs_past_a_keep_question() {
 
 /// Tab 0 parked, tab 1 running slowly, tabs 2 and 3 queued behind it.
 fn parked_tab_with_two_queued(name: &str) -> AppController {
-    let mut c = controller_on_mantis_512(name);
+    let mut c = scratch_controller(name);
+    common::open_frames_from(&mut c, "mantis-64", &format!("{name}_head"), 3);
     for i in 0..3 {
         open_mantis64_tab(&mut c, &format!("{name}_{i}"), 3);
     }
@@ -3551,13 +3611,13 @@ fn queue_survives_cancelling_a_queued_tab() {
     c.select_project(0);
     assert_eq!(
         c.pending_divergence(),
-        Some(&MANTIS_512_UNALIGNED.map(String::from)[..])
+        Some(&MANTIS_64_UNALIGNED.map(String::from)[..])
     );
 }
 
 #[test]
 fn a_clean_run_raises_no_unaligned_notice() {
-    let mut controller = controller_with_scratch("clean_run_no_notice");
+    let mut controller = scratch_controller("clean_run_no_notice");
     open_mantis64_tab(&mut controller, "clean_run_no_notice", 3);
     assert!(controller.start_fuse());
     settle_all(&mut controller);
@@ -3579,7 +3639,8 @@ fn a_clean_run_raises_no_unaligned_notice() {
 
 #[test]
 fn an_unresolved_align_id_is_refused_before_any_run() {
-    let mut controller = controller_on_mantis_512("unresolved_align_id");
+    let mut controller = scratch_controller("unresolved_align_id");
+    open_mantis64_tab(&mut controller, "unresolved_align_id", 2);
     controller.set_align_algorithm("");
     assert!(!controller.start_fuse());
     assert!(!controller.any_job_running());
@@ -3619,7 +3680,7 @@ fn assert_panes_correspond(controller: &AppController, case: &str) {
 /// still uses the raw frame's size.
 #[test]
 fn frame_and_plane_panes_share_one_size_and_rect() {
-    let mut controller = controller_with_scratch("shared_pane_geometry");
+    let mut controller = scratch_controller("shared_pane_geometry");
     open_mantis64_tab(&mut controller, "shared_pane_geometry", 3);
     let left = PaneRect {
         x: 0.0,
@@ -3691,7 +3752,7 @@ fn frame_and_plane_panes_share_one_size_and_rect() {
 /// still share one size.
 #[test]
 fn post_fuse_frame_uses_identity_at_the_composite_crop() {
-    let mut controller = controller_with_scratch("post_fuse_frame");
+    let mut controller = scratch_controller("post_fuse_frame");
     let root = open_fused_tab(&mut controller, "post_fuse_frame", 3);
     // A fuse now auto-enters Editor on the viewed tab; back out to Stacking
     // so `add_frames` below (Stacking-only) actually extends the frame set.
@@ -3868,7 +3929,7 @@ fn open_editor(name: &str) -> (AppController, PathBuf) {
 
 /// [`open_editor`] over a run of fuse method `method` instead of the default.
 fn open_editor_on(name: &str, method: Option<&str>) -> (AppController, PathBuf) {
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     controller.set_resident_tile_size_for_test(16);
     let root = open_fused_tab_on(&mut controller, name, 3, method);
     controller.set_pane_geometry(LEFT, RIGHT);
@@ -4352,7 +4413,7 @@ fn brush_controls_convert_to_storage_units() {
     c.wheel(0.0, 120.0, 0.0, 0.0, CTRL);
     assert_eq!(c.brush_source(), Some(0), "clamped to the frame list");
 
-    let mut narrow = controller_with_scratch("brush_units_narrow");
+    let mut narrow = scratch_controller("brush_units_narrow");
     open_cropped_tab(&mut narrow, "brush_units_narrow", 40, 24);
     narrow.set_align_algorithm("dummy-align");
     assert!(narrow.start_fuse());
@@ -4375,7 +4436,7 @@ fn brush_controls_convert_to_storage_units() {
 
 #[test]
 fn plain_wheel_over_the_images_list_steps_the_source_frame_in_both_modes() {
-    let mut stacking = controller_with_scratch("images_wheel_stacking");
+    let mut stacking = scratch_controller("images_wheel_stacking");
     open_mantis64_tab(&mut stacking, "images_wheel_stacking", 3);
     stacking.select_frame(2);
     stacking.images_list_wheel(60.0);
@@ -4404,10 +4465,11 @@ fn plain_wheel_over_the_images_list_steps_the_source_frame_in_both_modes() {
 
 #[test]
 fn image_preview_opening_a_short_list_after_a_scrolled_long_list_keeps_bounds_valid() {
-    let mut controller = controller_with_scratch("image_preview_tab_window");
+    let mut controller = scratch_controller("image_preview_tab_window");
     open_many_timed_frames(&mut controller, "image_preview_first", 1_000);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
     });
     controller.set_images_viewport_height(120.0);
     controller.select_frame(500);
@@ -4420,10 +4482,11 @@ fn image_preview_opening_a_short_list_after_a_scrolled_long_list_keeps_bounds_va
 
 #[test]
 fn image_preview_opening_an_empty_list_after_a_scrolled_long_list_keeps_bounds_valid() {
-    let mut controller = controller_with_scratch("image_preview_empty_tab_window");
+    let mut controller = scratch_controller("image_preview_empty_tab_window");
     open_many_timed_frames(&mut controller, "image_preview_empty_first", 1_000);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
     });
     controller.set_images_viewport_height(120.0);
     controller.select_frame(500);
@@ -4441,10 +4504,11 @@ fn image_preview_opening_an_empty_list_after_a_scrolled_long_list_keeps_bounds_v
 
 #[test]
 fn tab_switches_and_active_closes_reanchor_image_preview_windows() {
-    let mut controller = controller_with_scratch("image_preview_tab_window");
+    let mut controller = scratch_controller("image_preview_tab_window");
     open_many_timed_frames(&mut controller, "image_preview_first", 1_000);
     controller.install_appearance(AppearanceSettings {
         presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
     });
     controller.set_images_viewport_height(120.0);
     controller.select_frame(500);
@@ -4474,7 +4538,7 @@ use focusforge_gui::images::FrameSort;
 
 #[test]
 fn legend_rows_carry_the_z_map_palette() {
-    let mut c = controller_with_scratch("legend_palette");
+    let mut c = scratch_controller("legend_palette");
     open_fused_tab(&mut c, "legend_palette", 3);
     // Excluded after the fuse: the Z-Map is unchanged, so the legend must
     // still list, number and colour this frame like any other source.
@@ -4503,7 +4567,7 @@ fn legend_rows_carry_the_z_map_palette() {
 
 #[test]
 fn legend_header_states() {
-    let mut c = controller_with_scratch("legend_header");
+    let mut c = scratch_controller("legend_header");
     open_fused_tab(&mut c, "legend_header", 3);
     // A fuse now auto-enters Editor on the viewed tab; back out to Stacking
     // so the "before" half of this test observes the Stacking-mode legend.
@@ -4536,7 +4600,7 @@ fn legend_header_states() {
 
 #[test]
 fn legend_lists_only_frames_and_rejects_a_position_past_them() {
-    let mut c = controller_with_scratch("legend_no_source");
+    let mut c = scratch_controller("legend_no_source");
     open_fused_tab(&mut c, "legend_no_source", 3);
     c.set_mode(ShellMode::Stacking);
     assert!(c.set_mode(ShellMode::Editor));
@@ -4662,7 +4726,7 @@ fn overlay_for(sources: u32, opacity: f32) -> OverlayDraw {
 
 #[test]
 fn overlay_draws_in_stacking_on_a_fused_tab() {
-    let mut c = controller_with_scratch("overlay_stacking");
+    let mut c = scratch_controller("overlay_stacking");
     open_fused_tab(&mut c, "overlay_stacking", 3);
     assert!(c.set_mode(ShellMode::Editor));
     c.set_overlay_opacity_fraction(0.3);
@@ -4682,7 +4746,7 @@ fn overlay_draws_in_stacking_on_a_fused_tab() {
 
 #[test]
 fn overlay_unavailable_without_a_finished_fuse() {
-    let mut c = controller_with_scratch("overlay_unavailable");
+    let mut c = scratch_controller("overlay_unavailable");
     c.set_overlay_on(true);
     assert!(!c.overlay_available(), "no tab");
     assert_eq!(c.overlay_draw(), None, "no tab, toggle on");
@@ -4702,7 +4766,7 @@ fn overlay_unavailable_without_a_finished_fuse() {
 
 #[test]
 fn overlay_follows_the_active_tab() {
-    let mut c = controller_with_scratch("overlay_tabs");
+    let mut c = scratch_controller("overlay_tabs");
     open_fused_tab(&mut c, "overlay_tabs_fused", 3);
     assert!(c.set_mode(ShellMode::Stacking));
     c.set_overlay_on(true);
@@ -4725,7 +4789,7 @@ fn overlay_follows_the_active_tab() {
 
 #[test]
 fn overlay_counts_fused_sources_not_frames() {
-    let mut c = controller_with_scratch("overlay_sources");
+    let mut c = scratch_controller("overlay_sources");
     open_fused_tab(&mut c, "overlay_sources", 2);
     assert!(c.set_mode(ShellMode::Stacking));
     c.set_overlay_on(true);
@@ -4744,7 +4808,7 @@ fn overlay_counts_fused_sources_not_frames() {
 
 #[test]
 fn overlay_controls_match_the_render_parameters() {
-    let mut c = controller_with_scratch("overlay_params");
+    let mut c = scratch_controller("overlay_params");
     open_fused_tab(&mut c, "overlay_params", 3);
     assert!(c.set_mode(ShellMode::Stacking));
     assert_eq!(c.mode(), ShellMode::Stacking);
@@ -4850,7 +4914,7 @@ fn cursor_geometry_follows_radius_softness_and_zoom() {
 
 #[test]
 fn pipette_reads_and_appends_nothing() {
-    let mut c = controller_with_scratch("brush_pipette");
+    let mut c = scratch_controller("brush_pipette");
     // Fused with a decoy tab active at settle time, so the auto-entry into
     // Editor a commit now triggers skips tab 0 (it isn't the viewed tab) --
     // its edit session must open fresh below, after the Z-Map is rewritten,
@@ -4987,7 +5051,7 @@ fn pipette_reads_and_appends_nothing() {
 fn zmap_unreadable_leaves_the_image_working() {
     use focusforge_gui::canvas::CanvasFeed;
 
-    let mut c = controller_with_scratch("zmap_unreadable");
+    let mut c = scratch_controller("zmap_unreadable");
     open_fused_tab(&mut c, "zmap_unreadable_frames", 3);
     let (path, older, _head) = common::save_two_fuses(&mut c);
     common::corrupt_blob(&path, &saved_zmap_blob(&path, &older));
@@ -5718,7 +5782,7 @@ fn mirrored_cursor_marks_the_pipette_point() {
 /// the unfitted-viewport case and the no-panes-installed case at once.
 #[test]
 fn mirrored_cursor_absent_without_geometry() {
-    let mut c = controller_with_scratch("mirrored_cursor_absent");
+    let mut c = scratch_controller("mirrored_cursor_absent");
     assert!(c.brush_cursor_view().is_none(), "no active tab");
 
     open_fused_tab(&mut c, "mirrored_cursor_absent", 3);
@@ -6069,7 +6133,7 @@ fn stroke_matches_left_pane() {
 fn open_equalized_editor(name: &str, count: usize) -> AppController {
     use focusforge_core::params::ParamValue;
 
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     controller.set_resident_tile_size_for_test(16);
     open_mantis64_tab(&mut controller, name, count);
     controller.set_fuse_algorithm("depth-map");
@@ -6090,9 +6154,6 @@ fn equalize_rows_reach_the_run() {
     use focusforge_core::params::ParamValue;
 
     let mut controller = common::controller_with_frames("equalize_rows", 3);
-    // The default aligner parks these frames on a diverged one; a run that
-    // always converges keeps the held checkpoint this test reads.
-    controller.set_align_algorithm("dummy-align");
     controller.toggle_section_more("prepare");
     let rows: Vec<_> = controller
         .settings_panel()
@@ -6145,18 +6206,14 @@ fn equalize_rows_reach_the_run() {
     assert_eq!(recorded.gains.len(), 3, "one gain per frame");
 }
 
-/// A frame the equalization bound clamps is reported on the window's info
-/// toast, naming the frame, the bound and the bound that would cover it; a
-/// bound wide enough for the stack raises nothing.
+/// A frame the equalization bound clamps is reported as a record naming its
+/// file in plain words; a bound wide enough for the stack raises nothing.
 #[test]
 fn settings_journey_equalization_reports_a_clamped_frame() {
     use focusforge_core::equalize::UNIT_GAIN;
     use focusforge_core::params::ParamValue;
 
-    let mut controller = common::controller_with_frames("equalize_clamped_notice", 8);
-    // The default aligner parks eight mantis frames on a diverged one; a run
-    // that always converges keeps the held checkpoint this test reads.
-    controller.set_align_algorithm("dummy-align");
+    let mut controller = common::controller_with_frames("equalize_clamped_notice", 3);
     controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, SETTLE);
@@ -6180,17 +6237,21 @@ fn settings_journey_equalization_reports_a_clamped_frame() {
     );
     let notices = controller.notifications();
     assert!(notices.len() > 1, "each clamped frame has its own record");
-    let notice = notices[0].message.as_str();
-    assert!(notice.contains("frame "), "{notice}");
-    assert!(notice.contains("1.01"), "{notice}");
-    assert!(notice.contains("would cover it"), "{notice}");
-    assert!(!notice.contains(" more)"), "no collapsed count: {notice}");
+    let notice = &notices[0];
+    let file = notice
+        .frame
+        .as_deref()
+        .expect("the record names its frame file");
+    assert_eq!(notice.title, "Brightness not fully matched");
+    assert_eq!(
+        notice.message,
+        format!("{file} could not be brought to the same brightness as the other frames.")
+    );
 
-    let named: usize = notice
-        .strip_prefix("frame ")
-        .and_then(|rest| rest.split(':').next())
+    let named: usize = file
+        .strip_suffix(".tif")
         .and_then(|index| index.parse().ok())
-        .unwrap_or_else(|| panic!("the notice starts with its frame: {notice}"));
+        .unwrap_or_else(|| panic!("the frame file is its index: {file}"));
     let recorded = controller
         .held_checkpoints()
         .last()
@@ -6211,7 +6272,6 @@ fn settings_journey_fuses_each_method_with_its_settings() {
     use focusforge_core::params::ParamValue;
 
     let mut controller = common::controller_with_frames("journey_each_method", 3);
-    controller.set_align_algorithm("dummy-align");
     controller.toggle_section_more("fuse");
     controller.toggle_section_more("prepare");
     let methods = [
@@ -6259,9 +6319,6 @@ fn focus_map_run_equalizes_by_default_and_an_explicit_off_wins() {
     use focusforge_core::params::ParamValue;
 
     let mut controller = common::controller_with_frames("focus_map_equalize_default", 3);
-    // The default aligner parks these frames on a diverged one; a run that
-    // always converges keeps the held checkpoint this test reads.
-    controller.set_align_algorithm("dummy-align");
     controller.set_fuse_algorithm("depth-map");
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, SETTLE);
@@ -6963,7 +7020,8 @@ fn brush_cursor_hidden_under_every_modal() {
     // divergent run on a tab already holding a checkpoint, and
     // `brush_cursor_view` has no mode check either way.
     {
-        let mut c = divergent_controller_on_mantis_512("cursor_divergence");
+        let mut c = scratch_controller("cursor_divergence");
+        common::open_frames_from(&mut c, "mantis-64", "cursor_divergence", 3);
         c.set_pane_geometry(LEFT, RIGHT);
         assert!(
             c.brush_cursor_view().is_some(),
@@ -7098,7 +7156,8 @@ fn canvas_input_blocked_under_every_modal() {
         c.toggle_projects_overlay();
     }
     {
-        let mut c = divergent_controller_on_mantis_512("blocked_divergence");
+        let mut c = scratch_controller("blocked_divergence");
+        common::open_frames_from(&mut c, "mantis-64", "blocked_divergence", 3);
         c.set_pane_geometry(LEFT, RIGHT);
         assert!(c.start_fuse());
         settle_all(&mut c);
@@ -7148,7 +7207,8 @@ fn modal_opening_mid_stroke_leaves_no_live_drag() {
 
 #[test]
 fn refusal_dialog_counts_as_modal() {
-    let mut controller = controller_on_mantis_512("refusal_modal");
+    let mut controller = scratch_controller("refusal_modal");
+    open_mantis64_tab(&mut controller, "refusal_modal", 2);
     controller.set_align_algorithm("");
     assert!(!controller.modal_open(), "nothing raised yet");
     assert!(!controller.canvas_blocked());
@@ -7249,7 +7309,7 @@ fn paint(controller: &mut AppController, x: i32) {
 }
 
 fn reopen(path: &Path, name: &str) -> AppController {
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     assert!(matches!(
         common::open_and_settle(&mut controller, &[path.to_path_buf()]),
         OpenOutcome::Opened(_)
@@ -7296,7 +7356,7 @@ fn added_checkpoint(path: &Path, known: &[String]) -> project::Checkpoint {
 /// Fuses two frames, saves, then paints and saves once more per entry of
 /// `strokes`. Returns the project file and its checkpoint ids, oldest first.
 fn saved_chain(name: &str, strokes: &[i32]) -> (PathBuf, Vec<String>) {
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     open_fused_tab(&mut controller, &format!("{name}_frames"), 2);
     let path = save_to_proposed(&mut controller);
     let mut chain = vec![saved(&path).checkpoint().id.clone()];
@@ -7311,7 +7371,7 @@ fn saved_chain(name: &str, strokes: &[i32]) -> (PathBuf, Vec<String>) {
 #[test]
 fn saving_a_modified_live_writes_an_automatic_checkpoint_first() {
     // A never-saved project: fuse, paint, save.
-    let mut controller = controller_with_scratch("auto_checkpoint_new");
+    let mut controller = scratch_controller("auto_checkpoint_new");
     open_fused_tab(&mut controller, "auto_checkpoint_new_frames", 2);
     paint(&mut controller, 20);
     let painted_ops = ops(&controller);
@@ -7391,7 +7451,7 @@ fn a_fuse_records_the_current_row_as_its_parent() {
 
 #[test]
 fn save_is_enabled_only_with_something_to_write() {
-    let mut controller = controller_with_scratch("save_enabled_rule");
+    let mut controller = scratch_controller("save_enabled_rule");
     open_mantis64_tab(&mut controller, "save_enabled_rule_frames", 2);
     assert!(!controller.save_enabled(), "never fused");
 
@@ -7574,7 +7634,7 @@ fn a_snapshot_during_a_fuse_holds_no_files() {
 
 #[test]
 fn a_save_that_does_not_write_loses_nothing() {
-    let mut controller = controller_with_scratch("save_loses_nothing");
+    let mut controller = scratch_controller("save_loses_nothing");
     open_fused_tab(&mut controller, "save_loses_nothing_frames", 2);
     paint(&mut controller, 20);
     let painted_ops = ops(&controller);
@@ -7617,7 +7677,7 @@ fn a_save_that_does_not_write_loses_nothing() {
 #[test]
 fn an_older_checkpoint_edits_through_its_own_registration() {
     let name = "older_registration";
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     let frames = open_fused_tab(&mut controller, name, 3);
     let path = save_to_proposed(&mut controller);
     let mut controller = reopen(&path, "older_registration_reopened");
@@ -7692,7 +7752,7 @@ fn editor_changes(events: &Mutex<Vec<ShellEvent>>) -> usize {
 #[test]
 fn entering_the_editor_opens_its_session_off_thread() {
     let name = "session_off_thread";
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     controller.set_resident_tile_size_for_test(16);
     fused_twice_without_session(&mut controller, name);
     let (_, zmap) = controller
@@ -7755,7 +7815,7 @@ fn entering_the_editor_opens_its_session_off_thread() {
 fn a_session_lands_only_on_its_own_tab_and_generation() {
     // Closing the tab mid-open drops the result.
     let name = "session_closed_tab";
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     fused_twice_without_session(&mut controller, name);
     let events = record_events(&mut controller);
     assert!(controller.set_mode(ShellMode::Editor));
@@ -7767,7 +7827,7 @@ fn a_session_lands_only_on_its_own_tab_and_generation() {
     // Restoring another row mid-open drops the result; the replacement
     // installs.
     let name = "session_restored_row";
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     open_fused_tab(&mut controller, name, 2);
     paint(&mut controller, 20);
     let painted_ops = ops(&controller);
@@ -7796,7 +7856,7 @@ fn a_session_lands_only_on_its_own_tab_and_generation() {
     // A tab switch mid-open leaves the new tab without a session; the first
     // tab keeps its own.
     let name = "session_switched_tab";
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     fused_twice_without_session(&mut controller, name);
     open_mantis64_tab(&mut controller, &format!("{name}_unfused"), 2);
     controller.select_project(0);
@@ -7817,7 +7877,7 @@ fn a_session_lands_only_on_its_own_tab_and_generation() {
 #[test]
 fn a_failed_session_open_drops_back_to_stacking() {
     let name = "session_open_fails";
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     fused_twice_without_session(&mut controller, name);
     let (composite, _) = controller
         .materialize_active_tab_planes()
@@ -7843,7 +7903,7 @@ fn a_failed_session_open_drops_back_to_stacking() {
 #[test]
 fn a_save_settling_mid_open_restarts_the_session() {
     let name = "session_save_mid_open";
-    let mut controller = controller_with_scratch(name);
+    let mut controller = scratch_controller(name);
     fused_twice_without_session(&mut controller, name);
     let events = record_events(&mut controller);
     assert!(controller.set_mode(ShellMode::Editor));
@@ -7910,7 +7970,7 @@ fn duplicated_tab_keeps_crop_and_remembered_values() {
     controller.set_fuse_algorithm("weighted-average");
     assert_eq!(
         active_fuse_value(&controller, "weight-exponent"),
-        "4",
+        "4.0",
         "the copy carries the values remembered for other methods"
     );
     controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(6.0));
@@ -7921,7 +7981,7 @@ fn duplicated_tab_keeps_crop_and_remembered_values() {
     controller.set_fuse_algorithm("weighted-average");
     assert_eq!(
         active_fuse_value(&controller, "weight-exponent"),
-        "4",
+        "4.0",
         "editing the copy leaves the original's remembered values alone"
     );
 }
@@ -8565,11 +8625,27 @@ fn performance_readout_does_not_probe() {
         focusforge_gpu::harness::settled_backend().is_none(),
         "building the view must not bring a backend up"
     );
-    assert_eq!(view.vram_budget, performance_settings::NOT_PROBED);
+    assert_eq!(view.vram_cap.text, "");
+    assert_eq!(view.vram_cap.placeholder, performance_settings::NOT_PROBED);
     assert_eq!(view.backend, "");
-    assert!(view.host_budget.ends_with("iB"), "{}", view.host_budget);
+    assert_budget_default(&view.host_cap);
     assert!(view.vram_cap.enabled && view.gpu_enabled);
     assert_eq!(view.note, "");
+}
+
+/// The row shows a budget as a whole number of MiB or GiB and no failure mark.
+fn assert_budget_default(row: &performance_settings::CapField) {
+    assert!(
+        !row.text.is_empty() && row.text.bytes().all(|b| b.is_ascii_digit()),
+        "{:?}",
+        row.text
+    );
+    assert!(
+        matches!(row.unit.label(), "MiB" | "GiB"),
+        "{}",
+        row.unit.label()
+    );
+    assert!(row.enabled && !row.invalid);
 }
 
 #[test]
@@ -8577,7 +8653,7 @@ fn performance_vram_cap_pending_note() {
     use focusforge_core::algorithm::AlignAlgorithm;
 
     let config = tempfile::tempdir().unwrap();
-    let mut controller = controller_with_scratch("performance_vram_note");
+    let mut controller = scratch_controller("performance_vram_note");
     open_mantis64_tab(&mut controller, "performance_vram_note", 2);
     controller.install_recent(Vec::new(), config.path().to_path_buf());
 
@@ -8620,6 +8696,308 @@ fn performance_vram_cap_pending_note() {
         performance_settings::load(config.path()).max_vram_bytes(),
         Some(2 << 30),
         "text that does not parse leaves the stored cap"
+    );
+}
+
+const SIBLING_TABLE: &str = "# my notes\n[recent]\nentries = [] # none yet\n\n";
+
+/// Points `controller` at a fresh config directory whose settings file holds
+/// only a hand-edited table beside the one the Performance tab writes.
+fn install_hand_edited_settings(controller: &mut AppController) -> tempfile::TempDir {
+    let config = tempfile::tempdir().unwrap();
+    fs::write(config.path().join("settings.toml"), SIBLING_TABLE).unwrap();
+    controller.install_recent(Vec::new(), config.path().to_path_buf());
+    config
+}
+
+fn settings_text(config: &tempfile::TempDir) -> String {
+    fs::read_to_string(config.path().join("settings.toml")).unwrap()
+}
+
+/// `settings.toml` lines of the form `<key> = ...`.
+fn settings_lines<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
+    text.lines().filter(|line| line.starts_with(key)).collect()
+}
+
+#[test]
+fn host_cap_row_shows_the_default_then_the_committed_cap() {
+    use performance_settings::CapUnit;
+
+    let mut controller = scratch_controller("host_cap_row");
+    open_mantis64_tab(&mut controller, "host_cap_row", 2);
+    let config = install_hand_edited_settings(&mut controller);
+    let before = settings_text(&config);
+
+    let row = controller.performance_view().host_cap;
+    assert_budget_default(&row);
+    assert!(row.limit.is_empty());
+    assert_eq!(
+        settings_text(&config),
+        before,
+        "showing the default saves nothing"
+    );
+    assert_eq!(controller.job_request_for(0).unwrap().max_host_memory, None);
+
+    controller.set_host_cap_unit("MiB");
+    controller.edit_host_memory_cap("512");
+    controller.commit_cap_drafts();
+    let row = controller.performance_view().host_cap;
+    assert_eq!((row.text.as_str(), row.unit), ("512", CapUnit::Mib));
+    assert!(row.limit.is_empty() && !row.invalid);
+    assert_eq!(
+        controller.job_request_for(0).unwrap().max_host_memory,
+        Some(512 << 20)
+    );
+    let saved = settings_text(&config);
+    assert!(saved.starts_with(SIBLING_TABLE), "{saved:?}");
+    assert_eq!(
+        settings_lines(&saved, "max-host-memory"),
+        ["max-host-memory = \"512MiB\""]
+    );
+
+    controller.edit_host_memory_cap("100");
+    let row = controller.performance_view().host_cap;
+    assert_eq!(row.text, "512", "an unconfirmed number changes nothing");
+    assert_eq!(settings_text(&config), saved);
+
+    assert_eq!(
+        performance_settings::load(config.path()).max_host_memory_bytes(),
+        Some(512 << 20)
+    );
+}
+
+#[test]
+fn host_cap_over_the_maximum_shows_the_limit_and_stores_no_cap() {
+    use focusforge_gui::SettingsSection;
+
+    let mut controller = scratch_controller("host_cap_limit");
+    let config = install_hand_edited_settings(&mut controller);
+    controller.set_host_memory_cap("200MiB");
+    assert_eq!(
+        performance_settings::load(config.path()).max_host_memory_bytes(),
+        Some(200 << 20)
+    );
+    let over_the_maximum = |controller: &mut AppController| {
+        controller.edit_host_memory_cap("1000000");
+        controller.set_host_cap_unit("GiB");
+        controller.performance_view().host_cap
+    };
+
+    let row = over_the_maximum(&mut controller);
+    assert_eq!(
+        performance_settings::load(config.path()).max_host_memory_bytes(),
+        None,
+        "a number above the maximum stores no cap"
+    );
+    assert!(settings_lines(&settings_text(&config), "max-host-memory").is_empty());
+    assert!(settings_text(&config).starts_with(SIBLING_TABLE));
+    assert_budget_default(&row);
+    assert_ne!(
+        row.text, "1000000",
+        "the field shows the default, not the typed digits"
+    );
+    let named = row
+        .limit
+        .strip_prefix("Max ")
+        .and_then(|rest| rest.strip_suffix(" possible."))
+        .unwrap_or_else(|| panic!("a line naming the maximum, got {:?}", row.limit));
+    assert!(
+        named.ends_with(" MiB") || named.ends_with(" GiB"),
+        "the maximum is in format_bytes form: {named:?}"
+    );
+
+    controller.edit_host_memory_cap("200");
+    controller.set_host_cap_unit("MiB");
+    let row = controller.performance_view().host_cap;
+    assert_eq!(row.limit, "", "the next commit clears the line");
+    assert_eq!(
+        performance_settings::load(config.path()).max_host_memory_bytes(),
+        Some(200 << 20)
+    );
+
+    assert!(!over_the_maximum(&mut controller).limit.is_empty());
+    controller.select_settings_section(SettingsSection::About);
+    assert_eq!(controller.performance_view().host_cap.limit, "");
+
+    assert!(!over_the_maximum(&mut controller).limit.is_empty());
+    controller.close_settings();
+    assert_eq!(controller.performance_view().host_cap.limit, "");
+}
+
+#[test]
+fn vram_cap_row_mirrors_the_host_row() {
+    use performance_settings::CapUnit;
+
+    let mut controller = scratch_controller("vram_cap_row");
+    let config = install_hand_edited_settings(&mut controller);
+    let vram = |controller: &AppController| {
+        let row = controller.performance_view().vram_cap;
+        (row.text, row.unit, row.limit)
+    };
+    assert!(focusforge_gpu::harness::settled_backend().is_none());
+    let row = controller.performance_view().vram_cap;
+    assert_eq!(row.text, "");
+    assert_eq!(row.placeholder, performance_settings::NOT_PROBED);
+    assert!(row.enabled && !row.invalid);
+
+    controller.edit_vram_cap("8");
+    controller.commit_cap_drafts();
+    assert_eq!(vram(&controller), ("8".into(), CapUnit::Gib, String::new()));
+    assert_eq!(
+        settings_lines(&settings_text(&config), "max-vram"),
+        ["max-vram = \"8GiB\""]
+    );
+
+    controller.set_vram_cap_unit("MiB");
+    assert_eq!(vram(&controller), ("8".into(), CapUnit::Mib, String::new()));
+    assert_eq!(
+        settings_lines(&settings_text(&config), "max-vram"),
+        ["max-vram = \"8MiB\""],
+        "a unit change commits at once with the number as shown"
+    );
+
+    controller.edit_vram_cap("1000000");
+    controller.set_vram_cap_unit("GiB");
+    assert_eq!(
+        vram(&controller),
+        ("1000000".into(), CapUnit::Gib, String::new()),
+        "no maximum is known before a probe, so nothing is clamped"
+    );
+    assert_eq!(
+        performance_settings::load(config.path()).max_vram_bytes(),
+        Some(1_000_000 << 30)
+    );
+
+    controller.edit_vram_cap("");
+    controller.commit_cap_drafts();
+    controller.set_vram_cap_unit("MiB");
+    assert_eq!(
+        vram(&controller),
+        (String::new(), CapUnit::Mib, String::new()),
+        "an empty number keeps the unit picked beside it"
+    );
+    assert_eq!(
+        performance_settings::load(config.path()).max_vram_bytes(),
+        None
+    );
+    assert!(settings_text(&config).starts_with(SIBLING_TABLE));
+}
+
+#[test]
+fn cap_row_commits_only_on_confirm() {
+    fn host_row(controller: &AppController) -> performance_settings::CapField {
+        controller.performance_view().host_cap
+    }
+    fn vram_row(controller: &AppController) -> performance_settings::CapField {
+        controller.performance_view().vram_cap
+    }
+    type Rows = (
+        &'static str,
+        fn(&mut AppController, &str),
+        fn(&mut AppController, &str),
+        fn(&AppController) -> performance_settings::CapField,
+    );
+    let rows: [Rows; 2] = [
+        (
+            "max-host-memory",
+            AppController::edit_host_memory_cap,
+            AppController::set_host_cap_unit,
+            host_row,
+        ),
+        (
+            "max-vram",
+            AppController::edit_vram_cap,
+            AppController::set_vram_cap_unit,
+            vram_row,
+        ),
+    ];
+
+    for (key, edit, pick_unit, row) in rows {
+        let mut controller = scratch_controller(&format!("cap_row_{key}"));
+        let config = install_hand_edited_settings(&mut controller);
+        pick_unit(&mut controller, "MiB");
+        let before = settings_text(&config);
+        let shown = row(&controller);
+        assert!(before.starts_with(SIBLING_TABLE), "{key}: {before:?}");
+
+        for draft in ["5", "51", "512"] {
+            edit(&mut controller, draft);
+            assert_eq!(
+                settings_text(&config),
+                before,
+                "{key}: draft {draft:?} saved"
+            );
+            assert_eq!(
+                row(&controller).text,
+                shown.text,
+                "{key}: draft {draft:?} shown"
+            );
+        }
+
+        controller.commit_cap_drafts();
+        let committed = settings_text(&config);
+        assert_eq!(
+            settings_lines(&committed, key),
+            [format!("{key} = \"512MiB\"")],
+            "{key}"
+        );
+        assert!(committed.starts_with(SIBLING_TABLE), "{key}: {committed:?}");
+        assert_eq!(row(&controller).text, "512", "{key}");
+
+        controller.commit_cap_drafts();
+        assert_eq!(
+            settings_text(&config),
+            committed,
+            "{key}: a second commit changes nothing"
+        );
+
+        edit(&mut controller, "0");
+        controller.commit_cap_drafts();
+        assert_eq!(settings_text(&config), committed, "{key}: zero is refused");
+        assert!(
+            row(&controller).invalid,
+            "{key}: zero marks the row invalid"
+        );
+
+        edit(&mut controller, "");
+        controller.commit_cap_drafts();
+        let cleared = settings_text(&config);
+        assert!(
+            settings_lines(&cleared, key).is_empty(),
+            "{key}: {cleared:?}"
+        );
+        assert!(cleared.starts_with(SIBLING_TABLE), "{key}: {cleared:?}");
+        assert!(!row(&controller).invalid, "{key}");
+    }
+}
+
+#[test]
+fn cap_drafts_commit_when_settings_close_or_the_section_changes() {
+    use focusforge_gui::SettingsSection;
+
+    let mut controller = scratch_controller("cap_drafts_leave");
+    let config = install_hand_edited_settings(&mut controller);
+    controller.set_host_cap_unit("MiB");
+    controller.set_vram_cap_unit("MiB");
+
+    controller.edit_host_memory_cap("200");
+    controller.close_settings();
+    assert_eq!(
+        performance_settings::load(config.path()).max_host_memory_bytes(),
+        Some(200 << 20),
+        "closing commits the host number"
+    );
+
+    controller.edit_vram_cap("512");
+    controller.select_settings_section(SettingsSection::About);
+    assert_eq!(
+        performance_settings::load(config.path()).max_vram_bytes(),
+        Some(512 << 20),
+        "a section change commits the VRAM number"
+    );
+    assert_eq!(
+        settings_lines(&settings_text(&config), "max-vram"),
+        ["max-vram = \"512MiB\""]
     );
 }
 
@@ -8715,7 +9093,7 @@ fn storage_view_takes_its_rows_from_the_installed_directories() {
     let (config, data) = storage_dirs(&root.path().join("installed-marker"));
     let mut controller = AppController::new();
     controller.install_recent(Vec::new(), config.clone());
-    controller.set_diagnostics_dirs(Some(data.clone()), None);
+    controller.set_diagnostics_dirs(Some(data.clone()));
     controller.set_scratch_root_for_test(data.join("scratch"));
 
     let view = controller.storage_view();
@@ -8978,22 +9356,8 @@ fn storage_clear_failure_line_names_the_cause_without_the_os_error_code() {
 
 mod notification {
     use super::{AppController, SETTLE, common};
-    use focusforge_core::params::ParamValue;
+    use focusforge_gui::entry::ImportRefused;
     use focusforge_gui::notifications::{Kind, Notification};
-
-    fn every_frame_clamps(name: &str, excluded: Option<usize>) -> AppController {
-        let mut controller = common::controller_with_frames(name, 4);
-        controller.set_align_algorithm("dummy-align");
-        controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
-        controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.5));
-        controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.25));
-        if let Some(index) = excluded {
-            controller.toggle_frame_excluded(index);
-        }
-        assert!(controller.start_fuse());
-        common::wait_for_settle(&mut controller, SETTLE);
-        controller
-    }
 
     fn warnings(controller: &AppController) -> Vec<Notification> {
         controller
@@ -9006,63 +9370,41 @@ mod notification {
 
     #[test]
     fn every_brightness_warning_becomes_its_own_record() {
-        let controller = every_frame_clamps("notification_every_warning", None);
+        let controller = common::every_frame_clamps("notification_every_warning", None);
         let records = warnings(&controller);
-        assert_eq!(records.len(), 4, "one record per clamped frame");
+        assert_eq!(records.len(), 3, "one record per clamped frame");
         for (i, record) in records.iter().enumerate() {
-            assert!(
-                record.message.starts_with(&format!("frame {i}:")),
-                "{}",
-                record.message
+            assert_eq!(record.title, "Brightness not fully matched");
+            assert_eq!(
+                record.message,
+                format!(
+                    "{i:02}.tif could not be brought to the same brightness as the other frames."
+                )
             );
-            assert!(record.message.contains("1.25"), "{}", record.message);
         }
     }
 
     #[test]
     fn a_brightness_record_names_its_frame_file() {
-        let controller = every_frame_clamps("notification_frame_file", Some(0));
+        let controller = common::every_frame_clamps("notification_frame_file", Some(0));
         let records = warnings(&controller);
         assert_eq!(
             records.len(),
-            3,
+            2,
             "the excluded frame is not part of the run"
         );
         let files: Vec<_> = records.iter().map(|r| r.frame.as_deref()).collect();
-        assert_eq!(files, [Some("01.tif"), Some("02.tif"), Some("03.tif")]);
-        assert!(
-            records[0].message.starts_with("frame 0:"),
-            "the index is the run's own"
+        assert_eq!(files, [Some("01.tif"), Some("02.tif")]);
+        assert_eq!(
+            records[0].message,
+            "01.tif could not be brought to the same brightness as the other frames.",
+            "the message names the file, not the run's own index"
         );
-    }
-
-    #[test]
-    fn kept_unaligned_frames_record_the_count() {
-        let mut controller = super::controller_on_mantis_512("notification_kept_unaligned");
-        assert!(controller.start_fuse());
-        common::wait_for_settle(&mut controller, std::time::Duration::from_secs(300));
-        assert!(
-            controller
-                .notifications()
-                .iter()
-                .all(|n| !n.title.ends_with("unaligned")),
-            "nothing is recorded before Keep"
-        );
-        controller.keep_fused().expect("a parked run keeps");
-        let kept: Vec<_> = controller
-            .notifications()
-            .iter()
-            .filter(|n| n.title == "2 frames unaligned")
-            .collect();
-        assert_eq!(kept.len(), 1, "Keep records the count once");
-        assert_eq!(kept[0].kind, Kind::Warning);
-        assert!(kept[0].message.contains("2 frames unaligned"));
-        assert!(kept[0].project_title.is_some());
     }
 
     #[test]
     fn a_settled_run_publishes_once_across_polls() {
-        let mut controller = every_frame_clamps("notification_once", None);
+        let mut controller = common::every_frame_clamps("notification_once", None);
         let before = controller.notifications().len();
         assert!(before > 0);
         for _ in 0..5 {
@@ -9074,11 +9416,11 @@ mod notification {
     #[test]
     fn refused_add_records_its_full_message() {
         let mut controller = common::controller_with_frames("notification_refused", 3);
-        controller.set_align_algorithm("dummy-align");
         assert!(controller.start_fuse());
         let refused = controller
-            .add_frames(&[common::fixture_frame("mantis-64", 4)])
+            .add_frames(&[common::fixture_frame("mantis-64", 0)])
             .expect_err("a running job refuses an add");
+        assert!(matches!(refused, ImportRefused::JobRunning), "{refused:?}");
         let record = controller
             .notifications()
             .last()
@@ -9097,7 +9439,7 @@ mod notification {
     fn bell_over_projects_closes_projects_and_opens_the_center() {
         let mut controller = AppController::new();
         controller.toggle_projects_overlay();
-        controller.set_diagnostics_dirs(None, None);
+        controller.set_diagnostics_dirs(None);
         controller.scan_crash_notice();
         assert_eq!(controller.unread_notifications(), 1);
         assert!(
@@ -9116,7 +9458,7 @@ mod notification {
         let mut controller = AppController::new();
         controller.open_center();
         controller.set_window_focused(1, false);
-        controller.set_diagnostics_dirs(None, None);
+        controller.set_diagnostics_dirs(None);
         controller.scan_crash_notice();
         assert_eq!(
             controller.unread_notifications(),
@@ -9133,7 +9475,7 @@ mod notification {
     fn closing_projects_shows_unread_without_toast_replay() {
         let mut controller = AppController::new();
         controller.toggle_projects_overlay();
-        controller.set_diagnostics_dirs(None, None);
+        controller.set_diagnostics_dirs(None);
         controller.scan_crash_notice();
         controller.toggle_projects_overlay();
         assert!(
@@ -9147,25 +9489,26 @@ mod notification {
 
 mod native_delivery {
     use super::{AppController, SETTLE, common};
+    use focusforge_gui::entry::ImportRefused;
     use focusforge_gui::native_notify;
     use focusforge_gui::notifications::{Banner, context_line};
     use std::cell::Cell;
 
     fn crash_notice(controller: &mut AppController) {
-        controller.set_diagnostics_dirs(None, None);
+        controller.set_diagnostics_dirs(None);
         controller.scan_crash_notice();
     }
 
     #[test]
     fn background_arrival_is_banner_once() {
         let mut controller = common::controller_with_frames("native_once", 3);
-        controller.set_align_algorithm("dummy-align");
         controller.set_window_focused(1, false);
         crash_notice(&mut controller);
         assert!(controller.start_fuse());
-        controller
-            .add_frames(&[common::fixture_frame("mantis-64", 4)])
+        let refused = controller
+            .add_frames(&[common::fixture_frame("mantis-64", 0)])
             .expect_err("a running job refuses an add");
+        assert!(matches!(refused, ImportRefused::JobRunning), "{refused:?}");
 
         let titles: Vec<_> = controller
             .take_native_notifications()
@@ -9320,7 +9663,7 @@ fn fixture_two_stacks_ask_the_grouping_question() {
     let mut controller = AppController::new();
     match common::open_and_settle(&mut controller, &[root]) {
         OpenOutcome::Question(question, _) => {
-            assert_eq!(question.frame_count, 6);
+            assert_eq!(question.stack_sizes, vec![3, 3]);
             assert_eq!(question.project_count, 2);
         }
         _ => panic!("two stacks in one folder must raise the grouping question"),
@@ -9361,6 +9704,72 @@ fn fixture_root_and_subfolder_reports_the_skipped_subfolder() {
         .find(|card| card.kind == "not-a-project")
         .expect("the skipped subfolder keeps a card");
     assert_eq!(skipped.project_name, "notes");
+}
+
+/// What the open tab's folder shows through the GUI: each row's source
+/// preview state once the previews settle, whether each frame opens in the
+/// frame pane, and whether a fuse completes.
+fn exercise_open_folder(controller: &mut AppController) -> (Vec<&'static str>, Vec<bool>, bool) {
+    controller.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
+    });
+    controller.set_images_viewport_height(600.0);
+    let rows = controller.images_panel().rows;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let previews = loop {
+        controller.poll_source_previews();
+        let states: Vec<_> = rows
+            .iter()
+            .map(|row| controller.source_preview_state(&row.path, row.unresolved))
+            .collect();
+        if !states.contains(&"loading") {
+            break states;
+        }
+        assert!(Instant::now() < deadline, "previews never settled");
+        std::thread::yield_now();
+    };
+    let pane = rows
+        .iter()
+        .map(|row| {
+            focusforge_gui::canvas::FrameSource::default()
+                .set(&row.path, None, job::host_budget())
+                .is_ok()
+        })
+        .collect();
+    assert!(controller.start_fuse(), "the fuse must start");
+    common::wait_for_settle(controller, Duration::from_secs(60));
+    let fused = matches!(controller.job_view().state, job::RunState::Fused { .. });
+    (previews, pane, fused)
+}
+
+#[test]
+fn eight_bit_tiff_folder_previews_and_fuses() {
+    for set in ["mantis8-64", "mantis8-64-lzw-p1-tile-mm"] {
+        let mut controller = AppController::new();
+        controller.set_scratch_root_for_test(tree(&format!("eight_bit_{set}_scratch")));
+        common::open_fixture_tab(&mut controller, "eight_bit", set, 3);
+        let (previews, pane, fused) = exercise_open_folder(&mut controller);
+        assert_eq!(previews, ["ready"; 3], "{set}: source previews");
+        assert_eq!(pane, [true; 3], "{set}: frame pane opens every frame");
+        assert!(fused, "{set}: the fuse completes");
+    }
+
+    let root = tree("eight_bit_rgba_frames");
+    for i in 0..3 {
+        common::write_rgba8_frame(&root.join(format!("{i:02}.tif")), 16, 16);
+    }
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree("eight_bit_rgba_scratch"));
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[root]),
+        OpenOutcome::Opened(_)
+    ));
+    controller.set_align_algorithm("dummy-align");
+    let (previews, pane, fused) = exercise_open_folder(&mut controller);
+    assert_eq!(previews, ["ready"; 3], "RGBA: source previews");
+    assert_eq!(pane, [true; 3], "RGBA: frame pane opens every frame");
+    assert!(fused, "RGBA: the fuse completes");
 }
 
 #[test]
@@ -9442,7 +9851,7 @@ fn fixture_project_without_its_frames_opens_as_sources_missing() {
         .sources_notice()
         .expect("the missing frames raise the notice");
     assert_eq!(title, "The frames are no longer there");
-    assert_eq!(file_name, "missing");
+    assert_eq!(file_name, "missing.ffp");
 }
 
 #[test]

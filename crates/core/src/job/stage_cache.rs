@@ -115,6 +115,7 @@ impl From<ResumeError> for StageCacheError {
 pub struct FrameKey {
     pub file_size: u64,
     pub image_description: Option<String>,
+    pub orientation: u16,
     pub width: u32,
     pub height: u32,
     pub samples_per_pixel: u32,
@@ -128,6 +129,7 @@ impl From<&FrameFingerprint> for FrameKey {
         FrameKey {
             file_size: fp.file_size,
             image_description: fp.image_description.clone(),
+            orientation: fp.orientation,
             width: fp.width,
             height: fp.height,
             samples_per_pixel: fp.samples_per_pixel,

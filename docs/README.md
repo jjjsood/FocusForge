@@ -1,53 +1,71 @@
-# Documentation
+# The FocusForge Manual
 
-Product documentation for FocusForge: how to use it, and how its pieces fit
-together. Design rationale — what was chosen, what was rejected and why — is
-not here.
+![FocusForge with a fused stack of a praying mantis open in the editor](assets/manual/intro/landing.png)
 
-## Guide
+*A stack of eight frames of a praying mantis, fused and open in the editor.*
 
-Using FocusForge: shooting a stack, loading it, choosing an algorithm,
-retouching the result.
+FocusForge turns a series of photographs focused at different distances — a
+[*focus stack*](glossary.md#focus-stacking) — into one image that is sharp from front to back. It lines the
+frames up, picks the sharpest part of each, blends them into one [composite](glossary.md#composite) and
+then lets you repair by hand whatever the automatic result got wrong. It runs
+on Linux, macOS and Windows, uses a graphics card when there is one and gives
+the same result without one.
 
-- [`getting-started.md`](getting-started.md) — release artifacts when a
-  matching release provides them, or the source-build fallback when they do not
+This manual is for photographers. You do not need to have stacked before: the
+first part teaches the technique, the second walks through every function of
+the program, and the help section answers the questions that come up along the
+way.
 
-- [`guide/gui.md`](guide/gui.md) — opening a folder or a project in the
-  window, the dock's `Images` panel and the four-section `Settings` panel, the five-tab settings window, running and controlling
-  a fuse, saving the held result, exporting an image, switching between open
-  projects and the settings file
-- [`guide/stacking.md`](guide/stacking.md) — stacking TIFF or supported RAW
-  frames, choosing a fusion method, brightness equalization, getting a TIFF, PNG or JPEG image back with
-  `export` and its format options, and getting the Z-Map
-- [`guide/alignment.md`](guide/alignment.md) — how `focusforge-cli
-  align`/`stack` register frames before fusing, choosing a mode, and
-  checking a result before committing to a full run
-- [`guide/retouch.md`](guide/retouch.md) — retouching a result with soft
-  brush strokes, from the op list `focusforge-cli retouch` appends to the
-  window's brush, pipette, overlay and undo/redo
-- [`guide/history.md`](guide/history.md) — a project's checkpoint tree: the
-  window's checkpoint list, saving, restoring, branching and deleting, the
-  same from `focusforge-cli history`, and what a damaged or moved project
-  does
-- [`guide/batch-runs.md`](guide/batch-runs.md) — stacking a folder that holds
-  more than one stack: the grouping proposal and overriding it, presets,
-  re-running one stack, cancelling and resuming a run, the stage cache, and
-  reviewing the results
-- [`guide/diagnostics.md`](guide/diagnostics.md) — the log every run keeps,
-  what a crash leaves behind, the notice on the next start, and packaging a
-  diagnostics bundle, and tracing the window
+## How this manual is organised
 
-## Reference
+**[Part I — Focus stacking](stacking/depth-of-field.md)** explains the
+photography. Why a macro shot is only sharp in a thin slice, how many frames a
+subject needs and how far apart they should be, which aperture to choose, how
+to light and support a stack, and how to recognise and avoid the typical
+failures: [halos](glossary.md#halo), ghosts from movement and soft bands between frames. Read it
+before your first shoot, or whenever a result looks wrong and you want to know
+why.
 
-- [`reference/cli.md`](reference/cli.md) — every `focusforge-cli` subcommand
-  and flag, and the `info --json`, `algorithms --json`, `stack --json`,
-  `export --json`, `retouch --json`, `history` and `review --json` schemas
-- [`reference/tiff-fast-path.md`](reference/tiff-fast-path.md) — the TIFF
-  layout the reader accepts and the writer emits
-- [`reference/project-format.md`](reference/project-format.md) — the
-  `.ffp` project container: checkpoints, stored planes, source frame checks
-  and the refusals a damaged project gets
+**[Part II — Using FocusForge](getting-started.md)** explains the program,
+window first. It starts with installing FocusForge and fusing your first stack,
+then tours the window, the Images panel and every stacking setting, the
+retouching editor, checkpoints and saving, exporting, working with several
+projects, and the settings window.
 
-Building from source, the repository layout and the test suite are in
-[`../CONTRIBUTING.md`](../CONTRIBUTING.md), not here — this tree is for using
-FocusForge, not developing it.
+**[Help](troubleshooting.md)** collects the messages FocusForge can show you,
+what each one means and what to do about it, and a
+[glossary](glossary.md) of the terms the manual uses.
+
+**[Appendix](reference/cli.md)** is the reference material: every command and
+option of `focusforge-cli` for scripting the same steps from a terminal, batch
+runs from the command line, and the formats of the project file and of the
+TIFF files FocusForge reads and writes.
+
+## The quickest way in
+
+1. [Install FocusForge](getting-started.md).
+2. Shoot a stack — the [pre-shoot checklist](stacking/shooting-practice.md)
+   lists what to check before you press the shutter.
+3. Follow [Your first stack](guide/first-stack.md): open the folder, click
+   **Fuse stack**, keep the result and export it.
+
+> **Tip:** The screenshots in this manual all show the same eight-frame stack
+> of a praying mantis: 512 × 512 pixel crops from a 61-frame series, kept in
+> the source tree as `fixtures/mantis-512`. The series itself does not ship
+> with the program. Open the eight crops and what you see matches the page.
+
+## Conventions
+
+- **Bold** text names something you click or read in the window, spelled
+  exactly as the window spells it: **Fuse stack**, **Keep**, **Export image**.
+- `Monospace` text is something you type, a file name or a command-line option.
+- Notes, tips and warnings are set apart:
+
+> **Note:** extra background that helps you understand what is going on.
+
+> **Warning:** something that can cost you work if you miss it.
+
+FocusForge is free software under the GNU General Public License, version 3.
+Building it from source and contributing are described in
+[`CONTRIBUTING.md`](https://github.com/jjjsood/FocusForge/blob/main/CONTRIBUTING.md)
+in the repository; this manual is about using it.

@@ -223,11 +223,9 @@ mod tests {
         )
     }
 
-    #[test]
-    fn import_failure_keeps_the_previous_image_and_records_the_spec() {
-        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
-            return;
-        };
+    type Shared = &'static focusforge_gpu::device::SharedDevice;
+
+    fn import_failure_keeps_the_previous_image_and_records_the_spec(shared: Shared) {
         let mut pane = PaneTexture::default();
         let texture = DisplayTexture::new(shared.device(), 4, 4);
         let wanted = crate::canvas::TextureSpec {
@@ -256,8 +254,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn lifecycle_keeps_readers_and_rebuilds_gpu_draws() {
+    fn lifecycle_keeps_readers_and_rebuilds_gpu_draws(shared: Shared) {
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
         let frame = fixtures.join("mantis-64/frames/00.tif");
         let (composite, zmap) = golden_plane_files(&fixtures);
@@ -267,9 +264,6 @@ mod tests {
             crop: (0.0, 0.0, 64.0, 64.0),
             pixelated: false,
             step: NonZeroU32::MIN,
-        };
-        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
-            return;
         };
 
         let mut empty = CanvasRenderer::new();
@@ -398,11 +392,7 @@ mod tests {
         focusforge_core::timing::timing_snapshot().expect("trace accounting is enabled")
     }
 
-    #[test]
-    fn a_guarded_resize_or_source_replacement_releases_the_superseded_texture() {
-        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
-            return;
-        };
+    fn a_guarded_resize_or_source_replacement_releases_the_superseded_texture(shared: Shared) {
         let (composite, zmap) =
             golden_plane_files(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures"));
         let mut renderer = CanvasRenderer::new();
@@ -453,24 +443,19 @@ mod tests {
                 .is_some()
         );
         assert!(renderer.composite_pane.display_texture.is_some());
+        let scratch = tempfile::tempdir().unwrap();
+        let replacement = scratch.path().join("composite.tif");
+        std::fs::copy(&composite, &replacement).unwrap();
         renderer
-            .set_planes(&composite, Some(&zmap))
-            .expect("fixture planes re-open");
+            .set_planes(&replacement, Some(&zmap))
+            .expect("replacement planes open");
         assert!(renderer.composite_pane.display_texture.is_none());
         assert!(renderer.composite_pane.image.is_none());
     }
 
-    #[test]
-    fn each_attach_builds_one_display_renderer_whose_source_buffer_follows_guarded_draws() {
-        if !in_isolated_child(
-            "each_attach_builds_one_display_renderer_whose_source_buffer_follows_guarded_draws",
-        ) {
-            return;
-        }
-        focusforge_core::timing::enable_trace_accounting();
-        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
-            return;
-        };
+    fn each_attach_builds_one_display_renderer_whose_source_buffer_follows_guarded_draws(
+        shared: Shared,
+    ) {
         let mut renderer = CanvasRenderer::new();
         renderer
             .set_frame(&fixture_frame(), None, crate::job::host_budget())
@@ -524,15 +509,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_lost_device_creates_no_texture_buffer_or_render() {
-        if !in_isolated_child("a_lost_device_creates_no_texture_buffer_or_render") {
-            return;
-        }
-        focusforge_core::timing::enable_trace_accounting();
-        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
-            return;
-        };
+    fn a_lost_device_creates_no_texture_buffer_or_render(shared: Shared) {
         let mut renderer = CanvasRenderer::new();
         renderer.attach_device(shared.device().clone(), shared.queue().clone());
         renderer
@@ -568,6 +545,49 @@ mod tests {
             "nothing is uploaded to a lost device"
         );
     }
+
+    /// Runs `body`, re-raising a failure with `name` in front of its message.
+    fn block(name: &str, body: impl FnOnce()) {
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(ToString::to_string))
+                .unwrap_or_default();
+            panic!("{name}: {message}");
+        }
+    }
+
+    /// One child, one device: timing accounting and device loss are
+    /// process-global, so the blocks share the child and the device-loss block
+    /// runs last.
+    #[test]
+    fn canvas_device_blocks_run_in_one_isolated_child() {
+        if !in_isolated_child("canvas_device_blocks_run_in_one_isolated_child") {
+            return;
+        }
+        focusforge_core::timing::enable_trace_accounting();
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        block("import failure", || {
+            import_failure_keeps_the_previous_image_and_records_the_spec(shared)
+        });
+        block("lifecycle", || {
+            lifecycle_keeps_readers_and_rebuilds_gpu_draws(shared)
+        });
+        block("guarded resize", || {
+            a_guarded_resize_or_source_replacement_releases_the_superseded_texture(shared)
+        });
+        block("attach accounting", || {
+            each_attach_builds_one_display_renderer_whose_source_buffer_follows_guarded_draws(
+                shared,
+            )
+        });
+        block("lost device", || {
+            a_lost_device_creates_no_texture_buffer_or_render(shared)
+        });
+    }
 }
 
 /// What can go wrong opening the composite a [`CanvasRenderer`] holds open
@@ -581,6 +601,26 @@ pub enum CanvasRendererError {
         #[source]
         source: Box<TiffError>,
     },
+}
+
+/// An open plane file as [`CanvasRenderer::set_planes`] tells two apart: its
+/// path, size and last write time.
+#[derive(Clone, PartialEq)]
+struct PlaneFile {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl PlaneFile {
+    fn of(path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            path: path.to_path_buf(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
 }
 
 /// The composite pane's GPU-owned state, the frame pane's own, the one
@@ -598,6 +638,8 @@ pub struct CanvasRenderer {
     sample_scratch: Vec<u16>,
     composite: Option<Arc<TiffStack>>,
     zmap: Option<Arc<ZMapReader>>,
+    /// The files [`Self::set_planes`] last opened.
+    planes: Option<(PlaneFile, Option<PlaneFile>)>,
     composite_pane: PaneTexture,
     frame: crate::canvas::FrameSource,
     frame_pane: PaneTexture,
@@ -626,6 +668,7 @@ impl CanvasRenderer {
             sample_scratch: Vec::new(),
             composite: None,
             zmap: None,
+            planes: None,
             composite_pane: PaneTexture::default(),
             frame: crate::canvas::FrameSource::default(),
             frame_pane: PaneTexture::default(),
@@ -711,20 +754,28 @@ impl CanvasRenderer {
     }
 
     /// Opens `composite`, and `zmap` when given, as this renderer's planes,
-    /// replacing whichever were open before. A composite that fails to open
-    /// is an error naming it, leaving the previous planes untouched. A Z-Map
-    /// that fails to open is logged and left closed: the composite draws
-    /// without it, and only the overlay is lost.
+    /// replacing whichever were open before. Files already open (same paths,
+    /// sizes and write times) stay as they are, with the reads in flight for
+    /// them still valid. A composite that fails to open is an error naming
+    /// it, leaving the previous planes untouched. A Z-Map that fails to open
+    /// is logged and left closed: the composite draws without it, and only
+    /// the overlay is lost.
     pub fn set_planes(
         &mut self,
         composite_path: &Path,
         zmap_path: Option<&Path>,
     ) -> Result<(), CanvasRendererError> {
-        let composite = TiffStack::open_files(std::slice::from_ref(&composite_path.to_path_buf()))
-            .map_err(|source| CanvasRendererError::Composite {
+        let files = PlaneFile::of(composite_path)
+            .map(|composite| (composite, zmap_path.and_then(PlaneFile::of)));
+        if files.is_some() && files == self.planes {
+            return Ok(());
+        }
+        let composite = TiffStack::open_staged(composite_path).map_err(|source| {
+            CanvasRendererError::Composite {
                 path: composite_path.to_path_buf(),
                 source: Box::new(source),
-            })?;
+            }
+        })?;
         self.zmap = zmap_path.and_then(|path| match ZMapReader::open(path) {
             Ok(zmap) => Some(Arc::new(zmap)),
             Err(error) => {
@@ -733,6 +784,7 @@ impl CanvasRenderer {
             }
         });
         self.composite = Some(Arc::new(composite));
+        self.planes = files;
         self.reset_planes();
         Ok(())
     }
@@ -741,6 +793,7 @@ impl CanvasRenderer {
     pub fn clear_planes(&mut self) {
         self.composite = None;
         self.zmap = None;
+        self.planes = None;
         self.reset_planes();
     }
 

@@ -86,6 +86,17 @@ pub enum ProjectError {
     #[error("{}: is not a FocusForge project", path.display())]
     NotAProject { path: PathBuf },
 
+    /// The manifest's `format_version` is above the highest this build reads.
+    #[error(
+        "{}: saved by a newer FocusForge (project format {found}; this build reads up to {supported}). Update FocusForge to open it.",
+        path.display()
+    )]
+    NewerFormat {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    },
+
     /// `path` carries the project header but no footer that validates -- the
     /// file was cut short before its first save was committed.
     #[error(
@@ -110,6 +121,14 @@ pub enum ProjectError {
         path.display()
     )]
     FingerprintDisagrees { path: PathBuf, checkpoint: String },
+
+    /// A RAW project whose fused checkpoint holds a 16-bit result, which
+    /// clipped everything above white.
+    #[error(
+        "{}: is a RAW project saved by an older version, which stored a clipped 16-bit result; stack its source frames again to open it",
+        path.display()
+    )]
+    ClippedRawResult { path: PathBuf },
 
     /// A checkpoint carries ops but no `fuse` record and no `parent` --
     /// there is nothing for its `stack_fingerprint` to be checked against.
@@ -176,6 +195,22 @@ pub enum ProjectError {
         path: PathBuf,
         format: String,
         samples_per_pixel: u32,
+    },
+
+    /// A DNG export of an image that is not a camera RAW document: only a
+    /// project whose sources are all camera RAW has a camera colour space to
+    /// write. Refused before any pixel is rendered.
+    #[error("{}: a DNG holds camera RAW data, and this project's sources are not camera RAW", path.display())]
+    ExportDngNeedsRaw { path: PathBuf },
+
+    /// A DNG export whose first source frame cannot describe its camera
+    /// colour space (a monochrome sensor, no colour matrix, no as-shot white
+    /// balance). Refused before any pixel is rendered.
+    #[error("{}: cannot write a DNG: {source}", path.display())]
+    ExportDngColour {
+        path: PathBuf,
+        #[source]
+        source: Box<crate::io::RawError>,
     },
 
     /// [`super::render::CheckpointImage::prepare_pending`] found at least one of

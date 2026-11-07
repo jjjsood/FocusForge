@@ -1,5 +1,12 @@
 # CLI reference
 
+This appendix is for scripting and batch work in a terminal: it lists every
+`focusforge-cli` command, flag, output field and exit status, exactly as the
+program accepts them. Photographers working in the window do not need it;
+start with [Your first stack](../guide/first-stack.md) and the chapters that
+follow it. Installing the command line and shell completion is covered in
+[For the command line](../getting-started.md#for-the-command-line).
+
 `focusforge-cli` is the headless interface to FocusForge. Every algorithm,
 and every batch-run control (grouping, presets, resume, review, the stage
 cache), is reachable here.
@@ -12,18 +19,21 @@ focusforge-cli [OPTIONS] <COMMAND>
 |---|---|
 | [`info`](#info) | prints project, TIFF or RAW metadata for a file or a directory of frames |
 | [`algorithms`](#algorithms) | lists registered algorithms, or prints one's full parameter schema |
+| [`step-plan`](#step-plan) | computes the focus step, frame count, duration and disk need of a focus stack from the optics and a depth range |
+| [`sharp-areas`](#sharp-areas) | counts the areas of the image that are sharpest in each frame of a directory |
 | [`stack`](#stack) | fuses a directory's frames into one project per detected stack |
-| [`export`](#export) | renders a checkpoint to a TIFF, PNG or JPEG image, and/or writes its Z-Map or one source frame |
+| [`export`](#export) | renders a checkpoint to a TIFF, PNG, JPEG or (for RAW projects) DNG image, and/or writes its Z-Map or one source frame |
 | [`retouch`](#retouch) | appends an op list of brush strokes to a project as new checkpoints |
 | [`history`](#history) | lists, deletes and compacts a project's checkpoints |
 | [`align`](#align) | computes and reports each frame's transform, without fusing |
 | [`review`](#review) | reports one record per project found under a directory or a run's output |
 | [`cache`](#cache) | manages the stage cache under `.scratch/stage-cache/` |
 | [`diagnostics`](#diagnostics) | packages logs and crash evidence into one redacted ZIP |
+| [`check-update`](#check-update) | reports whether a newer release exists |
 
 Root help groups `stack`, `align`, `retouch` and `export` under Processing;
-`info`, `review` and `algorithms` under Inspection; and `history`, `cache`
-and `diagnostics` under Maintenance.
+`info`, `review`, `algorithms`, `step-plan` and `sharp-areas` under Inspection; and
+`history`, `cache`, `diagnostics` and `check-update` under Maintenance.
 
 ## Global options
 
@@ -87,8 +97,10 @@ does not read source frames or render a composite.
   `error: ...` to stderr and exits 1.
 - Inside a directory, a file that fails to parse is *not* fatal to the whole
   command: it is reported as one entry with an `error` field and counted in
-  `unreadable`, while every readable sibling still gets a full report. A
-  directory with zero matching files is a hard error.
+  `unreadable`, while every readable sibling still gets a full report. When
+  any file was unreadable, `info` exits 5 after printing the report (an
+  `info`-only code; a file that merely falls outside the fast read path
+  still exits 0). A directory with zero matching files is a hard error.
 - A file that parses but falls outside the fast read path (see
   [`tiff-fast-path.md`](tiff-fast-path.md)) is reported normally, with
   `mmap fast path: no` and the reason named — this is not an error. Supported
@@ -121,7 +133,7 @@ uniform layout: yes
 When the frames disagree on layout, the summary names the odd one out and
 what differs, for example `uniform layout: no — reference.tif is MM/rps=8, others II/rps=1`.
 A directory report also prints `unreadable: N` when any file failed to
-parse.
+parse, and the command then exits 5.
 
 ### `--json`
 
@@ -229,7 +241,7 @@ The `raw` object contains:
 focusforge-cli stack [OPTIONS] <DIR>
 ```
 
-Fuses every TIFF or supported RAW frame in `<DIR>` (non-recursive, descending into
+Fuses every TIFF, JPEG or supported RAW frame in `<DIR>` (non-recursive, descending into
 `<DIR>/frames` when that subdirectory exists) into one **project** per
 detected stack, through a registered stacking algorithm. A run prepares
 projects for review; it does not write an image file — run
@@ -238,8 +250,10 @@ out-of-core scheduler bounded by a memory budget. RAW decoding develops
 and caches whole frames within the host memory budget.
 
 `stack` accepts mixed uncompressed, LZW-compressed, Deflate-compressed, and
-tiled 16-bit unsigned chunky TIFF frames. RAW files use `rawler`; a stack
-cannot mix TIFF and RAW frames. Unsupported layouts or unreadable RAW files
+tiled 8-bit or 16-bit unsigned chunky TIFF frames (8-bit samples are widened
+to the 16-bit range), and 8-bit JPEG frames. RAW files use `rawler` and are
+fused as unclipped 32-bit float samples that clip once, to 16 bits, at
+export. A stack cannot mix TIFF, JPEG and RAW frames. Unsupported layouts or unreadable RAW files
 stop the run with the frame and reason named.
 
 **Alignment runs first, by default.** Before fusion, `stack` computes each
@@ -250,7 +264,7 @@ off.
 
 **Grouping runs before that.** `<DIR>` may hold more than one stack; `stack`
 proposes a split by capture time or directory structure and prints it before
-doing anything else — see [`guide/batch-runs.md`](../guide/batch-runs.md)
+doing anything else — see [`reference/batch-runs.md`](batch-runs.md)
 for the full workflow (`--groups`, `--write-groups`, `--only`).
 
 | flag | meaning |
@@ -262,7 +276,7 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 | `--groups <PATH>` | group the frames as this TOML file says instead of proposing a grouping |
 | `--write-groups <PATH>` | write the proposed grouping to this path in the format `--groups` reads, then carry on with the run |
 | `--only <ID>` | run only the named result(s), repeatable; every unselected group is skipped, its project left untouched |
-| `--no-align` | skip alignment: frame tiles are fused unwarped and the output stays full-frame. Alignment is on by default, matching the project's `align` value |
+| `--no-align` | skip alignment: frame tiles are fused unwarped. The auto-crop still trims a 2-pixel border on every side; add `--no-crop` to keep the full frame. Alignment is on by default, matching the project's `align` value |
 | `--no-crop` | skip the auto-crop: the output stays at the full frame extent even with alignment on. The crop is on by default, matching the project's `auto-crop` value; with the crop on and no interior common to the aligned frames, `stack` stops and names this flag |
 | `--align-algorithm <ALGO>` | alignment algorithm id; optional, defaults to the sole registered alignment algorithm |
 | `--strict` | refuse the run if any frame fails registration; identity fallback is the default |
@@ -273,10 +287,10 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 | `--tile-size <PX>` | override the scheduler's outer tile size, in pixels |
 | `--max-host-memory <SIZE>` | a **ceiling only** on the adaptive host-memory budget: it can lower the budget the host-derived estimate resolved to, never raise it. Omit it entirely to get the machine's own concurrency. Accepts suffixed sizes: `B`; `KiB`/`MiB`/`GiB`/`TiB` (1024-based); `KB`/`MB`/`GB`/`TB` (1000-based); no suffix means bytes (e.g. `8GiB`, `512MiB`, `4096`) |
 | `--max-vram <SIZE>` | a **ceiling only** on the adaptive device (VRAM) budget: it can lower the budget the startup probe settled on, never raise it. Omit it entirely to get the probed value. Same accepted sizes as `--max-host-memory`; absent when the binary was built `--no-default-features` |
-| `--preset <PATH>` | read parameter values from a TOML preset — see [`guide/batch-runs.md`](../guide/batch-runs.md#presets) |
+| `--preset <PATH>` | read parameter values from a TOML preset — see [`reference/batch-runs.md`](batch-runs.md#presets) |
 | `--write-preset <PATH>` | write the preset that reproduces this run |
 | `--status <PATH>` | append one NDJSON status record for this stack to this path |
-| `--dry-run` | resolve everything and print what would happen, without computing or writing anything |
+| `--dry-run` | resolve everything and print what would happen, without computing or writing anything, the run manifest included |
 | `--cpu` | force the CPU path even when a usable GPU adapter is present; absent when the binary was built `--no-default-features` |
 | `--no-cache` | skip the stage cache: recompute the alignment even when a valid entry exists, and store no new entry |
 
@@ -292,8 +306,9 @@ preset's `[stack]` table accept the settings that belong to the whole run
 | `equalize-max-gain` | float, 1.01 to 2.0 | `1.25` | the bound on the gain: with 1.25 a frame's gain stays between 0.8 and 1.25 |
 | `equalize-target` | float, -0.5 to 0.5 | `0.0` | the shared target in stops from the frames' average brightness; 0.0 keeps that average, +1 would double it |
 
-Equalization scales the encoded code values as delivered and is not a
-linear-light correction; it is on for every algorithm and every kind of input unless
+Equalization gives each frame one gain, leaving the source files unchanged. A
+RAW frame is measured and gained in linear light; any other frame on its
+encoded values. It is on for every algorithm and every kind of input unless
 `equalize=false` is set; `algorithms --json` lists each fusion method's
 defaults under `project_defaults`. The gains are fixed before alignment. A
 frame that would need a gain beyond the bound gets the bound and the run
@@ -449,6 +464,22 @@ worker count of its own; reporting one from a previous run's cache entry
 would be a fabricated number, exactly the confusion `align_source` exists to
 prevent.
 
+The `develop_counts` field counts full-frame RAW develops: one count per frame,
+in frame order, across every stage of this group (preparation, alignment,
+fusion and metrics together). A `stack` run develops every frame once, in a
+parallel pass before preparation, into scratch files that later reads map, so
+every count is 1 whatever the tile size or host-memory ceiling. It is `null`
+for TIFF and JPEG stacks, and
+the human summary prints a `develops per frame: min= mean= max=` line only
+when the field is present.
+
+Before any frame is read for fusion, every `stack` run measures the free space
+on each volume it writes to (the one holding `.scratch` and the one holding the
+output's directory) and refuses, with a failure naming each short directory,
+the bytes needed and the bytes free, when the developed RAW frames (6 bytes per
+pixel per frame), the staged composite and Z-Map, the resume ledger and the
+compressed result do not fit; nothing is developed, staged or left behind.
+
 ```json
 {
   "input": "fixtures/mantis-512",
@@ -507,6 +538,7 @@ prevent.
   "device_peak_in_flight": null,
   "align_cached": false,
   "stages": { "setup": 0.001, "align": 9.918, "fuse": 2.712, "warp_write": null, "finalize": 0.379 },
+  "develop_counts": null,
   "align_source": "computed",
   "align_workers": 7,
   "peak_align_workers": 7
@@ -539,7 +571,7 @@ Options:
 | `--set <KEY=VALUE>` | set one algorithm parameter, repeatable; a repeated key keeps the last value |
 | `-q, --quiet` | log errors only; results and required warnings remain visible |
 | `--no-progress` | suppress the one stage line |
-| `--preset <PATH>` | read `align-algo` and the `[align]` table from a TOML preset — see [`guide/batch-runs.md`](../guide/batch-runs.md#presets). A non-empty `[stack]` table or `algo` key in the same file is unused here and says so on stderr |
+| `--preset <PATH>` | read `align-algo` and the `[align]` table from a TOML preset — see [`reference/batch-runs.md`](batch-runs.md#presets). A non-empty `[stack]` table or `algo` key in the same file is unused here and says so on stderr |
 | `--write-preset <PATH>` | write the preset that reproduces this run: `align-algo` plus the `[align]` values chosen |
 | `--status <PATH>` | append one NDJSON status record for this run to this path |
 | `--max-host-memory <SIZE>` | ceiling on the host-memory budget the alignment workers are sized from; it only lowers the derived budget |
@@ -681,9 +713,12 @@ pyramidal-ecc - Pyramidal ECC (alignment)
 weighted-average - Weighted Average (stacking)
 ```
 
-- `laplacian` — Laplacian-pyramid coefficient selection
-- `weighted-average` — per-pixel sharpness-weighted blend
-- `depth-map` — per-pixel selection from a smoothed sharpness surface
+- `laplacian` — Laplacian-pyramid coefficient selection; the window calls it
+  **Details**
+- `weighted-average` — per-pixel sharpness-weighted blend; the window calls it
+  **Soft transitions**
+- `depth-map` — per-pixel selection from a smoothed sharpness surface; the
+  window calls it **Focus map**
 - `pyramidal-ecc` — the alignment solver `align` and `stack` both drive; see
   [`guide/alignment.md`](../guide/alignment.md)
 
@@ -733,6 +768,146 @@ and the command exits without printing a schema.
 `--json` emits the same per-parameter facts described above, one element in
 `{"algorithms": [...]}`.
 
+## `step-plan`
+
+```
+focusforge-cli step-plan [OPTIONS]
+```
+
+| flag | meaning |
+|---|---|
+| `--set <KEY=VALUE>` | set a parameter; repeatable, and a repeated key is last-wins |
+| `--json` | print the plan as one JSON object |
+
+Computes how many frames a focus stack needs. The depth of field is
+`DOF = 0.55 µm / NA²`. A lens states its marked f-stop `N` and the
+magnification `m`, which give `NA = 1 / (2 · N · (1 + m))` (the pupil
+magnification is taken as 1); an objective states its NA. The focus step is
+`DOF · (1 − overlap)`, rounded to a whole nanometre, and the frame count is
+`ceil(range / step) + 1`, so both ends of the depth range are covered. The
+duration is the frame count times the time per frame, and the disk need is
+the frame count times the size per frame.
+
+A parameter the chosen optics does not use is ignored: `na` with a lens,
+`aperture` with an objective. The output names the optics input that was
+used.
+
+| parameter | unit | default | allowed |
+|---|---|---|---|
+| `magnification` | × | 1 | 0.01 to 100 |
+| `optics` | | `lens` | `lens`, `objective` |
+| `aperture` | marked f-stop | 8 | 0.7 to 64 |
+| `na` | numerical aperture | 0.25 | 0.01 to 0.95 |
+| `overlap` | fraction of the depth of field | 0.25 | 0 to 0.9 |
+| `range_mm` | mm | 5 | 0 to 1000 (0 plans one frame) |
+| `frame_seconds` | s | 1 | 0 to 3600 |
+| `frame_mb` | MB | 50 | 0 to 2000 |
+
+A value outside its range, an unknown key or an unparsable value is
+reported on stderr, one line per violation, and the exit code is 1.
+
+```
+$ focusforge-cli step-plan --set magnification=1 --set aperture=8 --set frame_seconds=3
+optics:    lens, f/8
+NA:        0.031
+DOF:       563.2 µm
+step:      422.4 µm (422400 nm)
+frames:    13
+duration:  39 s
+disk:      650 MB
+```
+
+`--json` prints the same plan as one object. Its `optics` object carries
+only the input that was used (`aperture` for a lens, `na` for an objective):
+
+```
+$ focusforge-cli step-plan --set optics=objective --set na=0.25 --set range_mm=1 --json
+{
+  "optics": {
+    "kind": "objective",
+    "na": 0.25
+  },
+  "na": 0.25,
+  "dof_um": 8.8,
+  "step_nm": 6600,
+  "frames": 153,
+  "duration_s": 153.0,
+  "disk_mb": 7650.0
+}
+```
+
+## `sharp-areas`
+
+```
+focusforge-cli sharp-areas [OPTIONS] <DIR>
+```
+
+| flag | meaning |
+|---|---|
+| `--set <KEY=VALUE>` | set a parameter; repeatable, and a repeated key is last-wins |
+| `--json` | print the counts as one JSON object |
+| `--priority <low\|normal>` | `low` reads one frame at a time, `normal` (the default) as many as the host has threads; the counts are the same |
+
+Counts, for each frame of a directory, how many areas of the image are
+sharpest in that frame. `<DIR>` is read like `info`'s: the frames directly
+inside it, or inside its `frames/` subdirectory when that exists.
+
+The image is divided into square cells from the top left corner, smaller at
+the right and bottom edges. A cell's score in a frame is the mean focus
+score of its pixels (the score `depth-map` fuses by). A cell is counted in the
+frame where its score peaks, the lowest index on a tie, when that peak is
+more than `contrast` times the cell's lowest score over the stack; every
+other cell is counted in no frame, so the counts add up to at most the
+number of cells. A cell counts in the first or the last frame like any other.
+Frames are read tile by tile and counted as they are, without alignment. A
+single frame, or a stack with no detail, gives a count of 0 for every frame.
+
+| parameter | unit | default | allowed |
+|---|---|---|---|
+| `cell-size` | px | 64 | 16 to 512 |
+| `contrast` | peak-to-floor ratio | 2 | 1 to 10 |
+
+A value outside its range, an unknown key or an unparsable value is
+reported on stderr, one line per violation, and the exit code is 1. So are
+a directory without frames, a frame that cannot be read, and frames of
+different sizes.
+
+The text output is one row per frame: its index, its file name and its count.
+
+```
+$ focusforge-cli sharp-areas fixtures/mantis-512/frames
+0  00.tif  0
+1  01.tif  0
+2  02.tif  4
+3  03.tif  11
+4  04.tif  0
+5  05.tif  0
+6  06.tif  0
+7  07.tif  1
+```
+
+`--json` prints the resolved parameters, the number of cells and the same
+rows (here with `--set cell-size=256`):
+
+```
+$ focusforge-cli sharp-areas fixtures/mantis-512/frames --set cell-size=256 --json
+{
+  "cells": 4,
+  "frames": [
+    {
+      "count": 0,
+      "file": "00.tif",
+      "index": 0
+    },
+    ...
+  ],
+  "params": {
+    "cell-size": 256,
+    "contrast": 2.0
+  }
+}
+```
+
 ## `export`
 
 ```
@@ -757,7 +932,7 @@ opened project. See
 | `-o, --output <FILE>` | write the image to this path |
 | `--zmap <FILE>` | write the Z-Map to this path (as TIFF); needs no source frames |
 | `--checkpoint <ID>` | the checkpoint to export, an id or a unique id prefix; defaults to the head |
-| `--format <FORMAT>` | `tiff`, `png` or `jpeg`. Inferred from `-o`'s extension when omitted: `.tif`/`.tiff`, `.png`, `.jpg`/`.jpeg`; no extension means TIFF. An unrecognised extension needs `--format`; a `--format` that contradicts a recognised extension is refused |
+| `--format <FORMAT>` | `tiff`, `png`, `jpeg` or `dng` (a linear DNG of a RAW project; no format options, `--icc` has no effect). Inferred from `-o`'s extension when omitted: `.tif`/`.tiff`, `.png`, `.jpg`/`.jpeg`, `.dng`; no extension means TIFF. An unrecognised extension needs `--format`; a `--format` that contradicts a recognised extension is refused |
 | `--tiff-bits <BITS>` | TIFF bit depth: `16` (default) or `8` |
 | `--tiff-compression <NAME>` | TIFF compression: `none` (default), `lzw` or `deflate` |
 | `--png-bits <BITS>` | PNG bit depth: `16` (default) or `8` |
@@ -785,7 +960,8 @@ focusforge-cli export mantis-64.ffp --checkpoint 5b71 --zmap zmap-5b71.tif
 
 A source frame that cannot be found, or whose content changed since the
 project was written, makes a retouched `-o` and `--frame-output` refuse, naming every
-such frame; nothing is written. `--zmap` alone never reads a source frame.
+such frame; nothing is written. `--zmap` alone never reads a source frame and writes the fusion's Z-Map
+unchanged: retouch strokes are not included.
 The `.partial` file a run writes into is renamed only when the write
 completes.
 
@@ -816,7 +992,9 @@ for what a checkpoint is and how hidden checkpoints are handled.
 A project is validated when it is opened. A damaged one is refused by name
 with its own exit code (3 not a project, 4 truncated, 6 a missing entry, 7 a
 blob hash mismatch, 8 a broken link between checkpoints, `1` anything
-else). If a source frame's content changed since the project was written,
+else, including a project saved by a newer FocusForge). Those codes hold
+for every command that opens a project: `export`, `history`, `info` and
+`retouch`. If a source frame's content changed since the project was written,
 `list` and `delete` refuse with exit 9 naming the frames; their
 `--accept-changed-sources` flag proceeds with a warning instead. `compact`
 never accepts that flag. Frames that
@@ -925,7 +1103,10 @@ focusforge-cli review [OPTIONS] <DIR>
 Reports one record per stack found under `<DIR>` — a `stack` run's `-o`
 output directory, or a plain directory of `.ffp` files — without
 re-fusing, re-grouping or writing anything. When `<DIR>` holds a run
-manifest (`manifest.json`, written by every `stack` run), `review` reads it
+manifest (written by every `stack` run: `manifest.json` in the `-o`
+directory, or `<folder>-run.json` inside the folder the run was pointed at
+when `-o` is omitted),
+`review` reads it
 and lists every group the run attempted, a failed one included; otherwise it
 lists the `.ffp` files it finds directly, non-recursively.
 
@@ -940,7 +1121,7 @@ project's manifest; `coherence` is computed by streaming the project's
 Z-Map. Both are `--` when a project has no recorded metrics — a failed
 stack, for instance — and a note (the metrics reason, or the run's error)
 prints after the fields instead. See
-[`guide/batch-runs.md`](../guide/batch-runs.md#reviewing-the-results) for a
+[`reference/batch-runs.md`](batch-runs.md#reviewing-the-results) for a
 walkthrough.
 
 ### `--json`
@@ -978,7 +1159,7 @@ focusforge-cli cache clear [OPTIONS]
 
 Removes every entry from the stage cache under `.scratch/stage-cache/`, the
 store `stack` reads and writes to skip a repeated alignment solve — see
-[`guide/batch-runs.md`](../guide/batch-runs.md#the-stage-cache). Never touches
+[`reference/batch-runs.md`](batch-runs.md#the-stage-cache). Never touches
 `.scratch/resume/` or any project — a clear must never be able to destroy a
 cancelled run's recoverable work.
 
@@ -1019,3 +1200,55 @@ crash leaves behind, and the notice printed on the next start after one.
 
 Exits non-zero if the output path exists without `--force`, or if the
 bundle could not be written.
+
+## `check-update`
+
+```
+focusforge-cli check-update [OPTIONS]
+```
+
+| flag | meaning |
+|---|---|
+| `--json` | emit the JSON report instead of human-readable text |
+
+Asks the release server once whether a newer final release than the running
+version exists, and reports the one outcome. Pre-releases and drafts are
+never offered. The request waits at most 5 seconds in total and carries only
+`User-Agent: FocusForge/<version>` and `Accept`: no identifier, setting or
+file data is sent, and nothing is downloaded or installed.
+
+```
+$ focusforge-cli check-update
+FocusForge 0.1.0 is up to date
+$ focusforge-cli check-update
+FocusForge 0.2.0 is available (running 0.1.0): https://github.com/jjjsood/FocusForge/releases/tag/v0.2.0
+$ focusforge-cli check-update
+error: update check failed: could not reach the release server: <reason>
+```
+
+`--json` emits one document on stdout whose `outcome` field is one of:
+
+- `"up-to-date"`, with `running`, the running version;
+- `"newer"`, with `running`, `version` (the newer release's version) and
+  `url` (its download page);
+- `"failed"`, with `running` and `reason`, the same text the error line
+  carries.
+
+Exit status tells the outcome without parsing the output:
+
+| status | meaning |
+|---|---|
+| `0` | the running version is up to date |
+| `3` | a newer release is available |
+| `1` | the check failed: no network, a timeout, a refused connection, an answer other than HTTP 200, an answer that could not be read, or an answer that names no final release |
+
+A failure also prints `error: update check failed: <reason>` on stderr, in
+both modes. The `reason` is one of:
+
+| failure | reason |
+|---|---|
+| no network, a timeout, a refused connection, an answer other than HTTP 200 | `could not reach the release server: <detail>`, for example `<detail>` = `unexpected HTTP status 404` |
+| an answer that is not a usable release | `the release answer could not be read: <detail>` |
+| a draft or pre-release answer | `no final release is published` |
+
+A usage error exits `2`, as for every command.

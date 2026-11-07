@@ -79,6 +79,8 @@ pub struct Notification {
     /// is due a native banner.
     pub native: bool,
     pub crash: Option<CrashEvidence>,
+    /// The page the toast's link opens in the browser.
+    pub url: Option<String>,
 }
 
 impl Notification {
@@ -102,6 +104,7 @@ impl Notification {
             read: false,
             native: false,
             crash: None,
+            url: None,
         }
     }
 }

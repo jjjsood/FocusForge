@@ -28,9 +28,11 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
             [CompletionResult]::new('-V', '-V ', [CompletionResultType]::ParameterName, 'Print version')
             [CompletionResult]::new('--version', '--version', [CompletionResultType]::ParameterName, 'Print version')
-            [CompletionResult]::new('info', 'info', [CompletionResultType]::ParameterValue, 'Print project, TIFF or RAW metadata for a file, or for every frame in a directory')
+            [CompletionResult]::new('info', 'info', [CompletionResultType]::ParameterValue, 'Print project, TIFF, JPEG or RAW metadata for a file, or for every frame in a directory')
             [CompletionResult]::new('algorithms', 'algorithms', [CompletionResultType]::ParameterValue, 'List every registered algorithm, or print one named algorithm''s full parameter schema')
-            [CompletionResult]::new('stack', 'stack', [CompletionResultType]::ParameterValue, 'Fuse supported TIFF or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run `focusforge-cli export` for that')
+            [CompletionResult]::new('step-plan', 'step-plan', [CompletionResultType]::ParameterValue, 'Compute the focus step, frame count, duration and disk need of a focus stack')
+            [CompletionResult]::new('sharp-areas', 'sharp-areas', [CompletionResultType]::ParameterValue, 'Count the areas of the image that are sharpest in each frame of a stack')
+            [CompletionResult]::new('stack', 'stack', [CompletionResultType]::ParameterValue, 'Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run `focusforge-cli export` for that')
             [CompletionResult]::new('export', 'export', [CompletionResultType]::ParameterValue, 'Turn a project into an image file: the image with `-o`, the Z-Map with `--zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image')
             [CompletionResult]::new('retouch', 'retouch', [CompletionResultType]::ParameterValue, 'Append an op list to a project as new states, one per op, each the previous one''s child: on the current head, or on `--from` as a branch. `export --checkpoint` writes any of them')
             [CompletionResult]::new('history', 'history', [CompletionResultType]::ParameterValue, 'List, delete or compact a project''s checkpoints. Every history operation is reachable through this command, headless')
@@ -38,6 +40,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('review', 'review', [CompletionResultType]::ParameterValue, 'Report one record per result found under a directory of projects, or a batch run''s output directory: identity, outcome, sharpness ratio and Z-Map spread, with a failed stack a visible record rather than a missing file. Reads a run manifest when one is present, otherwise a non-recursive listing of `*.ffp` files; never groups frames itself and writes nothing')
             [CompletionResult]::new('cache', 'cache', [CompletionResultType]::ParameterValue, 'Remove every entry from the stage cache under `.scratch/stage-cache/`. Never touches `.scratch/resume/` or any project')
             [CompletionResult]::new('diagnostics', 'diagnostics', [CompletionResultType]::ParameterValue, 'Package this installation''s logs, crash reports, system summary, graphics adapter record, effective configuration and version into one ZIP, listing every file before writing it. The home directory and the user name are redacted out of every text entry, image data is never included, and nothing is sent anywhere')
+            [CompletionResult]::new('check-update', 'check-update', [CompletionResultType]::ParameterValue, 'Ask the release server whether a newer FocusForge release exists')
             [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
             break
         }
@@ -58,6 +61,27 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Log errors only')
             [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
+        'focusforge-cli;step-plan' {
+            [CompletionResult]::new('--set', '--set', [CompletionResultType]::ParameterName, 'Set a parameter: `--set key=value`, repeatable. A repeated key is last-wins')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print the plan as one JSON object')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail (repeatable)')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Log errors only')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Log errors only')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'focusforge-cli;sharp-areas' {
+            [CompletionResult]::new('--set', '--set', [CompletionResultType]::ParameterName, 'Set a parameter: `--set key=value`, repeatable. A repeated key is last-wins')
+            [CompletionResult]::new('--priority', '--priority', [CompletionResultType]::ParameterName, 'How many frames are read at once; the counts are the same at either value')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print the counts as one JSON object')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail (repeatable)')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Log errors only')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Log errors only')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
             break
         }
         'focusforge-cli;stack' {
@@ -97,7 +121,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('--output', '--output', [CompletionResultType]::ParameterName, 'Write the image to this path')
             [CompletionResult]::new('--zmap', '--zmap', [CompletionResultType]::ParameterName, 'Write the Z-Map to this path')
             [CompletionResult]::new('--checkpoint', '--checkpoint', [CompletionResultType]::ParameterName, 'A checkpoint id or unique id prefix. Defaults to the head. An unedited image export needs no source frames; an edited one re-reads and verifies the nearest fused ancestor''s. `--zmap` alone needs none')
-            [CompletionResult]::new('--format', '--format', [CompletionResultType]::ParameterName, 'The image format to write: `tiff`, `png` or `jpeg`. Inferred from `-o`''s extension when omitted (`.tif`/`.tiff` -> tiff, `.png` -> png, `.jpg`/`.jpeg` -> jpeg, no extension -> tiff, the default); refused if it names a format other than a recognised extension''s')
+            [CompletionResult]::new('--format', '--format', [CompletionResultType]::ParameterName, 'The image format to write: `tiff`, `png`, `jpeg` or `dng` (a linear DNG of a RAW project). Inferred from `-o`''s extension when omitted (`.tif`/`.tiff` -> tiff, `.png` -> png, `.jpg`/`.jpeg` -> jpeg, `.dng` -> dng, no extension -> tiff, the default); refused if it names a format other than a recognised extension''s')
             [CompletionResult]::new('--tiff-bits', '--tiff-bits', [CompletionResultType]::ParameterName, 'TIFF bit depth: `16` (default) or `8`. TIFF only')
             [CompletionResult]::new('--tiff-compression', '--tiff-compression', [CompletionResultType]::ParameterName, 'TIFF strip compression: `none` (default), `lzw` or `deflate`. TIFF only')
             [CompletionResult]::new('--png-bits', '--png-bits', [CompletionResultType]::ParameterName, 'PNG bit depth: `16` (default) or `8`. PNG only')
@@ -105,8 +129,8 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('--jpeg-quality', '--jpeg-quality', [CompletionResultType]::ParameterName, 'JPEG quality, 1-100, default 95. JPEG only')
             [CompletionResult]::new('--jpeg-subsampling', '--jpeg-subsampling', [CompletionResultType]::ParameterName, 'JPEG chroma subsampling: `420` (default) or `444`. JPEG only')
             [CompletionResult]::new('--exif', '--exif', [CompletionResultType]::ParameterName, 'Carry the alignment reference frame''s EXIF: `on` (default) or `off`')
-            [CompletionResult]::new('--icc', '--icc', [CompletionResultType]::ParameterName, 'Embed an ICC profile: `on` (default) or `off`')
-            [CompletionResult]::new('--xmp', '--xmp', [CompletionResultType]::ParameterName, 'Carry the source frame''s XMP packet verbatim: `on` or `off` (default)')
+            [CompletionResult]::new('--icc', '--icc', [CompletionResultType]::ParameterName, 'Embed an ICC profile: `on` (default) or `off`. Has no effect on a DNG, whose colour is defined by its camera matrices')
+            [CompletionResult]::new('--xmp', '--xmp', [CompletionResultType]::ParameterName, 'Carry the source frame''s XMP packet, with any `tiff:Orientation` set to 1: `on` or `off` (default)')
             [CompletionResult]::new('--iptc', '--iptc', [CompletionResultType]::ParameterName, 'Carry the source frame''s IPTC block verbatim: `on` or `off` (default). Never written to PNG')
             [CompletionResult]::new('--frame', '--frame', [CompletionResultType]::ParameterName, 'Write this source frame "as fused" -- warped by its recorded transform and offset by the applied crop, at the resolved checkpoint''s own composite width and height. Requires `--frame-output`')
             [CompletionResult]::new('--frame-output', '--frame-output', [CompletionResultType]::ParameterName, 'Where to write the frame `--frame` names')
@@ -263,10 +287,21 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
             break
         }
+        'focusforge-cli;check-update' {
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit the JSON report instead of human-readable text')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail (repeatable)')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Log errors only')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Log errors only')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
         'focusforge-cli;help' {
-            [CompletionResult]::new('info', 'info', [CompletionResultType]::ParameterValue, 'Print project, TIFF or RAW metadata for a file, or for every frame in a directory')
+            [CompletionResult]::new('info', 'info', [CompletionResultType]::ParameterValue, 'Print project, TIFF, JPEG or RAW metadata for a file, or for every frame in a directory')
             [CompletionResult]::new('algorithms', 'algorithms', [CompletionResultType]::ParameterValue, 'List every registered algorithm, or print one named algorithm''s full parameter schema')
-            [CompletionResult]::new('stack', 'stack', [CompletionResultType]::ParameterValue, 'Fuse supported TIFF or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run `focusforge-cli export` for that')
+            [CompletionResult]::new('step-plan', 'step-plan', [CompletionResultType]::ParameterValue, 'Compute the focus step, frame count, duration and disk need of a focus stack')
+            [CompletionResult]::new('sharp-areas', 'sharp-areas', [CompletionResultType]::ParameterValue, 'Count the areas of the image that are sharpest in each frame of a stack')
+            [CompletionResult]::new('stack', 'stack', [CompletionResultType]::ParameterValue, 'Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run `focusforge-cli export` for that')
             [CompletionResult]::new('export', 'export', [CompletionResultType]::ParameterValue, 'Turn a project into an image file: the image with `-o`, the Z-Map with `--zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image')
             [CompletionResult]::new('retouch', 'retouch', [CompletionResultType]::ParameterValue, 'Append an op list to a project as new states, one per op, each the previous one''s child: on the current head, or on `--from` as a branch. `export --checkpoint` writes any of them')
             [CompletionResult]::new('history', 'history', [CompletionResultType]::ParameterValue, 'List, delete or compact a project''s checkpoints. Every history operation is reachable through this command, headless')
@@ -274,6 +309,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('review', 'review', [CompletionResultType]::ParameterValue, 'Report one record per result found under a directory of projects, or a batch run''s output directory: identity, outcome, sharpness ratio and Z-Map spread, with a failed stack a visible record rather than a missing file. Reads a run manifest when one is present, otherwise a non-recursive listing of `*.ffp` files; never groups frames itself and writes nothing')
             [CompletionResult]::new('cache', 'cache', [CompletionResultType]::ParameterValue, 'Remove every entry from the stage cache under `.scratch/stage-cache/`. Never touches `.scratch/resume/` or any project')
             [CompletionResult]::new('diagnostics', 'diagnostics', [CompletionResultType]::ParameterValue, 'Package this installation''s logs, crash reports, system summary, graphics adapter record, effective configuration and version into one ZIP, listing every file before writing it. The home directory and the user name are redacted out of every text entry, image data is never included, and nothing is sent anywhere')
+            [CompletionResult]::new('check-update', 'check-update', [CompletionResultType]::ParameterValue, 'Ask the release server whether a newer FocusForge release exists')
             [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
             break
         }
@@ -281,6 +317,12 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             break
         }
         'focusforge-cli;help;algorithms' {
+            break
+        }
+        'focusforge-cli;help;step-plan' {
+            break
+        }
+        'focusforge-cli;help;sharp-areas' {
             break
         }
         'focusforge-cli;help;stack' {
@@ -321,6 +363,9 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             break
         }
         'focusforge-cli;help;diagnostics' {
+            break
+        }
+        'focusforge-cli;help;check-update' {
             break
         }
         'focusforge-cli;help;help' {

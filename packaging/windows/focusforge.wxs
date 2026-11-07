@@ -14,6 +14,8 @@
       <Component Id="ManRootComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManRoot" Source="$(var.CliAssets)\man\man1\focusforge-cli.1.gz" KeyPath="yes" /></Component>
       <Component Id="ManInfoComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManInfo" Source="$(var.CliAssets)\man\man1\focusforge-cli-info.1.gz" KeyPath="yes" /></Component>
       <Component Id="ManAlgorithmsComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManAlgorithms" Source="$(var.CliAssets)\man\man1\focusforge-cli-algorithms.1.gz" KeyPath="yes" /></Component>
+      <Component Id="ManStepPlanComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManStepPlan" Source="$(var.CliAssets)\man\man1\focusforge-cli-step-plan.1.gz" KeyPath="yes" /></Component>
+      <Component Id="ManSharpAreasComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManSharpAreas" Source="$(var.CliAssets)\man\man1\focusforge-cli-sharp-areas.1.gz" KeyPath="yes" /></Component>
       <Component Id="ManStackComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManStack" Source="$(var.CliAssets)\man\man1\focusforge-cli-stack.1.gz" KeyPath="yes" /></Component>
       <Component Id="ManExportComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManExport" Source="$(var.CliAssets)\man\man1\focusforge-cli-export.1.gz" KeyPath="yes" /></Component>
       <Component Id="ManRetouchComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManRetouch" Source="$(var.CliAssets)\man\man1\focusforge-cli-retouch.1.gz" KeyPath="yes" /></Component>
@@ -22,6 +24,7 @@
       <Component Id="ManReviewComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManReview" Source="$(var.CliAssets)\man\man1\focusforge-cli-review.1.gz" KeyPath="yes" /></Component>
       <Component Id="ManCacheComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManCache" Source="$(var.CliAssets)\man\man1\focusforge-cli-cache.1.gz" KeyPath="yes" /></Component>
       <Component Id="ManDiagnosticsComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManDiagnostics" Source="$(var.CliAssets)\man\man1\focusforge-cli-diagnostics.1.gz" KeyPath="yes" /></Component>
+      <Component Id="ManCheckUpdateComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManCheckUpdate" Source="$(var.CliAssets)\man\man1\focusforge-cli-check-update.1.gz" KeyPath="yes" /></Component>
       <Component Id="ManHistoryListComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManHistoryList" Source="$(var.CliAssets)\man\man1\focusforge-cli-history-list.1.gz" KeyPath="yes" /></Component>
       <Component Id="ManHistoryDeleteComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManHistoryDelete" Source="$(var.CliAssets)\man\man1\focusforge-cli-history-delete.1.gz" KeyPath="yes" /></Component>
       <Component Id="ManHistoryCompactComponent" Directory="Man1Directory" Bitness="always64"><File Id="ManHistoryCompact" Source="$(var.CliAssets)\man\man1\focusforge-cli-history-compact.1.gz" KeyPath="yes" /></Component>

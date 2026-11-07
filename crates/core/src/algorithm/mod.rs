@@ -19,11 +19,12 @@ mod error;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::display::preview::AlignedFrameSink;
 use crate::gpu::AlignBackend;
 pub use crate::params::StackContext;
 use crate::params::{ParamDesc, ParamValue, ParamValues};
 use crate::tile::plan::TileSupport;
-use crate::tile::{FramePreprocess, Rect, Tile};
+use crate::tile::{FramePreprocess, Rect, Sample, SampleFormat, Tile};
 use crate::timing::{TimingCounter, record_timing};
 
 pub use error::AlgorithmError;
@@ -41,9 +42,42 @@ pub use error::AlgorithmError;
 /// a checked constructor on `TileOutput` itself still waits for its first
 /// real caller.
 #[derive(Debug, Clone, PartialEq)]
-pub struct TileOutput {
-    pub tile: Tile,
+pub struct TileOutput<S = u16> {
+    pub tile: Tile<S>,
     pub zmap: Vec<u16>,
+    /// The winning sharpness of every pixel, when the algorithm holds one.
+    pub sharpness: Option<Sharpness>,
+}
+
+/// The per-pixel winning sharpness of one tile, over the same read rect as
+/// [`TileOutput::tile`]: one value per pixel, `-inf` where no frame was
+/// eligible.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Sharpness {
+    /// The best windowed score itself.
+    Score(Vec<f32>),
+    /// The best of `score ^ exponent`, the weight a blending algorithm keeps.
+    Weight { weights: Vec<f64>, exponent: f64 },
+}
+
+impl Sharpness {
+    /// The winning score of `pixel`; `-inf` for a pixel with no eligible
+    /// frame. A weight is mapped back to score scale.
+    pub fn score(&self, pixel: usize) -> f64 {
+        match self {
+            Sharpness::Score(scores) => f64::from(scores[pixel]),
+            Sharpness::Weight { weights, exponent } => {
+                let weight = weights[pixel];
+                // `powf(-inf, 1 / exponent)` is `+inf`, so the ineligible
+                // marker is tested before the map-back.
+                if weight >= 0.0 {
+                    weight.powf(exponent.recip())
+                } else {
+                    f64::NEG_INFINITY
+                }
+            }
+        }
+    }
 }
 
 /// The per-tile view across every frame of a stack that
@@ -218,6 +252,67 @@ impl<'a> TileCtx<'a> {
         Ok(())
     }
 
+    /// The sample type this context's frames are read in: `u16` for resident
+    /// tiles, the reader's native type for an on-demand context.
+    pub fn sample_format(&self) -> SampleFormat {
+        match &self.backing {
+            Backing::Resident { .. } => SampleFormat::U16,
+            Backing::OnDemand { reader, .. } => reader.sample_format(),
+        }
+    }
+
+    /// [`Self::for_each_frame`] handing each frame's samples in sample type
+    /// `S`: an on-demand context reads `S` from its reader and runs the
+    /// preprocess stage over it; a resident one widens its `u16` tiles when
+    /// `S` is `f32`. An algorithm picks `S` from [`Self::sample_format`].
+    pub fn for_each_frame_as<S: Sample>(
+        &self,
+        mut visit: impl FnMut(usize, &[S], Option<&[bool]>) -> Result<(), AlgorithmError>,
+    ) -> Result<(), AlgorithmError> {
+        match &self.backing {
+            Backing::Resident { tiles, coverage } => {
+                for (f, tile) in tiles.iter().enumerate() {
+                    self.frames_read.fetch_add(1, Ordering::Relaxed);
+                    let samples = S::from_u16(&tile.samples);
+                    visit(
+                        f,
+                        &samples,
+                        coverage.get(f).and_then(|mask| mask.as_deref()),
+                    )?;
+                }
+            }
+            Backing::OnDemand {
+                frame_count,
+                samples_per_pixel,
+                reader,
+                preprocess,
+            } => {
+                let len = self.rect.width as usize
+                    * self.rect.height as usize
+                    * *samples_per_pixel as usize;
+                let mut samples = vec![S::default(); len];
+                record_timing(
+                    TimingCounter::AllocationBytes,
+                    (samples.capacity() * std::mem::size_of::<S>()) as u64,
+                );
+                record_timing(TimingCounter::AllocationOperations, 1);
+                for f in 0..*frame_count {
+                    let coverage = S::read_tile_coverage(*reader, f, self.rect, &mut samples)?;
+                    self.frames_read.fetch_add(1, Ordering::Relaxed);
+                    samples = S::preprocess(
+                        *preprocess,
+                        f,
+                        self.rect,
+                        *samples_per_pixel,
+                        std::mem::take(&mut samples),
+                    )?;
+                    visit(f, &samples, coverage.as_deref())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// How many frame-tiles [`Self::for_each_frame`] has produced so far,
     /// across every call.
     pub fn frames_read(&self) -> usize {
@@ -257,6 +352,77 @@ pub trait TileReader: Send + Sync {
         Ok(None)
     }
 
+    /// [`Self::read_tile_into`] with every sample multiplied by the Q16
+    /// `gain` ([`crate::equalize::UNIT_GAIN`] is 1.0). The default scales the
+    /// encoded samples; a reader whose samples are not linear light overrides
+    /// this to apply the gain to its linear values.
+    fn read_tile_gained_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        gain: u32,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        self.read_tile_into(frame, rect, out)?;
+        crate::equalize::apply_gain(out, gain);
+        Ok(())
+    }
+
+    /// The sample type this reader serves natively. A reader that serves
+    /// `f32` overrides the `f32` reads below; every other reader's `f32`
+    /// reads widen its `u16` ones.
+    fn sample_format(&self) -> SampleFormat {
+        SampleFormat::U16
+    }
+
+    /// [`Self::read_tile_into`] in `f32` samples on the 16-bit scale, which a
+    /// native `f32` reader serves without clipping to 65535.
+    fn read_tile_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        widened(out, |scratch| self.read_tile_into(frame, rect, scratch))
+    }
+
+    /// [`Self::read_tile_coverage_into`] in `f32` samples. A native `f32`
+    /// reader without a coverage mask of its own reports full coverage.
+    fn read_tile_coverage_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<Option<Vec<bool>>, AlgorithmError> {
+        if self.sample_format() == SampleFormat::F32 {
+            return self.read_tile_f32_into(frame, rect, out).map(|()| None);
+        }
+        widened(out, |scratch| {
+            self.read_tile_coverage_into(frame, rect, scratch)
+        })
+    }
+
+    /// [`Self::read_tile_gained_into`] in `f32` samples.
+    fn read_tile_gained_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        gain: u32,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        widened(out, |scratch| {
+            self.read_tile_gained_into(frame, rect, gain, scratch)
+        })
+    }
+
+    /// The mean of each channel of `frame` in linear light, for a reader
+    /// whose samples are a nonlinear look of linear data. `None` for a reader
+    /// whose samples are the linear ones; an error when the frame cannot be
+    /// read.
+    fn linear_means(&self, _frame: usize) -> Result<Option<[f64; 3]>, AlgorithmError> {
+        Ok(None)
+    }
+
     /// The heap bytes one [`Self::read_tile_into`] of a `width x height` rect
     /// allocates besides `out`: decode buffers, warp sources and the like.
     /// Memory the reader keeps resident between reads (a decoded-segment
@@ -278,6 +444,20 @@ pub trait TileReader: Send + Sync {
     ) -> Result<(), AlgorithmError> {
         read_tile_step_into(self, frame, rect, step, samples_per_pixel, out)
     }
+}
+
+/// Fills `out` with what `read` writes into a `u16` scratch of the same
+/// length; `out` is untouched when `read` fails.
+pub(crate) fn widened<T>(
+    out: &mut [f32],
+    read: impl FnOnce(&mut [u16]) -> Result<T, AlgorithmError>,
+) -> Result<T, AlgorithmError> {
+    let mut scratch = vec![0u16; out.len()];
+    let result = read(&mut scratch)?;
+    for (wide, narrow) in out.iter_mut().zip(&scratch) {
+        *wide = f32::from(*narrow);
+    }
+    Ok(result)
 }
 
 /// Reads every `step`-th row and column of `rect` from `frame` through
@@ -352,6 +532,7 @@ pub struct AlignContext<'a> {
     reader: &'a dyn TileReader,
     prepared: Option<&'a (dyn std::any::Any + Send + Sync)>,
     align_backend: Option<&'a dyn AlignBackend>,
+    preview: Option<&'a AlignedFrameSink>,
 }
 
 impl<'a> AlignContext<'a> {
@@ -362,6 +543,7 @@ impl<'a> AlignContext<'a> {
             reader,
             prepared: None,
             align_backend: None,
+            preview: None,
         }
     }
 
@@ -370,6 +552,18 @@ impl<'a> AlignContext<'a> {
     pub fn with_align_backend(mut self, backend: Option<&'a dyn AlignBackend>) -> Self {
         self.align_backend = backend;
         self
+    }
+
+    /// Attaches the sink a registration offers its frame image to; `None`
+    /// offers nothing.
+    pub fn with_preview(mut self, preview: Option<&'a AlignedFrameSink>) -> Self {
+        self.preview = preview;
+        self
+    }
+
+    /// The sink attached with [`Self::with_preview`], if any.
+    pub fn preview(&self) -> Option<&'a AlignedFrameSink> {
+        self.preview
     }
 
     /// The accelerator attached with [`Self::with_align_backend`], if any.
@@ -417,6 +611,21 @@ impl<'a> AlignContext<'a> {
     ) -> Result<(), AlgorithmError> {
         self.reader.read_tile_into(frame, rect, out)
     }
+
+    /// The sample type the context's reader serves natively.
+    pub fn sample_format(&self) -> SampleFormat {
+        self.reader.sample_format()
+    }
+
+    /// [`Self::read_tile_into`] in `f32` samples on the 16-bit scale.
+    pub fn read_tile_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        self.reader.read_tile_f32_into(frame, rect, out)
+    }
 }
 
 /// A stacking (fusion) algorithm: fuses one tile across every frame of a
@@ -436,6 +645,19 @@ pub trait StackAlgorithm: Send + Sync + 'static {
     fn display_name(&self) -> &str;
     fn params(&self) -> &[ParamDesc];
     fn fuse(&self, ctx: &TileCtx<'_>, cfg: &ParamValues) -> Result<TileOutput, AlgorithmError>;
+
+    /// [`Self::fuse`] with the composite left in `f32`: nothing is clamped or
+    /// rounded to 16 bits. A method without an `f32` output refuses.
+    fn fuse_f32(
+        &self,
+        _ctx: &TileCtx<'_>,
+        _cfg: &ParamValues,
+    ) -> Result<TileOutput<f32>, AlgorithmError> {
+        Err(AlgorithmError::Failed {
+            algorithm: self.id().to_string(),
+            detail: "this method has no f32 output".to_string(),
+        })
+    }
 
     /// Registered for tests only: resolvable by id, never chosen as a default.
     fn test_only(&self) -> bool {
@@ -487,11 +709,24 @@ pub trait StackAlgorithm: Send + Sync + 'static {
     /// Heap bytes per pixel of the read rect that one `fuse` call keeps live
     /// beyond the frame-tile and coverage mask the scheduler already counts:
     /// accumulators, per-frame planes and output, for `samples_per_pixel`
-    /// samples per pixel and the resolved `cfg`. The scheduler adds this to
-    /// its per-tile bytes. The default of 0 suits an algorithm that
+    /// samples per pixel, the resolved `cfg` and the stack's sample `format`
+    /// (an `F32` stack fuses into an `f32` output). The scheduler adds this
+    /// to its per-tile bytes. The default of 0 suits an algorithm that
     /// allocates nothing of its own.
-    fn working_bytes_per_pixel(&self, _cfg: &ParamValues, _samples_per_pixel: u32) -> u64 {
+    fn working_bytes_per_pixel(
+        &self,
+        _cfg: &ParamValues,
+        _samples_per_pixel: u32,
+        _format: SampleFormat,
+    ) -> u64 {
         0
+    }
+
+    /// The largest score [`Sharpness::score`] can return for the resolved
+    /// `cfg` and `samples_per_pixel`, which fixes the heat scale of a whole
+    /// run. `None`, the default, means the algorithm offers no sharpness view.
+    fn heat_scale(&self, _cfg: &ParamValues, _samples_per_pixel: u32) -> Option<f64> {
+        None
     }
 }
 
@@ -619,6 +854,21 @@ impl TileReader for crate::io::TiffStack {
             .map_err(crate::io::FrameError::from)
             .map_err(AlgorithmError::from)
     }
+
+    fn sample_format(&self) -> SampleFormat {
+        crate::io::TiffStack::sample_format(self)
+    }
+
+    fn read_tile_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        crate::io::TiffStack::read_tile_f32_into(self, frame, rect, out)
+            .map_err(crate::io::FrameError::from)
+            .map_err(AlgorithmError::from)
+    }
 }
 
 #[cfg(test)]
@@ -679,6 +929,7 @@ mod tests {
                     ParamValue::Float(ctx.frame_count as f64)
                 })),
                 host_default: None,
+                stack_max: None,
             },
             ParamDesc {
                 id: "mode".to_string(),
@@ -700,6 +951,7 @@ mod tests {
                 advanced: false,
                 auto: None,
                 host_default: None,
+                stack_max: None,
             },
         ]
     });
@@ -747,7 +999,11 @@ mod tests {
             })?;
             let tile = first.expect("a context with a frame 0 visits it");
             let zmap = vec![0u16; (tile.rect.width * tile.rect.height) as usize];
-            Ok(TileOutput { tile, zmap })
+            Ok(TileOutput {
+                tile,
+                zmap,
+                sharpness: None,
+            })
         }
     }
 
@@ -1278,5 +1534,23 @@ mod tests {
             vec![0u16; 3],
             "a rejected buffer must not be partially written"
         );
+    }
+
+    #[test]
+    fn sharpness_heatmap_score_maps_weights_back_and_guards_the_ineligible() {
+        let score = Sharpness::Score(vec![3.5, f32::NEG_INFINITY]);
+        assert_eq!(score.score(0), 3.5);
+        assert_eq!(score.score(1), f64::NEG_INFINITY);
+
+        let weight = Sharpness::Weight {
+            weights: vec![81.0, 0.0, f64::NEG_INFINITY, f64::NAN, -2.0],
+            exponent: 4.0,
+        };
+        assert!((weight.score(0) - 3.0).abs() < 1e-12);
+        assert_eq!(weight.score(1), 0.0);
+        // `powf(-inf, 1/e)` is `+inf`; an uncovered pixel must stay cold.
+        assert_eq!(weight.score(2), f64::NEG_INFINITY);
+        assert_eq!(weight.score(3), f64::NEG_INFINITY);
+        assert_eq!(weight.score(4), f64::NEG_INFINITY);
     }
 }

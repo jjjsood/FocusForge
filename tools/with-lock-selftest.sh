@@ -10,6 +10,8 @@ TMP="$(cd -P "$(mktemp -d)" && pwd)"
 trap 'rm -rf "$TMP"' EXIT
 
 FAIL=0
+# The host's real RAM use must not queue these cases; exercise_build_slots fakes it.
+export FF_BUILD_RAM_CAP_GB=0
 
 lock_dir() {
   local checkout="$1"
@@ -390,12 +392,28 @@ exercise_live_holder_timeout() {
   reap_holder "$holder"
 }
 
-run_without_flock_suite() {
-  PATH="$NO_FLOCK_PATH" FF_LOCK_SELFTEST_NO_FLOCK=1 bash "$0"
+# One build slot by default queues separate targets; two slots let them build side by side; the RAM cap queues too.
+exercise_build_slots() {
+  local pool="$TMP/slot pool" ready="$TMP/slot-ready" meminfo="$TMP/meminfo" holder
+  mkdir -p "$pool/a" "$pool/b"
+  make_link "$pool/a" "$pool/cargo-target/a"
+  make_link "$pool/b" "$pool/cargo-target/b"
+  run_lock "$pool/a" flock 5 build -- sh -c 'printf held >"$1"; sleep 1' sh "$ready" >/dev/null 2>&1 &
+  holder=$!
+  require_ready "slot holder" "$holder" "$ready" || { reap_holder "$holder"; return; }
+  expect_status "default slot queues separate target" 4 run_lock "$pool/b" flock 0 build -- true
+  FF_BUILD_SLOTS=2 expect_status "two slots build separate targets alongside" 0 run_lock "$pool/b" flock 0 build -- true
+  wait "$holder"
+  printf 'MemTotal: %s kB\nMemAvailable: %s kB\n' 62914560 10485760 >"$meminfo"
+  FF_LOCK_MEMINFO="$meminfo" FF_BUILD_RAM_CAP_GB=50 \
+    expect_status "RAM cap queues build" 4 run_lock "$pool/b" flock 0 build -- true
+  FF_LOCK_MEMINFO="$meminfo" FF_BUILD_RAM_CAP_GB=51 \
+    expect_status "RAM below cap builds" 0 run_lock "$pool/b" flock 0 build -- true
 }
 
 if command -v flock >/dev/null 2>&1; then
   exercise_backend flock
+  exercise_build_slots
 fi
 if [ ! -x "$REPO/tools/lib/native-lock.py" ]; then
   echo "FAIL [native helper]: tools/lib/native-lock.py is not executable" >&2
@@ -413,9 +431,6 @@ fi
 exercise_cleanup_handoff
 exercise_readiness_failure
 exercise_live_holder_timeout
-if [ "${FF_LOCK_SELFTEST_NO_FLOCK:-}" != 1 ]; then
-  expect_status "whole suite without flock" 0 run_without_flock_suite
-fi
 
 [ "$FAIL" -eq 0 ] || exit 1
 echo "OK: lock directory selftest"

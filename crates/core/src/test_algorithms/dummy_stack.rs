@@ -11,6 +11,7 @@ use std::sync::LazyLock;
 use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
 use crate::params::{EnumVariant, ParamDesc, ParamKind, ParamValue, ParamValues};
 use crate::registry::StackRegistration;
+use crate::tile::{Sample, SampleFormat, Tile};
 
 static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     vec![
@@ -30,6 +31,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
                 ParamValue::Float(1.0 / ctx.frame_count.max(1) as f64)
             })),
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "mode".to_string(),
@@ -51,6 +53,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "workers".to_string(),
@@ -66,6 +69,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             host_default: Some(std::sync::Arc::new(|facts: &crate::host::HostFacts| {
                 ParamValue::Int(facts.logical_cores() as i64)
             })),
+            stack_max: None,
         },
     ]
 });
@@ -95,18 +99,35 @@ impl StackAlgorithm for DummyStack {
 
     fn fuse(&self, ctx: &TileCtx<'_>, cfg: &ParamValues) -> Result<TileOutput, AlgorithmError> {
         crate::params::validate(self.params(), cfg)?;
-        ctx.samples_per_pixel()?;
-        let mut first = None;
-        ctx.for_each_frame(|f, tile, _| {
-            if f == 0 {
-                first = Some(tile.clone());
-            }
-            Ok(())
-        })?;
-        let tile = first.expect("a context with a frame 0 visits it");
-        let zmap = vec![0u16; (tile.rect.width * tile.rect.height) as usize];
-        Ok(TileOutput { tile, zmap })
+        let samples_per_pixel = ctx.samples_per_pixel()?;
+        let samples = match ctx.sample_format() {
+            SampleFormat::U16 => first_frame::<u16>(ctx)?,
+            SampleFormat::F32 => first_frame::<f32>(ctx)?,
+        };
+        let rect = ctx.rect();
+        let zmap = vec![0u16; (rect.width * rect.height) as usize];
+        Ok(TileOutput {
+            tile: Tile {
+                rect,
+                samples_per_pixel,
+                samples,
+            },
+            zmap,
+            sharpness: None,
+        })
     }
+}
+
+/// Frame 0 of `ctx`, narrowed to `u16` once.
+fn first_frame<S: Sample>(ctx: &TileCtx<'_>) -> Result<Vec<u16>, AlgorithmError> {
+    let mut first = None;
+    ctx.for_each_frame_as::<S>(|f, samples, _| {
+        if f == 0 {
+            first = Some(samples.iter().map(|s| u16::narrow(s.widen())).collect());
+        }
+        Ok(())
+    })?;
+    Ok(first.expect("a context with a frame 0 visits it"))
 }
 
 inventory::submit! { StackRegistration::new(&DummyStack) }

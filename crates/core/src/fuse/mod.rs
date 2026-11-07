@@ -51,7 +51,7 @@ mod error;
 pub mod laplacian;
 pub mod metrics;
 pub mod pyramid;
-mod sharpness;
+pub(crate) mod sharpness;
 pub mod weighted_average;
 
 pub use backend_consumer::BackendFusionConsumer;

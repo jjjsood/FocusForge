@@ -98,21 +98,16 @@ mod tests {
     use tracing_subscriber::filter::Targets;
 
     use super::trace_targets;
-    use crate::{MIRRORED_OUTPUT_TARGET, file_targets};
+    use crate::MIRRORED_OUTPUT_TARGET;
 
     fn enabled(filter: &Targets, target: &str, level: Level) -> bool {
         filter.would_enable(target, &level)
     }
 
     #[test]
-    fn trace_filter_refuses_a_third_party_target_the_file_filter_accepts() {
+    fn trace_filter_refuses_a_third_party_target() {
         assert!(!enabled(
             &trace_targets(),
-            "some_third_party_crate",
-            Level::ERROR
-        ));
-        assert!(enabled(
-            &file_targets(),
             "some_third_party_crate",
             Level::ERROR
         ));
@@ -130,11 +125,6 @@ mod tests {
     fn trace_filter_refuses_the_mirrored_output_target() {
         assert!(!enabled(
             &trace_targets(),
-            MIRRORED_OUTPUT_TARGET,
-            Level::DEBUG
-        ));
-        assert!(enabled(
-            &file_targets(),
             MIRRORED_OUTPUT_TARGET,
             Level::DEBUG
         ));

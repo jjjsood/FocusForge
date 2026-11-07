@@ -7,11 +7,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::algorithm::{AlgorithmError, TileReader};
-use crate::align::warp::warp_tile;
+use crate::align::warp::warp_tile_samples;
 use crate::align::{SourceFootprint, Transform};
 use crate::equalize::{Equalization, UNIT_GAIN};
 use crate::job::stage_cache::{transform_from_bits, transform_to_bits};
-use crate::tile::Rect;
+use crate::tile::{Rect, Sample, SampleFormat};
 use crate::timing::{TimingCounter, measurement_scope, record_timing};
 
 /// A stack's alignment: every frame's reference-to-frame [`Transform`] and
@@ -95,7 +95,7 @@ mod transform_bits {
 /// grows by [`crate::align::KERNEL_RADIUS`] and clamps to the frame
 /// (`crate::align::transform`'s module docs), returning
 /// [`crate::align::SourceFootprint::Outside`] when the clamp empties the
-/// interval, which [`warp_tile`] answers with an all-zero, all-uncovered
+/// interval, which the warp answers with an all-zero, all-uncovered
 /// tile without reading. This decorator only ever hands `inner` an
 /// already-clamped rect.
 pub struct WarpingReader<'a> {
@@ -122,55 +122,13 @@ impl<'a> WarpingReader<'a> {
     }
 }
 
-impl TileReader for WarpingReader<'_> {
-    /// The largest of the inner reader's own scratch and, per non-identity
-    /// transform, a warped read of a rect this size centred in the frame:
-    /// the source buffer over the footprint, the warped samples with their
-    /// coverage, and the inner scratch at that footprint. Translations and
-    /// similarities need the same footprint at every position, and clamping
-    /// only shrinks it. The one live coverage mask is the scheduler's.
-    fn read_scratch_bytes(&self, width: u32, height: u32) -> u64 {
-        let spp = u64::from(self.samples_per_pixel);
-        let (width, height) = (width.min(self.frame.0), height.min(self.frame.1));
-        let dst = Rect {
-            x: (self.frame.0 - width) / 2,
-            y: (self.frame.1 - height) / 2,
-            width,
-            height,
-        };
-        let warped = u64::from(width) * u64::from(height) * (spp * 2 + 1);
-        let mut largest = self.inner.read_scratch_bytes(width, height);
-        for transform in &self.transforms {
-            if *transform == Transform::identity() {
-                continue;
-            }
-            if let Ok(SourceFootprint::Covers { read, .. }) =
-                transform.source_footprint(dst, self.frame)
-            {
-                let pixels = u64::from(read.width) * u64::from(read.height);
-                let inner = self.inner.read_scratch_bytes(read.width, read.height);
-                largest = largest.max(pixels * spp * 2 + warped + inner);
-            }
-        }
-        largest
-    }
-
-    fn read_tile_into(
+impl WarpingReader<'_> {
+    /// [`TileReader::read_tile_coverage_into`] in sample type `S`.
+    fn read_coverage<S: Sample>(
         &self,
         frame: usize,
         rect: Rect,
-        out: &mut [u16],
-    ) -> Result<(), AlgorithmError> {
-        self.read_tile_coverage_into(frame, rect, out).map(drop)
-    }
-
-    /// `None` for an identity transform and for a warp that covered every
-    /// pixel of `rect`; otherwise the mask [`warp_tile`] produced.
-    fn read_tile_coverage_into(
-        &self,
-        frame: usize,
-        rect: Rect,
-        out: &mut [u16],
+        out: &mut [S],
     ) -> Result<Option<Vec<bool>>, AlgorithmError> {
         let _scope = measurement_scope("warp_read");
         let t = self
@@ -190,10 +148,10 @@ impl TileReader for WarpingReader<'_> {
         // during an aligned one, bit-identical to a direct `TiffStack`
         // read.
         if *t == Transform::identity() {
-            return self.inner.read_tile_into(frame, rect, out).map(|()| None);
+            return S::read_tile(self.inner, frame, rect, out).map(|()| None);
         }
 
-        let warped = warp_tile(
+        let (samples, covered) = warp_tile_samples::<S>(
             self.inner,
             frame,
             self.frame,
@@ -206,21 +164,172 @@ impl TileReader for WarpingReader<'_> {
             detail: source.to_string(),
         })?;
 
-        if out.len() != warped.tile.samples.len() {
+        if out.len() != samples.len() {
             return Err(AlgorithmError::Failed {
                 algorithm: "warp".to_string(),
                 detail: format!(
-                    "buffer size mismatch: expected {} u16 samples, got {}",
-                    warped.tile.samples.len(),
+                    "buffer size mismatch: expected {} samples, got {}",
+                    samples.len(),
                     out.len()
                 ),
             });
         }
-        out.copy_from_slice(&warped.tile.samples);
+        out.copy_from_slice(&samples);
         let bytes = std::mem::size_of_val(out) as u64;
         record_timing(TimingCounter::WarpBytes, bytes);
         record_timing(TimingCounter::CopyBytes, bytes);
         record_timing(TimingCounter::CopyOperations, 1);
-        Ok(warped.covered.contains(&false).then_some(warped.covered))
+        Ok(covered.contains(&false).then_some(covered))
+    }
+}
+
+impl TileReader for WarpingReader<'_> {
+    fn sample_format(&self) -> SampleFormat {
+        self.inner.sample_format()
+    }
+
+    /// The inner reader's own scratch, or for a non-identity transform the
+    /// source buffer over the footprint of a centred rect this size, the
+    /// warped samples with coverage and the inner scratch at that footprint,
+    /// all at the inner reader's sample width.
+    fn read_scratch_bytes(&self, width: u32, height: u32) -> u64 {
+        let sample_bytes = u64::from(self.samples_per_pixel) * self.inner.sample_format().bytes();
+        let (width, height) = (width.min(self.frame.0), height.min(self.frame.1));
+        let dst = Rect {
+            x: (self.frame.0 - width) / 2,
+            y: (self.frame.1 - height) / 2,
+            width,
+            height,
+        };
+        let warped = u64::from(width) * u64::from(height) * (sample_bytes + 1);
+        let mut largest = self.inner.read_scratch_bytes(width, height);
+        for transform in &self.transforms {
+            if *transform == Transform::identity() {
+                continue;
+            }
+            if let Ok(SourceFootprint::Covers { read, .. }) =
+                transform.source_footprint(dst, self.frame)
+            {
+                let pixels = u64::from(read.width) * u64::from(read.height);
+                let inner = self.inner.read_scratch_bytes(read.width, read.height);
+                largest = largest.max(pixels * sample_bytes + warped + inner);
+            }
+        }
+        largest
+    }
+
+    fn read_tile_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        self.read_coverage(frame, rect, out).map(drop)
+    }
+
+    fn read_tile_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        self.read_coverage(frame, rect, out).map(drop)
+    }
+
+    /// `None` for an identity transform and for a warp that covered every
+    /// pixel of `rect`; otherwise the mask `warp_tile_samples` produced.
+    fn read_tile_coverage_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<Option<Vec<bool>>, AlgorithmError> {
+        self.read_coverage(frame, rect, out)
+    }
+
+    fn read_tile_coverage_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [f32],
+    ) -> Result<Option<Vec<bool>>, AlgorithmError> {
+        self.read_coverage(frame, rect, out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reader serving only `f32`: a step edge from 0 to 100000 at column 6.
+    struct Edge;
+
+    impl TileReader for Edge {
+        fn sample_format(&self) -> SampleFormat {
+            SampleFormat::F32
+        }
+
+        fn read_tile_into(&self, _: usize, _: Rect, _: &mut [u16]) -> Result<(), AlgorithmError> {
+            Err(AlgorithmError::Failed {
+                algorithm: "edge".to_string(),
+                detail: "serves f32 only".to_string(),
+            })
+        }
+
+        fn read_tile_f32_into(
+            &self,
+            _: usize,
+            rect: Rect,
+            out: &mut [f32],
+        ) -> Result<(), AlgorithmError> {
+            for (i, sample) in out.iter_mut().enumerate() {
+                let x = rect.x + (i % rect.width as usize) as u32;
+                *sample = if x < 6 { 0.0 } else { 100_000.0 };
+            }
+            Ok(())
+        }
+    }
+
+    struct Plain;
+
+    impl TileReader for Plain {
+        fn read_tile_into(&self, _: usize, _: Rect, _: &mut [u16]) -> Result<(), AlgorithmError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn f32_warp_reader_passes_headroom_and_the_inner_format_through() {
+        let shifted = Transform::similarity(1.0, 0.0, 0.5, 0.0);
+        let reader = WarpingReader::new(&Edge, (13, 9), 1, vec![Transform::identity(), shifted]);
+        assert_eq!(reader.sample_format(), SampleFormat::F32);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: 13,
+            height: 9,
+        };
+        let mut straight = vec![0.0f32; 13 * 9];
+        reader.read_tile_f32_into(0, rect, &mut straight).unwrap();
+        assert_eq!(straight[5], 0.0);
+        assert_eq!(straight[6], 100_000.0);
+        let mut warped = vec![0.0f32; 13 * 9];
+        let coverage = reader
+            .read_tile_coverage_f32_into(1, rect, &mut warped)
+            .unwrap()
+            .expect("the last column is past the frame");
+        assert!((warped[6] - 106_250.0).abs() < 1.0, "{}", warped[6]);
+        assert!(warped[4] < 0.0);
+        assert!(!coverage[12]);
+    }
+
+    #[test]
+    fn f32_warp_reader_scratch_counts_four_byte_samples() {
+        let shifted = Transform::similarity(1.0, 0.0, 0.5, 0.0);
+        let f32_reader = WarpingReader::new(&Edge, (13, 9), 1, vec![shifted]);
+        let narrow = WarpingReader::new(&Plain, (13, 9), 1, vec![shifted]);
+        let wide_bytes = f32_reader.read_scratch_bytes(13, 9);
+        let narrow_bytes = narrow.read_scratch_bytes(13, 9);
+        assert!(wide_bytes > narrow_bytes, "{wide_bytes} vs {narrow_bytes}");
     }
 }

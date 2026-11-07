@@ -2,9 +2,10 @@
 
 //! `focusforge-cli export`: a project in, an image out.
 //!
-//! One `laplacian` run over `fixtures/mantis-512` is shared through a
-//! `OnceLock`; its export is compared against an in-process export and the
-//! head's stored composite.
+//! One `laplacian` run over `fixtures/mantis-512` backs one test, which exports
+//! it and compares the export against an in-process export, the head's stored
+//! composite and the golden Z-Map. One `dummy-align` run backs the `--frame`
+//! test.
 //!
 //! Every spawn isolates `.scratch/` with its own per-process temp directory
 //! and `.current_dir(dir)`: `stack`'s scratch tree is cwd-relative, so
@@ -16,8 +17,6 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::OnceLock;
 
 use focusforge_core::algorithm::TileReader;
 use focusforge_core::align::{Registration, WarpingReader};
@@ -30,72 +29,49 @@ use focusforge_core::project::{
 use focusforge_core::tile::HostBudget;
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 
-use common::CliOutput;
-
-fn bin() -> Command {
-    common::cli_bin("export_cli")
-}
+use common::{CliOutput, bin, only_project, partial_of};
 
 fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
     common::run_in(&mut bin(), dir, args)
 }
 
-fn only_project(dir: &Path) -> PathBuf {
-    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "ffp"))
-        .collect();
-    assert_eq!(found.len(), 1, "exactly one project expected in {dir:?}");
-    found.pop().unwrap()
-}
-
 /// One `stack` run over `fixtures/mantis-512`, collected into a `-o`
-/// directory. ~50 s, paid once for this whole binary.
+/// directory. The run is the dominant cost of the one test that reads it.
 struct SharedProject {
-    /// The run's own working directory, held alive for the process's
-    /// lifetime: every test that reads [`SharedProject::project`] does so
-    /// long after this struct's builder closure returns, so the directory
-    /// must outlive the `OnceLock` cell, not just that closure. The
-    /// `OnceLock` static is never dropped, so `common::TmpDir::drop`'s
-    /// `remove_dir_all` never runs for this one.
+    /// The run's own working directory; dropped, and removed, with this value.
     cwd: common::TmpDir,
     project: PathBuf,
 }
 
-fn shared_project() -> &'static SharedProject {
-    static ONCE: OnceLock<SharedProject> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let cwd = common::tmp_dir("export_cli_shared_stack");
-        let out = cwd.join("out");
-        std::fs::create_dir_all(&out).unwrap();
-        let input = common::fixtures_dir().join("mantis-512");
-        let mut args = vec![
-            "stack".to_string(),
-            input.to_str().unwrap().to_string(),
-            "-o".to_string(),
-            out.to_str().unwrap().to_string(),
-            "--algorithm".to_string(),
-            "laplacian".to_string(),
-            "--no-align".to_string(),
-            "--no-crop".to_string(),
-            "--set".to_string(),
-            "equalize=false".to_string(),
-        ];
-        if cfg!(feature = "gpu") {
-            args.push("--cpu".to_string());
-        }
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let result = run_cli_in(&cwd, &args);
-        assert!(
-            result.success,
-            "stack must succeed -- stderr: {}",
-            result.stderr
-        );
-        let project = only_project(&out);
-        SharedProject { cwd, project }
-    })
+fn shared_project() -> SharedProject {
+    let cwd = common::tmp_dir("export_cli_shared_stack");
+    let out = cwd.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let input = common::fixtures_dir().join("mantis-512");
+    let mut args = vec![
+        "stack".to_string(),
+        input.to_str().unwrap().to_string(),
+        "-o".to_string(),
+        out.to_str().unwrap().to_string(),
+        "--algorithm".to_string(),
+        "laplacian".to_string(),
+        "--no-align".to_string(),
+        "--no-crop".to_string(),
+        "--set".to_string(),
+        "equalize=false".to_string(),
+    ];
+    if cfg!(feature = "gpu") {
+        args.push("--cpu".to_string());
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let result = run_cli_in(&cwd, &args);
+    assert!(
+        result.success,
+        "stack must succeed -- stderr: {}",
+        result.stderr
+    );
+    let project = only_project(&out);
+    SharedProject { cwd, project }
 }
 
 /// `project`'s head composite as stored, materialized under `dir`: its
@@ -112,10 +88,18 @@ fn stored_composite(project: &mut Project, dir: &Path) -> (u32, u32, Vec<u16>) {
     (width, height, samples)
 }
 
+/// Three exports of the one `laplacian` run: the image equals the head's
+/// stored composite and an in-process export, and warns about unresolved
+/// sources while still writing; the Z-Map equals the pinned golden map; the
+/// `--json` report describes what one invocation wrote.
 #[test]
-fn exported_image_is_the_stored_composite() {
+fn exports_of_the_laplacian_run_match_the_stored_composite_and_the_golden_map() {
     let shared = shared_project();
     let dir = common::tmp_dir("export_cli_gather");
+
+    // Image export. A project written with `-o <dir>` records absolute,
+    // `as-given` sources by construction: "relative" means descendant of the
+    // project's own directory.
     let out = dir.join("out.tif");
     let result = run_cli_in(
         &shared.cwd,
@@ -126,10 +110,10 @@ fn exported_image_is_the_stored_composite() {
             out.to_str().unwrap(),
         ],
     );
-    assert!(result.success, "stderr: {}", result.stderr);
+    assert!(result.success, "[image] stderr: {}", result.stderr);
     assert!(
         !dir.join("out.tif.partial").exists(),
-        "a temp file survived a successful export"
+        "[image] a temp file survived a successful export"
     );
 
     let mut project = Project::open(&shared.project).unwrap();
@@ -145,7 +129,7 @@ fn exported_image_is_the_stored_composite() {
     .expect("in-process export must succeed");
     assert!(
         std::fs::read(&out).unwrap() == std::fs::read(&in_process).unwrap(),
-        "the CLI export must equal the in-process export byte for byte"
+        "[image] the CLI export must equal the in-process export byte for byte"
     );
 
     let (width, height, stored) = stored_composite(&mut project, &dir);
@@ -154,74 +138,13 @@ fn exported_image_is_the_stored_composite() {
     let tile = exported.read_tile(0, branched_full(width, height)).unwrap();
     assert!(
         tile.samples == stored,
-        "the exported pixels must be the head's stored composite"
+        "[image] the exported pixels must be the head's stored composite"
     );
-}
 
-#[test]
-fn exported_zmap_matches_the_golden_map() {
-    let shared = shared_project();
-    let dir = common::tmp_dir("export_cli_zmap");
-    let out = dir.join("out-zmap.tif");
-    let result = run_cli_in(
-        &shared.cwd,
-        &[
-            "export",
-            shared.project.to_str().unwrap(),
-            "--zmap",
-            out.to_str().unwrap(),
-        ],
-    );
-    assert!(result.success, "stderr: {}", result.stderr);
-
-    let golden = common::fixtures_dir()
-        .join("mantis-512")
-        .join("golden")
-        .join("laplacian-zmap.tif");
-    assert_eq!(
-        std::fs::read(&out).unwrap(),
-        std::fs::read(&golden).unwrap(),
-        "the exported Z-Map must equal the pinned golden map byte for byte -- the \
-         Z-Map is invariant to tile geometry, the composite is not"
-    );
-}
-
-#[test]
-fn export_needs_at_least_one_output_flag() {
-    let shared = shared_project();
-    let result = run_cli_in(&shared.cwd, &["export", shared.project.to_str().unwrap()]);
-    assert!(!result.success);
-    assert!(
-        result.stderr.contains("-o") && result.stderr.contains("--zmap"),
-        "the refusal must name both flags: {}",
-        result.stderr
-    );
-}
-
-#[test]
-fn export_warns_about_unresolved_sources_and_still_writes() {
-    // A project written with `-o <dir>` records absolute, `as-given`
-    // sources by construction: "relative" means descendant of the
-    // project's own directory.
-    let shared = shared_project();
-    let dir = common::tmp_dir("export_cli_unresolved");
-    let out = dir.join("moved.tif");
-    let result = run_cli_in(
-        &shared.cwd,
-        &[
-            "export",
-            shared.project.to_str().unwrap(),
-            "-o",
-            out.to_str().unwrap(),
-        ],
-    );
-    assert!(
-        result.success,
-        "an unresolved source is a warning, not a refusal"
-    );
+    // Unresolved sources are a warning on the same export, not a refusal.
     assert!(
         result.stderr.contains("unresolved"),
-        "the warning must appear on stderr: {}",
+        "[unresolved sources] the warning must appear on stderr: {}",
         result.stderr
     );
     assert!(
@@ -229,23 +152,41 @@ fn export_warns_about_unresolved_sources_and_still_writes() {
             .stderr
             .contains("unedited image export reads no source frame")
             && !result.stderr.contains("re-reads every source frame"),
-        "the warning must say an unedited export needs no source: {}",
+        "[unresolved sources] the warning must say an unedited export needs no source: {}",
         result.stderr
     );
     assert!(
-        result.stderr.contains("00.tif") || result.stderr.contains(".tif"),
-        "the warning must name the sources: {}",
+        result.stderr.contains(".tif"),
+        "[unresolved sources] the warning must name the sources: {}",
         result.stderr
     );
-    assert!(out.exists(), "the image is still written");
-}
 
-#[test]
-fn export_json_reports_what_it_wrote() {
-    let shared = shared_project();
-    let dir = common::tmp_dir("export_cli_json");
-    let composite = dir.join("out.tif");
-    let zmap = dir.join("out-zmap.tif");
+    // Z-Map export against the golden pin.
+    let zmap_out = dir.join("out-zmap.tif");
+    let result = run_cli_in(
+        &shared.cwd,
+        &[
+            "export",
+            shared.project.to_str().unwrap(),
+            "--zmap",
+            zmap_out.to_str().unwrap(),
+        ],
+    );
+    assert!(result.success, "[golden zmap] stderr: {}", result.stderr);
+    let golden = common::fixtures_dir()
+        .join("mantis-512")
+        .join("golden")
+        .join("laplacian-zmap.tif");
+    assert_eq!(
+        std::fs::read(&zmap_out).unwrap(),
+        std::fs::read(&golden).unwrap(),
+        "[golden zmap] the exported Z-Map must equal the pinned golden map byte for byte -- the \
+         Z-Map is invariant to tile geometry, the composite is not"
+    );
+
+    // Both payloads in one `--json` invocation.
+    let composite = dir.join("json-out.tif");
+    let zmap = dir.join("json-out-zmap.tif");
     let result = run_cli_in(
         &shared.cwd,
         &[
@@ -258,7 +199,7 @@ fn export_json_reports_what_it_wrote() {
             "--json",
         ],
     );
-    assert!(result.success, "stderr: {}", result.stderr);
+    assert!(result.success, "[json] stderr: {}", result.stderr);
     let report: serde_json::Value = serde_json::from_str(&result.stdout).expect("--json parses");
     let wrote: Vec<String> = report["wrote"]
         .as_array()
@@ -269,7 +210,7 @@ fn export_json_reports_what_it_wrote() {
     assert_eq!(
         wrote.len(),
         2,
-        "one invocation emitted both payloads: {wrote:?}"
+        "[json] one invocation emitted both payloads: {wrote:?}"
     );
     assert_eq!(report["width"], serde_json::json!(512));
     assert_eq!(report["height"], serde_json::json!(512));
@@ -278,6 +219,78 @@ fn export_json_reports_what_it_wrote() {
     assert!(report["frame_count"].as_u64().unwrap() >= 2);
     assert!(!report["unresolved_sources"].as_array().unwrap().is_empty());
     assert!(composite.exists() && zmap.exists());
+}
+
+#[test]
+fn dng_listed() {
+    let dir = std::env::temp_dir();
+    let result = run_cli_in(&dir, &["export", "--help"]);
+    assert!(result.success, "stderr: {}", result.stderr);
+    let help = result
+        .stdout
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(help.contains("`tiff`, `png`, `jpeg` or `dng`"), "{help}");
+    assert!(help.contains("Has no effect on a DNG"), "{help}");
+}
+
+/// A project path that does not exist: the refusals below fire before the
+/// project is opened, so none of these tests builds one.
+fn missing_project(dir: &Path) -> PathBuf {
+    dir.join("missing.ffp")
+}
+
+#[test]
+fn export_needs_at_least_one_output_flag() {
+    let dir = common::tmp_dir("export_cli_no_output_flag");
+    let missing = missing_project(&dir);
+    let result = run_cli_in(&dir, &["export", missing.to_str().unwrap()]);
+    assert_eq!(
+        result.code,
+        Some(1),
+        "a missing output flag is the command's own refusal, not clap's exit 2: {}",
+        result.stderr
+    );
+    assert!(
+        result.stderr.contains("-o") && result.stderr.contains("--zmap"),
+        "the refusal must name both flags: {}",
+        result.stderr
+    );
+    assert!(
+        !result.stderr.contains("missing.ffp"),
+        "the refusal must come before the project is opened: {}",
+        result.stderr
+    );
+}
+
+/// A TIFF frame handed over as the project is refused as "not a project",
+/// with the exit code `history` gives the same file and one line on stderr.
+#[test]
+fn export_of_a_non_project_exits_not_a_project() {
+    let dir = common::tmp_dir("export_cli_non_project");
+    let frame = common::fixtures_dir().join("mantis-64/frames/00.tif");
+    let out = dir.join("out.tif");
+    let result = run_cli_in(
+        &dir,
+        &[
+            "export",
+            "-o",
+            out.to_str().unwrap(),
+            frame.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(result.code, Some(3), "stderr: {}", result.stderr);
+    assert!(result.stdout.is_empty(), "stdout: {}", result.stdout);
+    let lines: Vec<&str> = result.stderr.lines().collect();
+    assert_eq!(lines.len(), 1, "stderr: {}", result.stderr);
+    assert!(lines[0].starts_with("error: "), "stderr: {}", result.stderr);
+    assert!(
+        lines[0].ends_with(&format!("{}: is not a FocusForge project", frame.display())),
+        "stderr: {}",
+        result.stderr
+    );
+    assert!(!out.exists(), "a refused export wrote {}", out.display());
 }
 
 // `--checkpoint`: every history below is built directly through `core`'s
@@ -483,12 +496,6 @@ fn build_branched(name: &str) -> Branched {
     }
 }
 
-fn partial_of(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap().to_os_string();
-    name.push(".partial");
-    path.with_file_name(name)
-}
-
 #[test]
 fn exports_every_checkpoint_of_a_branched_history() {
     let branched = build_branched("export_cli_branched");
@@ -662,38 +669,35 @@ struct AlignedProject {
     project: PathBuf,
 }
 
-fn aligned_project() -> &'static AlignedProject {
-    static ONCE: OnceLock<AlignedProject> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let cwd = common::tmp_dir("export_cli_aligned_stack");
-        let out = cwd.join("out");
-        std::fs::create_dir_all(&out).unwrap();
-        let input = common::fixtures_dir().join("mantis-512");
-        let mut args = vec![
-            "stack".to_string(),
-            input.to_str().unwrap().to_string(),
-            "-o".to_string(),
-            out.to_str().unwrap().to_string(),
-            "--algorithm".to_string(),
-            "laplacian".to_string(),
-            "--align-algorithm".to_string(),
-            "dummy-align".to_string(),
-            "--set".to_string(),
-            "equalize=false".to_string(),
-        ];
-        if cfg!(feature = "gpu") {
-            args.push("--cpu".to_string());
-        }
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let result = run_cli_in(&cwd, &args);
-        assert!(
-            result.success,
-            "an aligned, cropped stack must succeed -- stderr: {}",
-            result.stderr
-        );
-        let project = only_project(&out);
-        AlignedProject { cwd, project }
-    })
+fn aligned_project() -> AlignedProject {
+    let cwd = common::tmp_dir("export_cli_aligned_stack");
+    let out = cwd.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let input = common::fixtures_dir().join("mantis-512");
+    let mut args = vec![
+        "stack".to_string(),
+        input.to_str().unwrap().to_string(),
+        "-o".to_string(),
+        out.to_str().unwrap().to_string(),
+        "--algorithm".to_string(),
+        "laplacian".to_string(),
+        "--align-algorithm".to_string(),
+        "dummy-align".to_string(),
+        "--set".to_string(),
+        "equalize=false".to_string(),
+    ];
+    if cfg!(feature = "gpu") {
+        args.push("--cpu".to_string());
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let result = run_cli_in(&cwd, &args);
+    assert!(
+        result.success,
+        "an aligned, cropped stack must succeed -- stderr: {}",
+        result.stderr
+    );
+    let project = only_project(&out);
+    AlignedProject { cwd, project }
 }
 
 /// The frame-as-fused view of `index`, built directly through the library
@@ -741,7 +745,7 @@ fn oracle_fused_frame(project_path: &Path, index: usize) -> (u32, u32, u32, Vec<
 }
 
 #[test]
-fn export_writes_one_frame_as_fused_at_the_composite_size() {
+fn export_writes_one_frame_as_fused_and_refuses_an_out_of_range_index() {
     let shared = aligned_project();
     let dir = common::tmp_dir("export_cli_frame");
     let out = dir.join("frame-05.tif");
@@ -756,7 +760,7 @@ fn export_writes_one_frame_as_fused_at_the_composite_size() {
             out.to_str().unwrap(),
         ],
     );
-    assert!(result.success, "stderr: {}", result.stderr);
+    assert!(result.success, "[frame] stderr: {}", result.stderr);
     assert!(out.exists(), "the frame TIFF must have been written");
     assert!(
         !partial_path(&out).exists(),
@@ -788,12 +792,8 @@ fn export_writes_one_frame_as_fused_at_the_composite_size() {
         got.samples, expected_samples,
         "the exported frame must equal the fused view of that frame"
     );
-}
 
-#[test]
-fn export_frame_out_of_range_is_refused_and_writes_nothing() {
-    let shared = aligned_project();
-    let dir = common::tmp_dir("export_cli_frame_out_of_range");
+    // An index past the last frame is refused and writes nothing.
     let out = dir.join("none.tif");
     let result = run_cli_in(
         &shared.cwd,
@@ -806,16 +806,22 @@ fn export_frame_out_of_range_is_refused_and_writes_nothing() {
             out.to_str().unwrap(),
         ],
     );
-    assert!(!result.success, "an out-of-range frame must be refused");
+    assert!(
+        !result.success,
+        "[out of range] an out-of-range frame must be refused"
+    );
     assert!(
         result.stderr.contains("999") && result.stderr.contains('0'),
-        "the refusal must name the valid range: {}",
+        "[out of range] the refusal must name the valid range: {}",
         result.stderr
     );
-    assert!(!out.exists(), "no output file must be written");
+    assert!(
+        !out.exists(),
+        "[out of range] no output file must be written"
+    );
     assert!(
         !partial_path(&out).exists(),
-        "no .partial must be left behind either"
+        "[out of range] no .partial must be left behind either"
     );
 }
 
@@ -1264,17 +1270,17 @@ fn refused_checkpoint_export_leaves_nothing() {
 
 #[test]
 fn export_frame_without_frame_output_is_a_clap_usage_error() {
-    let shared = aligned_project();
-    let result = run_cli_in(
-        &shared.cwd,
-        &["export", shared.project.to_str().unwrap(), "--frame", "0"],
+    let dir = common::tmp_dir("export_cli_frame_without_output");
+    let missing = missing_project(&dir);
+    let result = run_cli_in(&dir, &["export", missing.to_str().unwrap(), "--frame", "0"]);
+    assert_eq!(
+        result.code,
+        Some(2),
+        "--frame without --frame-output must be clap's usage error: {}",
+        result.stderr
     );
     assert!(
-        !result.success,
-        "--frame without --frame-output must be a usage error"
-    );
-    assert!(
-        result.stderr.contains("frame-output") || result.stderr.contains("frame_output"),
+        result.stderr.contains("--frame-output"),
         "clap's usage error must name the missing flag: {}",
         result.stderr
     );
@@ -1282,22 +1288,27 @@ fn export_frame_without_frame_output_is_a_clap_usage_error() {
 
 #[test]
 fn export_frame_output_alone_is_refused_by_name() {
-    let shared = aligned_project();
     let dir = common::tmp_dir("export_cli_frame_output_alone");
+    let missing = missing_project(&dir);
     let out = dir.join("frame.tif");
     let result = run_cli_in(
-        &shared.cwd,
+        &dir,
         &[
             "export",
-            shared.project.to_str().unwrap(),
+            missing.to_str().unwrap(),
             "--frame-output",
             out.to_str().unwrap(),
         ],
     );
-    assert!(!result.success, "--frame-output alone must be refused");
+    assert_eq!(
+        result.code,
+        Some(1),
+        "--frame-output alone is the command's own refusal, not clap's exit 2: {}",
+        result.stderr
+    );
     assert!(
-        result.stderr.contains("--frame"),
-        "the refusal must name --frame: {}",
+        result.stderr.contains("--frame-output requires --frame"),
+        "the refusal must name both flags: {}",
         result.stderr
     );
     assert!(!out.exists());

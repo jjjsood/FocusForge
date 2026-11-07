@@ -120,6 +120,7 @@ pub mod performance_settings;
 
 pub mod appearance_settings;
 pub mod source_previews;
+pub mod update_settings;
 
 /// The `Recent` list's own file format, mirroring `crate::input_config`. No
 /// `use slint::` anywhere in it. `pub` so `src/main.rs` and
@@ -130,3 +131,9 @@ pub mod recent;
 /// a project's saved history. No `use slint::` anywhere in it. `pub` so
 /// `tests/checkpoint_panel.rs` reaches its types directly.
 pub mod checkpoints;
+
+/// The Analytics overlay's rows and count.
+pub mod analytics;
+
+/// The step calculator's state and views.
+pub mod calculator;

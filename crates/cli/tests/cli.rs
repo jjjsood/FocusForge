@@ -8,15 +8,10 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 
-use common::mantis_512_dir;
-
-fn bin() -> Command {
-    common::cli_bin("cli")
-}
+use common::{bin, mantis_512_dir};
 
 /// Spawns the built CLI with `args`, in `dir` as its working directory.
 ///
@@ -188,7 +183,12 @@ fn info_json_nulls_every_metadata_field_on_a_broken_member() {
     std::fs::write(tmp.join("broken.tif"), b"junkbyte").unwrap();
 
     let output = spawn_in(&cwd, &["info", "--json", tmp.to_str().unwrap()]);
-    assert!(output.status.success(), "exit status: {:?}", output.status);
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "exit status: {:?}",
+        output.status
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let report: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
 
@@ -297,12 +297,61 @@ fn info_skips_non_tiff_and_names_a_broken_tiff() {
     std::fs::write(tmp.join("broken.tif"), b"junkbyte").unwrap();
 
     let output = spawn_in(&cwd, &["info", tmp.to_str().unwrap()]);
-    assert!(output.status.success(), "exit status: {:?}", output.status);
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "exit status: {:?}",
+        output.status
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("README.md"), "stdout: {stdout}");
     assert!(stdout.contains("broken.tif"), "stdout: {stdout}");
     assert!(stdout.contains("error:"), "stdout: {stdout}");
     assert!(stdout.contains("unreadable: 1"), "stdout: {stdout}");
+}
+
+/// A directory listing reports every member, then exits 5 when one cannot be
+/// read: the BigTIFF member's error is data in the report, the sibling keeps
+/// its full record, and the exit status tells a partial listing from success.
+#[test]
+fn info_directory_with_unreadable_member_exit_status() {
+    let cwd = common::tmp_dir("info_directory_with_unreadable_member_exit_status_cwd");
+    let tmp = common::tmp_dir("info_directory_with_unreadable_member_exit_status");
+    std::fs::copy(
+        mantis_64_dir().join("frames").join("00.tif"),
+        tmp.join("00.tif"),
+    )
+    .unwrap();
+    // Byte order, magic 43, offset size 8, reserved: a BigTIFF header.
+    std::fs::write(tmp.join("big.tif"), b"II\x2b\x00\x08\x00\x00\x00").unwrap();
+
+    let human = spawn_in(&cwd, &["info", tmp.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert_eq!(human.status.code(), Some(5), "human stdout: {stdout}");
+    assert!(
+        stdout.contains("64x64 3ch 16-bit II"),
+        "the readable sibling keeps its report: {stdout}"
+    );
+    assert!(stdout.contains("BigTIFF"), "human stdout: {stdout}");
+    assert!(stdout.trim_end().ends_with("unreadable: 1"), "{stdout}");
+
+    let json = spawn_in(&cwd, &["info", "--json", tmp.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&json.stdout);
+    assert_eq!(json.status.code(), Some(5), "json stdout: {stdout}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(report["unreadable_count"], 1, "report: {report}");
+    let file = |name: &str| {
+        report["files"]
+            .as_array()
+            .expect("files must be an array")
+            .iter()
+            .find(|f| f["name"] == name)
+            .unwrap_or_else(|| panic!("{name} must be listed: {report}"))
+    };
+    assert!(file("00.tif")["error"].is_null(), "report: {report}");
+    assert_eq!(file("00.tif")["width"], 64, "report: {report}");
+    let error = file("big.tif")["error"].as_str().expect("an error string");
+    assert!(error.contains("BigTIFF"), "error: {error}");
 }
 
 #[test]

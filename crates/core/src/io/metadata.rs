@@ -11,8 +11,9 @@ use rawler::exif::{Exif, ExifGPS};
 use rawler::formats::tiff::{Rational, SRational};
 use rawler::tags::{ExifGpsTag, ExifTag};
 
-use super::paths::{RAW_EXTENSIONS, has_extension};
-use super::raw::RawStack;
+use super::jpeg;
+use super::paths::{JPEG_EXTENSIONS, RAW_EXTENSIONS, has_extension};
+use super::raw::{DngColour, RawStack};
 use super::tiff::header::{self, TAG_ICC_PROFILE, TAG_IPTC, TAG_XMP, TiffHeader};
 use super::tiff::writer::ifd0_with_sub_ifds;
 
@@ -80,7 +81,8 @@ fn exif_datetime(now: DateTime<FixedOffset>) -> String {
     now.format("%Y:%m:%d %H:%M:%S").to_string()
 }
 
-fn set_entry(entries: &mut Vec<TagEntry>, entry: TagEntry) {
+/// Puts `entry` in `entries`, replacing the entry of the same tag if there is one.
+pub(crate) fn set_entry(entries: &mut Vec<TagEntry>, entry: TagEntry) {
     if let Some(existing) = entries.iter_mut().find(|e| e.tag == entry.tag) {
         *existing = entry;
     } else {
@@ -91,7 +93,8 @@ fn set_entry(entries: &mut Vec<TagEntry>, entry: TagEntry) {
 /// Rewrites `source` for one export: `Software` (305) and `DateTime` (306)
 /// become the export's own identity and moment, `OffsetTime` (36880)
 /// becomes that moment's UTC offset, and the EXIF image-dimension tags
-/// (40962/40963) become `width`/`height`. `now` is read once by the caller,
+/// (40962/40963) become `width`/`height`, and a TIFF source's Orientation
+/// (274) becomes 1. `now` is read once by the caller,
 /// not here: `chrono`'s local-time lookup is not safe to call concurrently
 /// with anything that mutates `TZ`.
 pub(crate) fn rewrite(
@@ -112,6 +115,11 @@ pub(crate) fn rewrite(
         &mut ifd0,
         exif_tag_entry(ExifTag::ModifyDate, &exif_datetime(now)),
     );
+
+    // A TIFF source is read upright, so the export's pixels need no turn.
+    if source.kind == SourceKind::Tiff && ifd0.iter().any(|entry| entry.tag == 274) {
+        set_entry(&mut ifd0, exif_tag_entry(ExifTag::Orientation, &1u16));
+    }
 
     let mut exif = source.exif.clone();
     set_entry(
@@ -459,10 +467,12 @@ pub(crate) fn from_raw(raw: &super::raw::RawMetadata) -> SourceMetadata {
 }
 
 /// Reads one export's source frame: TIFF through the TIFF header's own
-/// metadata reader, RAW through the RAW decoder's metadata mapping, chosen
-/// by `path`'s extension. Never fails: a source that cannot be opened at all
+/// metadata reader, JPEG through the same reader over its APP1 `Exif`
+/// segment, RAW through the RAW decoder's metadata mapping, chosen by
+/// `path`'s extension. Never fails: a source that cannot be opened at all
 /// yields an empty [`SourceMetadata`] with one warning, exactly like a
-/// damaged block within an otherwise readable file.
+/// damaged block within an otherwise readable file. A JPEG without an `Exif`
+/// segment yields an empty result and no warning.
 pub fn read_source_metadata(path: &Path) -> SourceMetadata {
     if has_extension(path, RAW_EXTENSIONS) {
         return match RawStack::open_files(&[path.to_path_buf()]) {
@@ -475,6 +485,16 @@ pub fn read_source_metadata(path: &Path) -> SourceMetadata {
             },
             Err(err) => SourceMetadata {
                 warnings: vec![format!("{}: {err}", path.display())],
+                ..Default::default()
+            },
+        };
+    }
+    if has_extension(path, JPEG_EXTENSIONS) {
+        return match jpeg::read_exif(path) {
+            Ok(Some(blob)) => header::read_exif_metadata(&blob, path),
+            Ok(None) => SourceMetadata::default(),
+            Err(err) => SourceMetadata {
+                warnings: vec![err.to_string()],
                 ..Default::default()
             },
         };
@@ -568,10 +588,56 @@ pub(crate) fn resolve_plan(
         icc,
         icc_bytes: if icc_on { source.icc.clone() } else { None },
         has_xmp: xmp_on && source.xmp.is_some(),
-        xmp_bytes: if xmp_on { source.xmp.clone() } else { None },
+        xmp_bytes: if xmp_on {
+            source.xmp.as_deref().map(|packet| match source.kind {
+                SourceKind::Tiff => upright_xmp_orientation(packet),
+                SourceKind::Raw => packet.to_vec(),
+            })
+        } else {
+            None
+        },
         has_iptc: iptc_on && source.iptc.is_some(),
         iptc_bytes: if iptc_on { source.iptc.clone() } else { None },
     }
+}
+
+/// Sets every `tiff:Orientation` value in an XMP packet to 1, in attribute
+/// (`tiff:Orientation="6"`) and element (`<tiff:Orientation>6</...>`) form,
+/// to agree with the upright pixels a TIFF or JPEG source exports. A text
+/// edit, not an XMP parse: a packet without the property, or one that is not
+/// UTF-8, comes back unchanged.
+fn upright_xmp_orientation(packet: &[u8]) -> Vec<u8> {
+    const NAME: &str = "tiff:Orientation";
+    let Ok(text) = std::str::from_utf8(packet) else {
+        return packet.to_vec();
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(NAME) {
+        let after = &rest[at + NAME.len()..];
+        let opened_as_element = rest[..at].ends_with('<');
+        out.push_str(&rest[..at + NAME.len()]);
+        // (text written before the value, offset of the value's end in `after`)
+        let value = match after.as_bytes() {
+            [b'=', quote @ (b'"' | b'\''), ..] => after[2..]
+                .find(*quote as char)
+                .map(|len| (&after[..2], 2 + len)),
+            [b'>', ..] if opened_as_element => {
+                after[1..].find('<').map(|len| (&after[..1], 1 + len))
+            }
+            _ => None,
+        };
+        match value {
+            Some((opening, end)) => {
+                out.push_str(opening);
+                out.push('1');
+                rest = &after[end..];
+            }
+            None => rest = after,
+        }
+    }
+    out.push_str(rest);
+    out.into_bytes()
 }
 
 /// One IFD0 entry for a raw byte block (ICC, XMP or IPTC): `field_type`
@@ -599,6 +665,129 @@ pub(crate) fn xmp_tag_entry(bytes: &[u8]) -> TagEntry {
 /// TIFF tag 33723, `UNDEFINED`.
 pub(crate) fn iptc_tag_entry(bytes: &[u8]) -> TagEntry {
     raw_block_entry(TAG_IPTC, FIELD_TYPE_UNDEFINED, bytes)
+}
+
+/// Denominator of the rationals a DNG's colour tags are written with.
+const DNG_RATIONAL_DENOMINATOR: u32 = 10_000;
+
+fn dng_entry(tag: u16, field_type: u16, count: usize, value: Vec<u8>) -> TagEntry {
+    TagEntry {
+        tag,
+        field_type,
+        count: count as u32,
+        value,
+    }
+}
+
+fn dng_shorts(tag: u16, values: &[u16]) -> TagEntry {
+    let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    dng_entry(tag, FIELD_TYPE_SHORT, values.len(), bytes)
+}
+
+fn dng_ascii(tag: u16, text: &str) -> TagEntry {
+    let mut bytes = text.as_bytes().to_vec();
+    bytes.push(0);
+    dng_entry(tag, FIELD_TYPE_ASCII, bytes.len(), bytes)
+}
+
+/// `values` as signed rationals over [`DNG_RATIONAL_DENOMINATOR`].
+fn dng_srationals(tag: u16, values: &[f64]) -> TagEntry {
+    let scale = f64::from(DNG_RATIONAL_DENOMINATOR);
+    let bytes = values
+        .iter()
+        .flat_map(|v| {
+            let numerator = ((v * scale).round() as i32).to_le_bytes();
+            numerator
+                .into_iter()
+                .chain(DNG_RATIONAL_DENOMINATOR.to_le_bytes())
+        })
+        .collect();
+    dng_entry(tag, FIELD_TYPE_SRATIONAL, values.len(), bytes)
+}
+
+/// `values` as unsigned rationals over [`DNG_RATIONAL_DENOMINATOR`].
+fn dng_rationals(tag: u16, values: &[f64]) -> TagEntry {
+    let scale = f64::from(DNG_RATIONAL_DENOMINATOR);
+    let bytes = values
+        .iter()
+        .flat_map(|v| {
+            let numerator = ((v * scale).round() as u32).to_le_bytes();
+            numerator
+                .into_iter()
+                .chain(DNG_RATIONAL_DENOMINATOR.to_le_bytes())
+        })
+        .collect();
+    dng_entry(tag, FIELD_TYPE_RATIONAL, values.len(), bytes)
+}
+
+/// The IFD0 entries that make a 16-bit, three-sample file a linear DNG 1.4
+/// in `colour`'s camera space: LinearRaw photometric interpretation, black 0
+/// and white 65535, the camera identity, its matrices with their camera
+/// calibrations, analog balance and as-shot neutral, and the frame's
+/// orientation.
+pub(crate) fn dng_entries(colour: &DngColour) -> Vec<TagEntry> {
+    const TAG_PHOTOMETRIC: u16 = 262;
+    const TAG_MAKE: u16 = 271;
+    const TAG_MODEL: u16 = 272;
+    const TAG_ORIENTATION: u16 = 274;
+    const TAG_DNG_VERSION: u16 = 50706;
+    const TAG_DNG_BACKWARD_VERSION: u16 = 50707;
+    const TAG_UNIQUE_CAMERA_MODEL: u16 = 50708;
+    const TAG_BLACK_LEVEL: u16 = 50714;
+    const TAG_WHITE_LEVEL: u16 = 50717;
+    const TAG_COLOR_MATRIX_1: u16 = 50721;
+    const TAG_CAMERA_CALIBRATION_1: u16 = 50723;
+    const TAG_ANALOG_BALANCE: u16 = 50727;
+    const TAG_AS_SHOT_NEUTRAL: u16 = 50728;
+    const TAG_CALIBRATION_ILLUMINANT_1: u16 = 50778;
+    const LINEAR_RAW: u16 = 34892;
+    const DNG_VERSION: [u8; 4] = [1, 4, 0, 0];
+    let mut entries = vec![
+        dng_shorts(TAG_PHOTOMETRIC, &[LINEAR_RAW]),
+        dng_ascii(TAG_MAKE, &colour.make),
+        dng_ascii(TAG_MODEL, &colour.model),
+        dng_entry(TAG_DNG_VERSION, FIELD_TYPE_BYTE, 4, DNG_VERSION.to_vec()),
+        dng_entry(
+            TAG_DNG_BACKWARD_VERSION,
+            FIELD_TYPE_BYTE,
+            4,
+            DNG_VERSION.to_vec(),
+        ),
+        dng_ascii(TAG_UNIQUE_CAMERA_MODEL, &colour.unique_model),
+        dng_shorts(TAG_BLACK_LEVEL, &[0; 3]),
+        dng_entry(
+            TAG_WHITE_LEVEL,
+            FIELD_TYPE_LONG,
+            3,
+            [65_535_u32; 3]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        ),
+        dng_rationals(TAG_AS_SHOT_NEUTRAL, &colour.as_shot_neutral),
+    ];
+    if let Some(orientation) = colour.orientation {
+        entries.push(dng_shorts(TAG_ORIENTATION, &[orientation]));
+    }
+    for (slot, matrix) in colour.matrices.iter().enumerate() {
+        let values: Vec<f64> = matrix.xyz_to_camera.iter().map(|&v| f64::from(v)).collect();
+        entries.push(dng_srationals(TAG_COLOR_MATRIX_1 + slot as u16, &values));
+        entries.push(dng_shorts(
+            TAG_CALIBRATION_ILLUMINANT_1 + slot as u16,
+            &[matrix.illuminant],
+        ));
+        if let Some(calibration) = &matrix.calibration {
+            let values: Vec<f64> = calibration.iter().map(|&v| f64::from(v)).collect();
+            entries.push(dng_srationals(
+                TAG_CAMERA_CALIBRATION_1 + slot as u16,
+                &values,
+            ));
+        }
+    }
+    if let Some(balance) = &colour.analog_balance {
+        entries.push(dng_rationals(TAG_ANALOG_BALANCE, balance));
+    }
+    entries
 }
 
 /// The namespace header (`http://ns.adobe.com/xap/1.0/\0`) an XMP packet is
@@ -1050,6 +1239,85 @@ mod tests {
         assert_eq!(plan.xmp_bytes, Some(b"<x:xmpmeta/>".to_vec()));
         assert!(plan.has_iptc);
         assert_eq!(plan.iptc_bytes, Some(vec![4, 5, 6]));
+    }
+
+    #[test]
+    fn jpeg_source_orientation_is_rewritten_to_one() {
+        let tags = MetadataTags {
+            ifd0: vec![exif_tag_entry(ExifTag::Orientation, &6u16)],
+            exif: vec![exif_tag_entry(
+                ExifTag::DateTimeOriginal,
+                &"2024:03:17 08:00:00".to_string(),
+            )],
+            gps: Vec::new(),
+        };
+        let blob = exif_blob(&tags);
+        let source = header::read_exif_metadata(&blob, Path::new("frame.jpg"));
+        assert!(source.warnings.is_empty(), "{:?}", source.warnings);
+        assert_eq!(source.kind, SourceKind::Tiff);
+
+        let now = fixed_offset_hms(0, 2026, 1, 1, 0, 0, 0);
+        let rewritten = rewrite(&source, 4, 3, now);
+        let orientation = rewritten.ifd0.iter().find(|e| e.tag == 274).expect("274");
+        assert_eq!(orientation.value, 1u16.to_le_bytes());
+        assert_eq!(
+            rewritten.exif.iter().find(|e| e.tag == 36867),
+            tags.exif.first()
+        );
+    }
+
+    fn xmp_through_plan(packet: &[u8], kind: SourceKind) -> Option<Vec<u8>> {
+        let source = SourceMetadata {
+            kind,
+            xmp: Some(packet.to_vec()),
+            ..populated_tiff_source()
+        };
+        let now = fixed_offset_hms(0, 2026, 1, 1, 0, 0, 0);
+        resolve_plan(&source, 1, 1, now, false, false, true, false).xmp_bytes
+    }
+
+    #[test]
+    fn xmp_orientation_is_set_to_one_in_attribute_and_element_form() {
+        for (packet, expected) in [
+            (
+                r#"<rdf:Description tiff:Make="X" tiff:Orientation="6"/>"#,
+                r#"<rdf:Description tiff:Make="X" tiff:Orientation="1"/>"#,
+            ),
+            (
+                "<rdf:Description tiff:Orientation='8'/>",
+                "<rdf:Description tiff:Orientation='1'/>",
+            ),
+            (
+                "<tiff:Orientation>6</tiff:Orientation>",
+                "<tiff:Orientation>1</tiff:Orientation>",
+            ),
+            (
+                r#"<a tiff:Orientation="6"/><b tiff:Orientation="3"/>"#,
+                r#"<a tiff:Orientation="1"/><b tiff:Orientation="1"/>"#,
+            ),
+        ] {
+            assert_eq!(
+                xmp_through_plan(packet.as_bytes(), SourceKind::Tiff),
+                Some(expected.as_bytes().to_vec()),
+                "{packet}"
+            );
+        }
+    }
+
+    #[test]
+    fn xmp_orientation_is_never_inserted_and_other_packets_pass_verbatim() {
+        let without = b"<rdf:Description tiff:Make=\"X\"/>";
+        assert_eq!(
+            xmp_through_plan(without, SourceKind::Tiff),
+            Some(without.to_vec())
+        );
+        let raw = br#"<rdf:Description tiff:Orientation="6"/>"#;
+        assert_eq!(xmp_through_plan(raw, SourceKind::Raw), Some(raw.to_vec()));
+        let not_utf8 = b"\xff\xfe<tiff:Orientation>6</tiff:Orientation>";
+        assert_eq!(
+            xmp_through_plan(not_utf8, SourceKind::Tiff),
+            Some(not_utf8.to_vec())
+        );
     }
 
     #[test]

@@ -245,7 +245,12 @@ def builder_location(value: str) -> str:
         if match:
             return template.format(match.group(1))
     match = TOOLCHAIN_ROOTS.match(path)
-    return "/usr/include/" + match.group(1) if match else path
+    if match:
+        return "/usr/include/" + match.group(1)
+    # The statically linked C runtime's debug info names Microsoft's build trees relatively.
+    if re.match(r"(?i)(?:minkernel/crts|VCCRT|onecore/internal|onecore/external|OSS/ARM-software/optimized-routines|shared/inc)/.+$", path):
+        return "/usr/include/" + path
+    return path
 
 
 def native_source(path: str) -> str:
@@ -257,7 +262,7 @@ def native_source(path: str) -> str:
 def reject_private_native(paths) -> None:
     rejected = sorted({path.replace("\\", "/") for path in paths if not safe_native_source(path)})
     if rejected:
-        raise ValueError(f"private source path in native symbols: {clipped(rejected[0])}" + (f" (+{len(rejected) - 1} more)" if len(rejected) > 1 else ""))
+        raise ValueError("private source path in native symbols: " + "; ".join(clipped(path) for path in rejected))
 
 
 def absolute_native(value: str) -> bool:
@@ -276,7 +281,7 @@ def normalized_source(value: str) -> str:
             return "crates/" + source.split("crates/", 1)[1]
     if source.startswith("dependency/"):
         return source
-    if source.startswith(("/rustc/", "/rust/deps/", "/root/.cargo/registry/", "/root/.cargo/git/checkouts/", "/out/target/", "/usr/include/")) or re.match(r"^/usr/lib/gcc/[^/]+/[^/]+/include/.+", source):
+    if source.startswith(("/rustc/", "/rust/deps/", "/root/.cargo/registry/", "/root/.cargo/git/checkouts/", "/work/vendor/", "C:/work/vendor/", "/out/target/", "/usr/include/")) or re.match(r"^/usr/lib/gcc/[^/]+/[^/]+/include/.+", source):
         return "dependency/" + source.rsplit("/", 1)[-1]
     raise ValueError(f"private or unsupported source path in symbols: {clipped(value)}")
 
@@ -295,7 +300,7 @@ def canonicalize_symbol_sources(path: Path) -> None:
                 if parts[2] not in rejected: rejected.append(parts[2])
         lines.append(line)
     if rejected:
-        raise ValueError("private or unsupported source path in symbols: " + "; ".join(clipped(value) for value in rejected[:5]) + (f" (+{len(rejected) - 5} more)" if len(rejected) > 5 else ""))
+        raise ValueError("private or unsupported source path in symbols: " + "; ".join(clipped(value) for value in rejected))
     path.write_text("".join(lines), encoding="utf-8")
 
 
@@ -315,7 +320,7 @@ def resolved_native_source(directory: str, value: str) -> str:
 
 def safe_native_source(path: str) -> bool:
     canonical = posixpath.normpath(path.replace("\\", "/"))
-    return canonical == "/work" or canonical.startswith(("/work/crates/", "C:/work/crates/", "/work/.cargo/registry/", "C:/work/.cargo/registry/", "/root/.cargo/registry/", "/root/.cargo/git/checkouts/", "/rustc/", "/rust/deps/", "/out/target/", "/usr/", "/lib/", "/lib64/", "/bin/", "/etc/", "/dev/", "/proc/", "/sys/"))
+    return canonical == "/work" or canonical.startswith(("/work/crates/", "C:/work/crates/", "/work/.cargo/registry/", "C:/work/.cargo/registry/", "/work/vendor/", "C:/work/vendor/", "/root/.cargo/registry/", "/root/.cargo/git/checkouts/", "/rustc/", "/rust/deps/", "/out/target/", "/usr/", "/lib/", "/lib64/", "/bin/", "/etc/", "/dev/", "/proc/", "/sys/"))
 
 
 def safe_source_less_cu(name: str) -> bool:
@@ -327,7 +332,7 @@ def safe_source_less_cu(name: str) -> bool:
     source, marker, unit = canonical.partition("/@/")
     if not marker or not source or not unit:
         return False
-    return source.startswith("crates/") or safe_native_source(source)
+    return source.startswith(("crates/", "vendor/")) or safe_native_source(source)
 
 
 def readelf_source_records(path: Path) -> tuple[list[str], int, int, int, int]:
@@ -739,15 +744,17 @@ def _inspect_windows_native(path: Path) -> dict:
                     if end < 0: raise ValueError("unterminated C13 source record")
                     value = strings[position:end].decode("utf-8", "strict")
                     if not absolute_native(value):
-                        if len(set(module_directories)) != 1:
+                        # A module with no compilation directory (the static C runtime's) keeps the relative path for mapping and rejection.
+                        if len(set(module_directories)) > 1:
                             raise ValueError("unresolved relative C13 source path")
-                        value = resolved_native_source(module_directories[0], value)
+                        if module_directories: value = resolved_native_source(module_directories[0], value)
                     paths.append(value)
                 c13_records += len(offsets)
         cursor = next_cursor
-    if any(not absolute_native(value) for value in file_paths) and len(set(compilation_directories)) != 1: raise ValueError("unresolved relative PDB source path")
+    # Several compilation directories leave a relative path unresolved for mapping and rejection.
+    single = compilation_directories[0] if len(set(compilation_directories)) == 1 else None
     paths.extend(compilation_directories)
-    paths.extend(resolved_native_source(compilation_directories[0], value) if not absolute_native(value) else value for value in file_paths)
+    paths.extend(resolved_native_source(single, value) if single and not absolute_native(value) else value for value in file_paths)
     paths = [native_source(item) for item in paths]
     reject_private_native(paths)
     return {"schema": SOURCE_INSPECTION_SCHEMA, "format": "pdb-dbi", "native_inspection_sha256": digest(path), "coverage": {"dbi_stream": 3, "file_records": len(file_paths), "module_c13_records": c13_records, "environment_records": environment_records}, "source_paths": sorted(set(paths))}

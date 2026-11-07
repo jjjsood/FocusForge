@@ -319,17 +319,52 @@ pub(crate) fn settled_device() -> Option<Result<&'static SharedDevice, &'static 
     SHARED.get().map(Result::as_ref)
 }
 
-/// `shared_device()`, but on failure prints `SKIP: no usable GPU adapter --
-/// <error>` and returns `None` instead of propagating the error -- the one
-/// place a test learns there is no GPU. Tests call this and `return` early so
-/// a skip prints a reason instead of failing or silently passing.
+/// What a test does with the device request's outcome.
+#[derive(Debug, PartialEq, Eq)]
+enum DeviceVerdict {
+    /// Run the test on the device.
+    Use,
+    /// Print `SKIP: <reason>` and return.
+    Skip(String),
+    /// Panic with the reason.
+    Refuse(String),
+}
+
+/// The skip-or-fail choice for a device request. `required` is a run meant to
+/// prove parity: a failed request and an adapter of device type `Cpu` are
+/// refused there, while a plain run skips a failed request and uses whatever
+/// adapter it got.
+fn device_verdict(required: bool, outcome: Result<wgpu::DeviceType, &GpuError>) -> DeviceVerdict {
+    match outcome {
+        Ok(wgpu::DeviceType::Cpu) if required => DeviceVerdict::Refuse(
+            "a GPU is required (FF_REQUIRE_GPU=1 or the nextest gpu profile) but the adapter is of device type Cpu".into(),
+        ),
+        Ok(_) => DeviceVerdict::Use,
+        Err(err) if required => DeviceVerdict::Refuse(format!(
+            "a GPU is required (FF_REQUIRE_GPU=1 or the nextest gpu profile) but the device request failed -- {err}"
+        )),
+        Err(err) => DeviceVerdict::Skip(format!("no usable GPU adapter -- {err}")),
+    }
+}
+
+/// `shared_device()`, but a failed request prints `SKIP: no usable GPU
+/// adapter -- <error>` and returns `None`; tests `return` early on it.
+/// With `FF_REQUIRE_GPU=1`, or under the nextest `gpu` profile, a failed
+/// request and an adapter of device type `Cpu` panic instead.
 pub fn shared_device_or_skip() -> Option<&'static SharedDevice> {
-    match shared_device() {
-        Ok(device) => Some(device),
-        Err(err) => {
-            println!("SKIP: no usable GPU adapter -- {err}");
+    let set = |name: &str, value: &str| std::env::var(name).is_ok_and(|v| v == value);
+    let required = set("FF_REQUIRE_GPU", "1") || set("NEXTEST_PROFILE", "gpu");
+    let outcome = shared_device();
+    match device_verdict(
+        required,
+        outcome.map(|device| device.adapter.get_info().device_type),
+    ) {
+        DeviceVerdict::Use => outcome.ok(),
+        DeviceVerdict::Skip(reason) => {
+            println!("SKIP: {reason}");
             None
         }
+        DeviceVerdict::Refuse(reason) => panic!("{reason}"),
     }
 }
 
@@ -340,4 +375,81 @@ pub fn adapter_report(info: &focusforge_core::gpu::BackendInfo) -> String {
         "adapter selected: name={} backend={} driver={} driver_info={}",
         info.name, info.backend, info.driver, info.driver_info
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use wgpu::DeviceType;
+
+    use super::{DeviceVerdict, GpuError, device_verdict};
+
+    const HARDWARE: [DeviceType; 4] = [
+        DeviceType::DiscreteGpu,
+        DeviceType::IntegratedGpu,
+        DeviceType::VirtualGpu,
+        DeviceType::Other,
+    ];
+
+    fn failures() -> [GpuError; 2] {
+        [
+            GpuError::NoAdapter {
+                reason: "no vulkan loader".into(),
+            },
+            GpuError::LimitsShort {
+                detail: "max_buffer_size".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_required_run_refuses_a_failed_request_naming_the_variable_and_the_error() {
+        for err in failures() {
+            let DeviceVerdict::Refuse(message) = device_verdict(true, Err(&err)) else {
+                panic!("{err} must be refused when a GPU is required");
+            };
+            assert!(message.contains("FF_REQUIRE_GPU"), "{message}");
+            assert!(message.contains(&err.to_string()), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_required_run_refuses_a_cpu_adapter_naming_the_variable() {
+        let DeviceVerdict::Refuse(message) = device_verdict(true, Ok(DeviceType::Cpu)) else {
+            panic!("a Cpu adapter must be refused when a GPU is required");
+        };
+        assert!(message.contains("FF_REQUIRE_GPU"), "{message}");
+        assert!(message.contains("Cpu"), "{message}");
+    }
+
+    #[test]
+    fn a_required_run_uses_every_hardware_adapter() {
+        for device_type in HARDWARE {
+            assert_eq!(
+                device_verdict(true, Ok(device_type)),
+                DeviceVerdict::Use,
+                "{device_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_run_skips_a_failed_request_with_the_error() {
+        for err in failures() {
+            let DeviceVerdict::Skip(reason) = device_verdict(false, Err(&err)) else {
+                panic!("{err} must be skipped when a GPU is not required");
+            };
+            assert_eq!(reason, format!("no usable GPU adapter -- {err}"));
+        }
+    }
+
+    #[test]
+    fn a_plain_run_uses_every_adapter_including_a_cpu_one() {
+        for device_type in HARDWARE.into_iter().chain([DeviceType::Cpu]) {
+            assert_eq!(
+                device_verdict(false, Ok(device_type)),
+                DeviceVerdict::Use,
+                "{device_type:?}"
+            );
+        }
+    }
 }

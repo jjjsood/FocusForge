@@ -20,6 +20,10 @@ pub mod downsample;
 pub use downsample::{Downsampler, center_crop};
 pub mod overlay;
 pub use overlay::{alpha_from_opacity, overlay_cpu};
+pub mod preview;
+pub use preview::{
+    PreviewCost, PreviewFeed, PreviewKind, PreviewKinds, StagePreview, heat8, heat16,
+};
 
 /// The 4x4 ordered (Bayer) dither matrix, values `0..=15`. Ordered, not
 /// random, so a still image dithers the same way on every frame and does

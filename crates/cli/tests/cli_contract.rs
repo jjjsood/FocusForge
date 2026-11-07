@@ -214,6 +214,7 @@ fn quiet_is_global_before_or_after_subcommand() {
         &["review"][..],
         &["cache", "clear"][..],
         &["diagnostics"][..],
+        &["check-update"][..],
     ] {
         for quiet in ["-q", "--quiet"] {
             let mut before = vec![quiet];
@@ -266,6 +267,7 @@ fn root_help_groups_product_commands_from_metadata() {
             "history",
             "cache",
             "diagnostics",
+            "check-update",
         ] {
             let listed = help
                 .lines()
@@ -391,7 +393,9 @@ fn quiet_stack_retains_a_fallback_warning_without_routine_stderr() {
         "--algorithm".to_string(),
         "dummy-stack".to_string(),
         "--align-algorithm".to_string(),
-        "pyramidal-ecc".to_string(),
+        "dummy-align".to_string(),
+        "--align-set".to_string(),
+        "fail-frame=0".to_string(),
         "--json".to_string(),
         "--quiet".to_string(),
         "--no-progress".to_string(),
@@ -641,5 +645,92 @@ fn no_progress_is_local_to_processing_commands() {
             String::from_utf8_lossy(&output.stdout).contains("--no-progress"),
             "{command} must expose --no-progress"
         );
+    }
+}
+
+/// Copies `src` to `dst` with `manifest.json`'s `format_version` raised to 2:
+/// a project saved by a newer FocusForge.
+fn write_newer_format_copy(src: &std::path::Path, dst: &std::path::Path) {
+    use focusforge_core::project::container::{ContainerWriter, Index};
+
+    let index = Index::read(src).unwrap();
+    let mut writer = ContainerWriter::create(dst).unwrap();
+    for name in index.names() {
+        let mut bytes = index.read_entry(src, name).unwrap();
+        if name == "manifest.json" {
+            let mut manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            manifest["format_version"] = serde_json::json!(2);
+            bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        }
+        writer.put_bytes(name, &bytes).unwrap();
+    }
+    writer.finish().unwrap();
+}
+
+/// A refusal of the project file is decided by its error class, so every
+/// subcommand that opens a project exits with the same code for the same
+/// file: 3 not a project, 4 truncated, 1 saved by a newer FocusForge.
+#[test]
+fn project_refusal_exit_code_matches_across_subcommands() {
+    let dir = common::tmp_dir("project_refusal_exit_code_matches_across_subcommands");
+    let projects = common::fixtures_dir().join("projects");
+
+    let text = dir.join("text.ffp");
+    std::fs::copy(projects.join("corrupt.ffp"), &text).unwrap();
+    let frame = dir.join("frame.ffp");
+    std::fs::copy(
+        common::fixtures_dir().join("mantis-64/frames/00.tif"),
+        &frame,
+    )
+    .unwrap();
+    let valid_bytes = std::fs::read(projects.join("valid.ffp")).unwrap();
+    let truncated = dir.join("truncated.ffp");
+    std::fs::write(&truncated, &valid_bytes[..valid_bytes.len() / 2]).unwrap();
+    let newer = dir.join("newer.ffp");
+    write_newer_format_copy(&projects.join("valid.ffp"), &newer);
+    let ops = dir.join("ops.json");
+    std::fs::write(&ops, "[]").unwrap();
+    let out = dir.join("out.tif");
+
+    for (input, path, code, fragment) in [
+        ("text file", &text, 3, "is not a FocusForge project"),
+        ("TIFF frame", &frame, 3, "is not a FocusForge project"),
+        (
+            "truncated project",
+            &truncated,
+            4,
+            "is truncated or incomplete",
+        ),
+        (
+            "newer-format project",
+            &newer,
+            1,
+            "saved by a newer FocusForge",
+        ),
+    ] {
+        let path = path.to_str().unwrap();
+        for (subcommand, args) in [
+            ("export", vec!["export", "-o", out.to_str().unwrap(), path]),
+            ("history list", vec!["history", "list", path]),
+            ("info", vec!["info", path]),
+            (
+                "retouch",
+                vec!["retouch", path, "--ops", ops.to_str().unwrap()],
+            ),
+        ] {
+            let output = common::run_in(&mut common::cli_bin("cli_contract"), &dir, &args);
+            let label = format!("{subcommand} on a {input}");
+            assert_eq!(output.code, Some(code), "{label}: {}", output.stderr);
+            assert!(
+                output.stdout.is_empty(),
+                "{label}: stdout {}",
+                output.stdout
+            );
+            assert!(
+                output.stderr.contains(fragment),
+                "{label}: {}",
+                output.stderr
+            );
+        }
     }
 }

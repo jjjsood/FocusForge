@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use focusforge_gui::bridge::Canvas;
-use focusforge_gui::{AppController, AppWindow, ThemeSheet, bridge, job, picker, screenshot};
+use focusforge_gui::{
+    AppController, AppWindow, Theme, ThemeSheet, bridge, job, picker, screenshot,
+};
 use slint::ComponentHandle;
 use slint::wgpu_29::wgpu;
 #[cfg(target_os = "linux")]
@@ -27,8 +29,12 @@ use slint::winit_030::winit::platform::x11::EventLoopBuilderExtX11;
 use slint::winit_030::{SlintEvent, WinitWindowAccessor, winit};
 
 #[derive(Parser)]
-#[command(name = "focusforge-gui")]
+#[command(name = "focusforge-gui", version)]
 struct Args {
+    /// Frames, a folder or a `*.ffp` to open together, as dropping them on the
+    /// window would. A file manager's "Open with" passes its selection here.
+    #[arg(value_name = "PATH")]
+    paths: Vec<PathBuf>,
     /// Exit this many milliseconds after the window is shown.
     #[arg(long)]
     exit_after: Option<u64>,
@@ -39,7 +45,7 @@ struct Args {
     /// Choose the main or detached window for `--screenshot`.
     #[arg(long, value_enum, default_value = "main", requires = "screenshot")]
     screenshot_window: ScreenshotWindow,
-    /// Undock a pane once a project loads, for window inspection.
+    /// Undock a pane once the `--open` project loads, for window inspection.
     #[arg(long, value_enum, requires = "open")]
     undock_pane: Option<UndockPane>,
     /// Dock the inspected pane this many milliseconds after undocking.
@@ -63,10 +69,24 @@ struct Args {
     /// order, one `open_paths` call per path.
     #[arg(long, action = clap::ArgAction::Append)]
     open: Vec<PathBuf>,
-    /// Read and write the input map at `<DIR>/focusforge/settings.toml`'s
-    /// `[input]` table instead of the platform config directory.
+    /// Read and write `<DIR>/focusforge/settings.toml` -- recent projects,
+    /// appearance, input map, export choice and performance -- instead of
+    /// the one in the platform config directory.
     #[arg(long)]
     config_dir: Option<PathBuf>,
+    /// Shows the notice for a newer release of this version without asking
+    /// the release server; nothing with the start-up check switched off.
+    #[arg(long, hide = true, value_name = "VERSION")]
+    update_notice_preview: Option<String>,
+    /// Shows one state of the About tab's update controls without asking the
+    /// release server; use with `--settings-section about`.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "STATE",
+        value_parser = ["idle", "checking", "up-to-date", "newer", "skipped", "failed", "save-error"]
+    )]
+    about_preview: Option<String>,
     /// Opens the settings modal on the named section at startup:
     /// `performance`, `appearance`, `storage`, `input-map`, `diagnostics` or `about`.
     #[arg(long)]
@@ -97,8 +117,8 @@ struct Args {
     toolbar_state: Option<String>,
     /// Opens the export modal at startup with literal preview text, for
     /// inspecting a state no click sequence quickly reaches: `ready`,
-    /// `ready-png`, `ready-jpeg`, `ready-menu`, `writing`, `refused` or
-    /// `refused-format`.
+    /// `ready-png`, `ready-jpeg`, `ready-dng`, `ready-menu`, `writing`,
+    /// `refused` or `refused-format`.
     #[arg(long)]
     export_dialog_preview: Option<String>,
     /// Opens the `Images` panel's sort menu at startup, for inspecting it
@@ -111,6 +131,29 @@ struct Args {
     /// load lands.
     #[arg(long)]
     projects_overlay: bool,
+    /// Opens the step calculator overlay at startup.
+    #[arg(long)]
+    calculator: bool,
+    /// Opens the Analytics overlay once the `--open` load, if any, has landed.
+    #[arg(long)]
+    analytics: bool,
+    /// With `--analytics`, holds the count's worker for MS milliseconds.
+    #[arg(long, requires = "analytics", value_name = "MS")]
+    analytics_hold_ms: Option<u64>,
+    /// With `--analytics`, counts in tiles of PX pixels.
+    #[arg(long, requires = "analytics", value_name = "PX")]
+    analytics_tile_size: Option<u32>,
+    /// With `--analytics`, pauses the count MS milliseconds after each tile.
+    #[arg(long, requires = "analytics", value_name = "MS")]
+    analytics_tile_pause_ms: Option<u64>,
+    /// With `--calculator`, selects the objective optics.
+    #[arg(long, requires = "calculator")]
+    calculator_objective: bool,
+    /// With `--calculator`, types TEXT into field slot SLOT (0 time per
+    /// frame, 1 magnification, 2 f-stop or numerical aperture, 3 overlap,
+    /// 4 depth range). Repeatable.
+    #[arg(long, requires = "calculator", value_name = "SLOT=TEXT")]
+    calculator_type: Vec<String>,
     /// Presses `Save project` once the last `--fuse-tabs` run settles,
     /// accepting the proposed path without a dialog -- for inspecting the
     /// saved state with no click sequence.
@@ -135,9 +178,9 @@ struct Args {
     /// the editor surface with no click sequence.
     #[arg(long, requires = "fuse_tabs")]
     enter_editor: bool,
-    /// Requests removing the frame at this index right after `--open`, for
-    /// inspecting the frame-set warning it raises on a checkpointed project
-    /// with no click sequence.
+    /// Presses the remove control of the frame at this index once the opened
+    /// project has loaded, for inspecting the frame-set warning it raises on
+    /// a checkpointed project with no click sequence.
     #[arg(long)]
     frame_remove_warning: Option<usize>,
     /// Presses `Export image` on the active tab's current row once `--open`
@@ -230,14 +273,15 @@ const TOOLBAR_STATES: [&str; 5] = ["idle", "running", "paused", "cancelling", "f
 /// sequence quickly reaches.
 fn apply_export_dialog_preview(app: &AppWindow, spec: &str) {
     use focusforge_gui::job::ExportFormat;
-    // `ready`, `ready-png`, `ready-jpeg`, `ready-menu` (TIFF compression
-    // list open), `writing`, `refused` or `refused-format` (a format cause,
-    // no `Locate frames…`).
+    // `ready`, `ready-png`, `ready-jpeg`, `ready-dng`, `ready-menu` (TIFF
+    // compression list open), `writing`, `refused` or `refused-format` (a
+    // format cause, no `Locate frames…`).
     let (stage, variant) = spec.split_once('-').unwrap_or((spec, ""));
     let choice = focusforge_gui::export_settings::ExportChoice {
         format: match variant {
             "png" => ExportFormat::Png,
             "jpeg" => ExportFormat::Jpeg,
+            "dng" => ExportFormat::Dng,
             _ => ExportFormat::Tiff,
         },
         ..Default::default()
@@ -245,7 +289,7 @@ fn apply_export_dialog_preview(app: &AppWindow, spec: &str) {
     let open = (variant == "menu").then_some("tiff-compression");
     focusforge_gui::bridge::push_export_view(app, &choice.view(open));
     app.set_export_open(true);
-    app.set_export_context("mantis-512.ffp · ORB · 2026-09-28 14:32".into());
+    app.set_export_context("mantis-512.ffp · Details · 2026-09-28 14:32".into());
     app.set_export_what("Exporting the saved checkpoint you selected.".into());
     app.set_export_stage(stage.into());
     app.set_export_writing_file_name(if stage == "writing" {
@@ -380,6 +424,50 @@ fn start_fuse_tabs_timer(
     *slot.borrow_mut() = Some(timer);
 }
 
+/// Presses the remove control of frame `index` once every `--open` load has
+/// settled (`open_timer` is the load timer starting them), so the press acts
+/// on the last-opened project and raises its frame-set warning. With nothing
+/// to open it fires on the first tick.
+fn start_frame_remove_timer(
+    app_weak: slint::Weak<AppWindow>,
+    controller: Arc<Mutex<AppController>>,
+    slot: &Rc<RefCell<Option<slint::Timer>>>,
+    index: usize,
+    open_timer: &Rc<RefCell<Option<slint::Timer>>>,
+) {
+    let timer_slot = slot.clone();
+    let open_timer = open_timer.clone();
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, job::POLL, move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if controller.lock().unwrap().load_in_flight()
+            || open_timer
+                .borrow()
+                .as_ref()
+                .is_some_and(slint::Timer::running)
+        {
+            return;
+        }
+        app.invoke_images_frame_remove_requested(index as i32);
+        if let Some(t) = timer_slot.borrow().as_ref() {
+            t.stop();
+        }
+    });
+    *slot.borrow_mut() = Some(timer);
+}
+
+/// The first load a launch starts and the `--open` paths queued behind it:
+/// the positional paths together, else the first `--open` path alone.
+fn startup_loads(args: &Args) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+    if !args.paths.is_empty() {
+        return Some((args.paths.clone(), args.open.clone()));
+    }
+    let (first, rest) = args.open.split_first()?;
+    Some((vec![first.clone()], rest.to_vec()))
+}
+
 /// Presses `Export image` and confirms with the proposed destination once
 /// the `--open`ed project settles, then polls the real worker
 /// (`AppController::settle_export`) to completion and repaints --
@@ -446,6 +534,41 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     }
 }
 
+/// Indices of `types` ordered GPU-backed first, software (`Cpu`) last; the
+/// enumeration order is kept inside a type.
+fn adapter_order(types: &[wgpu::DeviceType]) -> Vec<usize> {
+    use wgpu::DeviceType::{Cpu, DiscreteGpu, IntegratedGpu, Other, VirtualGpu};
+    let rank = |device_type: wgpu::DeviceType| match device_type {
+        DiscreteGpu => 0,
+        IntegratedGpu => 1,
+        VirtualGpu => 2,
+        Other => 3,
+        Cpu => 4,
+    };
+    let mut order: Vec<usize> = (0..types.len()).collect();
+    order.sort_by_key(|&index| rank(types[index]));
+    order
+}
+
+/// Returns the first candidate whose `request` succeeds, trying them in
+/// order. When none does, the error names every candidate and its failure.
+fn first_working_adapter<A, D>(
+    candidates: Vec<(String, A)>,
+    mut request: impl FnMut(&A) -> Result<D, String>,
+) -> Result<(A, D), String> {
+    if candidates.is_empty() {
+        return Err("no wgpu adapter for the selected backends".to_string());
+    }
+    let mut failures = Vec::new();
+    for (name, adapter) in candidates {
+        match request(&adapter) {
+            Ok(device) => return Ok((adapter, device)),
+            Err(error) => failures.push(format!("{name}: {error}")),
+        }
+    }
+    Err(failures.join("; "))
+}
+
 /// Builds the one device used by Slint and every imported canvas texture.
 fn manual_wgpu_configuration(
     #[cfg(target_os = "linux")] display_backend: LinuxDisplayBackend,
@@ -457,25 +580,45 @@ fn manual_wgpu_configuration(
         display_backend,
         std::env::var_os("WGPU_VALIDATION").is_some(),
     );
+    let backends = wgpu::Backends::from_env().unwrap_or_default();
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::from_env().unwrap_or_default(),
+        backends,
         flags,
         backend_options: wgpu::BackendOptions::from_env_or_default(),
         memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
         display: None,
     });
-    let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-        .map_err(|error| format!("no compatible wgpu adapter for the selected display: {error}"))?;
-    let limits = focusforge_gpu::limits::device_limits(&adapter.limits());
-    let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("focusforge-gui-device"),
-        required_features: focusforge_gpu::limits::REQUIRED_FEATURES,
-        required_limits: limits,
-        experimental_features: wgpu::ExperimentalFeatures::disabled(),
-        memory_hints: wgpu::MemoryHints::default(),
-        trace: wgpu::Trace::default(),
-    }))
+    let adapters = block_on(instance.enumerate_adapters(backends));
+    let types: Vec<_> = adapters
+        .iter()
+        .map(|adapter| adapter.get_info().device_type)
+        .collect();
+    let mut adapters: Vec<_> = adapters.into_iter().map(Some).collect();
+    let candidates = adapter_order(&types)
+        .into_iter()
+        .filter_map(|index| adapters[index].take())
+        .map(|adapter| (adapter.get_info().name, adapter))
+        .collect();
+    let (adapter, (device, queue)) = first_working_adapter(candidates, |adapter| {
+        let limits = focusforge_gpu::limits::device_limits(&adapter.limits());
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("focusforge-gui-device"),
+            required_features: focusforge_gpu::limits::REQUIRED_FEATURES,
+            required_limits: limits,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::default(),
+            trace: wgpu::Trace::default(),
+        }))
+        .map_err(|error| error.to_string())
+    })
     .map_err(|error| format!("could not create FocusForge's shared wgpu device: {error}"))?;
+    let info = adapter.get_info();
+    if info.device_type == wgpu::DeviceType::Cpu {
+        tracing::warn!(
+            "no GPU-backed adapter works; rendering on the software adapter {}",
+            info.name
+        );
+    }
 
     // Slint drops its Manual queue from thread-local backend state at process
     // shutdown, after wgpu's queue lock trace has already been destroyed.
@@ -605,6 +748,26 @@ fn teardown_is_current(generation: &std::cell::Cell<u64>, teardown: u64) -> bool
     generation.get() == teardown
 }
 
+/// Logs why the window could not start and returns the exit code. A Windows
+/// process started without any stderr (Explorer, the Start menu) also shows
+/// the message, since nothing else would; a captured stderr gets no dialog.
+fn startup_failed(message: &str) -> ExitCode {
+    tracing::error!("{message}");
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        if std::io::stderr().as_raw_handle().is_null() {
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("FocusForge")
+                .set_description(message)
+                .set_buttons(rfd::MessageButtons::Ok)
+                .show();
+        }
+    }
+    ExitCode::from(1)
+}
+
 /// Selects Slint's pinned wgpu 29 backend before any window is created.
 /// Returns whether the session is native Wayland, where dropping files onto
 /// the window does not work.
@@ -622,10 +785,7 @@ fn select_backend(
         display_backend,
     ) {
         Ok(config) => config,
-        Err(error) => {
-            tracing::error!("{error}");
-            return Err(ExitCode::from(1));
-        }
+        Err(error) => return Err(startup_failed(&error)),
     };
     #[cfg(not(target_os = "linux"))]
     let LaunchTokens = launch_tokens;
@@ -659,13 +819,13 @@ fn select_backend(
         ));
     if let Err(e) = selector.select() {
         #[cfg(target_os = "linux")]
-        tracing::error!(
+        let message = format!(
             "cannot open the {} display (check DISPLAY and WAYLAND_DISPLAY): {e}",
             display_backend.label()
         );
         #[cfg(not(target_os = "linux"))]
-        tracing::error!("{e}");
-        return Err(ExitCode::from(1));
+        let message = e.to_string();
+        return Err(startup_failed(&message));
     }
     #[cfg(target_os = "linux")]
     println!(
@@ -1000,17 +1160,8 @@ fn install_input_table(
 
     let mut controller = controller.lock().unwrap();
     controller.install_input_table(loaded.table);
-
-    let rows: Vec<focusforge_gui::InputRow> = controller
-        .input_rows()
-        .into_iter()
-        .map(|r| focusforge_gui::InputRow {
-            input: r.input.into(),
-            stacking: r.stacking.into(),
-            editor: r.editor.into(),
-        })
-        .collect();
-    app.set_input_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    controller.install_input_source(&loaded.provenance, &loaded.problems);
+    focusforge_gui::bridge::push_input_map_view(app, &controller);
 
     if let Some(section) = &args.settings_section {
         controller.open_settings();
@@ -1058,6 +1209,66 @@ fn preview_row(chip: [u8; 3], name: &str, time: &str) -> focusforge_gui::ImageRo
         preview: preview_image(),
         preview_state: "ready".into(),
     }
+}
+
+/// Samples for the sheet's stage view: a 5 x 4 tile grid over a synthetic
+/// picture, the first eight tiles fused, the next two the front.
+fn fill_stage_sheet(sheet: &ThemeSheet) {
+    use focusforge_gui::{StageTile, Theme};
+    const COLS: usize = 5;
+    const ROWS: usize = 4;
+    const TILE: (usize, usize) = (40, 35);
+    const FUSED: usize = 5;
+    const FRONT: usize = 7;
+    let ramp = bridge::heat_ramp(&sheet.global::<Theme>());
+    let (w, h) = (COLS * TILE.0, ROWS * TILE.1);
+    let heat_at = |x: usize, y: usize| {
+        let ripple = (x as f32 * 0.17).sin() * (y as f32 * 0.23).cos();
+        (128.0 + 127.0 * ripple).clamp(0.0, 255.0) as u8
+    };
+    let picture = |x: usize, y: usize| {
+        let stripe = if (x / 6 + y / 6).is_multiple_of(2) {
+            14
+        } else {
+            0
+        };
+        [
+            (60 + 120 * x / w + stripe) as u8,
+            (90 + 80 * y / h + stripe) as u8,
+            (150 - 70 * x / w + stripe) as u8,
+        ]
+    };
+    // `keep` says per tile whether it is opaque; `heated` whether it shows
+    // its heat instead of the picture.
+    let build = |keep: &dyn Fn(usize) -> bool, heated: &dyn Fn(usize) -> bool, only_heat: bool| {
+        let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w as u32, h as u32);
+        for (i, px) in pixels.make_mut_slice().iter_mut().enumerate() {
+            let (x, y) = (i % w, i / w);
+            let tile = (y / TILE.1) * COLS + x / TILE.0;
+            let [r, g, b] = if only_heat || heated(tile) {
+                ramp.colour(heat_at(x, y))
+            } else {
+                picture(x, y)
+            };
+            let a = if keep(tile) { 255 } else { 0 };
+            *px = slint::Rgba8Pixel { r, g, b, a };
+        }
+        slint::Image::from_rgba8(pixels)
+    };
+    let tiles: Vec<StageTile> = (FUSED..COLS * ROWS)
+        .map(|i| StageTile {
+            x: (i % COLS) as f32 * 80.0,
+            y: (i / COLS) as f32 * 70.0,
+            width: 80.0,
+            height: 70.0,
+            front: i < FRONT,
+        })
+        .collect();
+    sheet.set_stage_fusing(build(&|t| t < FRONT, &|t| t >= FUSED, false));
+    sheet.set_stage_fusing_bare(build(&|t| t < FUSED, &|_| false, false));
+    sheet.set_stage_complete(build(&|_| true, &|_| false, false));
+    sheet.set_stage_heat(build(&|t| t < FRONT, &|_| false, true));
+    sheet.set_stage_tiles(slint::ModelRc::new(slint::VecModel::from(tiles)));
 }
 
 fn preview_image() -> slint::Image {
@@ -1609,10 +1820,10 @@ fn install_diagnostics(
     controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
     app: &AppWindow,
 ) {
-    controller.lock().unwrap().set_diagnostics_dirs(
-        focusforge_diagnostics::data_dir_from_env(),
-        focusforge_diagnostics::config_dir_from_env(),
-    );
+    controller
+        .lock()
+        .unwrap()
+        .set_diagnostics_dirs(focusforge_diagnostics::data_dir_from_env());
     let _ = controller.lock().unwrap().start_manifest_scan();
     focusforge_gui::bridge::push_diagnostics_view(app, controller);
 }
@@ -1628,21 +1839,52 @@ fn install_recent(
     args: &Args,
 ) {
     let Some(config_dir) = resolve_config_dir(args) else {
-        controller.lock().unwrap().install_performance(
+        let mut controller = controller.lock().unwrap();
+        controller.install_performance(
             focusforge_gui::performance_settings::PerformanceSettings::default(),
         );
+        controller.install_updates(focusforge_gui::update_settings::UpdateSettings::default());
         return;
     };
     let entries = focusforge_gui::recent::load(&config_dir);
     let choice = focusforge_gui::export_settings::load(&config_dir);
     let performance = focusforge_gui::performance_settings::load(&config_dir);
     let appearance = focusforge_gui::appearance_settings::load(&config_dir);
+    let updates = focusforge_gui::update_settings::load(&config_dir);
     let mut controller = controller.lock().unwrap();
     controller.install_export_choice(choice);
     controller.install_performance(performance);
     controller.install_appearance(appearance);
+    controller.install_updates(updates);
     app.set_appearance_presentation(controller.source_presentation().slug().into());
+    app.set_appearance_sharpness_heatmap(controller.sharpness_heatmap());
+    app.set_appearance_reduce_motion(controller.reduce_motion());
+    app.global::<Theme>()
+        .set_reduce_motion(controller.reduce_motion());
     controller.install_recent(entries, config_dir);
+}
+
+/// Installs the release source behind Check now and starts the
+/// once-per-start update check from the installed `[updates]` settings: the
+/// preview release when `--update-notice-preview` names a version, else the
+/// latest GitHub release.
+fn start_update_check(
+    controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
+    args: &Args,
+) {
+    let preview = args.update_notice_preview.clone();
+    let factory: focusforge_gui::ReleaseSourceFactory =
+        std::sync::Arc::new(move || match &preview {
+            Some(version) => Box::new(focusforge_gui::update_settings::PreviewRelease::new(
+                version,
+            )) as Box<dyn focusforge_gui::job::ReleaseSource + Send>,
+            None => Box::new(focusforge_gui::job::HttpReleaseSource::new()),
+        });
+    let mut controller = controller.lock().unwrap();
+    let settings = controller.update_settings().clone();
+    controller.set_release_source(factory.clone());
+    // The thread reports through the sink and needs no join.
+    drop(controller.start_update_check(&settings, factory()));
 }
 
 /// Parses a whole number of at least 1; `None` for anything else, including
@@ -1711,9 +1953,56 @@ fn install_save_folder(args: &Args) {
     }
 }
 
+/// A windowed Windows process starts without a console, so clap's help,
+/// version and error text would go nowhere. Attaching the starting terminal's
+/// console first lets it print there. Without a parent console (Explorer, the
+/// Start menu) the call fails and nothing opens. Attaching resets all three
+/// standard handles to the console, so a handle the parent redirected to a
+/// file or pipe (`--help > help.txt`) is put back afterwards.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn attach_parent_console() {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType};
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    let streams = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
+    // SAFETY: no call takes a pointer; `GetFileType` answers an unknown type
+    // for a null or stale handle, which is then left alone.
+    unsafe {
+        let redirected = streams.map(|stream| {
+            Some(GetStdHandle(stream))
+                .filter(|&handle| matches!(GetFileType(handle), FILE_TYPE_DISK | FILE_TYPE_PIPE))
+        });
+        if AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
+            for (stream, handle) in streams.into_iter().zip(redirected) {
+                if let Some(handle) = handle {
+                    SetStdHandle(stream, handle);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
+/// Lets Slint accept the software adapter `manual_wgpu_configuration` may
+/// choose; a value the user set is kept.
+#[allow(unsafe_code)]
+fn allow_software_adapter() {
+    if std::env::var_os("SLINT_WGPU_CPU").is_none() {
+        // SAFETY: called first in `main`, before any other thread exists.
+        unsafe { std::env::set_var("SLINT_WGPU_CPU", "1") };
+    }
+}
+
 fn main() -> ExitCode {
-    // Before any thread or child process exists, so none inherits the tokens.
+    // Before any thread or child process exists, so none inherits the tokens
+    // and none reads the environment while it changes.
     let launch_tokens = take_launch_tokens();
+    allow_software_adapter();
     // Ahead of every parser: a re-spawned monitor process carries no
     // arguments of its own and never opens a window.
     if let Some(code) = focusforge_diagnostics::run_monitor() {
@@ -1728,7 +2017,11 @@ fn main() -> ExitCode {
     // installs the hook that reports it.
     focusforge_diagnostics::force_crash("startup");
 
-    let result = run(&Args::parse(), launch_tokens);
+    let args = Args::try_parse().unwrap_or_else(|error| {
+        attach_parent_console();
+        error.exit()
+    });
+    let result = run(&args, launch_tokens);
     focusforge_gui::bridge::finish_input_trace();
     result
 }
@@ -1773,7 +2066,8 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
     // Built before `select_backend`: the drop route (`bridge::DropHandler`)
     // installs on the `BackendSelector` chain before any window exists, and
     // needs the same renderer cell every other open path feeds.
-    let controller_state = AppController::new();
+    let mut controller_state = AppController::new();
+    controller_state.set_analytics_background(true);
     let controller = Arc::new(Mutex::new(controller_state));
     let canvas: Rc<RefCell<Canvas>> = Rc::new(RefCell::new(Canvas::default()));
     let app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>> = Rc::new(RefCell::new(None));
@@ -1793,6 +2087,7 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
 
     let code = if args.theme_sheet {
         let sheet = ThemeSheet::new().expect("failed to instantiate ThemeSheet");
+        fill_stage_sheet(&sheet);
         run_window(sheet, args, None, None, None)
     } else {
         let app = AppWindow::new().expect("failed to instantiate AppWindow");
@@ -1810,14 +2105,20 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
 
         install_input_table(&controller, &app, args);
         apply_appearance_preview(&app, args.appearance_preview);
+        install_recent(&controller, &app, args);
         install_diagnostics(&controller, &app);
         bridge::install_crash_notice(&controller, &app, &toast_timer);
-        install_recent(&controller, &app, args);
+        match &args.about_preview {
+            // The check reports through the sink and needs no join.
+            Some(state) => drop(controller.lock().unwrap().set_about_preview(state)),
+            None => start_update_check(&controller, args),
+        }
         install_slow_down(&controller, args);
         install_save_folder(args);
         bridge::push_performance_view(&app, &controller);
         bridge::push_storage_view(&app, &controller);
         bridge::push_about_view(&app);
+        bridge::push_update_controls_view(&app, &controller);
 
         if let Some(state) = &args.toolbar_state {
             let mut controller = controller.lock().unwrap();
@@ -1829,21 +2130,54 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
         }
 
         // Each load runs on its own worker thread; a refusal reaches the
-        // window's own refusal dialog. Only the first `--open` path starts
-        // here -- the load timer starts each of the rest in turn once the
-        // one before it settles, and repaints once the last one has.
+        // window's own refusal dialog. Only the first load starts here -- the
+        // load timer starts each queued `--open` path in turn once the one
+        // before it settles, and repaints once the last one has.
         let open_wait_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
-        if let Some((first, rest)) = args.open.split_first() {
-            controller
-                .lock()
-                .unwrap()
-                .open_paths(std::slice::from_ref(first));
+        if let Some((first, queued)) = startup_loads(args) {
+            controller.lock().unwrap().open_paths(&first);
             bridge::start_load_timer(
                 app.as_weak(),
                 controller.clone(),
                 canvas.clone(),
                 &open_wait_timer,
-                rest.to_vec(),
+                queued,
+            );
+        }
+
+        let analytics_timer = Rc::new(slint::Timer::default());
+        if args.analytics {
+            if let Some(ms) = args.analytics_hold_ms {
+                controller
+                    .lock()
+                    .unwrap()
+                    .set_analytics_hold(Duration::from_millis(ms));
+            }
+            if let Some(size) = args.analytics_tile_size {
+                controller.lock().unwrap().set_analytics_tile_size(size);
+            }
+            if let Some(ms) = args.analytics_tile_pause_ms {
+                controller
+                    .lock()
+                    .unwrap()
+                    .set_analytics_tile_pause(Duration::from_millis(ms));
+            }
+            let controller = controller.clone();
+            let timer = analytics_timer.clone();
+            let tabs = args.open.len() + usize::from(!args.paths.is_empty());
+            analytics_timer.start(
+                slint::TimerMode::Repeated,
+                Duration::from_millis(50),
+                move || {
+                    let mut controller = controller.lock().unwrap();
+                    // Every `--open` has produced a tab; a later load would
+                    // switch tabs and close the overlay.
+                    if controller.load_in_flight() || controller.project_tabs().len() < tabs {
+                        return;
+                    }
+                    controller.toggle_analytics();
+                    timer.stop();
+                },
             );
         }
 
@@ -1924,9 +2258,30 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
         if args.projects_overlay && args.fuse_tabs.is_empty() {
             controller.lock().unwrap().toggle_projects_overlay();
         }
+        if args.calculator {
+            let mut controller = controller.lock().unwrap();
+            controller.toggle_calculator();
+            if args.calculator_objective {
+                controller.calculator_set_optics("Objective (NA)");
+            }
+            for entry in &args.calculator_type {
+                if let Some((slot, text)) = entry.split_once('=')
+                    && let Ok(slot) = slot.parse::<usize>()
+                {
+                    controller.calculator_edit(slot, text);
+                }
+            }
+        }
 
+        let frame_remove_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
         if let Some(index) = args.frame_remove_warning {
-            controller.lock().unwrap().remove_frame(index);
+            start_frame_remove_timer(
+                app.as_weak(),
+                controller.clone(),
+                &frame_remove_timer,
+                index,
+                &open_wait_timer,
+            );
         }
 
         let export_active_row_timer: Rc<RefCell<Option<slint::Timer>>> =
@@ -1974,6 +2329,103 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
 mod tests {
     use super::*;
 
+    /// `count` of the mantis-64 frames copied into `<parent>/<name>`.
+    fn mantis_folder(parent: &Path, name: &str, count: usize) -> PathBuf {
+        let root = parent.join(name);
+        std::fs::create_dir(&root).unwrap();
+        for index in 0..count {
+            let frame = format!("{index:02}.tif");
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/mantis-64/frames")
+                    .join(&frame),
+                root.join(frame),
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    /// Advances the timers and the load worker's completion, which this
+    /// backend has no event loop to deliver, until no load or run is pending
+    /// and every timer in `slots` has stopped.
+    fn pump_until_settled(
+        app: &AppWindow,
+        controller: &Arc<Mutex<AppController>>,
+        slots: &[&Rc<RefCell<Option<slint::Timer>>>],
+    ) {
+        let started = std::time::Instant::now();
+        loop {
+            i_slint_backend_testing::mock_elapsed_time(job::POLL);
+            if controller.lock().unwrap().settle_open().is_some() {
+                bridge::push_projects(app, controller);
+            }
+            let idle = {
+                let controller = controller.lock().unwrap();
+                !controller.load_in_flight() && !controller.work_pending()
+            };
+            if idle
+                && !slots
+                    .iter()
+                    .any(|slot| slot.borrow().as_ref().is_some_and(slint::Timer::running))
+            {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(120),
+                "runs never settled"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn version_flag_prints_the_binary_name_and_workspace_version() {
+        let error = Args::try_parse_from(["focusforge-gui", "--version"])
+            .err()
+            .expect("--version is a recognised flag that stops parsing");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        let text = error.render().to_string();
+        assert!(text.starts_with("focusforge-gui "), "{text}");
+        assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+    }
+
+    #[test]
+    fn update_notice_preview_flag_parses_and_stays_out_of_the_help() {
+        use clap::CommandFactory;
+
+        let args =
+            Args::try_parse_from(["focusforge-gui", "--update-notice-preview", "999.0.0"]).unwrap();
+        assert_eq!(args.update_notice_preview.as_deref(), Some("999.0.0"));
+        let help = Args::command().render_long_help().to_string();
+        assert!(!help.contains("update-notice-preview"), "{help}");
+    }
+
+    #[test]
+    fn about_preview_flag_parses_and_stays_out_of_the_help() {
+        use clap::CommandFactory;
+
+        for state in [
+            "idle",
+            "checking",
+            "up-to-date",
+            "newer",
+            "skipped",
+            "failed",
+            "save-error",
+        ] {
+            let args = Args::try_parse_from(["focusforge-gui", "--about-preview", state]).unwrap();
+            assert_eq!(args.about_preview.as_deref(), Some(state));
+        }
+        let rejected = Args::try_parse_from(["focusforge-gui", "--about-preview", "bogus"])
+            .err()
+            .expect("an unknown state is refused at parse time");
+        assert_eq!(rejected.kind(), clap::error::ErrorKind::InvalidValue);
+        let help = Args::command().render_long_help().to_string();
+        assert!(!help.contains("about-preview"), "{help}");
+    }
+
     #[test]
     fn newer_setup_keeps_a_queued_older_teardown_stale() {
         let generation = std::cell::Cell::new(0);
@@ -1994,22 +2446,10 @@ mod tests {
         let app = AppWindow::new().unwrap();
         app.window().set_size(slint::PhysicalSize::new(1440, 900));
         let dir = tempfile::tempdir().unwrap();
-        let folder = |name: &str| {
-            let root = dir.path().join(name);
-            std::fs::create_dir(&root).unwrap();
-            for index in 0..3 {
-                let frame = format!("{index:02}.tif");
-                std::fs::copy(
-                    Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join("../../fixtures/mantis-64/frames")
-                        .join(&frame),
-                    root.join(frame),
-                )
-                .unwrap();
-            }
-            root
-        };
-        let (first, second) = (folder("first"), folder("second"));
+        let (first, second) = (
+            mantis_folder(dir.path(), "first", 3),
+            mantis_folder(dir.path(), "second", 3),
+        );
         let mut state = AppController::new();
         state.set_scratch_root_for_test(dir.path().join("scratch"));
         let controller = Arc::new(Mutex::new(state));
@@ -2055,30 +2495,7 @@ mod tests {
             &open_slot,
         );
 
-        let running = |slot: &Rc<RefCell<Option<slint::Timer>>>| {
-            slot.borrow().as_ref().is_some_and(slint::Timer::running)
-        };
-        let started = std::time::Instant::now();
-        loop {
-            i_slint_backend_testing::mock_elapsed_time(job::POLL);
-            // The load worker's completion event, which this backend has no
-            // event loop to deliver.
-            if controller.lock().unwrap().settle_open().is_some() {
-                bridge::push_projects(&app, &controller);
-            }
-            let idle = {
-                let controller = controller.lock().unwrap();
-                !controller.load_in_flight() && !controller.work_pending()
-            };
-            if idle && !running(&open_slot) && !running(&press_slot) {
-                break;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(120),
-                "runs never settled"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        pump_until_settled(&app, &controller, &[&open_slot, &press_slot]);
 
         let mut controller = controller.lock().unwrap();
         assert_eq!(controller.project_tabs().len(), 2);
@@ -2089,6 +2506,126 @@ mod tests {
                 "tab {tab} fused and parked at its own question"
             );
         }
+    }
+
+    /// With two `--open` folders, a frame-remove press must wait until the
+    /// last one has loaded and then act on that tab, not on the first.
+    #[test]
+    fn frame_remove_press_waits_for_every_queued_open() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = AppWindow::new().unwrap();
+        app.window().set_size(slint::PhysicalSize::new(1440, 900));
+        let dir = tempfile::tempdir().unwrap();
+        let first = mantis_folder(dir.path(), "first", 3);
+        let second = mantis_folder(dir.path(), "second", 2);
+        let mut state = AppController::new();
+        state.set_scratch_root_for_test(dir.path().join("scratch"));
+        let controller = Arc::new(Mutex::new(state));
+        let canvas: Rc<RefCell<Canvas>> = Rc::new(RefCell::new(Canvas::default()));
+        let _installed = bridge::install(
+            &app,
+            controller.clone(),
+            canvas.clone(),
+            Rc::new(RefCell::new(None)),
+        );
+
+        let load = controller
+            .lock()
+            .unwrap()
+            .open_paths(std::slice::from_ref(&first))
+            .expect("the first load starts");
+        load.join().unwrap();
+        controller.lock().unwrap().settle_open().unwrap();
+        let open_slot: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+        bridge::start_load_timer(
+            app.as_weak(),
+            controller.clone(),
+            canvas,
+            &open_slot,
+            vec![second],
+        );
+        let press_slot: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+        start_frame_remove_timer(
+            app.as_weak(),
+            controller.clone(),
+            &press_slot,
+            1,
+            &open_slot,
+        );
+
+        pump_until_settled(&app, &controller, &[&open_slot, &press_slot]);
+
+        let mut controller = controller.lock().unwrap();
+        assert_eq!(controller.project_tabs().len(), 2);
+        let frames = |controller: &mut AppController, tab: usize| {
+            controller.select_project(tab);
+            controller.images_panel().rows.len()
+        };
+        assert_eq!(
+            frames(&mut controller, 1),
+            1,
+            "the last-opened tab lost frame 1"
+        );
+        assert_eq!(frames(&mut controller, 0), 3, "the first tab is untouched");
+    }
+
+    fn parse(args: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(std::iter::once("focusforge-gui").chain(args.iter().copied()))
+    }
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn positional_paths_open_as_one_drop() {
+        let args = parse(&["a.tif", "b.tif", "c.tif", "--exit-after", "5"]).unwrap();
+        assert_eq!(args.paths, paths(&["a.tif", "b.tif", "c.tif"]));
+        assert_eq!(
+            startup_loads(&args),
+            Some((paths(&["a.tif", "b.tif", "c.tif"]), Vec::new()))
+        );
+        let folder = parse(&["frames"]).unwrap();
+        assert_eq!(
+            startup_loads(&folder),
+            Some((paths(&["frames"]), Vec::new()))
+        );
+    }
+
+    #[test]
+    fn positional_paths_load_before_the_open_queue() {
+        let args = parse(&["a.tif", "b.tif", "--open", "x", "--open", "y"]).unwrap();
+        assert_eq!(
+            startup_loads(&args),
+            Some((paths(&["a.tif", "b.tif"]), paths(&["x", "y"])))
+        );
+        // `--open` takes one value, so the second word is a positional.
+        let args = parse(&["--open", "a", "b"]).unwrap();
+        assert_eq!(args.open, paths(&["a"]));
+        assert_eq!(args.paths, paths(&["b"]));
+        assert!(parse(&["--frame-remove-warning", "1", "x.ffp"]).is_ok());
+    }
+
+    #[test]
+    fn positional_paths_leave_open_alone_unchanged() {
+        let args = parse(&["--open", "x", "--open", "y", "--open", "z"]).unwrap();
+        assert!(args.paths.is_empty());
+        assert_eq!(
+            startup_loads(&args),
+            Some((paths(&["x"]), paths(&["y", "z"])))
+        );
+        assert_eq!(startup_loads(&parse(&[]).unwrap()), None);
+    }
+
+    #[test]
+    fn positional_paths_do_not_unlock_flags_that_need_open() {
+        let error = parse(&["x.ffp", "--undock-pane", "frame"])
+            .err()
+            .expect("--undock-pane still requires --open");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2158,5 +2695,92 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn adapter_order_puts_gpu_types_before_cpu_and_keeps_order_within_a_type() {
+        use wgpu::DeviceType::*;
+        let types = [
+            Cpu,
+            IntegratedGpu,
+            Other,
+            Cpu,
+            VirtualGpu,
+            DiscreteGpu,
+            IntegratedGpu,
+        ];
+        assert_eq!(adapter_order(&types), [5, 1, 6, 4, 2, 0, 3]);
+    }
+
+    #[test]
+    fn adapter_order_keeps_a_cpu_only_list_and_an_empty_list() {
+        use wgpu::DeviceType::Cpu;
+        assert_eq!(adapter_order(&[Cpu, Cpu]), [0, 1]);
+        assert!(adapter_order(&[]).is_empty());
+    }
+
+    #[test]
+    fn adapter_fallthrough_takes_the_first_success_and_stops() {
+        let mut calls = 0;
+        let candidates = vec![
+            ("a".to_string(), 1),
+            ("b".to_string(), 2),
+            ("c".to_string(), 3),
+        ];
+        let (adapter, device) = first_working_adapter(candidates, |adapter| {
+            calls += 1;
+            if *adapter == 1 {
+                Err("no features".to_string())
+            } else {
+                Ok(adapter * 10)
+            }
+        })
+        .expect("the second candidate works");
+        assert_eq!((adapter, device, calls), (2, 20, 2));
+    }
+
+    #[test]
+    fn adapter_fallthrough_names_every_failure() {
+        let candidates = vec![
+            ("alpha".to_string(), ()),
+            ("beta".to_string(), ()),
+            ("gamma".to_string(), ()),
+        ];
+        let error = first_working_adapter::<_, ()>(candidates, |_| Err("boom".to_string()))
+            .expect_err("every candidate fails");
+        for name in ["alpha", "beta", "gamma"] {
+            assert!(error.contains(name), "{error}");
+        }
+        assert!(error.contains("boom"), "{error}");
+    }
+
+    #[test]
+    fn adapter_fallthrough_errs_on_an_empty_list() {
+        let error =
+            first_working_adapter::<(), ()>(Vec::new(), |_| Ok(())).expect_err("nothing to try");
+        assert!(error.contains("no wgpu adapter"), "{error}");
+    }
+
+    #[test]
+    fn export_preview_names_a_fusion_method() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = AppWindow::new().unwrap();
+        let methods: Vec<&str> = focusforge_core::registry::stack_algorithms()
+            .iter()
+            .map(|a| a.display_name())
+            .collect();
+        for spec in ["ready", "writing", "refused", "refused-format"] {
+            apply_export_dialog_preview(&app, spec);
+            let context = app.get_export_context().to_string();
+            let method = context
+                .split(" · ")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{context:?} has no method field"));
+            assert!(
+                methods.contains(&method),
+                "{method:?} in {context:?} is not a registered display name ({methods:?})"
+            );
+            assert!(!context.contains("ORB"), "{context:?}");
+        }
     }
 }

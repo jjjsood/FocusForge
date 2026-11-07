@@ -13,7 +13,6 @@ mod common;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use focusforge_core::algorithm::{AlgorithmError, TileCtx, TileReader};
 use focusforge_core::align::{
@@ -46,8 +45,8 @@ struct FusionResult {
 /// Runs `laplacian` at `(tile_size, levels)` over `fixtures/mantis-512`,
 /// reading through `reader` (`&TiffStack` for an unaligned run, a
 /// [`WarpingReader`] for an aligned one) and declaring both outputs at
-/// `crop.unwrap_or(full_frame)`, into `.scratch/fuse/<label>.tif` +
-/// `-zmap.tif`, then reads both back.
+/// `crop.unwrap_or(full_frame)`, into a per-call temporary directory
+/// (`<label>.tif` + `-zmap.tif`), then reads both back.
 #[allow(clippy::too_many_arguments)]
 fn run_fusion(
     label: &str,
@@ -72,15 +71,12 @@ fn run_fusion(
         params::resolve(algo.params(), &explicit, &stack_ctx).expect("resolve must succeed");
     let values = params::resolved_values(&resolved);
 
-    // Repo-relative `.scratch/fuse/`, resolved from `CARGO_MANIFEST_DIR`: a
-    // test binary's cwd is `crates/core`, not the workspace root.
-    let scratch_dir = common::workspace_root().join(".scratch").join("fuse");
-    std::fs::create_dir_all(&scratch_dir).expect("scratch dir must be creatable");
-    let composite_path = scratch_dir.join(format!("{label}.tif"));
-    let zmap_path = scratch_dir.join(format!("{label}-zmap.tif"));
+    // Unique per call, so concurrent test processes never share an output path.
+    let temp = common::target_tmp();
+    let composite_path = temp.path().join(format!("{label}.tif"));
+    let zmap_path = temp.path().join(format!("{label}-zmap.tif"));
 
-    let scheduler_scratch =
-        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("laplacian_fusion_{label}"));
+    let scheduler_scratch = temp.path().join("scheduler");
     let mut options = TileSchedulerOptions::explicit_budget(scheduler_scratch, max_bytes_in_flight);
     options.apply_support(algo.tile_support(&values));
     options.tile_size = tile_size;
@@ -149,97 +145,77 @@ fn open_mantis_512() -> (TiffStack, StackContext) {
 }
 
 /// 448/5: the golden geometry (four congruent 256px interiors over the
-/// 512px fixture), unaligned, full-frame. Computed once per test binary
-/// process and shared, since several tests below assert different things
-/// about the same run.
-fn golden_result() -> &'static FusionResult {
-    static ONCE: OnceLock<FusionResult> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let (stack, stack_ctx) = open_mantis_512();
-        run_fusion("mantis-512", 448, 5, 1 << 30, &stack, stack_ctx, None)
-    })
+/// 512px fixture), unaligned, full-frame.
+fn golden_result() -> FusionResult {
+    let (stack, stack_ctx) = open_mantis_512();
+    run_fusion("mantis-512", 448, 5, 1 << 30, &stack, stack_ctx, None)
 }
 
 /// 1024/5: one tile covering the whole 512x512 fixture (interior 704) -- the
 /// full-image reference every tiled run is compared against.
-fn single_tile_result() -> &'static FusionResult {
-    static ONCE: OnceLock<FusionResult> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let (stack, stack_ctx) = open_mantis_512();
-        run_fusion("single-tile", 1024, 5, 1 << 30, &stack, stack_ctx, None)
-    })
+fn single_tile_result() -> FusionResult {
+    let (stack, stack_ctx) = open_mantis_512();
+    run_fusion("single-tile", 1024, 5, 1 << 30, &stack, stack_ctx, None)
 }
 
 /// 480/5: the ragged variant (interiors of 160, 160 and 192).
-fn ragged_result() -> &'static FusionResult {
-    static ONCE: OnceLock<FusionResult> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let (stack, stack_ctx) = open_mantis_512();
-        run_fusion("ragged-480", 480, 5, 1 << 30, &stack, stack_ctx, None)
-    })
+fn ragged_result() -> FusionResult {
+    let (stack, stack_ctx) = open_mantis_512();
+    run_fusion("ragged-480", 480, 5, 1 << 30, &stack, stack_ctx, None)
 }
 
 /// `pyramidal-ecc` under its own defaults (`mode=rotation-scale`,
 /// `reference-frame=middle`) with `reference-policy=anchor`, and
 /// `FailurePolicy::IdentityFallback` (frame 0 diverges against the middle
-/// anchor), run once and shared between [`aligned_result`] and the
-/// self-consistency test below.
-fn alignment() -> &'static StackAlignment {
-    static ONCE: OnceLock<StackAlignment> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let (stack, stack_ctx) = open_mantis_512();
-        let align_algo =
-            registry::find_align("pyramidal-ecc").expect("pyramidal-ecc must be registered");
-        let resolved = params::resolve(align_algo.params(), &ParamValues::new(), &stack_ctx)
-            .expect("resolve must succeed with align defaults");
-        let mut align_values = params::resolved_values(&resolved);
-        align_values.insert(
-            "reference-policy".to_string(),
-            ParamValue::Enum("anchor".to_string()),
-        );
-        align_stack(
-            align_algo,
-            stack_ctx,
-            &stack,
-            &align_values,
-            FailurePolicy::IdentityFallback,
-        )
-        .expect("aligning the fixture must not error (frame 0's divergence is reported, not fatal)")
-    })
+/// anchor).
+fn alignment() -> StackAlignment {
+    let (stack, stack_ctx) = open_mantis_512();
+    let align_algo =
+        registry::find_align("pyramidal-ecc").expect("pyramidal-ecc must be registered");
+    let resolved = params::resolve(align_algo.params(), &ParamValues::new(), &stack_ctx)
+        .expect("resolve must succeed with align defaults");
+    let mut align_values = params::resolved_values(&resolved);
+    align_values.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum("anchor".to_string()),
+    );
+    align_stack(
+        align_algo,
+        stack_ctx,
+        &stack,
+        &align_values,
+        FailurePolicy::IdentityFallback,
+    )
+    .expect("aligning the fixture must not error (frame 0's divergence is reported, not fatal)")
 }
 
 /// 448/5, **aligned**: fused through a [`WarpingReader`] built from
-/// [`alignment`]'s transforms and declared at the stack's own auto-crop
-/// rect.
-fn aligned_result() -> &'static FusionResult {
-    static ONCE: OnceLock<FusionResult> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let (stack, stack_ctx) = open_mantis_512();
-        let (width, height) = (stack_ctx.width, stack_ctx.height);
-        let alignment = alignment();
+/// `alignment`'s transforms and declared at the stack's own auto-crop rect.
+fn aligned_result(alignment: &StackAlignment) -> FusionResult {
+    let (stack, stack_ctx) = open_mantis_512();
+    let (width, height) = (stack_ctx.width, stack_ctx.height);
 
-        let crop = auto_crop(alignment, (width, height))
-            .expect("the fixture's transforms are affine")
-            .expect("the fixture's footprints intersect");
+    let crop = auto_crop(alignment, (width, height))
+        .expect("the fixture's transforms are affine")
+        .expect("the fixture's footprints intersect");
 
-        let transforms: Vec<_> = alignment.frames.iter().map(|f| f.transform).collect();
-        let reader = WarpingReader::new(
-            &stack,
-            (width, height),
-            stack_ctx.samples_per_pixel,
-            transforms,
-        );
+    let transforms: Vec<_> = alignment.frames.iter().map(|f| f.transform).collect();
+    let reader = WarpingReader::new(
+        &stack,
+        (width, height),
+        stack_ctx.samples_per_pixel,
+        transforms,
+    );
 
-        run_fusion(
-            "aligned-mantis-512",
-            448,
-            5,
-            1 << 30,
-            &reader,
-            stack_ctx,
-            Some(crop),
-        )
-    })
+    run_fusion(
+        "aligned-mantis-512",
+        448,
+        5,
+        1 << 30,
+        &reader,
+        stack_ctx,
+        Some(crop),
+    )
 }
 
 /// Reads one frame's window through any [`TileReader`] -- `&stack` for an
@@ -286,14 +262,8 @@ fn algorithm_is_registered_and_lists_its_schema() {
 
 #[test]
 fn every_parameter_is_declared() {
-    let stack = TiffStack::open(common::mantis_512_dir()).expect("mantis-512 must open");
+    let (stack, stack_ctx) = common::align::open_stack_context("mantis-64");
     let (width, height) = stack.dimensions();
-    let stack_ctx = StackContext::new(
-        stack.len(),
-        width,
-        height,
-        stack.header(0).samples_per_pixel,
-    );
     let algo = registry::find_stack("laplacian").expect("laplacian must resolve by id");
 
     let resolved = params::resolve(algo.params(), &ParamValues::new(), &stack_ctx)
@@ -396,15 +366,17 @@ fn extract_window(samples: &[u16], full_width: u32, rect: Rect, spp: u32) -> Vec
     out
 }
 
-/// **Recorded only, nothing asserted.** `reference.tif` is another
-/// stacker's composite from a different alignment and fusion, so no
-/// SSIM/PSNR comparison isolates alignment: giving each composite its own
-/// best integer shift (up to +/-8 px, within the crop margin) still leaves the
-/// unaligned composite ahead on both metrics, with both optima pinned at
-/// the search boundary. Both composites' raw and best-shift numbers print.
+/// **Recorded only; only the fixture dimensions are asserted.**
+/// `reference.tif` is another stacker's composite from a different alignment
+/// and fusion, so no SSIM/PSNR comparison isolates alignment: even at each
+/// composite's best integer shift (up to +/-8 px) the metrics disagree: the
+/// aligned composite leads on SSIM, the unaligned one on PSNR. Prints raw and
+/// best-shift numbers, then sharpness.
 #[test]
+#[ignore = "measurement: prints the aligned and unaligned composites' similarity to reference.tif (raw and at the best integer shift) and their sharpness over the crop window"]
 fn composite_similarity_to_reference_is_recorded() {
-    let aligned = aligned_result();
+    let alignment = alignment();
+    let aligned = aligned_result(&alignment);
     let unaligned = golden_result();
     let crop = aligned
         .crop
@@ -508,50 +480,52 @@ fn composite_similarity_to_reference_is_recorded() {
          unaligned best-shift=({},{}) ssim={unaligned_best_ssim:.4} psnr={unaligned_psnr_best:.4}",
         aligned_best_shift.0, aligned_best_shift.1, unaligned_best_shift.0, unaligned_best_shift.1
     );
+
+    // The aligned path resamples through bicubic Catmull-Rom and the
+    // unaligned path never resamples, which could blur the aligned composite.
+    // The Laplacian variances below, over the same crop window, show whether it does.
+    let frame03_lapvar = sharpest_frame_lapvar(crop);
+    let aligned_lapvar =
+        metrics::laplacian_variance(&aligned.composite, crop.width, crop.height, aligned.spp);
+    let unaligned_lapvar =
+        metrics::laplacian_variance(&unaligned_window, crop.width, crop.height, unaligned.spp);
+    let aligned_ratio = aligned_lapvar / frame03_lapvar;
+    let unaligned_ratio = unaligned_lapvar / frame03_lapvar;
+    println!(
+        "composite_similarity_to_reference_is_recorded: lapvar(aligned)={aligned_lapvar:.1} \
+         lapvar(unaligned)={unaligned_lapvar:.1} lapvar(frame03 window)={frame03_lapvar:.1} \
+         ratio(aligned)={aligned_ratio:.4} ratio(unaligned)={unaligned_ratio:.4} -- aligned \
+         sharpness relative to unaligned: {:+.2}%",
+        (aligned_ratio / unaligned_ratio - 1.0) * 100.0
+    );
+}
+
+/// Laplacian variance of the sharpest single input frame (`03.tif`) over
+/// `crop`.
+fn sharpest_frame_lapvar(crop: Rect) -> f64 {
+    let (frame03, w, _h, spp) = open_frame(common::mantis_512_dir().join("frames").join("03.tif"));
+    let frame03_window = extract_window(&frame03, w, crop, spp);
+    metrics::laplacian_variance(&frame03_window, crop.width, crop.height, spp)
 }
 
 /// The aligned composite's sharpness ratio over the sharpest single input
 /// frame, over the crop window, **asserted** strictly greater than `1.0`,
 /// without an absolute floor: fixture-specific magnitudes are recorded, not
 /// asserted.
-#[test]
-fn composite_sharpness_ratio_is_recorded() {
-    let aligned = aligned_result();
-    let unaligned = golden_result();
+fn assert_aligned_composite_is_sharper_than_the_sharpest_frame(aligned: &FusionResult) {
     let crop = aligned
         .crop
-        .expect("aligned_result is declared at a crop rect");
-    let (frame03, w, _h, spp) = open_frame(common::mantis_512_dir().join("frames").join("03.tif"));
-    let frame03_window = extract_window(&frame03, w, crop, spp);
-
+        .expect("the aligned run is declared at a crop rect");
     let lapvar =
         metrics::laplacian_variance(&aligned.composite, crop.width, crop.height, aligned.spp);
-    let frame03_lapvar = metrics::laplacian_variance(&frame03_window, crop.width, crop.height, spp);
+    let frame03_lapvar = sharpest_frame_lapvar(crop);
     let ratio = lapvar / frame03_lapvar;
     println!(
-        "composite_sharpness_ratio_is_recorded: lapvar(aligned)={lapvar:.1} lapvar(frame03 window)={frame03_lapvar:.1} ratio={ratio:.4}"
+        "aligned sharpness: lapvar(aligned)={lapvar:.1} lapvar(frame03 window)={frame03_lapvar:.1} ratio={ratio:.4}"
     );
     assert!(
         ratio > 1.0,
-        "aligned composite sharpness ratio {ratio} must exceed 1.0 over the crop window (sharper than the sharpest input frame)"
-    );
-
-    // The aligned path resamples through bicubic Catmull-Rom while the
-    // unaligned path never resamples, which could make the aligned
-    // composite the blurrier one. Recorded here, over the same crop window,
-    // and it comes out the other way: the aligned composite is sharper, not
-    // blurrier, so that is not what makes the unaligned composite closer to
-    // `reference.tif`.
-    let unaligned_window =
-        extract_window(&unaligned.composite, unaligned.width, crop, unaligned.spp);
-    let unaligned_lapvar =
-        metrics::laplacian_variance(&unaligned_window, crop.width, crop.height, unaligned.spp);
-    let unaligned_ratio = unaligned_lapvar / frame03_lapvar;
-    println!(
-        "composite_sharpness_ratio_is_recorded: lapvar(unaligned)={unaligned_lapvar:.1} \
-         ratio(unaligned)={unaligned_ratio:.4} -- aligned is sharper by {:.2}% \
-         (refutes the bicubic-resample-blurs hypothesis)",
-        (ratio / unaligned_ratio - 1.0) * 100.0
+        "aligned sharpness: composite sharpness ratio {ratio} must exceed 1.0 over the crop window (sharper than the sharpest input frame)"
     );
 }
 
@@ -584,9 +558,7 @@ fn composite_sharpness_ratio_is_recorded() {
 /// No magnitude is asserted here: a fitted number would be tuned to this
 /// one fixture. Every per-frame delta and the two mean deltas are printed
 /// instead.
-#[test]
-fn per_frame_alignment_agrees_with_the_anchor_more_than_unaligned_frames_do() {
-    let alignment = alignment();
+fn assert_each_frame_agrees_with_the_anchor(alignment: &StackAlignment) {
     let (stack, stack_ctx) = open_mantis_512();
     let (width, height) = (stack_ctx.width, stack_ctx.height);
     let spp = stack_ctx.samples_per_pixel;
@@ -628,7 +600,7 @@ fn per_frame_alignment_agrees_with_the_anchor_more_than_unaligned_frames_do() {
         let is_identity = frame.transform == Transform::identity();
 
         println!(
-            "per_frame_alignment_agrees_with_the_anchor_more_than_unaligned_frames_do: frame {} \
+            "per-frame alignment: frame {} \
              status={:?} identity={is_identity} unaligned_ssim={ssim_unaligned:.6} \
              aligned_ssim={ssim_aligned:.6} delta={delta:+.6}",
             frame.frame, frame.status
@@ -636,26 +608,26 @@ fn per_frame_alignment_agrees_with_the_anchor_more_than_unaligned_frames_do() {
 
         assert!(
             ssim_aligned >= ssim_unaligned,
-            "frame {} must not degrade: aligned ssim {ssim_aligned} < unaligned {ssim_unaligned}",
+            "per-frame alignment: frame {} must not degrade: aligned ssim {ssim_aligned} < unaligned {ssim_unaligned}",
             frame.frame
         );
 
         if is_identity {
             assert_eq!(
                 aligned_window, unaligned_window,
-                "frame {} has an identity transform, so WarpingReader's identity short-circuit \
+                "per-frame alignment: frame {} has an identity transform, so WarpingReader's identity short-circuit \
                  must return bit-identical bytes",
                 frame.frame
             );
             assert_eq!(
                 ssim_aligned, ssim_unaligned,
-                "frame {} has an identity transform: aligned and unaligned SSIM must match exactly",
+                "per-frame alignment: frame {} has an identity transform: aligned and unaligned SSIM must match exactly",
                 frame.frame
             );
         } else {
             assert!(
                 ssim_aligned > ssim_unaligned,
-                "frame {} received a non-identity transform: aligned ssim {ssim_aligned} must \
+                "per-frame alignment: frame {} received a non-identity transform: aligned ssim {ssim_aligned} must \
                  strictly exceed unaligned {ssim_unaligned}",
                 frame.frame
             );
@@ -668,7 +640,7 @@ fn per_frame_alignment_agrees_with_the_anchor_more_than_unaligned_frames_do() {
     let mean_non_identity =
         non_identity_deltas.iter().sum::<f64>() / non_identity_deltas.len() as f64;
     println!(
-        "per_frame_alignment_agrees_with_the_anchor_more_than_unaligned_frames_do: mean delta over \
+        "per-frame alignment: mean delta over \
          {} non-anchor frames = {mean_all:+.6}; mean delta over {} non-identity frames = \
          {mean_non_identity:+.6}",
         all_deltas.len(),
@@ -676,13 +648,11 @@ fn per_frame_alignment_agrees_with_the_anchor_more_than_unaligned_frames_do() {
     );
 }
 
-#[test]
-fn zmap_uses_several_sources() {
-    let result = golden_result();
+fn assert_zmap_uses_several_sources(result: &FusionResult) {
     let distinct: std::collections::HashSet<u16> = result.zmap.iter().copied().collect();
     assert!(
         distinct.len() > 1,
-        "the Z-Map must draw on more than one source frame, got {distinct:?}"
+        "Z-Map sources: the Z-Map must draw on more than one source frame, got {distinct:?}"
     );
 
     // "Winner varies by region": split the map into quadrants and require
@@ -703,18 +673,19 @@ fn zmap_uses_several_sources() {
     }
     assert!(
         quadrant_winners.len() > 1,
-        "the dominant winner must not be identical in every quadrant"
+        "Z-Map sources: the dominant winner must not be identical in every quadrant"
     );
 }
 
-#[test]
-fn zmap_indices_are_in_range() {
-    let result = golden_result();
+fn assert_zmap_indices_are_in_range(result: &FusionResult) {
     for &index in &result.zmap {
-        assert_ne!(index, NO_SOURCE, "laplacian must never emit NO_SOURCE");
+        assert_ne!(
+            index, NO_SOURCE,
+            "Z-Map index range: laplacian must never emit NO_SOURCE"
+        );
         assert!(
             (index as usize) < result.frame_count,
-            "index {index} is out of range for frame_count {}",
+            "Z-Map index range: index {index} is out of range for frame_count {}",
             result.frame_count
         );
     }
@@ -757,17 +728,13 @@ fn spatial_coherence_fraction(zmap: &[u16], width: u32, height: u32) -> f64 {
     agree as f64 / total as f64
 }
 
-#[test]
-fn zmap_is_spatially_coherent() {
-    let result = golden_result();
+fn assert_zmap_is_spatially_coherent(result: &FusionResult) {
     let fraction = spatial_coherence_fraction(&result.zmap, result.width, result.height);
     let all8 = all_eight_identical_fraction(&result.zmap, result.width, result.height);
-    println!(
-        "zmap_is_spatially_coherent: majority-agreement={fraction:.4} all-8-identical={all8:.4}"
-    );
+    println!("Z-Map coherence: majority-agreement={fraction:.4} all-8-identical={all8:.4}");
     assert!(
         fraction >= 0.60,
-        "Z-Map 8-neighbourhood majority agreement must be >= 60%, got {:.2}%",
+        "Z-Map coherence: 8-neighbourhood majority agreement must be >= 60%, got {:.2}%",
         fraction * 100.0
     );
 }
@@ -777,18 +744,16 @@ fn zmap_is_spatially_coherent() {
 /// majority vote does not). Asserted `>= 55%` against a measured 63.76%
 /// under this file's border convention and the 12.5% baseline a random
 /// 8-way map produces.
-#[test]
-fn zmap_neighbourhood_is_uniform_well_above_the_random_baseline() {
-    let result = golden_result();
+fn assert_zmap_neighbourhood_is_uniform_well_above_the_random_baseline(result: &FusionResult) {
     let fraction = all_eight_identical_fraction(&result.zmap, result.width, result.height);
     println!(
-        "zmap_neighbourhood_is_uniform_well_above_the_random_baseline: all-8-identical={:.4} \
+        "Z-Map uniform neighbourhood: all-8-identical={:.4} \
          (old golden 0.1273, random baseline 0.125, target >= 0.55)",
         fraction
     );
     assert!(
         fraction >= 0.55,
-        "Z-Map all-8-neighbours-identical fraction must be >= 55%, got {:.2}%",
+        "Z-Map uniform neighbourhood: all-8-neighbours-identical fraction must be >= 55%, got {:.2}%",
         fraction * 100.0
     );
 }
@@ -796,33 +761,27 @@ fn zmap_neighbourhood_is_uniform_well_above_the_random_baseline() {
 /// The composite and the Z-Map of the tiled (448/5) run equal the full-image
 /// (1024/5) run byte for byte: the 160 px margin covers the composite's whole
 /// dependency cone (`crate::fuse::laplacian`'s "Tiling").
-#[test]
-fn tiled_composite_and_zmap_are_exact() {
-    let tiled = golden_result();
-    let single = single_tile_result();
+fn assert_tiled_composite_and_zmap_are_exact(tiled: &FusionResult, single: &FusionResult) {
     assert_eq!(
         tiled.zmap, single.zmap,
-        "the Z-Map at tile 448/5 must equal the single-tile (1024/5) Z-Map element for element"
+        "tile invariance: the Z-Map at tile 448/5 must equal the single-tile (1024/5) Z-Map element for element"
     );
     assert_eq!(
         tiled.composite, single.composite,
-        "the composite at tile 448/5 must equal the single-tile (1024/5) composite sample for sample"
+        "tile invariance: the composite at tile 448/5 must equal the single-tile (1024/5) composite sample for sample"
     );
 }
 
 /// 480/5 plans interiors of 160, 160 and 192 (the 32 px remainder is
 /// absorbed): the ragged last tile is exact too.
-#[test]
-fn ragged_tiling_composite_and_zmap_are_exact() {
-    let ragged = ragged_result();
-    let single = single_tile_result();
+fn assert_ragged_tiling_composite_and_zmap_are_exact(ragged: &FusionResult, single: &FusionResult) {
     assert_eq!(
         ragged.zmap, single.zmap,
-        "the ragged (480/5) Z-Map must equal the single-tile (1024/5) Z-Map element for element"
+        "ragged tile invariance: the ragged (480/5) Z-Map must equal the single-tile (1024/5) Z-Map element for element"
     );
     assert_eq!(
         ragged.composite, single.composite,
-        "the ragged (480/5) composite must equal the single-tile (1024/5) composite sample for sample"
+        "ragged tile invariance: the ragged (480/5) composite must equal the single-tile (1024/5) composite sample for sample"
     );
 }
 
@@ -875,21 +834,57 @@ fn result_is_deterministic() {
     );
 }
 
-#[test]
-fn golden_pin_matches_byte_for_byte() {
-    let result = golden_result();
+fn assert_golden_pin_matches_byte_for_byte(result: &FusionResult) {
     let golden_dir = common::fixtures_dir().join("mantis-512").join("golden");
     let (golden_composite, gw, gh, gspp) = open_frame(golden_dir.join("laplacian.tif"));
-    assert_eq!((gw, gh, gspp), (result.width, result.height, result.spp));
+    assert_eq!(
+        (gw, gh, gspp),
+        (result.width, result.height, result.spp),
+        "golden pin: the golden composite's geometry must match a fresh 448/5 run"
+    );
     assert_eq!(
         golden_composite, result.composite,
-        "the golden composite must be byte-for-byte identical to a fresh 448/5 run"
+        "golden pin: the golden composite must be byte-for-byte identical to a fresh 448/5 run"
     );
 
     let (golden_zmap, zw, zh, zspp) = open_frame(golden_dir.join("laplacian-zmap.tif"));
-    assert_eq!((zw, zh, zspp), (result.width, result.height, 1));
+    assert_eq!(
+        (zw, zh, zspp),
+        (result.width, result.height, 1),
+        "golden pin: the golden Z-Map's geometry must match a fresh 448/5 run"
+    );
     assert_eq!(
         golden_zmap, result.zmap,
-        "the golden Z-Map must be byte-for-byte identical to a fresh 448/5 run"
+        "golden pin: the golden Z-Map must be byte-for-byte identical to a fresh 448/5 run"
     );
+}
+
+/// The golden, single-tile and ragged runs, each computed once: the golden
+/// pin, the Z-Map shape claims on the golden run, and tile invariance of the
+/// 448/5 and 480/5 runs against the 1024/5 run.
+#[test]
+fn tiled_runs_match_the_golden_pin_and_the_single_tile_run() {
+    let golden = golden_result();
+    let single = single_tile_result();
+    let ragged = ragged_result();
+
+    assert_golden_pin_matches_byte_for_byte(&golden);
+    assert_zmap_uses_several_sources(&golden);
+    assert_zmap_indices_are_in_range(&golden);
+    assert_zmap_is_spatially_coherent(&golden);
+    assert_zmap_neighbourhood_is_uniform_well_above_the_random_baseline(&golden);
+    assert_tiled_composite_and_zmap_are_exact(&golden, &single);
+    assert_ragged_tiling_composite_and_zmap_are_exact(&ragged, &single);
+}
+
+/// One alignment and one aligned run: the aligned composite is sharper than
+/// the sharpest input frame, and every non-anchor frame agrees with the
+/// anchor at least as well once warped.
+#[test]
+fn aligned_run_is_sharper_and_each_frame_agrees_with_the_anchor() {
+    let alignment = alignment();
+    let aligned = aligned_result(&alignment);
+
+    assert_aligned_composite_is_sharper_than_the_sharpest_frame(&aligned);
+    assert_each_frame_agrees_with_the_anchor(&alignment);
 }

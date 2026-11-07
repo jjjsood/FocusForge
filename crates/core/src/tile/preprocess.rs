@@ -6,12 +6,28 @@
 //! [`FramePreprocess`] implementation, not a pipeline change.
 
 use crate::algorithm::AlgorithmError;
-use crate::tile::Tile;
+use crate::tile::{Rect, Tile};
 
 /// A per-frame-tile preprocessing stage, run before a frame's tile reaches
 /// the [`super::consumer::TileConsumer`].
 pub trait FramePreprocess: Send + Sync {
     fn preprocess(&self, frame: usize, tile: &mut Tile) -> Result<(), AlgorithmError>;
+
+    /// [`Self::preprocess`] over `f32` samples of `rect`, 16-bit scale. A
+    /// stage that has no `f32` form refuses the tile rather than passing it
+    /// through unprocessed.
+    fn preprocess_f32(
+        &self,
+        _frame: usize,
+        _rect: Rect,
+        _samples_per_pixel: u32,
+        _samples: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        Err(AlgorithmError::Failed {
+            algorithm: "preprocess".to_string(),
+            detail: "this stage does not process f32 samples".to_string(),
+        })
+    }
 }
 
 /// Leaves the tile untouched.
@@ -21,12 +37,21 @@ impl FramePreprocess for NoopPreprocess {
     fn preprocess(&self, _frame: usize, _tile: &mut Tile) -> Result<(), AlgorithmError> {
         Ok(())
     }
+
+    fn preprocess_f32(
+        &self,
+        _frame: usize,
+        _rect: Rect,
+        _samples_per_pixel: u32,
+        _samples: &mut [f32],
+    ) -> Result<(), AlgorithmError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tile::Rect;
 
     #[test]
     fn noop_preprocess_leaves_the_tile_untouched() {

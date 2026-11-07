@@ -22,11 +22,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::CliOutput;
-
-fn bin() -> Command {
-    common::cli_bin("project_cli")
-}
+use common::{CliOutput, bin};
 
 /// Runs the binary with `cwd` as its working directory.
 fn run_cli_in(cwd: &Path, args: &[&str]) -> CliOutput {

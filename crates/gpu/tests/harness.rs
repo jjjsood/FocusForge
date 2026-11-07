@@ -23,6 +23,8 @@ mod full_frame_render_identity;
 mod parity;
 #[path = "harness/parity_blend.rs"]
 mod parity_blend;
+#[path = "harness/parity_f32.rs"]
+mod parity_f32;
 #[path = "harness/parity_fusion.rs"]
 mod parity_fusion;
 #[path = "harness/parity_pipeline.rs"]

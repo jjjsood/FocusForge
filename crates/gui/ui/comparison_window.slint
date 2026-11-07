@@ -5,6 +5,8 @@ import { ShellGeometry } from "geometry.slint";
 import { FFPane } from "components/ff_pane.slint";
 import { FFWindowBar } from "components/ff_window_bar.slint";
 import { FFBrushCursor } from "components/ff_brush_cursor.slint";
+import { FFPanePlaceholder } from "components/ff_pane_placeholder.slint";
+import { FFStageView, StageTile } from "components/ff_stage_view.slint";
 
 export component ComparisonWindow inherits Window {
     preferred-width: 820px;
@@ -44,8 +46,23 @@ export component ComparisonWindow inherits Window {
     in property <length> cursor-x;
     in property <length> cursor-y;
     in property <bool> window-maximized: false;
+    // The live stage view of a Composite pane in this window.
+    in property <bool> stage-visible: false;
+    in property <image> stage-source;
+    in property <length> stage-image-x;
+    in property <length> stage-image-y;
+    in property <length> stage-image-w;
+    in property <length> stage-image-h;
+    in property <[StageTile]> stage-tiles: [];
+    in property <bool> stage-inset-visible: false;
+    in property <bool> stage-inset-only: false;
+    in property <bool> stage-mosaic-fading: false;
+    in property <bool> stage-inset-fading: false;
+    in property <image> stage-heat;
+    in property <string> stage-card-title: "";
+    in property <string> stage-card-body: "";
 
-    callback window-drag-requested();
+    callback window-drag-pointer(PointerEventButton, bool);
     callback window-minimize-requested();
     callback window-maximize-toggled();
     callback window-close-requested();
@@ -115,7 +132,7 @@ export component ComparisonWindow inherits Window {
         width: root.width;
         title: root.bar-title;
         maximized: root.window-maximized;
-        drag-requested => { root.window-drag-requested(); }
+        drag-pointer(button, down) => { root.window-drag-pointer(button, down); }
         minimize-requested => { root.window-minimize-requested(); }
         maximize-toggled => { root.window-maximize-toggled(); }
         close-requested => { root.window-close-requested(); }
@@ -146,6 +163,31 @@ export component ComparisonWindow inherits Window {
         pixelated: root.pixelated;
         undock-requested => { root.dock-requested(); }
         dock-back: true;
+
+        FFStageView {
+            width: parent.width;
+            height: parent.height;
+            visible: root.stage-visible;
+            source: root.stage-source;
+            image-x: root.stage-image-x;
+            image-y: root.stage-image-y;
+            image-w: root.stage-image-w;
+            image-h: root.stage-image-h;
+            tiles: root.stage-tiles;
+            inset-visible: root.stage-inset-visible;
+            inset-only: root.stage-inset-only;
+            mosaic-fading: root.stage-mosaic-fading;
+            inset-fading: root.stage-inset-fading;
+            heat: root.stage-heat;
+        }
+    }
+
+    stage-card := FFPanePlaceholder {
+        x: pane.x + (pane.width - self.width) / 2;
+        y: pane.y + (pane.height - self.height) / 2;
+        title: root.stage-card-title;
+        body: root.stage-card-body;
+        visible: root.project-loaded && root.stage-card-title != "";
     }
 
     cursor-clip := Rectangle {

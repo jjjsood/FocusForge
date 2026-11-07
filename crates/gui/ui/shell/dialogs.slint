@@ -26,7 +26,7 @@ import { FFSegmented } from "../components/ff_segmented.slint";
 
 export component FFGroupingQuestion inherits FFModalPanel {
     in property <bool> question-open: false;
-    in property <int> frame-count: 0;
+    in property <string> body;
     in property <int> project-count: 0;
     callback open-as-one();
     callback open-as-many();
@@ -45,8 +45,7 @@ export component FFGroupingQuestion inherits FFModalPanel {
         HorizontalLayout {
             padding-right: root.close-reserve;
             body := Text {
-                text: "This folder reads as " + root.project-count + " stacks of "
-                    + root.frame-count + " frames.";
+                text: root.body;
                 color: Theme.text-primary;
                 font-size: Theme.text-body.size;
                 wrap: word-wrap;
@@ -98,48 +97,15 @@ export component FFGroupingQuestion inherits FFModalPanel {
     }
 }
 
-export component FFRefusalDialog inherits FFModalPanel {
-    in property <bool> refusal-open: false;
-    in property <string> title: "No frames here";
-    in property <string> body: "";
-    in property <string> button-label: "Pick another folder…";
-    callback pick-another-folder();
-
-    modal-open: root.refusal-open;
-    panel-width: 420px;
-    panel-height: 180px;
-
-    VerticalLayout {
-        padding: Theme.space-4;
-        spacing: Theme.space-3;
-
-        Text {
-            text: root.title;
-            color: Theme.text-primary;
-            font-size: Theme.text-title.size;
-            font-weight: Theme.text-title.weight;
-        }
-        Text {
-            text: root.body;
-            color: Theme.text-secondary;
-            font-size: Theme.text-body.size;
-            wrap: word-wrap;
-        }
-        pick-area := Rectangle {
-            height: 36px;
-            background: Theme.accent-default;
-            border-radius: Theme.radius-sm;
-            TouchArea { clicked => { root.pick-another-folder(); } }
-            Text {
-                text: root.button-label;
-                color: Theme.text-primary;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                width: 100%;
-                height: 100%;
-            }
-        }
-    }
+// An entry or run refusal; the controller supplies the title, the body and
+// whichever button labels the refusal offers. An empty `confirm-label`
+// leaves the dismiss button alone, and `Esc` closes it either way.
+export component FFRefusalDialog inherits FFDialog {
+    tone: "caution";
+    panel-width: 540px;
+    panel-height: 220px;
+    closable: false;
+    confirm-kind: "primary";
 }
 
 // The one warning a frame-set change (add/reorder/remove) shows once its
@@ -147,6 +113,7 @@ export component FFRefusalDialog inherits FFModalPanel {
 // supplies every string and flag below, already rendered.
 export component FFFrameSetWarning inherits FFDialog {
     tone: "warning";
+    panel-width: root.tertiary-label != "" ? 640px : 480px;
     confirm-kind: "primary";
 }
 
@@ -244,6 +211,8 @@ export component FFExportDialog inherits FFModalPanel {
     in property <[string]> format-segments: [];
     in property <string> format-selected: "";
     in property <string> settings-heading: "";
+    // One muted line in place of the rows; empty when rows show.
+    in property <string> settings-note: "";
     in property <[ExportRowView]> rows: [];
     // The group is a slider row then a segmented row, not menus.
     in property <bool> slider-group: false;
@@ -333,7 +302,7 @@ export component FFExportDialog inherits FFModalPanel {
         FFSegmented {
             x: 128px;
             y: 0px;
-            width: 252px;
+            width: 336px;
             segments: root.format-segments;
             selected: root.format-selected;
             segment-selected(label) => { root.format-chosen(label); }
@@ -356,6 +325,15 @@ export component FFExportDialog inherits FFModalPanel {
             y: settings-heading.y + settings-heading.height + 2px;
             width: 0px;
             height: 0px;
+        }
+
+        if root.settings-note != "": FFRowText {
+            x: 0px;
+            y: rows-top.y;
+            width: 528px;
+            height: 28px;
+            muted: true;
+            text: root.settings-note;
         }
 
         if !root.slider-group: Rectangle {

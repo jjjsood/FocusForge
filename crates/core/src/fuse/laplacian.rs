@@ -144,17 +144,17 @@
 
 use std::sync::{Arc, LazyLock};
 
-use crate::algorithm::{AlgorithmError, StackAlgorithm, TileCtx, TileOutput};
+use crate::algorithm::{AlgorithmError, Sharpness, StackAlgorithm, TileCtx, TileOutput};
 use crate::fuse::error::{algorithm_error, missing_key};
 use crate::fuse::sharpness::eligible;
 use crate::fuse::{Plane, Pyramid, build, collapse, max_levels};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues, StackContext};
 use crate::registry::StackRegistration;
-use crate::tile::Tile;
 use crate::tile::plan::{
     DEFAULT_TILE_SIZE, MAX_LEVELS, TileSupport, margin_for_levels, max_levels_for_tile,
 };
 use crate::tile::scheduler::DEFAULT_LEVELS;
+use crate::tile::{Sample, SampleFormat, Tile};
 use crate::zmap::NO_SOURCE;
 
 /// `auto_levels(ctx) = min(fuse::max_levels(ctx.width, ctx.height),
@@ -185,6 +185,9 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         advanced: true,
         auto: Some(Arc::new(auto_levels)),
         host_default: None,
+        stack_max: Some(Arc::new(|ctx: &StackContext| {
+            i64::from(max_levels(ctx.width, ctx.height).max(1))
+        })),
     }]
 });
 
@@ -220,6 +223,19 @@ pub fn score_radius(levels: u32, level: u32) -> u32 {
     let headroom = margin_for_levels(levels).saturating_sub(build_reach);
     let w = SCORE_RADIUS.min(headroom).max(1);
     (w >> level).max(1)
+}
+
+/// The largest value a chain of [`score_plane`] passes can reach on a plane
+/// whose entries are at most 65535 in magnitude: each pass sums
+/// `(2 * radius + 1)^2` such entries per channel.
+pub(crate) fn window_score_ceiling(samples_per_pixel: u32, radii: &[u32]) -> f64 {
+    radii.iter().fold(
+        65535.0 * f64::from(samples_per_pixel),
+        |ceiling, &radius| {
+            let side = f64::from(2 * radius + 1);
+            ceiling * side * side
+        },
+    )
 }
 
 /// The windowed sharpness score of every pixel of one Laplacian level: a
@@ -368,6 +384,72 @@ impl StackAlgorithm for Laplacian {
     }
 
     fn fuse(&self, ctx: &TileCtx<'_>, cfg: &ParamValues) -> Result<TileOutput, AlgorithmError> {
+        match ctx.sample_format() {
+            SampleFormat::U16 => self.fuse_as::<u16, u16>(ctx, cfg),
+            SampleFormat::F32 => self.fuse_as::<f32, u16>(ctx, cfg),
+        }
+    }
+
+    fn fuse_f32(
+        &self,
+        ctx: &TileCtx<'_>,
+        cfg: &ParamValues,
+    ) -> Result<TileOutput<f32>, AlgorithmError> {
+        match ctx.sample_format() {
+            SampleFormat::U16 => self.fuse_as::<u16, f32>(ctx, cfg),
+            SampleFormat::F32 => self.fuse_as::<f32, f32>(ctx, cfg),
+        }
+    }
+
+    /// Two `f32` pyramids (the running best and the current frame's, `4/3`
+    /// for the levels), the collapsed plane and `u16` output, then per level
+    /// a score, a winner, the current score and an eligibility byte, plus the
+    /// Z-Map; an `f32` output adds 2 B per sample.
+    fn working_bytes_per_pixel(
+        &self,
+        _cfg: &ParamValues,
+        samples_per_pixel: u32,
+        format: SampleFormat,
+    ) -> u64 {
+        let per_sample = if format == SampleFormat::F32 { 19 } else { 17 };
+        per_sample * u64::from(samples_per_pixel) + 17
+    }
+
+    /// The composite's dependency cone (`composite_reach`) on the `levels`
+    /// decimation grid.
+    fn tile_support(&self, cfg: &ParamValues) -> TileSupport {
+        let levels = cfg
+            .get("levels")
+            .and_then(ParamValue::as_i64)
+            .map(|levels| levels.max(0) as u32)
+            .unwrap_or(0);
+        TileSupport {
+            reach_px: composite_reach(levels),
+            decimation_levels: levels,
+        }
+    }
+
+    /// A level-0 score sums `|L|` (at most 65535) over a `(2r + 1)`-square
+    /// window of every channel.
+    fn heat_scale(&self, cfg: &ParamValues, samples_per_pixel: u32) -> Option<f64> {
+        let levels = cfg
+            .get("levels")
+            .and_then(ParamValue::as_i64)
+            .map(|levels| levels.max(0) as u32)?;
+        Some(window_score_ceiling(
+            samples_per_pixel,
+            &[score_radius(levels, 0)],
+        ))
+    }
+}
+
+impl Laplacian {
+    /// Fuses frames read as `S` into a composite of `O` samples.
+    fn fuse_as<S: Sample, O: Sample>(
+        &self,
+        ctx: &TileCtx<'_>,
+        cfg: &ParamValues,
+    ) -> Result<TileOutput<O>, AlgorithmError> {
         crate::params::validate(self.params(), cfg)?;
         let levels = cfg
             .get("levels")
@@ -395,9 +477,9 @@ impl StackAlgorithm for Laplacian {
         // Frame 0's pyramid seeds the running best -- streaming, never
         // `frame_count` pyramids at once.
         let mut running: Option<Running> = None;
-        ctx.for_each_frame(|f, tile, covered| {
-            let current = build(&tile.samples, width, height, spp, levels)
-                .map_err(algorithm_error("laplacian"))?;
+        ctx.for_each_frame_as::<S>(|f, samples, covered| {
+            let current =
+                build(samples, width, height, spp, levels).map_err(algorithm_error("laplacian"))?;
             let masks = covered.map(|covered| EligibleMasks::new(covered, width, height, levels));
 
             let Some(run) = running.as_mut() else {
@@ -489,6 +571,7 @@ impl StackAlgorithm for Laplacian {
         })?;
         let Running {
             mut best,
+            best_scores,
             winner,
             residual_sum,
             residual_count,
@@ -509,10 +592,7 @@ impl StackAlgorithm for Laplacian {
         }
 
         let collapsed = collapse(&best);
-        let mut samples = vec![0u16; width as usize * height as usize * spp_usize];
-        collapsed
-            .to_u16_into(&mut samples)
-            .map_err(algorithm_error("laplacian"))?;
+        let samples: Vec<O> = collapsed.data().iter().map(|&v| O::narrow(v)).collect();
 
         // Level-0 winner is the Z-Map; `levels >= 1` is enforced by the
         // schema, so `winner` always has at least one entry.
@@ -530,29 +610,10 @@ impl StackAlgorithm for Laplacian {
                 samples,
             },
             zmap,
+            sharpness: Some(Sharpness::Score(best_scores.into_iter().next().expect(
+                "levels >= 1 (enforced by the schema) guarantees a level-0 score plane",
+            ))),
         })
-    }
-
-    /// Two `f32` pyramids (the running best and the current frame's, `4/3`
-    /// for the levels), the collapsed plane and `u16` output, then per level
-    /// a score, a winner, the current score and an eligibility byte, plus the
-    /// Z-Map.
-    fn working_bytes_per_pixel(&self, _cfg: &ParamValues, samples_per_pixel: u32) -> u64 {
-        17 * u64::from(samples_per_pixel) + 17
-    }
-
-    /// The composite's dependency cone (`composite_reach`) on the `levels`
-    /// decimation grid.
-    fn tile_support(&self, cfg: &ParamValues) -> TileSupport {
-        let levels = cfg
-            .get("levels")
-            .and_then(ParamValue::as_i64)
-            .map(|levels| levels.max(0) as u32)
-            .unwrap_or(0);
-        TileSupport {
-            reach_px: composite_reach(levels),
-            decimation_levels: levels,
-        }
     }
 }
 
@@ -637,6 +698,41 @@ mod tests {
             TilePlan::new(w, h, DEFAULT_TILE_SIZE, levels as u32).unwrap_or_else(|e| {
                 panic!("auto-proposed levels={levels} must plan for {w}x{h}: {e}")
             });
+        }
+    }
+
+    #[test]
+    fn levels_the_window_offers_always_plan() {
+        let algo = Laplacian;
+        let desc = &algo.params()[0];
+
+        for &(w, h, bound) in &[
+            (64u32, 64u32, 4i64),
+            (512, 512, 7),
+            (300, 7000, 6),
+            (8192, 5464, 10),
+        ] {
+            let ctx = StackContext::new(8, w, h, 3);
+            let ParamKind::Int { min, max } = desc.kind_for(Some(&ctx)) else {
+                panic!("levels is an Int")
+            };
+            assert_eq!((min, max), (1, bound), "{w}x{h}");
+
+            for levels in min..=max {
+                let support = algo.tile_support(&cfg_with_levels(levels));
+                let plan = TilePlan::new(w, h, support.default_tile_size(), support)
+                    .unwrap_or_else(|e| panic!("levels={levels} must plan for {w}x{h}: {e}"));
+                for tile in plan.tiles() {
+                    let read = tile.read();
+                    assert!(
+                        i64::from(max_levels(read.width, read.height)) >= levels,
+                        "tile {} read {}x{} cannot carry levels={levels} on {w}x{h}",
+                        tile.index(),
+                        read.width,
+                        read.height
+                    );
+                }
+            }
         }
     }
 
@@ -827,8 +923,24 @@ mod tests {
     #[test]
     fn working_bytes_per_pixel_are_pinned() {
         let cfg = cfg_with_levels(5);
-        assert_eq!(Laplacian.working_bytes_per_pixel(&cfg, 3), 68);
-        assert_eq!(Laplacian.working_bytes_per_pixel(&cfg, 1), 34);
+        assert_eq!(
+            Laplacian.working_bytes_per_pixel(&cfg, 3, SampleFormat::U16),
+            68
+        );
+        assert_eq!(
+            Laplacian.working_bytes_per_pixel(&cfg, 1, SampleFormat::U16),
+            34
+        );
+    }
+
+    #[test]
+    fn f32_output_adds_two_bytes_per_sample_to_the_working_bytes() {
+        let cfg = cfg_with_levels(5);
+        for spp in [1, 3] {
+            let u16_bytes = Laplacian.working_bytes_per_pixel(&cfg, spp, SampleFormat::U16);
+            let f32_bytes = Laplacian.working_bytes_per_pixel(&cfg, spp, SampleFormat::F32);
+            assert_eq!(f32_bytes - u16_bytes, 2 * u64::from(spp));
+        }
     }
 
     #[test]
@@ -923,14 +1035,18 @@ mod tests {
         }
     }
 
+    /// The (frame count, side, levels) cases of the constant-stack claims: the
+    /// drift needs many frames of a value, not large frames, so the 999-frame
+    /// case runs on the smallest plane that holds three levels.
+    const CONSTANT_CASES: [(usize, u32, i64); 3] = [(1, 128, 5), (61, 128, 5), (999, 32, 3)];
+
     #[test]
     fn constant_stack_exports_the_constant() {
-        let (w, h) = (128u32, 128u32);
         for triple in CONSTANT_TRIPLES {
-            let tiles = constant_tiles(triple, 999, w, h);
-            for n in [1usize, 61, 999] {
-                let ctx = TileCtx::new(rect(w, h), &tiles[..n]);
-                let out = Laplacian.fuse(&ctx, &cfg_with_levels(5)).unwrap();
+            for (n, side, levels) in CONSTANT_CASES {
+                let tiles = constant_tiles(triple, n, side, side);
+                let ctx = TileCtx::new(rect(side, side), &tiles);
+                let out = Laplacian.fuse(&ctx, &cfg_with_levels(levels)).unwrap();
                 assert_every_sample_is(&out, triple, &format!("{triple:?} at {n} frames"));
             }
         }
@@ -938,20 +1054,19 @@ mod tests {
 
     #[test]
     fn constant_stack_masked_exports_the_constant() {
-        let (w, h) = (128u32, 128u32);
         for triple in CONSTANT_TRIPLES {
-            let tiles = constant_tiles(triple, 999, w, h);
-            let coverage: Vec<Option<Vec<bool>>> = (0..tiles.len())
-                .map(|f| {
-                    if f % 2 == 1 {
-                        columns_uncovered_below(w, h, 16)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            for n in [1usize, 61, 999] {
-                let out = fuse_masked(&tiles[..n], &coverage[..n], 5, w, h);
+            for (n, side, levels) in CONSTANT_CASES {
+                let tiles = constant_tiles(triple, n, side, side);
+                let coverage: Vec<Option<Vec<bool>>> = (0..n)
+                    .map(|f| {
+                        if f % 2 == 1 {
+                            columns_uncovered_below(side, side, 16)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let out = fuse_masked(&tiles, &coverage, levels, side, side);
                 assert_every_sample_is(&out, triple, &format!("{triple:?} masked at {n} frames"));
             }
         }
@@ -1034,5 +1149,100 @@ mod tests {
         // = 6, so the clamp binds: W = min(8, 6) = 6, and r_1 = max(1, 3).
         assert_eq!(score_radius(2, 0), 6);
         assert_eq!(score_radius(2, 1), 3);
+    }
+
+    fn textured(w: u32, h: u32, spp: u32, seed: u32) -> Vec<u16> {
+        let mut out = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..spp {
+                    let hash = (x * 7 + y * 13 + c * 5 + seed).wrapping_mul(2654435761u32);
+                    out.push((hash >> 16) as u16);
+                }
+            }
+        }
+        out
+    }
+
+    fn assert_close(actual: f64, expected: f64, context: &str) {
+        assert!(
+            (actual - expected).abs() <= 1e-6 * expected.abs(),
+            "{context}: {actual} against {expected}"
+        );
+    }
+
+    #[test]
+    fn sharpness_heatmap_matches_running_best() {
+        let (w, h, levels) = (64u32, 40u32, 2u32);
+        for spp in [1u32, 3] {
+            let tiles: Vec<Tile> = (1..=3)
+                .map(|seed| tile_of(w, h, spp, textured(w, h, spp, seed)))
+                .collect();
+            let ctx = TileCtx::new(rect(w, h), &tiles);
+            let out = Laplacian
+                .fuse(&ctx, &cfg_with_levels(i64::from(levels)))
+                .unwrap();
+            let sharpness = out
+                .sharpness
+                .as_ref()
+                .expect("laplacian hands over its scores");
+            let planes: Vec<Vec<f32>> = tiles
+                .iter()
+                .map(|t| {
+                    let pyramid = build(&t.samples, w, h, spp, levels).unwrap();
+                    score_plane(&pyramid.levels()[0], score_radius(levels, 0))
+                })
+                .collect();
+            for p in 0..(w * h) as usize {
+                let expected = planes
+                    .iter()
+                    .map(|plane| plane[p])
+                    .fold(f32::NEG_INFINITY, f32::max);
+                assert_close(
+                    sharpness.score(p),
+                    f64::from(expected),
+                    &format!("spp {spp} pixel {p}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sharpness_heatmap_ineligible_and_flat() {
+        let (w, h, spp) = (16u32, 16u32, 3u32);
+        let tiles = [
+            tile_of(w, h, spp, checkerboard(w, h, spp)),
+            tile_of(w, h, spp, flat(w, h, spp, 999)),
+        ];
+        let none = Some(vec![false; (w * h) as usize]);
+        let out = fuse_masked(&tiles, &[none.clone(), none], 2, w, h);
+        let sharpness = out.sharpness.as_ref().unwrap();
+        for p in 0..(w * h) as usize {
+            assert_eq!(sharpness.score(p), f64::NEG_INFINITY);
+            assert_eq!(
+                crate::display::preview::heat16(sharpness.score(p), 1.0e6),
+                0
+            );
+        }
+
+        let tiles = constant_tiles([30000; 3], 3, 32, 32);
+        let out = Laplacian
+            .fuse(&TileCtx::new(rect(32, 32), &tiles), &cfg_with_levels(3))
+            .unwrap();
+        let sharpness = out.sharpness.as_ref().unwrap();
+        let hottest = (0..32 * 32)
+            .map(|p| crate::display::preview::heat16(sharpness.score(p), 1.0e6))
+            .max();
+        assert_eq!(hottest, Some(0), "a flat stack is cold everywhere");
+    }
+
+    #[test]
+    fn sharpness_heatmap_scale_is_the_largest_windowed_sum() {
+        let cfg = cfg_with_levels(5);
+        let side = u64::from(2 * score_radius(5, 0) + 1);
+        assert_eq!(
+            Laplacian.heat_scale(&cfg, 3),
+            Some((65535 * 3 * side * side) as f64)
+        );
     }
 }

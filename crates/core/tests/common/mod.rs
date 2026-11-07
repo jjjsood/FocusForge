@@ -6,6 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod align;
+
 #[path = "reference_stack.rs"]
 mod reference_stack;
 #[allow(unused_imports)]
@@ -29,6 +31,12 @@ pub fn fixtures_dir() -> PathBuf {
 #[allow(dead_code)]
 pub fn mantis_512_dir() -> PathBuf {
     fixtures_dir().join("mantis-512")
+}
+
+/// A fresh temporary directory under `CARGO_TARGET_TMPDIR`, removed on drop.
+#[allow(dead_code)]
+pub fn target_tmp() -> tempfile::TempDir {
+    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("temporary directory")
 }
 
 /// Fuses `frames` in-process with the registered stack algorithm
@@ -85,6 +93,7 @@ pub fn fuse_held(
         resume: false,
         cache: true,
         poll: Duration::from_millis(50),
+        free_space: None,
     };
     let outcome = focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
         .expect("the fusion must complete");

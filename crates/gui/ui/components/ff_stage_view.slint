@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The live stage image of a fuse run over a whole canvas pane, with the tile
+// grid, the front of just-fused tiles and the sharpness inset.
+
+import { Theme } from "../theme.slint";
+import { FFStageInset } from "ff_stage_inset.slint";
+
+// One tile mark in pane coordinates: an unfused tile is a grid cell, a front
+// tile is framed in the accent. Fused tiles carry no mark.
+export struct StageTile {
+    x: length,
+    y: length,
+    width: length,
+    height: length,
+    front: bool,
+}
+
+export component FFStageView inherits Rectangle {
+    in property <image> source;
+    in property <length> image-x;
+    in property <length> image-y;
+    in property <length> image-w;
+    in property <length> image-h;
+    in property <[StageTile]> tiles;
+    in property <bool> inset-visible: false;
+    in property <image> heat;
+    // Only the inset, over whatever the pane shows.
+    in property <bool> inset-only: false;
+    // The image fades out, over the composite it stood in for.
+    in property <bool> mosaic-fading: false;
+    in property <bool> inset-fading: false;
+
+    clip: true;
+
+    // The image with its grid; fading it leaves the inset where it is.
+    Rectangle {
+        background: root.inset-only ? Colors.transparent : Theme.surface-canvas;
+        opacity: root.mosaic-fading ? 0 : 1;
+        animate opacity { duration: Theme.motion-slow; easing: ease-out; }
+
+        Image {
+            visible: !root.inset-only;
+            source: root.source;
+            x: root.image-x;
+            y: root.image-y;
+            width: root.image-w;
+            height: root.image-h;
+            image-fit: fill;
+            image-rendering: ImageRendering.smooth;
+        }
+
+        // An unfused cell is one pixel wider and taller so that neighbours
+        // share their edge pixel and the grid stays one pixel thick.
+        for tile in root.tiles: Rectangle {
+            x: tile.x;
+            y: tile.y;
+            width: tile.front ? tile.width : tile.width + 1px;
+            height: tile.front ? tile.height : tile.height + 1px;
+            border-width: tile.front ? 2px : 1px;
+            border-color: tile.front ? Theme.accent-default : Theme.border-default;
+        }
+    }
+
+    if root.inset-visible: FFStageInset {
+        x: parent.width - self.width - Theme.space-2;
+        y: parent.height - self.height - 26px;
+        heat: root.heat;
+        fading: root.inset-fading;
+    }
+}

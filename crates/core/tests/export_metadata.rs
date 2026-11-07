@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use focusforge_core::align::Registration;
 use focusforge_core::io::test_frames::{
-    FrameMetadata, ascii_entry, longs_bo, write_frame_with_metadata,
+    FrameMetadata, ascii_entry, longs_bo, shorts_bo, write_frame_with_metadata,
 };
 use focusforge_core::io::{ByteOrder, TiffSpec, TiffWriter, read_source_metadata};
 use focusforge_core::params::ParamValues;
@@ -43,21 +43,32 @@ fn tmp_dir(name: &str) -> PathBuf {
 /// ("thumbnail"), and enough whitelisted EXIF to make the EXIF switch carry
 /// something at all.
 fn seal_project_with_rich_source(name: &str) -> (PathBuf, String, PathBuf) {
+    seal_project_with_source(name, &[])
+}
+
+/// [`seal_project_with_rich_source`] with `extra_ifd0` entries added to the
+/// source's IFD0.
+fn seal_project_with_source(
+    name: &str,
+    extra_ifd0: &[(u16, u16, Vec<u8>)],
+) -> (PathBuf, String, PathBuf) {
     let dir = tmp_dir(name);
     let staging = dir.join("staging");
     std::fs::create_dir_all(&staging).unwrap();
 
     let frame_path = dir.join("source.tif");
+    let mut ifd0 = vec![
+        (271, 2, ascii_entry("TestCam")),         // Make, whitelisted
+        (37500, 7, MAKER_NOTE_SENTINEL.to_vec()), // MakerNote, dropped
+        (269, 2, ascii_entry("/home/user/private/export.tif")), // DocumentName, dropped
+    ];
+    ifd0.extend(extra_ifd0.iter().cloned());
     write_frame_with_metadata(
         &frame_path,
         WIDTH,
         HEIGHT,
         &FrameMetadata {
-            ifd0: vec![
-                (271, 2, ascii_entry("TestCam")),         // Make, whitelisted
-                (37500, 7, MAKER_NOTE_SENTINEL.to_vec()), // MakerNote, dropped
-                (269, 2, ascii_entry("/home/user/private/export.tif")), // DocumentName, dropped
-            ],
+            ifd0,
             exif: vec![
                 (36867, 2, ascii_entry("2024:03:17 08:00:00")), // DateTimeOriginal, kept
                 (40965, 4, longs_bo(ByteOrder::Little, &[0])),  // Interop pointer, dropped
@@ -215,6 +226,46 @@ fn rewrites_dimensions_software_and_drops_layout_tags() {
     }
 
     assert_eq!(outcome.frame, 0);
+}
+
+/// The Orientation entry of the export written from a source with
+/// `extra_ifd0` entries.
+fn exported_orientation(name: &str, extra_ifd0: &[(u16, u16, Vec<u8>)]) -> Option<(u16, Vec<u8>)> {
+    let (project_path, checkpoint, dir) = seal_project_with_source(name, extra_ifd0);
+    let mut project = Project::open(&project_path).unwrap();
+    let out_path = dir.join("out.tif");
+    project::export_checkpoint(
+        &mut project,
+        &checkpoint,
+        &out_path,
+        &ExportOptions::default(),
+        &MetadataOptions::default(),
+    )
+    .expect("export must succeed");
+    read_source_metadata(&out_path)
+        .ifd0
+        .into_iter()
+        .find(|entry| entry.tag == 274)
+        .map(|entry| (entry.field_type, entry.value))
+}
+
+#[test]
+fn orientation_of_a_tagged_source_is_reset_to_upright() {
+    let tagged = |value: u16| vec![(274, 3, shorts_bo(ByteOrder::Little, &[value]))];
+    let upright = Some((3, 1_u16.to_le_bytes().to_vec()));
+    assert_eq!(
+        exported_orientation("export_orientation_6", &tagged(6)),
+        upright
+    );
+    assert_eq!(
+        exported_orientation("export_orientation_1", &tagged(1)),
+        upright
+    );
+}
+
+#[test]
+fn orientation_stays_absent_for_an_untagged_source() {
+    assert_eq!(exported_orientation("export_orientation_none", &[]), None);
 }
 
 #[test]

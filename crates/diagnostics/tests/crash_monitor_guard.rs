@@ -171,6 +171,43 @@ const RESPAWNED: &str = "FF_CRASH_MONITOR_ARGUMENT_CHILD";
 /// The argument a re-spawned monitor carries.
 const MONITOR_ARGUMENT: &str = "--focusforge-crash-monitor";
 
+/// True when the body of `attach` in `text` — from `fn attach(` to the first
+/// closing brace at the start of a line — passes `MONITOR_ARG` to the spawn.
+fn attach_passes_the_monitor_argument(text: &str) -> bool {
+    let Some(start) = text.find("fn attach(") else {
+        return false;
+    };
+    let attach = &text[start..];
+    let body = attach.find("\n}\n").map_or(attach, |end| &attach[..end]);
+    body.contains(".arg(MONITOR_ARG)")
+}
+
+#[test]
+fn an_argument_outside_attach_does_not_count() {
+    let text = r#"
+pub(crate) fn attach() {
+    let monitor = Command::new(executable).spawn();
+}
+
+fn elsewhere() {
+    Command::new(executable).arg(MONITOR_ARG);
+}
+"#;
+    assert!(!attach_passes_the_monitor_argument(text));
+}
+
+#[test]
+fn an_argument_inside_attach_counts() {
+    let text = r#"
+pub(crate) fn attach() {
+    let monitor = Command::new(executable).arg(MONITOR_ARG).spawn();
+}
+
+fn elsewhere() {}
+"#;
+    assert!(attach_passes_the_monitor_argument(text));
+}
+
 #[test]
 fn the_monitor_spawn_carries_an_argument_no_argument_parser_accepts() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -178,11 +215,8 @@ fn the_monitor_spawn_carries_an_argument_no_argument_parser_accepts() {
         .join("native.rs");
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{} must be readable: {e}", path.display()));
-    let attach = &text[text
-        .find("fn attach(")
-        .expect("native.rs spawns the monitor in attach")..];
     assert!(
-        attach.contains(".arg("),
+        attach_passes_the_monitor_argument(&text),
         "the spawned monitor must carry an argument a test binary cannot accept"
     );
     assert!(

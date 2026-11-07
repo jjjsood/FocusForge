@@ -13,17 +13,19 @@ export component FFProgressBar inherits Rectangle {
     // A fixed-width segment sweeps back and forth instead of the
     // fractional fill, for work whose length is unknown ahead of time.
     in property <bool> indeterminate: false;
+    in property <length> thickness: ShellGeometry.progress-bar-height;
+    // Defaults to a pill.
+    in property <length> corner-radius: root.thickness / 2;
 
-    height: ShellGeometry.progress-bar-height;
-    border-radius: self.height / 2;
+    height: root.thickness;
+    border-radius: root.corner-radius;
     background: Theme.surface-overlay;
     clip: true;
 
-    // Reads `animation-tick()` only while indeterminate, so a static bar
-    // never schedules a per-frame redraw for a sweep it isn't showing.
-    property <bool> sweep-right: root.indeterminate
-        ? mod(animation-tick() / 1ms, 1800.0) >= 900.0
-        : true;
+    // Reads the clock only while indeterminate, so a static bar never
+    // schedules a per-frame redraw for a sweep it isn't showing. With
+    // Reduce motion on the segment stays at the left.
+    property <bool> sweep-right: root.indeterminate && Theme.sweep-right;
 
     fill := Rectangle {
         height: 100%;
@@ -36,7 +38,7 @@ export component FFProgressBar inherits Rectangle {
             : parent.width * max(0.0, min(1.0, root.fraction));
         x: root.indeterminate ? (root.sweep-right ? parent.width - self.width : 0px) : 0px;
 
-        animate x { duration: 900ms; easing: ease-in-out; }
-        animate width { duration: 150ms; }
+        animate x { duration: Theme.reduce-motion ? 0ms : 900ms; easing: ease-in-out; }
+        animate width { duration: Theme.motion-fast; easing: ease-out; }
     }
 }

@@ -6,7 +6,7 @@ bell.svg keeps the unmodified glyph.
 
 Source: https://lucide.dev / https://github.com/lucide-icons/lucide
 Version vendored: 1.46.0 (upstream git tag `1.46.0`)
-Glyph count shipped: 40 Lucide glyphs in 42 files -- one file per glyph,
+Glyph count shipped: 42 Lucide glyphs in 44 files -- one file per glyph,
 assets/icons/<lucide-name>.svg, plus pipette-cursor.svg, a stroke-width
 variant of pipette.svg, and bell-filled.svg, a solid-fill variant of bell.svg
 

@@ -17,13 +17,32 @@ use std::time::{Duration, Instant};
 
 use common::has_display;
 
+/// Spawns every command before awaiting any, so the windows open together,
+/// and returns the outputs in command order.
+fn run_together(commands: Vec<std::process::Command>) -> Vec<std::process::Output> {
+    let children: Vec<_> = commands
+        .into_iter()
+        .map(|mut command| {
+            command
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("launch focusforge-gui")
+        })
+        .collect();
+    children
+        .into_iter()
+        .map(|child| child.wait_with_output().expect("await focusforge-gui"))
+        .collect()
+}
+
 #[test]
 fn comparison_window_geometry() {
     use focusforge_gui::ComparisonWindow;
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let window = ComparisonWindow::new().unwrap();
     window.window().set_size(slint::PhysicalSize::new(820, 600));
     let rect = |id| {
@@ -39,13 +58,80 @@ fn comparison_window_geometry() {
     assert_eq!(rect("ComparisonWindow::pane"), (1.0, 29.0, 818.0, 570.0));
 }
 
+/// Rests the pointer on `control` for the tooltip delay and returns the
+/// shown tooltip's text and its `(x, y, width, height)`.
+fn hover_tooltip(
+    window: &slint::Window,
+    root: &impl i_slint_backend_testing::ElementRoot,
+    control: &i_slint_backend_testing::ElementHandle,
+) -> (String, (f32, f32, f32, f32)) {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::platform::WindowEvent;
+
+    window.dispatch_event(WindowEvent::PointerMoved {
+        position: common::element_center(control),
+    });
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(600));
+    let tooltip = ElementQuery::from_root(root)
+        .match_predicate(|element| element.type_name().as_deref() == Some("FFTooltip"))
+        .find_first()
+        .expect("hovering the control shows its tooltip through the control's own touch area");
+    let text = tooltip
+        .query_descendants()
+        .match_type_name("Text")
+        .find_first()
+        .and_then(|text| text.accessible_label())
+        .expect("the tooltip holds its text");
+    let position = tooltip.absolute_position();
+    let size = tooltip.size();
+    (
+        text.to_string(),
+        (position.x, position.y, size.width, size.height),
+    )
+}
+
+// tier: synthetic; layer: GUI view
+#[test]
+fn undock_control_shows_its_label_as_a_tooltip() {
+    use focusforge_gui::{AppWindow, ComparisonWindow};
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+
+    common::init_window_backend();
+    for index in 0..2 {
+        let app = AppWindow::new().unwrap();
+        app.window().set_size(slint::PhysicalSize::new(1440, 900));
+        app.set_project_loaded(true);
+        let controls = ElementQuery::from_root(&app)
+            .match_id("FFPane::pane-undock")
+            .find_all();
+        assert_eq!(controls.len(), 2, "both docked panes carry the control");
+        let (text, (x, y, width, height)) = hover_tooltip(app.window(), &app, &controls[index]);
+        assert_eq!(text, "Undock pane", "pane {index}");
+        assert!(
+            x >= 0.0 && y >= 0.0 && x + width <= 1440.0 && y + height <= 900.0,
+            "pane {index}: the tooltip ({x}, {y}, {width}, {height}) lies inside the window"
+        );
+    }
+
+    let window = ComparisonWindow::new().unwrap();
+    window.window().set_size(slint::PhysicalSize::new(820, 600));
+    window.set_project_loaded(true);
+    let control = ElementQuery::from_root(&window)
+        .match_id("FFPane::pane-undock")
+        .find_first()
+        .expect("the comparison window's pane carries the dock control");
+    let (text, _) = hover_tooltip(window.window(), &window, &control);
+    assert_eq!(text, "Dock pane");
+}
+
 #[test]
 fn comparison_current_crop_matches_the_visible_draw() {
     use focusforge_gui::ComparisonWindow;
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let window = ComparisonWindow::new().unwrap();
     window.window().set_size(slint::PhysicalSize::new(820, 600));
     window.set_crop_x(18.0);
@@ -80,7 +166,7 @@ fn comparison_backdrop_sits_under_the_exact_image_outside_its_crop() {
     use i_slint_backend_testing::ElementQuery;
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let window = ComparisonWindow::new().unwrap();
     window.window().set_size(slint::PhysicalSize::new(820, 600));
     let images = |window: &ComparisonWindow| {
@@ -129,7 +215,7 @@ fn comparison_window_forwards_focused_keys_and_focus_loss() {
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let window = ComparisonWindow::new().unwrap();
     let events = Rc::new(RefCell::new(Vec::new()));
     let focus_changes = Rc::new(Cell::new(0));
@@ -167,7 +253,7 @@ fn comparison_hover_ends_outside_its_pane() {
     use slint::ComponentHandle;
     use slint::platform::WindowEvent;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let window = ComparisonWindow::new().unwrap();
     window.window().set_size(slint::PhysicalSize::new(820, 600));
     window.window().dispatch_event(WindowEvent::PointerMoved {
@@ -188,7 +274,7 @@ fn undock_without_project_is_empty() {
     use focusforge_gui::{AppController, ComparisonWindow};
     use i_slint_backend_testing::ElementQuery;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let mut controller = AppController::new();
     controller.undock_requested(PaneSource::Frame);
     assert_eq!(controller.detached_pane(), Some(PaneSource::Frame));
@@ -212,7 +298,7 @@ fn dock_back_restores_two_panes() {
     use focusforge_gui::{AppController, AppWindow};
     use slint::ComponentHandle;
 
-    i_slint_backend_testing::init_no_event_loop();
+    common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let mut controller = AppController::new();
@@ -237,7 +323,7 @@ fn comparison_capture_requires_detached_pane() {
     let output = common::gui_bin("comparison_capture_requires_detached_pane")
         .args(["--exit-after", "500", "--screenshot-window", "comparison"])
         .arg("--screenshot")
-        .arg(common::workspace_root().join(".scratch/gui-screenshots/no-detached-pane.png"))
+        .arg(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("no-detached-pane.png"))
         .output()
         .expect("launch focusforge-gui");
     assert!(!output.status.success());
@@ -260,12 +346,16 @@ fn refused_slow_down_values_are_logged_and_the_window_opens() {
         (&["--slow-run-seconds", "x"], "--slow-run-seconds expects"),
         (&["--slow-open", "x"], "--slow-open expects"),
     ];
-    for (i, (args, expected)) in cases.into_iter().enumerate() {
-        let output = common::gui_bin(&format!("refused_slow_down_{i}"))
-            .args(args)
-            .args(["--exit-after", "500"])
-            .output()
-            .expect("launch focusforge-gui");
+    let commands = cases
+        .iter()
+        .enumerate()
+        .map(|(i, (args, _))| {
+            let mut command = common::gui_bin(&format!("refused_slow_down_{i}"));
+            command.args(*args).args(["--exit-after", "500"]);
+            command
+        })
+        .collect();
+    for ((args, expected), output) in cases.into_iter().zip(run_together(commands)) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
             output.status.code(),
@@ -300,13 +390,19 @@ fn refused_save_folder_is_logged_and_the_window_opens() {
             refused.push(locked);
         }
     }
-    for (i, path) in refused.iter().enumerate() {
-        let output = common::gui_bin(&format!("refused_save_folder_{i}"))
-            .arg("--save-folder")
-            .arg(path)
-            .args(["--exit-after", "500"])
-            .output()
-            .expect("launch focusforge-gui");
+    let commands = refused
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            let mut command = common::gui_bin(&format!("refused_save_folder_{i}"));
+            command
+                .arg("--save-folder")
+                .arg(path)
+                .args(["--exit-after", "500"]);
+            command
+        })
+        .collect();
+    for (path, output) in refused.iter().zip(run_together(commands)) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
             output.status.code(),
@@ -331,16 +427,22 @@ fn both_sides_open_a_real_comparison_window() {
         return;
     }
     let dir = common::tree("both_comparison_sides");
-    for side in ["frame", "composite"] {
+    let sides = ["frame", "composite"];
+    let commands = sides
+        .iter()
+        .map(|side| {
+            let mut command = common::gui_bin(&format!("comparison_{side}"));
+            command
+                .arg("--open")
+                .arg(common::fixture_frame("mantis-64", 0))
+                .args(["--undock-pane", side, "--exit-after", "8000"])
+                .args(["--screenshot-window", "comparison", "--screenshot"])
+                .arg(dir.join(format!("{side}.png")));
+            command
+        })
+        .collect();
+    for (side, output) in sides.into_iter().zip(run_together(commands)) {
         let capture = dir.join(format!("{side}.png"));
-        let output = common::gui_bin(&format!("comparison_{side}"))
-            .arg("--open")
-            .arg(common::fixture_frame("mantis-64", 0))
-            .args(["--undock-pane", side, "--exit-after", "8000"])
-            .args(["--screenshot-window", "comparison", "--screenshot"])
-            .arg(&capture)
-            .output()
-            .expect("launch comparison window");
         assert!(
             output.status.success(),
             "{side} failed: {}",
@@ -361,7 +463,8 @@ fn comparison_reopens_after_dock_and_main_close_exits() {
         return;
     }
     let capture = common::tree("comparison_reopen").join("reopened.png");
-    let output = common::gui_bin("comparison_reopen")
+    let mut reopen = common::gui_bin("comparison_reopen");
+    reopen
         .arg("--open")
         .arg(common::fixture_frame("mantis-64", 0))
         .args([
@@ -377,18 +480,11 @@ fn comparison_reopens_after_dock_and_main_close_exits() {
             "comparison",
             "--screenshot",
         ])
-        .arg(&capture)
-        .output()
-        .expect("launch reopened comparison");
-    assert!(
-        output.status.success(),
-        "reopen failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(capture.exists(), "reopened comparison was not captured");
+        .arg(&capture);
 
     let watchdog_capture = common::tree("comparison_main_close").join("watchdog.png");
-    let output = common::gui_bin("comparison_main_close")
+    let mut main_close = common::gui_bin("comparison_main_close");
+    main_close
         .arg("--open")
         .arg(common::fixture_frame("mantis-64", 0))
         .args([
@@ -400,13 +496,21 @@ fn comparison_reopens_after_dock_and_main_close_exits() {
             "15000",
             "--screenshot",
         ])
-        .arg(&watchdog_capture)
-        .output()
-        .expect("launch comparison and close main");
+        .arg(&watchdog_capture);
+
+    let mut outputs = run_together(vec![reopen, main_close]).into_iter();
+    let (output, main_close_output) = (outputs.next().unwrap(), outputs.next().unwrap());
     assert!(
         output.status.success(),
-        "main close failed: {}",
+        "reopen failed: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(capture.exists(), "reopened comparison was not captured");
+
+    assert!(
+        main_close_output.status.success(),
+        "main close failed: {}",
+        String::from_utf8_lossy(&main_close_output.stderr)
     );
     assert!(
         !watchdog_capture.exists(),
@@ -540,6 +644,10 @@ fn unusable_x11_display_fails_clearly() {
         .expect("launch focusforge-gui");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    if stderr.contains("no wgpu adapter") {
+        println!("SKIP: no wgpu adapter, so the display is never opened");
+        return;
+    }
     assert!(
         stderr.contains("display") || stderr.contains("x11"),
         "no display error: {stderr}"
@@ -556,6 +664,10 @@ fn unusable_wayland_display_fails_clearly() {
         .expect("launch focusforge-gui");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    if stderr.contains("no wgpu adapter") {
+        println!("SKIP: no wgpu adapter, so the display is never opened");
+        return;
+    }
     assert!(
         stderr.contains("display") || stderr.contains("wayland"),
         "no Wayland display error: {stderr}"
@@ -615,6 +727,43 @@ fn x11_only_launch_reports_x11() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn software_adapter_start() {
+    const LAVAPIPE_ICD: &str = "/usr/share/vulkan/icd.d/lvp_icd.json";
+    if !has_display() || !std::path::Path::new(LAVAPIPE_ICD).exists() {
+        println!("SKIP: needs a display and the lavapipe Vulkan driver");
+        return;
+    }
+    let output = common::gui_bin("software_adapter_start")
+        .env("VK_DRIVER_FILES", LAVAPIPE_ICD)
+        .env("WGPU_BACKEND", "vulkan")
+        .env_remove("SLINT_WGPU_CPU")
+        .args(["--exit-after", "1500"])
+        .output()
+        .expect("launch focusforge-gui on a software adapter");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let stderr = stderr.to_lowercase();
+    assert!(stderr.contains("software adapter"), "{stderr}");
+    assert!(stderr.contains("llvmpipe"), "{stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn no_adapter_start() {
+    let output = common::gui_bin("no_adapter_start")
+        .env("DISPLAY", ":0")
+        .env_remove("WAYLAND_DISPLAY")
+        .env("WGPU_BACKEND", "metal")
+        .args(["--exit-after", "1500"])
+        .output()
+        .expect("launch focusforge-gui without an adapter");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no wgpu adapter"), "{stderr}");
+}
+
 #[test]
 fn screenshot_is_not_uniform() {
     if !has_display() {
@@ -622,8 +771,7 @@ fn screenshot_is_not_uniform() {
         return;
     }
 
-    let out_path = common::workspace_root()
-        .join(".scratch")
+    let out_path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("gui-screenshots")
         .join("screenshot_is_not_uniform.png");
     if let Some(parent) = out_path.parent() {

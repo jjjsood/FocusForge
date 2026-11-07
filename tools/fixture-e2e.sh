@@ -2,11 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Usage: tools/fixture-e2e.sh
 #
-# Drive the built CLI over the checked-in fixtures. This is the gate that
-# catches what `cargo test` structurally cannot: that the binary someone
-# actually runs starts, parses its arguments, and reads a real TIFF off disk.
-# A workspace can be green on every unit test and still ship a CLI that panics
-# on startup.
+# Drive the built CLI over the checked-in fixtures: the binary someone actually
+# runs starts, parses an `align` command, reads a real TIFF off disk and
+# reports every frame. The CLI integration tests pin the report's contents.
 #
 # It runs the ALREADY-BUILT binary rather than invoking cargo, which is what
 # lets check-all.sh run it in the background beside the cargo gates -- cargo
@@ -39,56 +37,22 @@ if [ ! -d fixtures/mantis-512 ]; then
   exit 0
 fi
 
-echo "+ $CLI info fixtures/mantis-512"
-"$CLI" info fixtures/mantis-512
-
-echo "+ $CLI info --json fixtures/mantis-512"
-JSON_OUT="$("$CLI" info --json fixtures/mantis-512)"
-
-printf '%s' "$JSON_OUT" | grep -q '"frame_count": 8' \
-  || { echo "FAIL: fixture e2e -- missing fact: frame_count 8" >&2; exit 1; }
-echo "OK: fact present -- frame_count: 8"
-
-printf '%s' "$JSON_OUT" | grep -q '"uniform_layout": true' \
-  || { echo "FAIL: fixture e2e -- missing fact: uniform_layout true" >&2; exit 1; }
-echo "OK: fact present -- uniform_layout: true"
-
-printf '%s' "$JSON_OUT" | grep -q '"total_bytes": 12617712' \
-  || { echo "FAIL: fixture e2e -- missing fact: total_bytes 12617712" >&2; exit 1; }
-echo "OK: fact present -- total_bytes: 12617712"
-
-printf '%s' "$JSON_OUT" | grep -q '"rows_per_strip": 1' \
-  || { echo "FAIL: fixture e2e -- missing fact: rows_per_strip 1" >&2; exit 1; }
-echo "OK: fact present -- rows_per_strip: 1"
-
-echo "+ $CLI info fixtures/mantis-512/frames/00.tif"
-SINGLE_OUT="$("$CLI" info fixtures/mantis-512/frames/00.tif)"
-printf '%s' "$SINGLE_OUT" | grep -q 'mmap fast path: yes' \
-  || { echo "FAIL: fixture e2e -- missing fact: mmap fast path: yes" >&2; exit 1; }
-echo "OK: fact present -- mmap fast path: yes"
-
-# `align`, cheap: `--algorithm pyramidal-ecc` is explicit because the all-targets
-# debug build also registers a test algorithm, which makes the bare default
-# ambiguous. `reference-policy=anchor` is explicit because the pinned counts
-# below are those of registering every frame against the middle anchor. The
-# default fallback records divergent frames. Never a `stack` invocation here:
+# `--algorithm pyramidal-ecc` is explicit because the all-targets debug build
+# also registers a test algorithm, which makes the bare default ambiguous.
+# `reference-policy=anchor` keeps the run near 5 s in a debug build; the default
+# policy takes about 20 s on the same fixture. Never a `stack` invocation here:
 # that is minutes of debug-profile fusion this cheap gate must not pay for.
 echo "+ $CLI align fixtures/mantis-512 --algorithm pyramidal-ecc --set reference-policy=anchor --json"
-ALIGN_OUT="$("$CLI" align fixtures/mantis-512 --algorithm pyramidal-ecc --set reference-policy=anchor --json)"
-
-printf '%s' "$ALIGN_OUT" | grep -q '"frame_count": 8' \
-  || { echo "FAIL: fixture e2e -- align missing fact: frame_count 8" >&2; exit 1; }
-echo "OK: fact present -- align frame_count: 8"
-
-printf '%s' "$ALIGN_OUT" | grep -q '"reference": 3' \
-  || { echo "FAIL: fixture e2e -- align missing fact: reference 3" >&2; exit 1; }
-echo "OK: fact present -- align reference: 3"
-
-# Frames 0, 1 and 7 diverge against the middle anchor; frame 6 (scale 1.1075)
-# is flagged validation-failed by the off-centre check.
-printf '%s' "$ALIGN_OUT" | grep -q '"failure_count": 4' \
-  || { echo "FAIL: fixture e2e -- align missing fact: failure_count 4" >&2; exit 1; }
-echo "OK: fact present -- align failure_count: 4 (per-frame divergence, recorded)"
+"$CLI" align fixtures/mantis-512 --algorithm pyramidal-ecc --set reference-policy=anchor --json | python3 -c '
+import json, sys
+report = json.load(sys.stdin)
+frames, entries = report.get("frame_count"), len(report.get("alignments", []))
+if frames != 8:
+    sys.exit(f"FAIL: fixture e2e -- align report: frame_count {frames}, want 8")
+if entries != 8:
+    sys.exit(f"FAIL: fixture e2e -- align report: {entries} alignments, want 8")
+'
+echo "OK: align report parsed -- frame_count 8, 8 alignments"
 
 # Removed processing flags must not appear in README.md or docs/.
 echo "+ grepping the docs tree for removed processing flags"

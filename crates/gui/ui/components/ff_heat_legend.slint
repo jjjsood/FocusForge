@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The sharpness ramp as a strip with its two end labels.
+
+import { Theme } from "../theme.slint";
+
+export component FFHeatLegend inherits Rectangle {
+    width: 144px;
+    height: strip.height + Theme.space-1 + 14px;
+
+    strip := Rectangle {
+        y: 0px;
+        height: 6px;
+        background: @linear-gradient(90deg,
+            Theme.surface-canvas 0%,
+            Theme.accent-subtle 30%,
+            Theme.accent-pressed 62%,
+            Theme.accent-default 82%,
+            Theme.text-primary 100%);
+    }
+
+    Text {
+        x: 0px;
+        y: strip.height + Theme.space-1;
+        text: "blurred";
+        color: Theme.text-muted;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+    }
+
+    Text {
+        x: parent.width - self.width;
+        y: strip.height + Theme.space-1;
+        text: "sharp";
+        color: Theme.text-muted;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+        horizontal-alignment: right;
+    }
+}

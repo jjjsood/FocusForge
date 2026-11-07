@@ -8,6 +8,8 @@
 //! scroll has hard stops at the first tab's left edge and the last tab's
 //! right edge.
 
+mod common;
+
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -185,18 +187,6 @@ fn scroll_into_view_is_minimal_and_exact() {
     assert_eq!(tab_scroll_into_view(228.0, 3, count, viewport), 228.0);
 }
 
-fn init_backend() {
-    thread_local! {
-        static INIT: Cell<bool> = const { Cell::new(false) };
-    }
-    INIT.with(|done| {
-        if !done.get() {
-            i_slint_backend_testing::init_no_event_loop();
-            done.set(true);
-        }
-    });
-}
-
 fn click(app: &focusforge_gui::AppWindow, x: f32, y: f32) {
     let position = slint::LogicalPosition::new(x, y);
     let window = app.window();
@@ -226,7 +216,7 @@ fn rect(app: &focusforge_gui::AppWindow, id: &str) -> (f32, f32, f32, f32) {
 /// region under it.
 #[test]
 fn overflow_layout_matches_the_arithmetic_and_arrows_click() {
-    init_backend();
+    common::init_window_backend();
     let app = focusforge_gui::AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     let r = app.get_tab_region_width();

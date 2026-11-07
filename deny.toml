@@ -55,6 +55,13 @@ allow = ["LGPL-2.1"]
 name = "jpeg-encoder"
 allow = ["IJG"]
 
+# Certificate data of the update check's HTTPS client, under a permissive data
+# licence with no copyleft and no restriction on combining, so it is
+# GPL-compatible.
+[[licenses.exceptions]]
+name = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
+
 # Reached only through Slint; no fixed version exists. Revisit on a Slint bump.
 [advisories]
 ignore = [
@@ -72,6 +79,9 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint or notify-rust version bump" },
     { id = "RUSTSEC-2026-0371", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint or notify-rust version bump" },
     { id = "RUSTSEC-2026-0372", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint or notify-rust version bump" },
+    # pin-utils v0.1.0, via pin-utils -> spin_on -> i-slint-renderer-skia ->
+    # slint -> focusforge-gui
+    { id = "RUSTSEC-2026-0441", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint version bump" },
 ]
 
 # `akaze` is taken from the one git revision that carries the detector fixes

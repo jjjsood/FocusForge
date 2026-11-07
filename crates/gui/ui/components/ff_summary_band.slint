@@ -1,0 +1,102 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A two-row read-out band: SUMMARY at the left, then an ENTERED and a
+// CALCULATED row of caption-over-value cells.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export struct SummaryCell {
+    caption: string,
+    value: string,
+}
+
+component SummaryRow inherits Rectangle {
+    in property <string> title;
+    in property <[SummaryCell]> cells;
+
+    Text {
+        x: ShellGeometry.summary-title-x;
+        height: 100%;
+        text: root.title;
+        color: Theme.text-secondary;
+        font-size: Theme.text-section.size;
+        font-weight: Theme.text-section.weight;
+        vertical-alignment: center;
+    }
+    for cell[i] in root.cells: VerticalLayout {
+        x: ShellGeometry.summary-cells-x + i * ShellGeometry.summary-cell-width;
+        y: 3px;
+        width: ShellGeometry.summary-cell-width;
+        Text {
+            text: cell.caption;
+            color: Theme.text-muted;
+            font-size: Theme.text-section.size;
+            font-weight: Theme.text-body.weight;
+            height: Theme.space-4;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        Text {
+            text: cell.value;
+            color: Theme.text-primary;
+            font-size: Theme.text-value.size;
+            font-weight: Theme.text-value.weight;
+            height: Theme.space-4;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+export component FFSummaryBand inherits Rectangle {
+    in property <[SummaryCell]> entered: [];
+    in property <[SummaryCell]> calculated: [];
+
+    height: ShellGeometry.summary-band-height;
+    background: Theme.surface-canvas;
+
+    Rectangle {
+        y: 0px;
+        height: 1px;
+        background: Theme.border-default;
+    }
+    Text {
+        x: Theme.space-4 - 1px;
+        y: 0px;
+        height: 100%;
+        text: "SUMMARY";
+        color: Theme.text-muted;
+        font-size: Theme.text-section.size;
+        font-weight: Theme.text-section.weight;
+        vertical-alignment: center;
+    }
+    Rectangle {
+        x: ShellGeometry.summary-title-x - Theme.space-4;
+        y: Theme.space-3;
+        width: 1px;
+        height: root.height - 2 * Theme.space-3;
+        background: Theme.border-default;
+    }
+    SummaryRow {
+        y: 0px;
+        height: root.height / 2;
+        width: 100%;
+        title: "ENTERED";
+        cells: root.entered;
+    }
+    Rectangle {
+        x: ShellGeometry.summary-title-x;
+        y: root.height / 2;
+        width: root.width - self.x - Theme.space-4;
+        height: 1px;
+        background: Theme.border-default;
+    }
+    SummaryRow {
+        y: root.height / 2;
+        height: root.height / 2;
+        width: 100%;
+        title: "CALCULATED";
+        cells: root.calculated;
+    }
+}

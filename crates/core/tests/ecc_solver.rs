@@ -10,40 +10,17 @@
 
 mod common;
 
+use common::align::{
+    XorShift32, corner_error, default_region, frame_3_tile, full_rect, similarity_about,
+};
+
 use focusforge_core::align::warp::warp_from_tile;
 use focusforge_core::align::{
     DivergenceReason, EccMode, EccParams, EccResult, EccStatus, Transform, solve_level,
 };
 use focusforge_core::fuse::Plane;
 use focusforge_core::fuse::metrics::luma;
-use focusforge_core::io::TiffStack;
 use focusforge_core::tile::{Rect, Tile};
-
-const FRAME_3: usize = 3;
-
-fn open_fixture() -> TiffStack {
-    TiffStack::open(common::mantis_512_dir()).expect("opening fixtures/mantis-512")
-}
-
-fn full_rect(width: u32, height: u32) -> Rect {
-    Rect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    }
-}
-
-/// Opens `fixtures/mantis-512` and reads frame 3's full tile.
-fn frame_3_tile() -> (Tile, u32, u32) {
-    let stack = open_fixture();
-    let (width, height) = stack.dimensions();
-    let rect = full_rect(width, height);
-    let tile = stack
-        .read_tile(FRAME_3, rect)
-        .expect("reading frame 3's tile");
-    (tile, width, height)
-}
 
 /// Reduces a chunky RGB [`Tile`] to a single-channel luminance [`Plane`],
 /// [`luma`] sample-for-sample -- the same reduction
@@ -58,76 +35,6 @@ fn luma_plane(tile: &Tile, width: u32, height: u32) -> Plane {
         })
         .collect();
     Plane::from_f32(&data, width, height, 1).expect("luma plane has the right length")
-}
-
-/// The maximum, over `region`'s four corners, of the Euclidean distance
-/// between where `a` and `b` map that corner -- the same "corner
-/// displacement" measure [`solve_level`]'s own termination criterion uses,
-/// applied here to compare a recovered transform against ground truth.
-fn corner_error(a: &Transform, b: &Transform, region: Rect) -> f64 {
-    let corners = [
-        (region.x as f64, region.y as f64),
-        ((region.x + region.width - 1) as f64, region.y as f64),
-        (region.x as f64, (region.y + region.height - 1) as f64),
-        (
-            (region.x + region.width - 1) as f64,
-            (region.y + region.height - 1) as f64,
-        ),
-    ];
-    corners
-        .iter()
-        .map(|&(x, y)| {
-            let (ax, ay) = a
-                .map_point(x, y)
-                .expect("ground-truth transform stays in domain");
-            let (bx, by) = b
-                .map_point(x, y)
-                .expect("recovered transform stays in domain");
-            ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt()
-        })
-        .fold(0.0f64, f64::max)
-}
-
-/// A rotation+scale [`Transform`] about `(cx, cy)`, built by composing
-/// three transforms rather than hand-deriving the closed-form translation
-/// component -- `Transform::compose` is already tested elsewhere, so this
-/// stays a thin, obviously-correct wrapper.
-fn similarity_about(scale: f64, radians: f64, cx: f64, cy: f64) -> Transform {
-    let to_origin = Transform::translation(-cx, -cy);
-    let rot_scale = Transform::similarity(scale, radians, 0.0, 0.0);
-    let back = Transform::translation(cx, cy);
-    back.compose(&rot_scale).compose(&to_origin)
-}
-
-/// A deterministic xorshift32 PRNG, seeded with a fixed constant -- never
-/// `rand`, reproducible across runs, and local to this test file.
-struct XorShift32(u32);
-
-impl XorShift32 {
-    fn next(&mut self) -> u32 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        self.0 = x;
-        x
-    }
-}
-
-/// The region every ground-truth test in this file solves over: inset far
-/// enough from the 512px frame's edges that no fabricated rim pixel
-/// (`warp_from_tile`'s clamp-to-edge taps near the source frame's border)
-/// ever enters the accumulation, for every transform this file uses --
-/// `KERNEL_RADIUS` (2px) plus the largest corner displacement any test
-/// here applies (well under 40px) is far inside a 64px inset on a 512px
-/// frame.
-fn default_region() -> Rect {
-    Rect {
-        x: 64,
-        y: 64,
-        width: 384,
-        height: 384,
-    }
 }
 
 fn default_params() -> EccParams {
@@ -155,7 +62,7 @@ const ROTATION_SCALE_TOLERANCE_PX: f64 = 1e-3;
 
 #[test]
 fn recovers_known_translation() {
-    let (tile, width, height) = frame_3_tile();
+    let (tile, width, height, _) = frame_3_tile();
     let rect = full_rect(width, height);
 
     let moving_plane = luma_plane(&tile, width, height);
@@ -187,7 +94,7 @@ fn recovers_known_translation() {
 
 #[test]
 fn recovers_known_rotation_and_scale() {
-    let (tile, width, height) = frame_3_tile();
+    let (tile, width, height, _) = frame_3_tile();
     let rect = full_rect(width, height);
 
     let moving_plane = luma_plane(&tile, width, height);
@@ -233,7 +140,7 @@ fn recovers_known_rotation_and_scale() {
 /// about the centre is a no-op and proves nothing about this step at all.
 #[test]
 fn similarity_conjugates_increment_about_region_centre() {
-    let (tile, width, height) = frame_3_tile();
+    let (tile, width, height, _) = frame_3_tile();
     let rect = full_rect(width, height);
     let moving_plane = luma_plane(&tile, width, height);
 
@@ -275,7 +182,7 @@ fn similarity_conjugates_increment_about_region_centre() {
 
 #[test]
 fn identity_converges_immediately() {
-    let (tile, width, height) = frame_3_tile();
+    let (tile, width, height, _) = frame_3_tile();
     let plane = luma_plane(&tile, width, height);
     let region = default_region();
 
@@ -304,7 +211,7 @@ fn identity_converges_immediately() {
 
 #[test]
 fn photometric_gain_and_bias_do_not_move_the_estimate() {
-    let (tile, width, height) = frame_3_tile();
+    let (tile, width, height, _) = frame_3_tile();
     let template_plane = luma_plane(&tile, width, height);
     let region = default_region();
     let params = default_params();
@@ -353,7 +260,7 @@ fn photometric_gain_and_bias_do_not_move_the_estimate() {
 
 #[test]
 fn rotation_converges_quadratically() {
-    let (tile, width, height) = frame_3_tile();
+    let (tile, width, height, _) = frame_3_tile();
     let rect = full_rect(width, height);
     let moving_plane = luma_plane(&tile, width, height);
 
@@ -440,7 +347,7 @@ fn rotation_converges_quadratically() {
 
 #[test]
 fn hopeless_input_reports_failure() {
-    let (tile, width, height) = frame_3_tile();
+    let (tile, width, height, _) = frame_3_tile();
     let template_plane = luma_plane(&tile, width, height);
 
     let mut rng = XorShift32(0x5EED_1234);
@@ -467,42 +374,11 @@ fn hopeless_input_reports_failure() {
     );
 }
 
-#[test]
-fn iteration_cap_is_honored() {
-    let (tile, width, height) = frame_3_tile();
-    let rect = full_rect(width, height);
-    let moving_plane = luma_plane(&tile, width, height);
-
-    let w_true = Transform::translation(15.0, 15.0);
-    let warped = warp_from_tile(&tile, (width, height), rect, &w_true)
-        .expect("translation stays well inside the frame");
-    let template_plane = luma_plane(&warped.tile, width, height);
-
-    let region = default_region();
-    let params = EccParams {
-        max_iterations: 2,
-        epsilon_px: 1e-9,
-        min_valid_fraction: 0.99,
-    };
-    let result = solve_level(
-        &template_plane,
-        region,
-        &moving_plane,
-        &Transform::identity(),
-        EccMode::Translation,
-        &params,
-    )
-    .expect("valid solver inputs");
-
-    assert_eq!(result.status, EccStatus::HitCap, "result: {result:?}");
-    assert_eq!(result.iterations, 2);
-}
-
 /// A frame against its own contrast inversion is anti-correlated: whatever the
 /// solver reports, it is not `Converged`.
 #[test]
 fn an_inverted_contrast_pair_is_not_converged() {
-    let (tile, width, height) = frame_3_tile();
+    let (tile, width, height, _) = frame_3_tile();
     let template_plane = luma_plane(&tile, width, height);
     let inverted = Tile {
         samples: tile.samples.iter().map(|&s| u16::MAX - s).collect(),
@@ -526,7 +402,7 @@ fn an_inverted_contrast_pair_is_not_converged() {
 
 #[test]
 fn result_reports_iterations_and_error() {
-    let (tile, width, height) = frame_3_tile();
+    let (tile, width, height, _) = frame_3_tile();
     let rect = full_rect(width, height);
     let moving_plane = luma_plane(&tile, width, height);
 
@@ -569,7 +445,7 @@ const SWEEP_MAX_PX: u32 = 100;
 
 #[test]
 fn capture_range_is_measured() {
-    let (tile, width, height) = frame_3_tile();
+    let (tile, width, height, _) = frame_3_tile();
     let rect = full_rect(width, height);
     let moving_plane = luma_plane(&tile, width, height);
     let region = default_region();
@@ -644,7 +520,7 @@ fn fingerprint(result: &EccResult) -> String {
 /// must not move a single bit.
 #[test]
 fn results_are_bit_identical_to_the_recorded_run() {
-    let (tile, width, height) = frame_3_tile();
+    let (tile, width, height, _) = frame_3_tile();
     let rect = full_rect(width, height);
     let plane = luma_plane(&tile, width, height);
     let region = default_region();

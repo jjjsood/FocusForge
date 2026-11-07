@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The calculator's key to its two kinds of number: a field swatch for what
+// is entered and the calculator glyph for what is calculated.
+
+import { Theme } from "../theme.slint";
+
+export component FFCalculatorLegend inherits HorizontalLayout {
+    spacing: Theme.space-6;
+    alignment: start;
+
+    HorizontalLayout {
+        spacing: Theme.space-2;
+        Rectangle {
+            y: (parent.height - self.height) / 2;
+            width: Theme.space-4 + Theme.space-1;
+            height: 14px;
+            border-radius: Theme.radius-sm;
+            background: Theme.surface-overlay;
+        }
+        Text {
+            text: "Entered";
+            color: Theme.text-primary;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            vertical-alignment: center;
+        }
+    }
+    HorizontalLayout {
+        spacing: Theme.space-2;
+        Image {
+            y: (parent.height - self.height) / 2;
+            width: Theme.space-3;
+            height: Theme.space-3;
+            source: @image-url("../../../../assets/icons/calculator.svg");
+            colorize: Theme.text-muted;
+        }
+        Text {
+            text: "Calculated";
+            color: Theme.text-muted;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            vertical-alignment: center;
+        }
+    }
+}
