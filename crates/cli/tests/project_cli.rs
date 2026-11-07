@@ -371,6 +371,15 @@ fn cancel_keeps_the_staged_planes_for_resume() {
             break;
         }
     }
+    // The entry line can precede the first staged plane on a slow machine; cancel
+    // only once a plane is on disk, or when the run has ended without one.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while staged_composites(&cwd).is_empty()
+        && child.try_wait().expect("poll child").is_none()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     send_sigint(child.id());
     let status = child.wait().expect("wait");
     let rest: Vec<String> = lines.map_while(Result::ok).collect();
