@@ -272,7 +272,7 @@ pub fn two_frame_reader(
 }
 
 /// Hashes a lattice point to `[-1, 1]`.
-pub fn lattice(ix: i64, iy: i64, seed: u32) -> f64 {
+fn lattice(ix: i64, iy: i64, seed: u32) -> f64 {
     let mut h = (ix as u32).wrapping_mul(0x9E37_79B1)
         ^ (iy as u32).wrapping_mul(0x85EB_CA77)
         ^ seed.wrapping_mul(0xC2B2_AE3D);
@@ -395,7 +395,7 @@ pub fn shifted_frame_3(dx: f64) -> (Vec<u16>, Tile, u32, u32, u32) {
 
 /// One alignment result as exact bits and its status, so a recorded run and a
 /// later one compare without a tolerance.
-pub fn fingerprint(
+fn fingerprint(
     transform: &Transform,
     status: AlignStatus,
     iterations: u32,
@@ -436,7 +436,7 @@ pub fn frame_fingerprint(frame: &FrameAlignment) -> String {
 
 /// A fingerprint without its status token: the transform, iteration count and
 /// residual bits alone.
-pub fn without_status(fingerprint: &str) -> String {
+fn without_status(fingerprint: &str) -> String {
     fingerprint
         .split_whitespace()
         .filter(|token| !token.starts_with("status="))
