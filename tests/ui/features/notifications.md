@@ -6,7 +6,7 @@ Gotchas:
 - A toast shows only while the window holds keyboard focus; otherwise the record becomes a desktop banner. The toast steps are human only and live in `manual/15-toasts-and-crash-record.md`; journey 15 reads the same records through the bell.
 - Opening the center reads every record and clears the toast queue; reopening it keeps the row selected last.
 - An info or warning toast stays 6 s, a crash toast 10 s; the pointer on a toast holds it.
-- One `mantis-512` run with the target at +0.5 and Max brightness gain 1.25 gives 8 records "Brightness target limited", one per frame; **Keep** adds "3 frames unaligned" (00.tif, 01.tif, 06.tif; a default run without the raised target leaves only 00.tif and 01.tif, so the count belongs to this setting). Records last for the session.
+- One `mantis-512` run with the target at +0.5 and Max brightness gain 1.25 gives 8 records "Brightness not fully matched", one per frame; **Keep** adds "3 frames unaligned" (00.tif, 01.tif, 06.tif; a default run without the raised target leaves only 00.tif and 01.tif, so the count belongs to this setting). Records last for the session.
 - The keyboard in the center (Down, Return, Escape, Return) is driven (15 steps 10-13): each `Press` goes to the control holding the keyboard focus, which the click on a row in step 9 gave it. The crash steps (a hand-made data folder through `FOCUSFORGE_DATA_DIR`) and the toast steps are human only and live in `manual/15-toasts-and-crash-record.md`: a toast needs the window to hold the system's keyboard focus, which no step grants.
 Guides: 15-notification-center.md
 Book: guide/batch-runs.md#read-the-notification-center

@@ -2,6 +2,7 @@
 
 //! Bounded, full-source reductions for source-image views.
 
+use std::borrow::Cow;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -329,8 +330,6 @@ pub enum PreviewError {
     OverBudget,
     #[error("source preview exceeds its cache allowance")]
     CacheLimit,
-    #[error("source preview has unsupported samples-per-pixel {0}")]
-    UnsupportedSamples(u32),
     #[error("source preview was cancelled")]
     Cancelled,
     #[error("source preview could not read {0}")]
@@ -346,15 +345,28 @@ fn target_dimensions(width: u32, height: u32) -> (u32, u32) {
     )
 }
 
+/// Shows grey for fewer than three samples per pixel and the first three
+/// (red, green, blue) otherwise; any channel past those, such as alpha, is
+/// not shown.
 fn tonemap_source(samples: &[u16], width: u32, height: u32, spp: u32, rgba: &mut [u8]) {
-    if spp != 1 {
-        display::tonemap_cpu(samples, width, height, spp, 0, rgba);
+    let shown = if spp >= 3 { 3 } else { 1 };
+    let shown_samples: Cow<[u16]> = if spp == shown {
+        Cow::Borrowed(samples)
+    } else {
+        samples
+            .chunks_exact(spp as usize)
+            .flat_map(|pixel| pixel[..shown as usize].iter().copied())
+            .collect::<Vec<_>>()
+            .into()
+    };
+    if shown == 3 {
+        display::tonemap_cpu(&shown_samples, width, height, 3, 0, rgba);
         return;
     }
     for (index, pixel) in rgba.chunks_exact_mut(4).enumerate() {
         let x = index as u32 % width;
         let y = index as u32 / width;
-        let value = display::reduce16to8(samples[index], x, y);
+        let value = display::reduce16to8(shown_samples[index], x, y);
         pixel.copy_from_slice(&[value, value, value, 255]);
     }
 }
@@ -406,9 +418,6 @@ fn render_with_max_step(
     let reader = frame_set.reader;
     let frame = reader.frame(0);
     let spp = frame.samples_per_pixel;
-    if !matches!(spp, 1 | 3) {
-        return Err(PreviewError::UnsupportedSamples(spp));
-    }
     let (target_width, target_height) = target_dimensions(frame.width, frame.height);
     let target_cells = u64::from(target_width) * u64::from(target_height);
     let accumulator = target_cells

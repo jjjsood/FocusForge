@@ -629,8 +629,21 @@ pub fn run(
     if let Some(tile_size) = request.tile_size {
         options.tile_size = tile_size;
     }
+    // A cap below the levels' minimum tile cannot be planned; the run then
+    // keeps its size and finishes on the host.
+    let mut cap_fallback = None;
     if let Some(backend) = request.backend {
-        options.tile_size = options.tile_size.min(backend.max_tile_size(spp));
+        let cap = backend.max_tile_size(spp);
+        if cap >= support.min_tile_size() {
+            options.tile_size = options.tile_size.min(cap);
+        } else {
+            cap_fallback = Some(format!(
+                "the GPU accepts tiles up to {cap} px and {} levels need {} px; \
+                 continuing on the CPU path",
+                support.decimation_levels,
+                support.min_tile_size()
+            ));
+        }
     }
 
     let workers = std::thread::available_parallelism()
@@ -1019,15 +1032,17 @@ pub fn run(
     let warping_reader = WarpingReader::new(&gain_reader, (width, height), spp, transforms.clone());
 
     // The scheduler's own per-tile rect: the largest read rect it plans.
-    let gpu_fallback = request.backend.and_then(|b| {
-        b.tile_budget_shortfall(
-            options.tile_size.min(width),
-            options.tile_size.min(height),
-            spp,
-            support.decimation_levels,
-            &transforms,
-            gain_reader.sample_format(),
-        )
+    let gpu_fallback = cap_fallback.or_else(|| {
+        request.backend.and_then(|b| {
+            b.tile_budget_shortfall(
+                options.tile_size.min(width),
+                options.tile_size.min(height),
+                spp,
+                support.decimation_levels,
+                &transforms,
+                gain_reader.sample_format(),
+            )
+        })
     });
     if let Some(message) = &gpu_fallback {
         observer.notice(message);

@@ -173,6 +173,7 @@ mod tests {
                 advanced: false,
                 auto: None,
                 host_default: None,
+                stack_max: None,
             },
             ParamDesc {
                 id: "i".to_string(),
@@ -183,6 +184,7 @@ mod tests {
                 advanced: false,
                 auto: None,
                 host_default: None,
+                stack_max: None,
             },
             ParamDesc {
                 id: "b".to_string(),
@@ -193,6 +195,7 @@ mod tests {
                 advanced: false,
                 auto: None,
                 host_default: None,
+                stack_max: None,
             },
             ParamDesc {
                 id: "e".to_string(),
@@ -208,6 +211,7 @@ mod tests {
                 advanced: false,
                 auto: None,
                 host_default: None,
+                stack_max: None,
             },
         ]
     }

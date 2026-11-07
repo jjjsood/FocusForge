@@ -62,4 +62,4 @@ Start: --open fixtures/blackmagic-micro-dng --open fixtures/mantis8-64-lzw-p2-ti
 27. (human only) Click **Open…** (`FFEmptyState::open`), then cancel the file chooser that opens.
     Expect: a native file chooser titled "Open images" opens with the file-type choices "TIFF frames", "JPEG frames" and "Camera RAW"; after cancelling it the canvas still shows the title "No project open" and the tab strip shows no tab.
 28. (human only) Press `Ctrl+N`, then cancel the folder chooser that opens.
-    Expect: a native folder chooser titled "Open folder or project" opens, not the "Open images" one; after cancelling it the canvas still shows the title "No project open".
+    Expect: a native folder chooser titled "Choose a folder" opens, not the "Open images" one; after cancelling it the canvas still shows the title "No project open".

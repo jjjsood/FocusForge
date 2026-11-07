@@ -52,7 +52,7 @@ The window then shows one project named "frame-1-3" with 3 frames. A fuse takes 
 20. Click the RECENT row "frame-1-3" (`FFProjectsRail::recent-row` 0).
     Expect: (within 120 s) the overlay is gone and the tab strip shows one tab titled "frame-1-3" with no "UNSAVED" marker.
 21. Click **Fit** (`FFZoomCluster::zoom-fit`).
-    Expect: the Composite pane (`FFCanvas::pane-right`) shows the same picture of the bird in front of the pale disc; the CHECKPOINTS list shows 2 rows, "Details" over a time, newest first.
+    Expect: the Composite pane (`FFCanvas::pane-right`) shows the same picture of the bird in front of the pale disc; the CHECKPOINTS list shows 2 rows, newest first: "Retouch on Details" over a time, then "Details" over a time.
 ## Enter the editor again and paint once more
 22. Click **EDITOR** (`FFModeSwitch::editor-half`).
     Expect: the toolbar row shows "Size", "Soft" and **Save checkpoint**; `buttons AppWindow::editor-toolbar` lists **Undo**, **Redo** and **Save checkpoint** with enabled false; the CHECKPOINTS list shows 2 rows.

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The settings modal: reachable only through the bottom bar's gear. The
+// The settings modal: opened from the left icon bar's Settings button. The
 // frame -- header, nav rail and content host -- over one tab per section.
 
 import { Theme } from "../theme.slint";
@@ -23,6 +23,8 @@ export { AboutState, UpdateControlsState, FFManifestRow, InputRow, PerformanceCa
 export component FFSettingsModal inherits FFModalPanel {
     in property <bool> settings-open: false;
     in property <[InputRow]> input-rows: [];
+    in property <string> input-source: "";
+    in property <[string]> input-problems: [];
     in property <string> settings-section: "performance";
     callback settings-close-requested();
     callback settings-section-selected(string);
@@ -31,8 +33,14 @@ export component FFSettingsModal inherits FFModalPanel {
     callback performance-gpu-toggled(bool);
     callback performance-host-cap-edited(string);
     callback performance-vram-cap-edited(string);
+    callback performance-cap-committed();
     callback performance-host-cap-cursor-moved(length, length);
     callback performance-vram-cap-cursor-moved(length, length);
+    callback performance-host-unit-toggled();
+    callback performance-vram-unit-toggled();
+    callback performance-host-unit-selected(string);
+    callback performance-vram-unit-selected(string);
+    callback performance-unit-dismissed();
 
     in property <string> appearance-presentation: "image-list";
     in property <bool> appearance-menu-open: false;
@@ -171,7 +179,11 @@ export component FFSettingsModal inherits FFModalPanel {
 
         key-pressed(event) => {
             if event.text == Key.Escape {
-                root.settings-close-requested();
+                if root.performance.host-cap.unit-open || root.performance.vram-cap.unit-open {
+                    root.performance-unit-dismissed();
+                } else {
+                    root.settings-close-requested();
+                }
                 return accept;
             }
             return reject;
@@ -220,8 +232,14 @@ export component FFSettingsModal inherits FFModalPanel {
                 gpu-toggled(on) => { root.performance-gpu-toggled(on); }
                 host-cap-edited(t) => { root.performance-host-cap-edited(t); }
                 vram-cap-edited(t) => { root.performance-vram-cap-edited(t); }
+                cap-committed => { root.performance-cap-committed(); }
                 host-cap-cursor-moved(x, w) => { root.performance-host-cap-cursor-moved(x, w); }
                 vram-cap-cursor-moved(x, w) => { root.performance-vram-cap-cursor-moved(x, w); }
+                host-unit-toggled => { root.performance-host-unit-toggled(); }
+                vram-unit-toggled => { root.performance-vram-unit-toggled(); }
+                host-unit-selected(u) => { root.performance-host-unit-selected(u); }
+                vram-unit-selected(u) => { root.performance-vram-unit-selected(u); }
+                unit-dismissed => { root.performance-unit-dismissed(); }
             }
         }
 
@@ -265,6 +283,8 @@ export component FFSettingsModal inherits FFModalPanel {
 
             FFInputMapTab {
                 input-rows: root.input-rows;
+                input-source: root.input-source;
+                input-problems: root.input-problems;
             }
         }
 

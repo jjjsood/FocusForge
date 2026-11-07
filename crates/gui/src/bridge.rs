@@ -25,8 +25,8 @@ use crate::canvas::{
 };
 use crate::controller::{
     AppController, ChromeKey, DockTab, GroupingQuestion, GuardSecondary, JobView, LocateTarget,
-    OpenAs, OpenOutcome, SaveAsk, SettingsSection, ShellEvent, ShellMode, StoragePath,
-    WindowChromeIntent, WindowTarget,
+    OpenAs, OpenOutcome, RefusalAction, SaveAsk, SettingsSection, ShellEvent, ShellMode,
+    StoragePath, WindowChromeIntent, WindowTarget,
 };
 use crate::diagnostics::{
     DiagnosticsStatus, InputBatch, InputSurface, finish_input_batches, input_trace_incomplete,
@@ -48,7 +48,7 @@ use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
 use crate::job;
 use crate::notifications::Kind;
-use crate::overlay::Thumbnail;
+use crate::overlay::{Thumbnail, grouping_body};
 use crate::picker::{self, DialogAnswer, DialogRequest};
 use crate::settings_panel::{HeadingState, PanelModel, RowKind};
 use crate::viewport::{PaneDraw, PaneRect};
@@ -310,6 +310,25 @@ pub fn push_busy(app: &AppWindow, controller: &AppController) {
     let saving = controller.save_in_flight();
     app.set_load_caption(if saving { "Saving…" } else { "Loading…" }.into());
     app.set_load_active(controller.load_in_flight() || saving);
+}
+
+/// Fills the Input map tab: its rows, its provenance line and the lines
+/// naming a refused `[input]` table.
+pub fn push_input_map_view(app: &AppWindow, controller: &AppController) {
+    let rows: Vec<crate::InputRow> = controller
+        .input_rows()
+        .into_iter()
+        .map(|r| crate::InputRow {
+            input: r.input.into(),
+            stacking: r.stacking.into(),
+            editor: r.editor.into(),
+        })
+        .collect();
+    app.set_input_rows(Rc::new(slint::VecModel::from(rows)).into());
+    let (source, problems) = controller.input_source();
+    app.set_input_source(source.into());
+    let problems: Vec<slint::SharedString> = problems.into_iter().map(Into::into).collect();
+    app.set_input_problems(Rc::new(slint::VecModel::from(problems)).into());
 }
 
 /// Publishes the worker's completed reads and shows every pane where the
@@ -1454,6 +1473,20 @@ pub fn push_performance_view(app: &AppWindow, controller: &Arc<Mutex<AppControll
     push_performance(app, controller, None);
 }
 
+/// Applies `change` to the controller, then pushes the Performance view.
+fn performance_change(
+    app_weak: &slint::Weak<AppWindow>,
+    controller: &Arc<Mutex<AppController>>,
+    change: impl FnOnce(&mut AppController),
+) {
+    record_surface_input(InputSurface::Other);
+    change(&mut controller.lock().unwrap());
+    if let Some(app) = app_weak.upgrade() {
+        push_performance_view(&app, controller);
+        direct_publication_scope(InputSurface::Other);
+    }
+}
+
 /// [`push_performance_view`] that leaves the text of the field being typed in
 /// as the window has it, so a push never rewrites what the user is typing.
 fn push_performance(
@@ -1465,9 +1498,12 @@ fn push_performance(
     let cap = |field: &crate::performance_settings::CapField| PerformanceCap {
         text: field.text.as_str().into(),
         placeholder: field.placeholder.into(),
+        unit: field.unit.label().into(),
         invalid: field.invalid,
         enabled: field.enabled,
         scroll_offset: field.scroll_offset,
+        limit: field.limit.as_str().into(),
+        unit_open: field.unit_open,
     };
     let mut state = PerformanceState {
         gpu: view.gpu,
@@ -1475,9 +1511,6 @@ fn push_performance(
         backend: view.backend.into(),
         host_cap: cap(&view.host_cap),
         vram_cap: cap(&view.vram_cap),
-        host_budget: view.host_budget.into(),
-        vram_budget: view.vram_budget.into(),
-        vram_budget_known: view.vram_budget_known,
         note: view.note.into(),
     };
     let shown = app.get_performance();
@@ -2345,12 +2378,14 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
     match controller.pending_frame_change() {
         Some(copy) => {
             let secondary = copy.secondary_label();
+            let tertiary = copy.tertiary_label();
             app.set_frame_warning_open(true);
             app.set_frame_warning_title(copy.title.into());
             app.set_frame_warning_body(copy.body.into());
             app.set_frame_warning_info(copy.info.into());
             app.set_frame_warning_confirm_label(copy.confirm_label.into());
             app.set_frame_warning_secondary_label(secondary.into());
+            app.set_frame_warning_tertiary_label(tertiary.into());
         }
         None => app.set_frame_warning_open(false),
     }
@@ -2705,7 +2740,7 @@ pub fn push_projects_overlay(app: &AppWindow, controller: &AppController) {
 /// Pushes a raised [`GroupingQuestion`] into `app`'s dialog properties.
 fn push_question(app: &AppWindow, question: &GroupingQuestion) {
     app.set_question_open(true);
-    app.set_question_frame_count(question.frame_count as i32);
+    app.set_question_body(grouping_body(&question.stack_sizes).into());
     app.set_question_project_count(question.project_count as i32);
 }
 
@@ -2926,8 +2961,7 @@ fn ask_save(ask: SaveAsk, then: impl FnOnce(u64, Option<PathBuf>) + 'static) {
     }
 }
 
-/// `Save project` on the active tab, from the toolbar, `Ctrl+S` or the
-/// projects rail.
+/// `Save project` on the active tab, from `Ctrl+S` or the projects rail.
 fn save_active_project(
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
@@ -3990,30 +4024,52 @@ pub fn install(
     });
     app.on_performance_host_cap_edited({
         let controller = controller.clone();
-        let app_weak = app.as_weak();
         move |text| {
             record_surface_input(InputSurface::Other);
             controller
                 .lock()
                 .unwrap()
-                .set_host_memory_cap(text.as_str());
-            if let Some(app) = app_weak.upgrade() {
-                push_performance(&app, &controller, Some(EditedCap::HostMemory));
-                direct_publication_scope(InputSurface::Other);
-            }
+                .edit_host_memory_cap(text.as_str());
+            direct_publication_scope(InputSurface::Other);
         }
     });
     app.on_performance_vram_cap_edited({
         let controller = controller.clone();
-        let app_weak = app.as_weak();
         move |text| {
             record_surface_input(InputSurface::Other);
-            controller.lock().unwrap().set_vram_cap(text.as_str());
-            if let Some(app) = app_weak.upgrade() {
-                push_performance(&app, &controller, Some(EditedCap::Vram));
-                direct_publication_scope(InputSurface::Other);
-            }
+            controller.lock().unwrap().edit_vram_cap(text.as_str());
+            direct_publication_scope(InputSurface::Other);
         }
+    });
+    app.on_performance_cap_committed({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || performance_change(&app_weak, &controller, |c| c.commit_cap_drafts())
+    });
+    app.on_performance_host_unit_toggled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || performance_change(&app_weak, &controller, |c| c.toggle_host_unit_list())
+    });
+    app.on_performance_vram_unit_toggled({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || performance_change(&app_weak, &controller, |c| c.toggle_vram_unit_list())
+    });
+    app.on_performance_host_unit_selected({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |unit| performance_change(&app_weak, &controller, |c| c.set_host_cap_unit(&unit))
+    });
+    app.on_performance_vram_unit_selected({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move |unit| performance_change(&app_weak, &controller, |c| c.set_vram_cap_unit(&unit))
+    });
+    app.on_performance_unit_dismissed({
+        let controller = controller.clone();
+        let app_weak = app.as_weak();
+        move || performance_change(&app_weak, &controller, |c| c.close_unit_lists())
     });
     app.on_performance_host_cap_cursor_moved({
         let controller = controller.clone();
@@ -4288,27 +4344,40 @@ pub fn install(
             }
         }
     });
-    app.on_refusal_pick_another_folder({
+    app.on_refusal_dismissed({
+        let controller = controller.clone();
+        let canvas = canvas.clone();
+        let app_weak = app.as_weak();
+        move || {
+            record_gallery_input();
+            controller.lock().unwrap().dismiss_refusal();
+            close_refusal_dialog(&app_weak, &controller, &canvas);
+        }
+    });
+    app.on_refusal_confirmed({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
         let load_timer = load_timer.clone();
         move || {
             record_gallery_input();
-            // Only the folder-empty refusal offers a folder picker; every
-            // other refusal's button just closes, read before
-            // `dismiss_refusal` would clear it.
-            let is_folder_empty = controller.lock().unwrap().refusal_title().is_none();
+            let action = controller.lock().unwrap().refusal_action();
             controller.lock().unwrap().dismiss_refusal();
             close_refusal_dialog(&app_weak, &controller, &canvas);
-            if is_folder_empty {
-                open_from_picker(
+            match action {
+                Some(RefusalAction::PickFolder) => open_from_picker(
                     &controller,
                     &canvas,
                     &app_weak,
                     &load_timer,
                     DialogRequest::Entry,
-                )
+                ),
+                Some(RefusalAction::LocateTab(id)) => {
+                    locate_from_picker(&controller, move |c, folder| {
+                        c.locate_frames(LocateTarget::Tab(id), folder);
+                    });
+                }
+                Some(RefusalAction::Close) | None => {}
             }
         }
     });
@@ -4755,6 +4824,13 @@ pub fn install(
             }
         }
     });
+    app.on_frame_warning_tertiary_pressed({
+        let controller = controller.clone();
+        move || {
+            record_gallery_input();
+            controller.lock().unwrap().new_project_instead();
+        }
+    });
     app.on_divergence_discarded({
         let controller = controller.clone();
         let canvas = canvas.clone();
@@ -5107,22 +5183,15 @@ fn push_project_dialogs(app: &AppWindow, controller: &AppController) {
         }
         None => app.set_sources_missing_open(false),
     }
-    let folder_empty_refusal = controller.refusal_title().is_none();
-    app.set_refusal_title(
-        controller
-            .refusal_title()
-            .unwrap_or("No frames here")
-            .into(),
-    );
+    app.set_refusal_title(controller.refusal_title().unwrap_or_default().into());
     app.set_refusal_body(controller.last_refusal().unwrap_or_default().into());
-    app.set_refusal_button_label(
-        if folder_empty_refusal {
-            "Pick another folder…"
-        } else {
-            "Close"
-        }
-        .into(),
-    );
+    let (dismiss, confirm) = match controller.refusal_action() {
+        Some(RefusalAction::PickFolder) => ("Cancel", "Pick another folder…"),
+        Some(RefusalAction::LocateTab(_)) => ("Cancel", "Locate frames…"),
+        Some(RefusalAction::Close) | None => ("Close", ""),
+    };
+    app.set_refusal_dismiss_label(dismiss.into());
+    app.set_refusal_confirm_label(confirm.into());
 }
 
 /// Pushes the export modal's own state -- every place it can newly open,

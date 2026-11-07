@@ -2,8 +2,8 @@
 
 //! The `[performance]` table of `settings.toml` -- GPU processing on or off
 //! and an optional ceiling on the host-memory and device budgets -- and the
-//! pure view the Performance tab shows. A cap is kept as the text the user
-//! typed, in the size syntax of `--max-host-memory` and `--max-vram`
+//! pure view the Performance tab shows. A cap is kept as size text, in the
+//! syntax of `--max-host-memory` and `--max-vram`
 //! ([`focusforge_core::bytes::parse_byte_size`]); it can only lower a budget.
 //! No `use slint::` anywhere in this file.
 
@@ -167,31 +167,80 @@ pub fn save(config_dir: &Path, settings: &PerformanceSettings) -> Result<(), Wri
 pub enum DeviceState {
     /// No run has tried the GPU yet.
     NotProbed,
-    /// The probed (and capped) device budget, in bytes.
+    /// The probed device budget before any cap, in bytes.
     Ready(u64),
     /// A run tried the GPU and found no usable adapter.
     NoAdapter,
 }
 
-/// Cap field text the user typed that did not parse. The stored cap stays as
-/// it was; the field shows this text in the failure tone.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RejectedCaps {
-    pub host_memory: Option<String>,
-    pub vram: Option<String>,
+impl DeviceState {
+    /// The most a VRAM cap can name; unknown before a probe.
+    pub fn maximum(self) -> Option<u64> {
+        match self {
+            DeviceState::Ready(bytes) => Some(bytes),
+            DeviceState::NotProbed | DeviceState::NoAdapter => None,
+        }
+    }
 }
 
-/// One cap field as the tab draws it.
+/// The unit of a cap row's number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapUnit {
+    Mib,
+    Gib,
+}
+
+impl CapUnit {
+    pub const fn label(self) -> &'static str {
+        match self {
+            CapUnit::Mib => "MiB",
+            CapUnit::Gib => "GiB",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<CapUnit> {
+        [CapUnit::Mib, CapUnit::Gib]
+            .into_iter()
+            .find(|unit| unit.label() == label)
+    }
+
+    const fn bytes(self) -> u64 {
+        match self {
+            CapUnit::Mib => 1 << 20,
+            CapUnit::Gib => 1 << 30,
+        }
+    }
+}
+
+/// What a cap row shows beyond its stored cap.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CapNotes {
+    /// Size text the user confirmed that is not a cap. The stored cap stays as
+    /// it was; the row shows this text in the failure tone.
+    pub rejected: Option<String>,
+    /// The line under the row naming the maximum a confirmed number exceeded.
+    pub limit: Option<String>,
+    /// The unit picked while the row had no number to keep it in.
+    pub unit: Option<CapUnit>,
+}
+
+/// One cap row as the tab draws it: a number, a unit and the line under it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CapField {
+    /// The number shown; empty while the placeholder shows.
     pub text: String,
     /// Shown while `text` is empty.
     pub placeholder: &'static str,
-    /// The text does not parse as a cap.
+    pub unit: CapUnit,
+    /// The number does not make a cap.
     pub invalid: bool,
+    /// False when the row is unavailable: one disabled box.
     pub enabled: bool,
     /// How far the entry is scrolled inside the field, zero or negative.
     pub scroll_offset: f32,
+    /// The error line under the row; empty when there is none.
+    pub limit: String,
+    pub unit_open: bool,
 }
 
 /// Everything the Performance tab shows, as plain strings and flags.
@@ -206,11 +255,6 @@ pub struct PerformanceView {
     pub backend: String,
     pub host_cap: CapField,
     pub vram_cap: CapField,
-    pub host_budget: String,
-    pub vram_budget: String,
-    /// `vram_budget` is a figure rather than "not probed yet" or
-    /// "unavailable".
-    pub vram_budget_known: bool,
     /// The VRAM cap changed after this session's budget settled; empty
     /// otherwise.
     pub note: &'static str,
@@ -218,55 +262,64 @@ pub struct PerformanceView {
 
 /// The start of every `job::resolve_backend` line.
 const BACKEND_PREFIX: &str = "fusion backend: ";
-/// Shown while a cap field is empty.
-pub const NO_CAP: &str = "No cap";
-/// The device budget before any run has tried the GPU.
+/// Shown in the VRAM number before any run has tried the GPU.
 pub const NOT_PROBED: &str = "Not probed yet";
-/// The device budget and the VRAM cap field without an adapter.
+/// The VRAM row without an adapter.
 pub const UNAVAILABLE: &str = "Unavailable";
 /// Shown while an edited VRAM cap waits for the next launch.
 pub const VRAM_PENDING_NOTE: &str =
     "Caps only lower the probed budgets. Changes apply from the next start.";
 
-/// Builds the tab's view. `host_budget` is the derived host budget in bytes;
+/// Builds the tab's view. `host_budget` is the uncapped derived host budget in
+/// bytes, the default the host row shows and the most it takes;
 /// `backend_line` is the last run's `job::resolve_backend` line.
 pub fn view(
     settings: &PerformanceSettings,
-    rejected: &RejectedCaps,
+    host_notes: &CapNotes,
+    vram_notes: &CapNotes,
     host_budget: u64,
     device: DeviceState,
     backend_line: Option<&str>,
     vram_pending: bool,
 ) -> PerformanceView {
-    let field = |stored: &Option<Cap>, rejected: &Option<String>| CapField {
-        text: rejected
-            .clone()
-            .or_else(|| stored.as_ref().map(|cap| cap.text.clone()))
-            .unwrap_or_default(),
-        placeholder: NO_CAP,
-        invalid: rejected.is_some(),
-        enabled: true,
-        scroll_offset: 0.0,
+    let field = |stored: &Option<Cap>,
+                 notes: &CapNotes,
+                 default: Option<u64>,
+                 placeholder: &'static str| {
+        let (text, unit) = if let Some(rejected) = &notes.rejected {
+            split_labelled(rejected).unwrap_or_else(|| (rejected.clone(), CapUnit::Gib))
+        } else if let Some(cap) = stored {
+            split_cap(cap)
+        } else if let Some(bytes) = default {
+            let (number, unit) = floor_to_unit(bytes);
+            (number.to_string(), unit)
+        } else {
+            (String::new(), notes.unit.unwrap_or(CapUnit::Gib))
+        };
+        CapField {
+            text,
+            placeholder,
+            unit,
+            invalid: notes.rejected.is_some(),
+            enabled: true,
+            scroll_offset: 0.0,
+            limit: notes.limit.clone().unwrap_or_default(),
+            unit_open: false,
+        }
     };
-    let (vram_cap, vram_budget) = match device {
-        DeviceState::NotProbed => (
-            field(&settings.max_vram, &rejected.vram),
-            NOT_PROBED.to_string(),
-        ),
-        DeviceState::Ready(bytes) => (
-            field(&settings.max_vram, &rejected.vram),
-            format_bytes(bytes),
-        ),
-        DeviceState::NoAdapter => (
-            CapField {
-                text: String::new(),
-                placeholder: UNAVAILABLE,
-                invalid: false,
-                enabled: false,
-                scroll_offset: 0.0,
-            },
-            UNAVAILABLE.to_string(),
-        ),
+    let vram_cap = match device {
+        DeviceState::NoAdapter => CapField {
+            text: String::new(),
+            placeholder: UNAVAILABLE,
+            unit: CapUnit::Gib,
+            invalid: false,
+            enabled: false,
+            scroll_offset: 0.0,
+            limit: String::new(),
+            unit_open: false,
+        },
+        DeviceState::NotProbed => field(&settings.max_vram, vram_notes, None, NOT_PROBED),
+        DeviceState::Ready(bytes) => field(&settings.max_vram, vram_notes, Some(bytes), ""),
     };
     PerformanceView {
         gpu: settings.gpu,
@@ -275,13 +328,82 @@ pub fn view(
             .map(|line| line.strip_prefix(BACKEND_PREFIX).unwrap_or(line))
             .unwrap_or_default()
             .to_string(),
-        host_cap: field(&settings.max_host_memory, &rejected.host_memory),
+        host_cap: field(&settings.max_host_memory, host_notes, Some(host_budget), ""),
         vram_cap,
-        host_budget: format_bytes(host_budget),
-        vram_budget,
-        vram_budget_known: matches!(device, DeviceState::Ready(_)),
         note: if vram_pending { VRAM_PENDING_NOTE } else { "" },
     }
+}
+
+/// What a confirmed number and unit store, and the line to show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FittedCap {
+    /// `None`: no cap, the row returns to its default.
+    pub cap: Option<Cap>,
+    /// Names the maximum when the number was above it.
+    pub limit: Option<String>,
+}
+
+/// Turns a confirmed `number` in `unit` into the cap to store. An empty
+/// number, or a size at or above `max` (`None` when it is not known), is no
+/// cap; a size above `max` also yields the line naming it. A number that is
+/// zero or too large for a byte count is refused.
+pub fn fit_cap(number: &str, unit: CapUnit, max: Option<u64>) -> Result<FittedCap, String> {
+    let number = number.trim();
+    if number.is_empty() {
+        return Ok(FittedCap {
+            cap: None,
+            limit: None,
+        });
+    }
+    let cap = parse_cap(&format!("{number}{}", unit.label()))?
+        .expect("a non-empty size text parses to a cap");
+    match max {
+        Some(max) if cap.bytes.get() >= max => Ok(FittedCap {
+            cap: None,
+            limit: (cap.bytes.get() > max).then(|| format!("Max {} possible.", format_bytes(max))),
+        }),
+        _ => Ok(FittedCap {
+            cap: Some(cap),
+            limit: None,
+        }),
+    }
+}
+
+/// `text` as digits followed by a MiB or GiB suffix, in the number and unit a
+/// row shows.
+fn split_labelled(text: &str) -> Option<(String, CapUnit)> {
+    let lower = text.trim().to_ascii_lowercase();
+    [CapUnit::Mib, CapUnit::Gib].into_iter().find_map(|unit| {
+        let number = lower
+            .strip_suffix(&unit.label().to_ascii_lowercase())?
+            .trim_end();
+        let digits = !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit());
+        digits.then(|| (number.to_string(), unit))
+    })
+}
+
+/// A stored cap as a row's number and unit: its own MiB or GiB suffix, else
+/// GiB when it is a whole number of them, else MiB floored.
+fn split_cap(cap: &Cap) -> (String, CapUnit) {
+    split_labelled(&cap.text).unwrap_or_else(|| {
+        let bytes = cap.bytes.get();
+        let unit = if bytes.is_multiple_of(CapUnit::Gib.bytes()) {
+            CapUnit::Gib
+        } else {
+            CapUnit::Mib
+        };
+        ((bytes / unit.bytes()).to_string(), unit)
+    })
+}
+
+/// A budget as a whole number: GiB from a gibibyte up and MiB below, floored.
+fn floor_to_unit(bytes: u64) -> (u64, CapUnit) {
+    let unit = if bytes >= CapUnit::Gib.bytes() {
+        CapUnit::Gib
+    } else {
+        CapUnit::Mib
+    };
+    (bytes / unit.bytes(), unit)
 }
 
 /// One decimal, GiB from a gibibyte up and MiB below.
@@ -511,16 +633,201 @@ mod tests {
     }
 
     const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+
+    fn view_of(
+        settings: &PerformanceSettings,
+        notes: &CapNotes,
+        host_budget: u64,
+        device: DeviceState,
+    ) -> PerformanceView {
+        view(settings, notes, notes, host_budget, device, None, false)
+    }
 
     fn default_view(device: DeviceState) -> PerformanceView {
-        view(
+        view_of(
             &PerformanceSettings::default(),
-            &RejectedCaps::default(),
+            &CapNotes::default(),
             48 * GIB,
             device,
-            None,
-            false,
         )
+    }
+
+    /// The host row for a stored cap (or none) under a host budget.
+    fn host_row(stored: Option<&str>, host_budget: u64) -> CapField {
+        let settings = PerformanceSettings {
+            max_host_memory: stored.and_then(cap),
+            ..PerformanceSettings::default()
+        };
+        view_of(
+            &settings,
+            &CapNotes::default(),
+            host_budget,
+            DeviceState::NotProbed,
+        )
+        .host_cap
+    }
+
+    fn shown(field: &CapField) -> (&str, CapUnit) {
+        (field.text.as_str(), field.unit)
+    }
+
+    #[test]
+    fn cap_row_splits_stored_text_into_number_and_unit() {
+        use CapUnit::{Gib, Mib};
+        for (stored, expected) in [
+            ("8GiB", ("8", Gib)),
+            ("512MiB", ("512", Mib)),
+            ("1 GiB", ("1", Gib)),
+            ("512mib", ("512", Mib)),
+            // Another suffix: whole GiB show as GiB, anything else in MiB floored.
+            ("2TiB", ("2048", Gib)),
+            ("1073741824", ("1", Gib)),
+            ("1500MB", ("1430", Mib)),
+            ("1048576", ("1", Mib)),
+            ("1 MB", ("0", Mib)),
+            ("4096", ("0", Mib)),
+        ] {
+            let field = host_row(Some(stored), 48 * GIB);
+            assert_eq!(shown(&field), expected, "{stored:?}");
+            assert!(!field.invalid && field.limit.is_empty(), "{stored:?}");
+        }
+    }
+
+    #[test]
+    fn cap_row_keeps_a_stored_cap_above_the_current_budget() {
+        let field = host_row(Some("8GiB"), 4 * GIB);
+        assert_eq!(shown(&field), ("8", CapUnit::Gib));
+        assert!(field.limit.is_empty(), "the line follows a commit only");
+    }
+
+    #[test]
+    fn cap_row_shows_the_default_budget_without_a_cap() {
+        use CapUnit::{Gib, Mib};
+        for (budget, expected) in [
+            (48 * GIB + GIB * 2 / 5, ("48", Gib)),
+            (GIB, ("1", Gib)),
+            (GIB - 1, ("1023", Mib)),
+            (300 * MIB, ("300", Mib)),
+        ] {
+            let host = host_row(None, budget);
+            assert_eq!(shown(&host), expected, "host {budget}");
+            assert!(host.enabled && !host.invalid && host.limit.is_empty());
+            let vram = default_view(DeviceState::Ready(budget)).vram_cap;
+            assert_eq!(shown(&vram), expected, "vram {budget}");
+            assert!(vram.enabled && !vram.invalid && vram.limit.is_empty());
+        }
+    }
+
+    #[test]
+    fn cap_row_without_a_known_budget_shows_the_placeholder_and_the_picked_unit() {
+        let field = default_view(DeviceState::NotProbed).vram_cap;
+        assert_eq!(shown(&field), ("", CapUnit::Gib));
+        assert_eq!(field.placeholder, NOT_PROBED);
+        assert!(field.enabled);
+
+        let notes = CapNotes {
+            unit: Some(CapUnit::Mib),
+            ..CapNotes::default()
+        };
+        let picked = view_of(
+            &PerformanceSettings::default(),
+            &notes,
+            GIB,
+            DeviceState::NotProbed,
+        )
+        .vram_cap;
+        assert_eq!(shown(&picked), ("", CapUnit::Mib));
+    }
+
+    #[test]
+    fn cap_row_shows_refused_text_in_the_failure_tone_and_the_limit_line() {
+        let settings = PerformanceSettings {
+            max_host_memory: cap("2GiB"),
+            ..PerformanceSettings::default()
+        };
+        for (refused, expected) in [
+            ("0MiB", ("0", CapUnit::Mib)),
+            (
+                "99999999999999999999GiB",
+                ("99999999999999999999", CapUnit::Gib),
+            ),
+            ("8G", ("8G", CapUnit::Gib)),
+        ] {
+            let notes = CapNotes {
+                rejected: Some(refused.to_string()),
+                ..CapNotes::default()
+            };
+            let field = view_of(&settings, &notes, 48 * GIB, DeviceState::NotProbed).host_cap;
+            assert_eq!(shown(&field), expected, "{refused:?}");
+            assert!(field.invalid, "{refused:?}");
+        }
+
+        let notes = CapNotes {
+            limit: Some("Max 48.0 GiB possible.".to_string()),
+            ..CapNotes::default()
+        };
+        let field = view_of(&settings, &notes, 48 * GIB, DeviceState::NotProbed).host_cap;
+        assert_eq!(field.limit, "Max 48.0 GiB possible.");
+        assert!(!field.invalid);
+    }
+
+    #[test]
+    fn fit_cap_clamps_above_the_maximum_and_names_it() {
+        use CapUnit::{Gib, Mib};
+        let fit = |number, unit, max| fit_cap(number, unit, max).unwrap();
+        let stores = |text: &str| FittedCap {
+            cap: cap(text),
+            limit: None,
+        };
+        let no_cap_with = |line: &str| FittedCap {
+            cap: None,
+            limit: Some(line.to_string()),
+        };
+        let ten = Some(10 * GIB);
+
+        assert_eq!(fit("9", Gib, ten), stores("9GiB"));
+        assert_eq!(fit("10239", Mib, ten), stores("10239MiB"));
+        assert_eq!(fit("12", Gib, ten), no_cap_with("Max 10.0 GiB possible."));
+        assert_eq!(
+            fit("10241", Mib, ten),
+            no_cap_with("Max 10.0 GiB possible.")
+        );
+        assert_eq!(
+            fit("800", Mib, Some(700 * MIB)),
+            no_cap_with("Max 700.0 MiB possible.")
+        );
+        assert_eq!(
+            fit("10", Gib, ten),
+            FittedCap {
+                cap: None,
+                limit: None
+            },
+            "exactly the maximum is no cap and needs no line"
+        );
+        assert_eq!(fit("12", Gib, None), stores("12GiB"), "no maximum known");
+        assert_eq!(
+            fit("1000000", Gib, None),
+            stores("1000000GiB"),
+            "no maximum known"
+        );
+    }
+
+    #[test]
+    fn fit_cap_empty_number_is_no_cap_and_unusable_numbers_are_refused() {
+        for blank in ["", "  "] {
+            assert_eq!(
+                fit_cap(blank, CapUnit::Gib, Some(GIB)),
+                Ok(FittedCap {
+                    cap: None,
+                    limit: None
+                })
+            );
+        }
+        let zero = fit_cap("0", CapUnit::Mib, Some(GIB)).unwrap_err();
+        assert!(zero.contains("zero"), "{zero}");
+        let huge = fit_cap("18446744073709551615", CapUnit::Gib, None).unwrap_err();
+        assert!(huge.contains("overflow"), "{huge}");
     }
 
     #[test]
@@ -528,25 +835,14 @@ mod tests {
         let v = default_view(DeviceState::NotProbed);
         assert!(v.gpu && v.gpu_enabled);
         assert_eq!(v.backend, "");
-        assert_eq!(v.host_budget, "48.0 GiB");
-        assert_eq!(v.vram_budget, NOT_PROBED);
+        assert_eq!(shown(&v.host_cap), ("48", CapUnit::Gib));
+        assert_eq!(shown(&v.vram_cap), ("", CapUnit::Gib));
+        assert_eq!(v.vram_cap.placeholder, NOT_PROBED);
         for field in [&v.host_cap, &v.vram_cap] {
-            assert_eq!(field.text, "");
-            assert_eq!(field.placeholder, NO_CAP);
-            assert!(field.enabled && !field.invalid);
+            assert!(field.enabled && !field.invalid && !field.unit_open);
+            assert_eq!(field.limit, "");
         }
         assert_eq!(v.note, "");
-    }
-
-    #[test]
-    fn performance_settings_view_formats_the_probed_device_budget() {
-        let v = default_view(DeviceState::Ready(15 * GIB + GIB * 2 / 5));
-        assert_eq!(v.vram_budget, "15.4 GiB");
-        assert!(v.vram_cap.enabled);
-        assert_eq!(
-            default_view(DeviceState::Ready(256 << 20)).vram_budget,
-            "256.0 MiB"
-        );
     }
 
     #[test]
@@ -556,54 +852,46 @@ mod tests {
             max_vram: cap("2GiB"),
             ..PerformanceSettings::default()
         };
-        let v = view(
+        let v = view_of(
             &settings,
-            &RejectedCaps::default(),
+            &CapNotes::default(),
             48 * GIB,
             DeviceState::NoAdapter,
-            None,
-            false,
         );
         assert!(!v.gpu, "the switch keeps the stored value");
         assert!(!v.gpu_enabled);
-        assert_eq!(v.vram_budget, UNAVAILABLE);
         assert_eq!(
             v.vram_cap,
             CapField {
                 text: String::new(),
                 placeholder: UNAVAILABLE,
+                unit: CapUnit::Gib,
                 invalid: false,
                 enabled: false,
                 scroll_offset: 0.0,
-            }
+                limit: String::new(),
+                unit_open: false,
+            },
+            "one disabled box, the stored cap not shown"
         );
         assert!(v.host_cap.enabled, "the host cap row is unchanged");
     }
 
     #[test]
-    fn performance_settings_view_shows_stored_caps_and_rejected_text() {
+    fn performance_settings_view_shows_the_stored_caps() {
         let settings = PerformanceSettings {
             max_host_memory: cap("2GiB"),
-            max_vram: cap("1GiB"),
+            max_vram: cap("512MiB"),
             ..PerformanceSettings::default()
         };
-        let rejected = RejectedCaps {
-            host_memory: None,
-            vram: Some("8G".to_string()),
-        };
-        let v = view(
+        let v = view_of(
             &settings,
-            &rejected,
-            GIB,
-            DeviceState::NotProbed,
-            None,
-            false,
+            &CapNotes::default(),
+            48 * GIB,
+            DeviceState::Ready(8 * GIB),
         );
-        assert_eq!(
-            (v.host_cap.text.as_str(), v.host_cap.invalid),
-            ("2GiB", false)
-        );
-        assert_eq!((v.vram_cap.text.as_str(), v.vram_cap.invalid), ("8G", true));
+        assert_eq!(shown(&v.host_cap), ("2", CapUnit::Gib));
+        assert_eq!(shown(&v.vram_cap), ("512", CapUnit::Mib));
     }
 
     #[test]
@@ -612,7 +900,8 @@ mod tests {
         let show = |line| {
             view(
                 &PerformanceSettings::default(),
-                &RejectedCaps::default(),
+                &CapNotes::default(),
+                &CapNotes::default(),
                 GIB,
                 DeviceState::NotProbed,
                 line,
@@ -629,12 +918,20 @@ mod tests {
     fn performance_settings_view_notes_a_pending_vram_cap() {
         let v = view(
             &PerformanceSettings::default(),
-            &RejectedCaps::default(),
+            &CapNotes::default(),
+            &CapNotes::default(),
             GIB,
             DeviceState::Ready(GIB),
             None,
             true,
         );
         assert_eq!(v.note, VRAM_PENDING_NOTE);
+    }
+
+    #[test]
+    fn device_state_maximum_is_known_only_after_a_probe() {
+        assert_eq!(DeviceState::Ready(GIB).maximum(), Some(GIB));
+        assert_eq!(DeviceState::NotProbed.maximum(), None);
+        assert_eq!(DeviceState::NoAdapter.maximum(), None);
     }
 }

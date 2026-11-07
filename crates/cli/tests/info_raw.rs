@@ -123,7 +123,7 @@ fn unreadable_raw_is_reported_by_name() {
     assert!(String::from_utf8_lossy(&file.stderr).contains("broken.dng"));
 
     let listing = info(&["info", "--json", dir.to_str().unwrap()]);
-    assert!(listing.status.success());
+    assert_eq!(listing.status.code(), Some(5));
     let report: serde_json::Value = serde_json::from_slice(&listing.stdout).expect("listing JSON");
     assert_eq!(report["frame_count"], 1);
     assert_eq!(report["unreadable_count"], 1);
@@ -131,7 +131,7 @@ fn unreadable_raw_is_reported_by_name() {
     assert!(report["files"][0]["error"].as_str().is_some());
 
     let human = info(&["info", dir.to_str().unwrap()]);
-    assert!(human.status.success());
+    assert_eq!(human.status.code(), Some(5));
     assert!(String::from_utf8_lossy(&human.stdout).contains("1 frames (0 TIFF, 1 RAW)"));
 }
 

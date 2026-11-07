@@ -174,6 +174,31 @@ fn settings_section_argument_help_names_every_live_tab() {
 }
 
 #[test]
+fn config_dir_help_names_the_whole_settings_file() {
+    let output = common::gui_bin("diagnostics_config_dir_help")
+        .arg("--help")
+        .output()
+        .expect("failed to run focusforge-gui");
+    assert!(output.status.success(), "{output:?}");
+    let help = String::from_utf8_lossy(&output.stdout);
+    let section = help
+        .split("--config-dir <")
+        .nth(1)
+        .and_then(|rest| rest.split("--settings-section <").next())
+        .expect("--help describes --config-dir")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(section.contains("settings.toml"), "{section}");
+    for table in ["recent", "appearance", "input map", "export", "performance"] {
+        assert!(
+            section.contains(table),
+            "--config-dir help must name {table}: {section}"
+        );
+    }
+}
+
+#[test]
 fn fuse_tabs_help_names_the_decision_wait() {
     let output = common::gui_bin("diagnostics_fuse_tabs_help")
         .arg("--help")

@@ -38,9 +38,9 @@ fn single_report(dir: &Path) -> (PathBuf, serde_json::Value) {
     (reports[0].clone(), parsed)
 }
 
-/// A stdout whose reader is gone before the child starts, so its first write
-/// fails.
-fn closed_stdout() -> Stdio {
+/// A pipe whose reader is gone before the child starts, so its first write
+/// fails. Hand it to `stdout` or `stderr`.
+fn closed_pipe() -> Stdio {
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
     Stdio::from(writer)
@@ -73,7 +73,7 @@ fn closed_stdout_ends_quietly_without_a_report() {
         let mut cmd = common::cli_bin(name);
         let output = cmd
             .args(args)
-            .stdout(closed_stdout())
+            .stdout(closed_pipe())
             .output()
             .expect("failed to run the binary");
 
@@ -100,7 +100,7 @@ fn closed_stdout_keeps_the_commands_own_outcome() {
     let mut cmd = common::cli_bin("crash_cli_closed_stdout_bundle");
     let output = cmd
         .args(["diagnostics", "-o", bundle.to_str().unwrap()])
-        .stdout(closed_stdout())
+        .stdout(closed_pipe())
         .output()
         .expect("failed to run the binary");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -113,7 +113,7 @@ fn closed_stdout_keeps_the_commands_own_outcome() {
     let mut cmd = common::cli_bin("crash_cli_closed_stdout_refusal");
     let output = cmd
         .args(["diagnostics", "-o", bundle.to_str().unwrap()])
-        .stdout(closed_stdout())
+        .stdout(closed_pipe())
         .output()
         .expect("failed to run the binary");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -121,6 +121,108 @@ fn closed_stdout_keeps_the_commands_own_outcome() {
     assert!(stderr.contains("pass --force"), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
     assert_no_report(&crashes_dir(&cmd));
+}
+
+/// A dry run over a synthetic folder, grouping proposal on stderr.
+fn dry_run_args(frames: &Path, out: &Path) -> Vec<String> {
+    [
+        "stack",
+        frames.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--algorithm",
+        "dummy-stack",
+        "--no-align",
+        "--no-crop",
+        "--dry-run",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// A closed stderr drops what the command writes there: it runs on to its own
+/// exit code and records no crash.
+#[test]
+fn closed_stderr_keeps_the_commands_own_code() {
+    let frames = common::synthetic_frames("crash_cli_closed_stderr_frames");
+    let out = common::tmp_dir("crash_cli_closed_stderr_out");
+    let missing = out.join("absent.tif");
+    let not_a_directory = out.join("data-is-a-file");
+    std::fs::write(&not_a_directory, b"").unwrap();
+
+    // The refusal's own code, with stderr open.
+    let control = common::cli_bin("crash_cli_closed_stderr_control")
+        .args(["info", missing.to_str().unwrap()])
+        .output()
+        .expect("failed to run the binary");
+    let refusal = control.status.code();
+    assert!(
+        refusal.is_some_and(|code| code != 0 && code != 101),
+        "the control run is a plain refusal: {refusal:?}"
+    );
+
+    let dry_run = dry_run_args(&frames, &out);
+    let cases: [(&str, Vec<&str>, bool, Option<i32>); 3] = [
+        (
+            "dry_run",
+            dry_run.iter().map(String::as_str).collect(),
+            false,
+            Some(0),
+        ),
+        (
+            "refusal",
+            vec!["info", missing.to_str().unwrap()],
+            false,
+            refusal,
+        ),
+        // The log file cannot open, so the command notes it on stderr.
+        ("unopenable_log", vec!["algorithms"], true, Some(0)),
+    ];
+    for (name, args, data_dir_is_a_file, expected) in cases {
+        let mut cmd = common::cli_bin(&format!("crash_cli_closed_stderr_{name}"));
+        if data_dir_is_a_file {
+            cmd.env("FOCUSFORGE_DATA_DIR", &not_a_directory);
+        }
+        let output = cmd
+            .args(&args)
+            .stderr(closed_pipe())
+            .output()
+            .expect("failed to run the binary");
+        assert_eq!(output.status.code(), expected, "{name}");
+        assert_no_report(&crashes_dir(&cmd));
+    }
+}
+
+/// The `2>&1 | head` shape: one closed pipe takes both streams.
+#[test]
+fn closed_stdout_and_stderr_end_without_a_report() {
+    let frames = common::synthetic_frames("crash_cli_closed_both_frames");
+    let out = common::tmp_dir("crash_cli_closed_both_out");
+    let frame = common::fixtures_dir().join("mantis-64/frames/00.tif");
+    let dry_run = dry_run_args(&frames, &out);
+    let info = ["info", frame.to_str().unwrap(), "--json"].map(String::from);
+
+    for (name, args) in [("dry_run", &dry_run[..]), ("info", &info[..])] {
+        let mut cmd = common::cli_bin(&format!("crash_cli_closed_both_{name}"));
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let output = cmd
+            .args(args)
+            .stdout(Stdio::from(writer.try_clone().unwrap()))
+            .stderr(Stdio::from(writer))
+            .output()
+            .expect("failed to run the binary");
+        assert_eq!(output.status.code(), Some(0), "{name}");
+        assert_no_report(&crashes_dir(&cmd));
+
+        let next = Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+            .env("FOCUSFORGE_DATA_DIR", common::data_dir_of(&cmd))
+            .arg("algorithms")
+            .output()
+            .expect("failed to run the binary");
+        let stderr = String::from_utf8_lossy(&next.stderr);
+        assert!(!stderr.contains("crashed"), "{name}: {stderr}");
+    }
 }
 
 #[test]

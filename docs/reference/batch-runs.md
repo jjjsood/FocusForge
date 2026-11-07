@@ -74,10 +74,8 @@ Every frame under the directory must appear in exactly one group; a listed
 frame the walk didn't find, a frame in two groups, or a frame no group lists
 is refused by name before anything is read.
 
-> **Note:** `--dry-run` computes nothing and writes no project, but it still
-> writes the run's manifest (see [Reviewing the results](#reviewing-the-results)).
-> Without `-o`, that is a file named `<folder>-run.json` inside the folder you
-> pointed the run at.
+> **Note:** `--dry-run` computes nothing and writes no project and no
+> manifest.
 
 ## Status records and resource limits
 
@@ -180,7 +178,7 @@ entirely for one run, reading nothing from it and leaving nothing behind;
 focusforge-cli review projects/
 ```
 
-Every `stack` run writes a manifest: `manifest.json` in the `-o` directory,
+Every `stack` run except a `--dry-run` writes a manifest: `manifest.json` in the `-o` directory,
 or, without `-o`, `<folder>-run.json` in the folder the run was pointed at.
 `review` reads a run's manifest (or, given a plain directory of projects, no
 manifest, the `.ffp` files it finds) and reports one record per stack:

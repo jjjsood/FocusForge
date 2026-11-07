@@ -27,6 +27,9 @@ export component FFMenu inherits Rectangle {
     // draws the list itself, over everything, and sets this so this
     // instance draws none of its own.
     in property <bool> external-list: false;
+    // The chevron's distance from the right edge; a narrow menu draws it
+    // closer so the label keeps its room.
+    in property <length> chevron-inset: Theme.space-4;
     callback toggled();
     callback option-selected(string);
     callback previous-requested();
@@ -56,7 +59,7 @@ export component FFMenu inherits Rectangle {
     }
 
     chevron := Text {
-        x: parent.width - Theme.space-4 - self.width;
+        x: parent.width - root.chevron-inset - self.width;
         y: (ShellGeometry.field-height - self.height) / 2;
         text: "\u{2304}";
         color: Theme.text-secondary;

@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 // fields and `resolve_in`/`registry`/`Family` stay private to this module,
 // the only place that resolves a schema.
 use focusforge_core::equalize::EqualizeSettings;
-use focusforge_core::params::{ParamDesc, ParamKind, ResolvedParams, resolve_in};
+use focusforge_core::params::{ParamDesc, ParamKind, ResolvedParams, check_for, resolve_in};
 pub(crate) use focusforge_core::params::{
     ParamValue, ParamValues, ParamViolation, StackContext, validate,
 };
@@ -490,17 +490,23 @@ fn snap_to_step(value: f64, min: f64, max: f64, step: f64) -> f64 {
     ((on_grid * scale).round() / scale).clamp(min, max) + 0.0
 }
 
-/// A linear `Float` slider's readout. A range that dips below zero reads
-/// signed: step decimals, an explicit `+`, U+2212 for negatives, `0.0` at
-/// zero. Every other range keeps the plain number.
+/// A linear `Float` slider's readout, always at the step's decimals. A range
+/// that dips below zero reads signed: an explicit `+`, U+2212 for negatives,
+/// `0.0` at zero. Every other range reads the plain number.
 fn float_text(value: f64, kind: &ParamKind) -> String {
-    let &ParamKind::Float { min, step, .. } = kind else {
+    let &ParamKind::Float {
+        min,
+        step,
+        logarithmic: false,
+        ..
+    } = kind
+    else {
         return format!("{value}");
     };
-    if min >= 0.0 {
-        return format!("{value}");
-    }
     let decimals = step_decimals(step);
+    if min >= 0.0 {
+        return format!("{value:.decimals$}");
+    }
     let text = format!("{:.decimals$}", value.abs());
     if text.chars().all(|c| matches!(c, '0' | '.')) {
         text
@@ -766,9 +772,11 @@ fn section_rows(
     } = *section_ctx;
 
     let has_more = schema.iter().any(|desc| desc.advanced);
-    let hidden_violation = schema
-        .iter()
-        .any(|desc| desc.advanced && errors.contains_key(&menu_key(section, &desc.id)));
+    let hidden_violation = schema.iter().any(|desc| {
+        desc.advanced
+            && (errors.contains_key(&menu_key(section, &desc.id))
+                || stored_violation(desc, values, ctx).is_some())
+    });
     let open = expanded.contains(section) || hidden_violation;
 
     // A map can be shared by several sections, so only keys this schema
@@ -812,15 +820,24 @@ fn section_rows(
             .get(&desc.id)
             .map(|r| r.value.clone())
             .unwrap_or_else(|| desc.default.clone());
-        let mut rows = vec![field_row(
+        let mut rows = vec![field_row_for(
             section,
             desc,
             &value,
             menu_open == Some(key.as_str()),
+            ctx,
         )];
-        if let Some(violation) = errors.get(&key) {
+        let message = errors.get(&key).map(violation_text).or_else(|| {
+            stored_violation(desc, values, ctx).map(|violation| match violation {
+                ParamViolation::OutOfRange { min, max, .. } => {
+                    format!("Allowed range {min} to {max}")
+                }
+                other => violation_text(&other),
+            })
+        });
+        if let Some(value_text) = message {
             rows.push(SettingsRow {
-                value_text: violation_text(violation),
+                value_text,
                 ..SettingsRow::new(RowKind::Error, section, &desc.id)
             });
         }
@@ -853,15 +870,56 @@ fn section_rows(
     rows
 }
 
-/// One parameter's own row, its shape ([`control_kind`]) driving which of
-/// `value_text`/`fraction`/`choices`/`selected` carries the value.
+/// The violation of `desc`'s explicitly stored value in `values` against the
+/// range `ctx`'s stack allows, `None` when nothing is stored or it fits.
+fn stored_violation(
+    desc: &ParamDesc,
+    values: &ParamValues,
+    ctx: Option<&StackContext>,
+) -> Option<ParamViolation> {
+    check_for(desc, values.get(&desc.id)?, ctx).err()
+}
+
+/// Whether the Fuse or Align selection holds an explicit value outside the
+/// range `ctx`'s stack allows.
+pub(crate) fn has_stored_violation(
+    fuse_id: &str,
+    fuse_values: &ParamValues,
+    align_id: &str,
+    align_values: &ParamValues,
+    ctx: Option<&StackContext>,
+) -> bool {
+    let out_of_reach = |params: &[ParamDesc], values: &ParamValues| {
+        params
+            .iter()
+            .any(|desc| stored_violation(desc, values, ctx).is_some())
+    };
+    registry::find_stack(fuse_id).is_ok_and(|a| out_of_reach(a.params(), fuse_values))
+        || registry::find_align(align_id).is_ok_and(|a| out_of_reach(a.params(), align_values))
+}
+
+/// [`field_row_for`] without a stack, for fields no stack bounds.
 pub(crate) fn field_row(
     section: &str,
     desc: &ParamDesc,
     value: &ParamValue,
     menu_open: bool,
 ) -> SettingsRow {
+    field_row_for(section, desc, value, menu_open, None)
+}
+
+/// One parameter's own row, its shape ([`control_kind`]) driving which of
+/// `value_text`/`fraction`/`choices`/`selected` carries the value. A slider's
+/// thumb is placed on the range `ctx`'s stack allows.
+pub(crate) fn field_row_for(
+    section: &str,
+    desc: &ParamDesc,
+    value: &ParamValue,
+    menu_open: bool,
+    ctx: Option<&StackContext>,
+) -> SettingsRow {
     let kind = control_kind(&desc.kind);
+    let reach = desc.kind_for(ctx);
     let mut row = SettingsRow {
         label: desc.label.clone(),
         ..SettingsRow::new(kind, section, &desc.id)
@@ -870,12 +928,12 @@ pub(crate) fn field_row(
         RowKind::LinearFloat | RowKind::LogFloat => {
             let v = value.as_f64().unwrap_or_default();
             row.value_text = float_text(v, &desc.kind);
-            row.fraction = slider_fraction(v, &desc.kind);
+            row.fraction = slider_fraction(v, &reach);
         }
         RowKind::Int => {
             let v = value.as_i64().unwrap_or_default();
             row.value_text = v.to_string();
-            row.fraction = slider_fraction(v as f64, &desc.kind);
+            row.fraction = slider_fraction(v as f64, &reach);
         }
         RowKind::Bool => {
             let v = value.as_bool().unwrap_or_default();
@@ -1073,6 +1131,40 @@ mod tests {
         // rather than dividing by an infinite log.
         let non_positive_min = float_desc(0.0, 10.0, true);
         assert_eq!(slider_fraction(5.0, &non_positive_min), 0.5);
+    }
+
+    /// The declared kind of a project or fusion parameter.
+    fn declared_kind(id: &str) -> ParamKind {
+        let fusion = registry::find_stack("weighted-average").expect("a registered fusion method");
+        focusforge_core::project::PROJECT_PARAMS
+            .iter()
+            .chain(fusion.params())
+            .find(|d| d.id == id)
+            .unwrap_or_else(|| panic!("no parameter {id}"))
+            .kind
+            .clone()
+    }
+
+    #[test]
+    fn linear_float_readout_shows_step_decimals() {
+        let exponent = declared_kind("weight-exponent");
+        for (value, shown) in [(1.0, "1.0"), (4.0, "4.0"), (4.5, "4.5"), (8.0, "8.0")] {
+            assert_eq!(float_text(value, &exponent), shown, "weight-exponent");
+        }
+        let gain = declared_kind("equalize-max-gain");
+        for (value, shown) in [(1.01, "1.01"), (1.2, "1.20"), (1.25, "1.25"), (2.0, "2.00")] {
+            assert_eq!(float_text(value, &gain), shown, "equalize-max-gain");
+        }
+        let target = declared_kind("equalize-target");
+        for (value, shown) in [(-0.5, "\u{2212}0.5"), (0.0, "0.0"), (0.5, "+0.5")] {
+            assert_eq!(float_text(value, &target), shown, "equalize-target");
+        }
+    }
+
+    #[test]
+    fn logarithmic_float_readout_stays_the_plain_number() {
+        let kind = float_desc(1e-9, 1.0, true);
+        assert_eq!(float_text(1e-4, &kind), "0.0001");
     }
 
     #[test]

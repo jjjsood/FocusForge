@@ -266,7 +266,7 @@ fn notice_link_opens_download_page() {
     .unwrap();
 
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(Some(data), None);
+    controller.set_diagnostics_dirs(Some(data));
     let opened: Arc<Mutex<Vec<String>>> = Arc::default();
     let recorder = opened.clone();
     controller.set_url_opener(Arc::new(move |url| {

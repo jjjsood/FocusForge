@@ -203,6 +203,11 @@ impl Calculator {
             .unwrap_or_default();
 
         let row = |id: &str| field_row("calculator", desc(id), &self.values[id], false);
+        // Floats read as the plain number, not at the slider's step decimals.
+        let plain = |id: &str| match &self.values[id] {
+            ParamValue::Float(f) => f.to_string(),
+            _ => row(id).value_text.to_string(),
+        };
         let caption = |label: &str| {
             label
                 .split_once(" (")
@@ -215,11 +220,7 @@ impl Calculator {
             .map(|slot| {
                 slot.map(|id| FieldView {
                     label: desc(id).label.clone(),
-                    text: self
-                        .typed
-                        .get(id)
-                        .cloned()
-                        .unwrap_or_else(|| row(id).value_text.to_string()),
+                    text: self.typed.get(id).cloned().unwrap_or_else(|| plain(id)),
                     error: self.errors.get(id).map(violation_text).unwrap_or_default(),
                 })
             })
@@ -237,7 +238,7 @@ impl Calculator {
         ];
         for id in order {
             if self.slots().contains(&Some(id)) {
-                let value = format!("{}{}", row(id).value_text, unit(id));
+                let value = format!("{}{}", plain(id), unit(id));
                 entered.push((caption(&desc(id).label), value));
             }
         }

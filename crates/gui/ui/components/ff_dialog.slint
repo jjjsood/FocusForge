@@ -23,12 +23,14 @@ export component FFDialog inherits FFModalPanel {
     in property <bool> divider: true;
     in property <string> cancel-label: "Cancel";
     in property <string> secondary-label: "";
+    in property <string> tertiary-label: "";
     in property <string> confirm-label: "Confirm";
     in property <string> confirm-kind: "primary";
     // False leaves the top-right close control out.
     in property <bool> closable: true;
     callback cancelled();
     callback secondary-pressed();
+    callback tertiary-pressed();
     callback confirmed();
 
     modal-open: root.open;
@@ -124,10 +126,12 @@ export component FFDialog inherits FFModalPanel {
         FFDialogFooter {
             cancel-label: root.cancel-label;
             secondary-label: root.secondary-label;
+            tertiary-label: root.tertiary-label;
             confirm-label: root.confirm-label;
             confirm-kind: root.confirm-kind;
             cancelled => { root.cancelled(); }
             secondary-pressed => { root.secondary-pressed(); }
+            tertiary-pressed => { root.tertiary-pressed(); }
             confirmed => { root.confirmed(); }
         }
     }
