@@ -157,15 +157,13 @@ A frame that would need a larger gain than **Max brightness gain** allows is
 brightened or darkened only up to the limit. After the run, FocusForge reports
 it in a notification titled "Brightness not fully matched", naming the frame
 in the sentence "`<file>` could not be brought to the same brightness as the
-other frames." Similar notices report a completely
-black frame (it keeps its brightness, because a gain cannot brighten black)
-and a frame whose gain pushes highlights to pure white. See
+other frames." The notice names the frame only. See
 [Projects, notifications and quitting](batch-runs.md) for where notifications
 appear.
 
 The result is still usable: only that frame stays a little brighter or darker
-than the rest. If you see blotches where it contributed, raise the limit to
-the value the notice suggests and fuse again, or exclude the frame.
+than the rest. If you see blotches where it contributed, raise **Max
+brightness gain** and fuse again, or exclude the frame.
 
 ## FUSE: choose how the frames are combined
 

@@ -30,7 +30,7 @@ The same dialog title appears with other messages:
 | Message | Cause and fix |
 |---|---|
 | "`<path>`: not a folder of frames or a FocusForge project" | You opened a single file that is neither a frame nor a project file. Open the folder of frames or the `.ffp` file instead. |
-| "`<name>` is a BigTIFF file, which FocusForge cannot read. Save the frames as standard TIFF and open them again." (titled "These frames cannot be read") | A frame is BigTIFF, or uses a TIFF layout other than standard 8- or 16-bit TIFF ("`<name>` uses a TIFF layout FocusForge cannot read. Save the frames as standard 8- or 16-bit TIFF and open them again."). Re-export the frames as standard TIFF. |
+| "`<name>` is a BigTIFF file, which FocusForge cannot read. Save the frames as standard TIFF and open them again." (titled "These frames cannot be read") | A frame is BigTIFF, or uses a TIFF layout other than standard 8- or 16-bit TIFF ("`<name>` uses a TIFF layout FocusForge cannot read. Save the frames as standard 8- or 16-bit TIFF and open them again."). Re-export the frames as standard TIFF. The same title also carries "`<name>` is not a TIFF file, though its name says so." (the file is not a TIFF despite its .tif or .tiff name: restore or re-export it), "`<name>` is damaged: its TIFF header does not read." (the start of the file is damaged: restore or re-export it) and "`<name>` could not be read: …" (the operating system's reason follows: check that the file is there and readable). |
 | "`<path>` is no longer on disk. This project cannot be fused again until it is back." (titled "A frame is no longer there") | You pressed **Fuse stack** on a project whose frames were moved or deleted. On a saved project, **Locate frames…** chooses the folder that holds them now; an unsaved one offers **Close**. See [The frames are no longer there](#the-frames-are-no-longer-there). |
 
 See: ["No frames here"](guide/first-stack.md#no-frames-here) in *Your first stack*.
@@ -156,12 +156,13 @@ its own. See
 In the **Images** list a row reads "Preview unavailable", and the **Frame**
 pane reads "Cannot show this frame:" with the file name.
 
-**Cause:** FocusForge cannot decode that file: it is damaged or cut short, or
-it is a TIFF layout FocusForge does not read (JPEG-compressed, 32-bit
-floating point, BigTIFF). A fuse of the stack will fail; see the next section.
+**Cause:** FocusForge cannot decode that file: it is damaged or cut short. A
+fuse of the stack will fail; see the next section. (A TIFF layout FocusForge
+does not read is refused when the folder is opened instead; see
+"These frames cannot be read", under ["No frames here"](#no-frames-here).)
 
-**Fix:** exclude or remove the frame in the **Images** panel, or re-export it
-as an uncompressed or LZW-compressed TIFF. See [Which files can FocusForge read?](#which-files-can-focusforge-read)
+**Fix:** exclude or remove the frame in the **Images** panel, or restore or
+re-export it. See [Which files can FocusForge read?](#which-files-can-focusforge-read)
 and [The Images panel](guide/images-panel.md#leave-a-frame-out-of-the-next-fuse).
 
 ## Fusing
@@ -183,13 +184,12 @@ the folder was opened.", and the line below gives the reason, for example:
 | Full message | Cause |
 |---|---|
 | "`<path>`: IFD value for tag 273 runs past end of file" | The frame's file is cut short, for example by an interrupted copy. |
-| "`<path>`: BigTIFF (magic 43) is not supported, only classic TIFF (magic 42)" | The frame is a BigTIFF file. |
-| "`<path>`: Compression=7 is not supported by the decoded TIFF reader" | The frame is a TIFF compressed with JPEG (a 32-bit floating-point TIFF reads `BitsPerSample=[32, 32, 32]` instead). |
 
 **Fix:** **Retry** runs the same fuse again, which only helps when the cause
-was passing (a network drive that was briefly away). For a damaged or
-unsupported frame, exclude or remove it, or replace it with an uncompressed
-or LZW-compressed TIFF export, and fuse again.
+was passing (a network drive that was briefly away). For a damaged
+frame, exclude or remove it, or replace it with an intact copy of the file,
+and fuse again. A TIFF layout FocusForge cannot read is refused when the
+folder is opened, see ["These frames cannot be read"](guide/first-stack.md#these-frames-cannot-be-read).
 
 See: [When a fuse fails](guide/first-stack.md#when-a-fuse-fails) and
 [Cards that need attention](guide/batch-runs.md#cards-that-need-attention).
@@ -246,8 +246,7 @@ allows, so the frame stays a little brighter or darker than the rest. A
 notice per frame at the default limit.
 
 **Fix:** if you see blotches where that frame contributed, raise **Max
-brightness gain** to the value the notice suggests and fuse again, or exclude
-the frame.
+brightness gain** and fuse again, or exclude the frame.
 
 See: [When a frame needs more than the limit](guide/stacking.md#when-a-frame-needs-more-than-the-limit).
 

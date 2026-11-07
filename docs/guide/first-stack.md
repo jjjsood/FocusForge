@@ -219,6 +219,9 @@ the folder:
 |---|---|
 | "`<name>` is a BigTIFF file, which FocusForge cannot read. Save the frames as standard TIFF and open them again." | The frame is a BigTIFF file (the 64-bit variant of TIFF). |
 | "`<name>` uses a TIFF layout FocusForge cannot read. Save the frames as standard 8- or 16-bit TIFF and open them again." | The frame is stored in a layout other than standard 8- or 16-bit grey or colour TIFF. |
+| "`<name>` is not a TIFF file, though its name says so." | The file ends in .tif or .tiff but does not start like a TIFF file. |
+| "`<name>` is damaged: its TIFF header does not read." | The start of the file is unreadable. |
+| "`<name>` could not be read: …" | The file could not be opened or read; the operating system's reason follows. |
 
 The projects overview lists the folder as a "Not a project" card. Re-export
 the frames from your raw converter or photo editor as standard TIFF, then
@@ -466,7 +469,7 @@ stops and says so:
   with a sentence naming the unreadable file, for example "02.tif could not
   be read. It may be damaged, or it changed after the folder was opened.",
   followed by the reason on the next line. The project's card reads, for
-  example, "FAILED WHILE SETTING UP". It
+  example, "FAILED WHILE PREPARING". The notification
   shows as a short pop-up message while the window is in front, and stays in
   the notification center behind the bell, where its full message names the
   file and the reason.

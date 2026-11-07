@@ -161,8 +161,11 @@ pad   = 8
 [[shot]]
 name  = "settings-about-newer"
 args  = ["--open", "fixtures/mantis-512/frames", "--settings-section", "about", "--update-notice-preview", "0.2.0"]
+config = "seeds/updates/check-on.toml"
 steps = [
   ["wait-id", "AppWindow::settings-modal"],
+  ["wait-id", "AppWindow::toast"],
+  ["wait-gone", "AppWindow::toast", "30"],
   ["click-label", "Check now"],
   ["wait-text", "is available."],
   ["pause", "800"],
