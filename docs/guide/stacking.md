@@ -63,8 +63,9 @@ three brightness settings live there.
 ### Sliders, switches and menus
 
 - **Sliders.** Click anywhere on the track to jump there, or drag the round
-  handle. The box at the right shows the value; it is a readout, not a field
-  you can type into. After clicking a slider, the **Left** and **Right** arrow
+  handle. The value at the right is plain text, not a field you
+  can type into; it always shows the step's decimals (**Max brightness gain**
+  reads `1.20`, **Sharp-source preference** `4.0`). After clicking a slider, the **Left** and **Right** arrow
   keys move it one step at a time (whole numbers step by one, the brightness
   sliders by their own step). The **Epsilon (px)** slider in **ALIGN** spans
   several powers of ten and has no keyboard steps.
@@ -154,9 +155,9 @@ adjust the exported image in your photo editor.
 
 A frame that would need a larger gain than **Max brightness gain** allows is
 brightened or darkened only up to the limit. After the run, FocusForge reports
-it in a notification titled "Brightness target limited", naming the frame,
-the gain it needed, the gain it got, the smallest limit that would have
-covered it and the brightness it reached. Similar notices report a completely
+it in a notification titled "Brightness not fully matched", naming the frame
+in the sentence "`<file>` could not be brought to the same brightness as the
+other frames." Similar notices report a completely
 black frame (it keeps its brightness, because a gain cannot brighten black)
 and a frame whose gain pushes highlights to pure white. See
 [Projects, notifications and quitting](batch-runs.md) for where notifications
@@ -187,12 +188,15 @@ contribution in every layer separately and puts the layers back together.
 
 | Setting | Range | Default | What it does |
 |---|---|---|---|
-| **Levels** (under **More...**) | 1 to 16 | worked out from the image size | How many layers of detail are compared and blended. |
+| **Levels** (under **More...**) | 1 to the deepest level the frames support (7 for 512-pixel frames, 4 for 64-pixel frames) | worked out from the image size | How many layers of detail are compared and blended. |
 
 The default of **Levels** is not a fixed number: FocusForge works it out from
 the frame size each time (it reads 5 for 512-pixel frames). Leave it there.
-More layers make every piece of work far larger and slower, and a value much
-higher than the automatic one can stop the run with an error.
+More layers make every piece of work far larger and slower. The slider ends
+at the deepest level your frames support, so a run cannot be started with a
+value that is too deep. A saved project can still hold a deeper value: the
+slider then shows "Allowed range 1 to N" and **Fuse stack** waits until you
+move it back.
 
 ![The FUSE section with Details chosen and More... open, showing the Levels slider at 5.](../assets/manual/stacking/stacking-details-levels.png)
 

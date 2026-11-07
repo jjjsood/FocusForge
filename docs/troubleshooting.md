@@ -12,7 +12,7 @@ file or a number, this page writes it as `<path>`, `N` or "…".
 
 ### "No frames here"
 
-![The dialog "No frames here" with the text "FocusForge reads TIFF (.tif, .tiff), JPEG (.jpg, .jpeg) and camera RAW files. This folder holds none." and the button Pick another folder….](assets/manual/first-stack/refusal-no-frames.png)
+![The dialog "No frames here" with the text "FocusForge reads TIFF (.tif, .tiff), JPEG (.jpg, .jpeg) and camera RAW files. This folder holds none." and the buttons Cancel and Pick another folder….](assets/manual/first-stack/refusal-no-frames.png)
 
 *The refusal for a folder that holds nothing FocusForge can stack.*
 
@@ -22,7 +22,7 @@ file or a number, this page writes it as `<path>`, `N` or "…".
 files are not stacked; neither are documents or sidecar files.
 
 **Fix:** click **Pick another folder…** and choose the folder that holds the
-frames, or press `Escape`. If your frames are PNG files, export TIFFs or JPEGs
+frames, or click **Cancel** or press `Escape`. If your frames are PNG files, export TIFFs or JPEGs
 from your raw converter instead, or open the [camera RAW](glossary.md#camera-raw) files directly.
 
 The same dialog title appears with other messages:
@@ -30,7 +30,8 @@ The same dialog title appears with other messages:
 | Message | Cause and fix |
 |---|---|
 | "`<path>`: not a folder of frames or a FocusForge project" | You opened a single file that is neither a frame nor a project file. Open the folder of frames or the `.ffp` file instead. |
-| "`<path>` is no longer on disk. This project cannot be fused again until it is back." | You pressed **Fuse stack** on a project whose frames were moved or deleted. See [The frames are no longer there](#the-frames-are-no-longer-there). |
+| "`<name>` is a BigTIFF file, which FocusForge cannot read. Save the frames as standard TIFF and open them again." (titled "These frames cannot be read") | A frame is BigTIFF, or uses a TIFF layout other than standard 8- or 16-bit TIFF ("`<name>` uses a TIFF layout FocusForge cannot read. Save the frames as standard 8- or 16-bit TIFF and open them again."). Re-export the frames as standard TIFF. |
+| "`<path>` is no longer on disk. This project cannot be fused again until it is back." (titled "A frame is no longer there") | You pressed **Fuse stack** on a project whose frames were moved or deleted. On a saved project, **Locate frames…** chooses the folder that holds them now; an unsaved one offers **Close**. See [The frames are no longer there](#the-frames-are-no-longer-there). |
 
 See: ["No frames here"](guide/first-stack.md#no-frames-here) in *Your first stack*.
 
@@ -127,10 +128,11 @@ of the files match, so renaming other frames does not help.
 
 See: [Locate frames…](guide/first-stack.md#locate-frames).
 
-### "This folder reads as N stacks of M frames."
+### "This folder holds N stacks of M frames each."
 
-This is a question, not an error. The folder holds frames from several
-sessions, in subfolders or shot more than a minute apart.
+This is a question, not an error ("This folder holds 2 stacks (3 and 4
+frames)." when the stacks differ in size). The folder holds frames from
+several sessions, in subfolders or shot more than a minute apart.
 
 **Fix:** choose **Open as N projects** to get one project per stack, or
 **Open as one project** if it really is one stack (for example, you paused
@@ -164,7 +166,7 @@ and [The Images panel](guide/images-panel.md#leave-a-frame-out-of-the-next-fuse)
 
 ## Fusing
 
-### "Failed": "Setup failed", "Alignment failed" or "Fusion failed"
+### "Failed": "Setup failed", "Alignment failed", "Preparing failed" or "Fusing failed"
 
 ![The window after a failed fuse: the toolbar shows Retry, the bottom bar reads Failed in red with "ETA —", the bell in the left bar shows the number 1, and the frame 02.tif in the Images list reads "Preview unavailable".](assets/manual/first-stack/fuse-failed.png)
 
@@ -173,8 +175,10 @@ and [The Images panel](guide/images-panel.md#leave-a-frame-out-of-the-next-fuse)
 The bottom bar reads "Failed" in red, **Retry** replaces **Fuse stack**, the
 bell shows a new notification, and the project's card in the projects
 overview reads "Did not stack". The notification's title names the step that
-failed; its full message (click the bell, then the row) names the file and the
-reason, for example:
+failed ("Writing failed" and "Developing failed" are the other two); its full
+message (click the bell, then the row) opens with a sentence naming the file,
+for example "02.tif could not be read. It may be damaged, or it changed after
+the folder was opened.", and the line below gives the reason, for example:
 
 | Full message | Cause |
 |---|---|
@@ -231,7 +235,9 @@ A record, not an error: you kept a result with frames that could not be
 aligned. Nothing to do. See
 [Keep or discard the result](guide/first-stack.md#keep-or-discard-the-result).
 
-### "Brightness target limited"
+### "Brightness not fully matched"
+
+> `<file>` could not be brought to the same brightness as the other frames.
 
 **Cause:** [brightness equalization](glossary.md#brightness-equalization)
 needed a larger change for the named frame than **Max brightness gain**
@@ -256,14 +262,15 @@ of these frames aligns them afresh. The result is the same; only the time it
 took changes. If such notices keep coming, see
 [The Backend line reads "cpu — …"](#the-backend-line-reads-cpu--) below.
 
-### The fuse fails after raising Levels
+### **Fuse stack** waits and **Levels** reads "Allowed range 1 to N"
 
-A **Levels** value far above the automatic one makes the run stop with a
-message such as "tile_size 1182 leaves no interior at margin 327680 for
-levels=16; use tile_size >= 1048640, or request fewer levels".
+A saved project can hold a **Levels** value deeper than its frames support.
+The slider then keeps the stored number, the line "Allowed range 1 to N"
+appears under it, and **Fuse stack** does nothing until the value is back
+in range.
 
-**Fix:** set **Levels** back to its default (the **DEFAULT** badge, or
-**Reset All to Default**) and fuse again. See [Details](guide/stacking.md#details).
+**Fix:** move the **Levels** slider (it ends at the deepest level the frames
+support), or click **Reset All to Default**. See [Details](guide/stacking.md#details).
 
 ### **Run again** does nothing
 
@@ -297,8 +304,7 @@ one on the graphics card, only more slowly.
 | "cpu — the GPU device was lost earlier in this session" | The graphics card failed during an earlier fuse; that fuse finished on the processor. Restart FocusForge to use the card again. |
 | "cpu — … has no GPU implementation" | The chosen [fusion method](glossary.md#fusion-method) only runs on the processor. Use **Details** for GPU speed. |
 
-When no usable graphics card is found at all, **VRAM cap** and **VRAM
-budget** read "Unavailable" and the switch cannot be changed for the session.
+When no usable graphics card is found at all, the **VRAM** row reads "Unavailable" and the switch cannot be changed for the session.
 
 See: [GPU processing and the Backend line](guide/settings-window.md#gpu-processing-and-the-backend-line).
 
@@ -385,18 +391,29 @@ See: [When an export is refused](guide/export.md#when-an-export-is-refused).
 
 ## Settings and diagnostics
 
-### A cap field has a red outline
+### "Max … possible." under a memory row
 
-The text in **Host memory cap** or **VRAM cap** is not a size FocusForge
-understands, so the last valid cap stays in effect. Typical mistakes: `8G`
-instead of `8GiB`, a decimal point (`1.5GiB`), or `0`. Finish the unit or
-empty the field.
+> Max 17.4 GiB possible.
 
-> **Warning:** a number without a unit means bytes. If fuses became very
-> slow after you typed a cap, check that the field does not hold a bare
-> number.
+**Cause:** the number you confirmed in **Host memory** (or **VRAM**) is above
+what the computer can give, so FocusForge stored no cap and shows its own
+budget again.
 
-See: [Type a cap](guide/settings-window.md#type-a-cap).
+**Fix:** enter a number at or below the maximum the line names, or leave the
+row as it is.
+
+See: [Set a cap](guide/settings-window.md#set-a-cap).
+
+### "Could not check for updates: …"
+
+The **Check now** button in **About** reports this when the release server
+could not be reached or its answer could not be read; the reason follows the
+colon. Nothing else is affected: the check only reports, and the window never
+installs anything. Try again when the network is back. The same check on the
+command line is `focusforge-cli check-update`, which exits 1 in this case.
+
+To stop the check at start, switch off **Check for updates at start**. See
+[Updates](guide/settings-window.md#updates).
 
 ### My key bindings are ignored
 
@@ -574,12 +591,12 @@ folder and stack again.
 ### `no usable GPU adapter`
 
 ```
-no usable GPU adapter: …; continuing on the CPU path
+no usable GPU adapter; continuing on the CPU path
 ```
 
 A notice, not a failure: no usable graphics card was found, so the run
 continues on the processor with the same result, only more slowly. The
-middle part names what was tried. The exit status is that of the run.
+driver's own message goes to the log. The exit status is that of the run.
 
 **Fix:** nothing is required. To use the graphics card, install or update its
 driver. To skip the attempt, pass `--cpu`.

@@ -139,7 +139,7 @@ question appears.
 ### A folder with several stacks
 
 When you open a folder that holds more than one stack, the window asks how to
-split it, for example "This folder reads as 2 stacks of 6 frames." The
+split it, for example "This folder holds 2 stacks of 3 frames each." The
 question and its answers are explained in
 [A folder with several stacks](first-stack.md#a-folder-with-several-stacks).
 
@@ -186,8 +186,9 @@ overview then reads "Cancelled", with the stage you stopped in and a
 
 Anything the window has to tell you outside a dialog is kept as a
 notification: a failed fuse ("Setup failed", "Alignment failed",
-"Fusion failed") or a failed save ("Save failed"), a notice from a run such as
-"Brightness target limited" for each frame whose brightness could not be fully
+"Preparing failed", "Fusing failed", "Developing failed" or "Writing failed")
+or a failed save ("Save failed"), a notice from a run such as
+"Brightness not fully matched" for each frame whose brightness could not be fully
 matched, "3 frames unaligned" when you keep a result with frames that could not
 be aligned, "Some images were skipped" when an opened folder held something
 else, and the crash notice described below. Notifications last for the
@@ -214,7 +215,7 @@ title and a context line: where it came from ("Import", "Save" or "Startup";
 nothing for a fuse), the project, the frame or file it concerns, and the time,
 for example "Import · 00:19".
 
-![The notification center with two rows: a selected "Fusion failed" row for the project open-rejected showing its full error message, and a "Some images were skipped" row from Import.](../assets/manual/notifications/center.png)
+![The notification center with two rows: a selected "Preparing failed" row for the project open-rejected showing its full error message, and a "Some images were skipped" row from Import.](../assets/manual/notifications/center.png)
 
 *The notification center, newest first, with the selected row showing its full message.*
 
@@ -245,6 +246,24 @@ the canvas, under the toolbar:
 
 While the center or the overview is open, no toast appears. What arrives
 meanwhile is counted on the bell and is not shown as a toast later.
+
+### The update notice
+
+Once per start, in the background, FocusForge asks whether a newer release
+exists (see [Updates](settings-window.md#updates)). A newer one adds a
+notification titled "FocusForge `<version>` is available" with the context
+line "Startup · `<time>`" and the message "FocusForge `<version>` has been
+released. Download page: `<link>`". It also appears as a toast with the link
+**Open download page**:
+
+![The toast "FocusForge 0.2.0 is available" with an information icon, the link Open download page and a close icon](../assets/manual/notifications/update-notice.png)
+
+*The update notice as a toast.*
+
+Click **Open download page** (or the toast) to open the release page in your
+browser; the toast then closes and the notification stays in the center. The
+notice appears at most once per start and never when the check finds nothing
+newer, fails or is switched off.
 
 ### Banners while the window is in the background
 

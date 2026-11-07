@@ -17,11 +17,12 @@ image, so it adds very little to the file.
 The CHECKPOINTS list sits in the dock, under the **STACKING** / **EDITOR**
 switch, in both modes. It lists the active tab's checkpoints, newest first.
 Each row shows the [fusion method](../glossary.md#fusion-method) and the time the checkpoint was made. A
-retouched checkpoint shows the fusion method of the result it was painted on.
+retouched checkpoint reads "Retouch on" followed by the fusion method of the
+result it was painted on, for example "Retouch on Details".
 When the list spans more than one day, the rows are grouped under day
 headings: TODAY, YESTERDAY, then the date.
 
-![The CHECKPOINTS list with two rows named Details, each with a time; the top row is selected, with a raised background, an accent bar at its left edge and a red trash icon at its right edge](../assets/manual/checkpoints/checkpoints-list.png)
+![The CHECKPOINTS list with two rows, "Retouch on Details" (top) and "Details" (bottom), each with a time; the top row is selected, with a raised background, an accent bar at its left edge and a red trash icon at its right edge](../assets/manual/checkpoints/checkpoints-list.png)
 
 *Two checkpoints: a fused result (bottom) and a retouched version of it (top, selected). The pointer is over the top row, so its trash icon shows.*
 
@@ -68,7 +69,7 @@ are not in a checkpoint yet, and greyed out otherwise. See
 3. The dialog "Delete this checkpoint?" names the checkpoint by fusion method
    and time and says what stays. Click **Delete**.
 
-![The dialog "Delete this checkpoint?" with the line "Details · 00:17:34", the sentence "The other checkpoint is untouched, and the stack is not fused again." and the buttons Cancel and Delete](../assets/manual/checkpoints/checkpoints-delete-question.png)
+![The dialog "Delete this checkpoint?" with the line "Retouch on Details · 17:14:55", the sentence "The other checkpoint is untouched, and the stack is not fused again." and the buttons Cancel and Delete](../assets/manual/checkpoints/checkpoints-delete-question.png)
 
 *Deleting one of two checkpoints. Cancel, the close button at the top right and Escape all delete nothing.*
 
@@ -108,9 +109,9 @@ strokes would be lost.
 
 You clicked another row of the CHECKPOINTS list while strokes were unsaved.
 The question names the checkpoint you clicked ("Restoring Details ·
-00:07:59") and how many strokes have happened since the last checkpoint.
+17:14:03") and how many strokes have happened since the last checkpoint.
 
-![The dialog "Save this state first?" with the line "Restoring Details · 00:07:59", text explaining that 1 brush stroke belongs to no saved state, and the buttons Cancel, Save first, then restore and Discard and restore](../assets/manual/checkpoints/checkpoints-restore-question.png)
+![The dialog "Save this state first?" with the line "Restoring Details · 17:14:03", text explaining that 1 brush stroke belongs to no saved state, and the buttons Cancel, Save first, then restore and Discard and restore](../assets/manual/checkpoints/checkpoints-restore-question.png)
 
 *The question before going back to an older checkpoint over one unsaved stroke.*
 

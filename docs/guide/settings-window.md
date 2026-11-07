@@ -2,7 +2,7 @@
 
 The settings window holds the preferences that apply to FocusForge as a
 whole, not to one [stack](../glossary.md#stack): whether to use the graphics card, how much memory
-FocusForge may claim, how the **Images** panel looks, where FocusForge keeps
+FocusForge may claim, whether it looks for a newer release, how the **Images** panel looks, where FocusForge keeps
 its files, which mouse and key gestures do what, and the [diagnostics bundle](../glossary.md#diagnostics-bundle)
 you attach to a bug report.
 
@@ -56,19 +56,16 @@ the accepted values.
 on the graphics card or on the processor only, and how much memory it may
 take.
 
-![The Performance section: under PROCESSING the GPU processing switch is on and Backend is empty; under LIMITS the Host memory cap and VRAM cap fields show "No cap", Host budget shows a size in GiB and VRAM budget reads "Not probed yet"](../assets/manual/settings-window/settings-performance.png)
+![The Performance section: under PROCESSING the GPU processing switch is on and Backend is empty; under LIMITS the Host memory row shows a number beside the unit GiB and the VRAM row shows "Not probed yet" beside GiB](../assets/manual/settings-window/settings-performance.png)
 
-*Performance before the first fuse of the session. Your budget figures
-depend on your computer.*
+*Performance before the first fuse of the session. The Host memory number depends on your computer.*
 
 | Setting | Values | Default | What it does |
 | --- | --- | --- | --- |
 | **GPU processing** | on / off | on | Fuses on the graphics card (GPU) when the [fusion method](../glossary.md#fusion-method) supports it. Off fuses on the processor only. |
 | **Backend** | text | empty | What the last fuse actually ran on, and why. |
-| **Host memory cap** | a size, or empty | empty ("No cap") | The most working memory a fuse may use. |
-| **VRAM cap** | a size, or empty | empty ("No cap") | The most graphics-card memory a fuse may use. |
-| **Host budget** | text | — | The working memory FocusForge would allow itself on this computer. |
-| **VRAM budget** | text | — | The graphics-card memory the fuses of this session may use. |
+| **Host memory** | a number and a unit (MiB or GiB) | the memory FocusForge would claim on its own | The most working memory a fuse may use. |
+| **VRAM** | a number and a unit (MiB or GiB) | "Not probed yet" until a fuse has used the graphics card, then the card's budget | The most graphics-card memory a fuse may use. |
 
 ### GPU processing and the Backend line
 
@@ -95,64 +92,58 @@ what that fuse used, `gpu` or `cpu`, followed by the reason. For example:
   the processor.
 
 If a fuse finds no usable graphics card at all, the switch keeps its setting
-but cannot be changed for the rest of the session, and **VRAM cap** and
-**VRAM budget** read "Unavailable".
+but cannot be changed for the rest of the session, and the **VRAM** row
+reads "Unavailable".
 
 ### Memory caps and budgets
 
 FocusForge works through a stack in pieces, holding only as many in memory
-as its [budget](../glossary.md#budget) allows. On its own it claims a
-**Host budget** of 40 % of the memory that is free when it starts a run, and
-on the graphics card a **VRAM budget** it measures the first time a fuse uses
-the card. Until then **VRAM budget** reads "Not probed yet".
+as its [budget](../glossary.md#budget) allows. On its own it claims 40 % of
+the memory that is free when it starts a run (the **Host memory** budget),
+and on the graphics card a budget it measures the first time a fuse uses the
+card (the **VRAM** budget).
 
-A [cap](../glossary.md#cap) is a ceiling you set on top of that. It is
+Each **LIMITS** row shows the number that is in effect: your own
+[cap](../glossary.md#cap) when you set one, otherwise the budget FocusForge
+works out for itself. A cap is a ceiling you set on top of that. It is
 useful when you want to keep working in another program, a raw converter or
 an editor, while a large stack fuses, or when the graphics card is shared
-with your display. A cap can only lower a budget, never raise it: a cap above
-the budget changes nothing. A lower cap makes FocusForge hold fewer pieces at
-once, which can make a fuse slower but never changes the result.
+with your display. A cap can only lower a budget, never raise it. A lower cap
+makes FocusForge hold fewer pieces at once, which can make a fuse slower but
+never changes the result.
 
-- **Host memory cap** applies from the next fuse you start. The **Host
-  budget** row keeps showing what FocusForge would claim on its own; a lower
-  cap is what the fuse actually uses.
-- **VRAM cap** applies when a fuse first uses the graphics card. Once that
-  has happened in a session, a changed VRAM cap is saved but takes effect
-  only at the next start, and the line "Caps only lower the probed budgets.
-  Changes apply from the next start." appears under the rows.
+- **Host memory** applies from the next fuse you start.
+- **VRAM** shows "Not probed yet" until a fuse has used the graphics card, and
+  you can enter a number before that. A changed VRAM cap is saved and takes
+  effect when the next fuse uses the card; once the session's graphics-card
+  budget is known, the line "Caps only lower the probed budgets. Changes apply
+  from the next start." appears under the rows.
 
 On the command line, the same two caps are the `--max-host-memory <SIZE>` and
-`--max-vram <SIZE>` options of `stack` and `align`; they take the sizes
-described below and lower the budget in the same way.
+`--max-vram <SIZE>` options of `stack` and `align`; they lower the budget in
+the same way.
 
-### Type a cap
+### Set a cap
 
-Click into a cap field and type a whole number with a unit, without spaces
-or with one space:
+Click the number of a row, type a whole number and pick **MiB** or **GiB**
+in the menu beside it.
 
-| Unit | Means | Example |
-| --- | --- | --- |
-| `KiB`, `MiB`, `GiB`, `TiB` | binary units (1 GiB = 1024 MiB) | `8GiB`, `512MiB` |
-| `KB`, `MB`, `GB`, `TB` | decimal units (1 GB = 1000 MB) | `8 GB`, `1000MB` |
-| none, or `B` | bytes | `4096` |
+- The number counts when you confirm it: press Return, click out of the
+  field, click another section in the list or close the window. A unit you
+  pick counts at once, with the number as shown.
+- To remove a cap, empty the number and confirm. The row then shows the
+  budget FocusForge works out for itself again.
+- The number accepts digits only, so a unit cannot be left half-typed.
 
-Upper or lower case does not matter. To remove a cap, empty the field: it
-shows "No cap" again. Every valid entry is saved as you type.
+![The Performance section after 99999 was confirmed in the Host memory row: the row shows the budget again (17 GiB) and a red line under it reads "Max 17.5 GiB possible."](../assets/manual/settings-window/settings-cap-over-maximum.png)
 
-![The Performance section with "8G" typed into the Host memory cap field, which has a red outline; the VRAM cap field still shows "No cap"](../assets/manual/settings-window/settings-invalid-cap.png)
+*A number above what the computer can give stores no cap and names the maximum; the figure is that of the computer the picture was taken on.*
 
-*An entry that is not a valid size gets a red outline and is not used.*
-
-If the text is not a size FocusForge understands, the field gets a red
-outline. There is no message: the field simply keeps your text while the cap
-in effect stays the last valid one (or none). Typical mistakes are a unit
-without its last letters (`8G`, `8Gi`), a decimal point (`1.5GiB`) and `0`.
-Finish the entry, or empty the field, and the outline goes away.
-
-> **Warning:** A number without a unit means bytes. While you type `8GiB`,
-> the first keystroke already saves a cap of 8 bytes. Always finish the unit;
-> if you stop after the number, every fuse runs with the smallest possible
-> amount of memory and becomes very slow.
+A **Host memory** number above what the computer can give stores no cap: the
+row shows the budget again and a red line "Max `<size>` possible." names the
+largest value. The line stays until you confirm the row again, click another
+section or close the window. **VRAM** accepts a number above the graphics
+card's budget the same way once that budget is known.
 
 ## Appearance
 
@@ -243,16 +234,18 @@ action; "—" means the gesture does nothing in that mode.
 
 *The default bindings, as the Input map shows them.*
 
+The line under BINDINGS says where the bindings come from: "Built-in bindings."
+when FocusForge uses the shipped defaults, or "Read from `<path>`: `<n>` bindings
+differ from the built-in ones." when it read your settings file. If it refused
+your `[input]` table, one red line per problem appears under the line, naming
+the file, the line and the problem (see
+[When FocusForge refuses your bindings](#when-focusforge-refuses-your-bindings)).
+
 The table is read-only: clicking a row changes nothing. To change a binding,
 edit the settings file as described in
 [Keyboard and mouse bindings](#keyboard-and-mouse-bindings), then restart
-FocusForge.
-
-The table always shows the bindings that actually took effect at start-up:
-the shipped defaults, or your own from the settings file. It does not say
-which of the two you are looking at. If you edited the file and the table
-still shows the defaults, FocusForge refused your table; the reason is
-written to the log (see [Rebind a gesture](#rebind-a-gesture)).
+FocusForge. The table always shows the bindings that actually took effect at
+start-up.
 
 ## Diagnostics
 
@@ -282,17 +275,51 @@ folder path and user name, and never any image data) are in
 
 **About** shows which FocusForge you are running and under which terms.
 
-![The About section: under FOCUSFORGE the rows Version 0.1.0 and License GPL-3.0; under NOTICE the copyright line, the GNU General Public License paragraph, the no-warranty sentence and the row Source with github.com/jjjsood/FocusForge](../assets/manual/settings-window/settings-about.png)
+![The About section: under FOCUSFORGE the rows Version 0.1.0 and License GPL-3.0; under UPDATES the switch Check for updates at start, turned on, and the Check now button; under NOTICE the copyright line, the GNU General Public License paragraph, the no-warranty sentence and the row Source with github.com/jjjsood/FocusForge](../assets/manual/settings-window/settings-about.png)
 
 *About. The version number depends on the build you installed.*
 
 - **Version**: the version of this build. Quote it in a bug report.
 - **License**: GPL-3.0, the GNU General Public License, version 3.
+- UPDATES: see [Updates](#updates).
 - NOTICE: "Copyright © 2026 Johannes Sood", the statement that FocusForge is
   free software you may redistribute and modify under the GNU General Public
   License version 3, and that it comes with ABSOLUTELY NO WARRANTY. The full
   licence text is in the `LICENSE` file that comes with FocusForge.
 - **Source**: where the source code lives, `github.com/jjjsood/FocusForge`.
+
+### Updates
+
+FocusForge can tell you when a newer release exists. The check never
+downloads or installs anything: it only reports the newest final release
+(never a pre-release or draft) and links to its download page.
+
+- **Check for updates at start** (on by default): once per start, FocusForge
+  asks the release server in the background whether a newer release exists.
+  A newer one raises a notification, "FocusForge `<version>` is available",
+  with the link **Open download page**; clicking it opens the page in your
+  browser. Being up to date, having no network or a failed request shows
+  nothing. With the switch off, FocusForge makes no request at start.
+- **Check now** asks the same question at once, whatever the switch says,
+  and shows the answer beside the button: "Checking for updates…", then
+  "FocusForge is up to date.", or, under the row, "FocusForge `<version>` is
+  available." with **Open download page** and **Skip this version**. A failed
+  check reads "Could not check for updates: " followed by the reason.
+- **Skip this version** remembers that release: the check at start no longer
+  announces it, and the line reads "FocusForge `<version>` is available
+  (skipped)." A later release is announced again. **Check now** still shows a
+  skipped version.
+
+![The About section after Check now found a newer release: the line "FocusForge 0.2.0 is available.", the link Open download page and the button Skip this version under the Check now button](../assets/manual/settings-window/settings-about-newer.png)
+
+*The result of **Check now** for a newer release.*
+
+The request carries only the program's name and version, no identifier,
+setting or file data. It waits at most five seconds. The same check is
+available on the command line as `focusforge-cli check-update`; see the
+[command-line reference](../reference/cli.md#check-update). If the choice
+cannot be saved, the section shows the reason and "The change is active for
+this session."
 
 ## Keyboard and mouse bindings
 
@@ -330,7 +357,7 @@ question is open:
 | Ctrl + O | open a saved project file |
 | Ctrl + S | save the current project (see [Checkpoints and saving](history.md)) |
 | Ctrl + W | close the current project (see [Projects, notifications and quitting](batch-runs.md)) |
-| Esc | close the front-most dialog or refusal, the Projects overview, or the settings window |
+| Esc | close the front-most dialog or refusal, the Projects overview, the step calculator or Analytics, or the settings window |
 
 In lists and menus, Up and Down move the selection; on a focused slider, Left
 and Right move it by one step.
@@ -430,6 +457,7 @@ file is in TOML format, one table per topic:
 | `[appearance]` | `presentation = "list"`, `"image-list"` or `"large"`, `sharpness_heatmap = true` or `false`, `reduce_motion = true` or `false` | [Appearance](#appearance) |
 | `[input]` | the key and mouse bindings | editing by hand, see [Rebind a gesture](#rebind-a-gesture) |
 | `[export]` | the export dialog's last format and its settings | [Exporting an image](export.md) |
+| `[updates]` | `check_on_start = true` or `false`, and `skipped_version`, the release version you chose to skip | [Updates](#updates) |
 | `[performance]` | `gpu = true` or `false`, and the optional size strings `max-host-memory` and `max-vram` | [Performance](#performance) |
 
 For example, after switching GPU processing off and typing a host memory cap,
@@ -454,7 +482,8 @@ start writes a fresh one with the default bindings.
 ### Use another settings file
 
 `focusforge-gui --config-dir <DIR>` makes the window read and write
-`<DIR>/focusforge/settings.toml` instead, for example to try settings
+`<DIR>/focusforge/settings.toml` instead (the whole file: recent projects,
+appearance, input map, export choice, performance and update settings), for example to try settings
 without touching your usual ones, or to keep one set per project folder. Only
 the settings file moves: the log, the crash reports and the scratch folder
 stay in the data folder.
