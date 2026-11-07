@@ -135,6 +135,12 @@ run `focusforge-gui` in a terminal). The window opens with no project:
 From here, [Your first stack](guide/first-stack.md) walks you through opening
 your frames, fusing them and keeping the result.
 
+Each start, FocusForge asks the release server once, in the background,
+whether a newer release exists, and tells you with a notification if there
+is one. Nothing is downloaded or installed. You can switch the check off, or
+run it yourself, in [Updates](guide/settings-window.md#updates); the command
+line has `focusforge-cli check-update`.
+
 > **Tip:** On Linux, when you start FocusForge from a launcher that shows a
 > busy cursor, the window tells the desktop as soon as it has appeared, so the
 > busy cursor ends right away. (It uses the startup token the launcher passes

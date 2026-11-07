@@ -90,11 +90,6 @@ The toolbar changes with what you are doing:
 - **In the editor**, it holds the brush: **Size**, **Soft**, the pipette,
   undo and redo, and **Save checkpoint**. See [Retouching](retouch.md).
 
-> **Note:** In stacking, the right end of the toolbar shows a greyed-out
-> "Save checkpoint" caption. It is only a label: it does nothing when
-> clicked. Checkpoints are saved from the editor, and every fuse you keep
-> becomes one automatically.
-
 ## The two panes
 
 The canvas in the middle of the window shows two images side by side:
@@ -268,7 +263,7 @@ On a second monitor it can help to see the source frame and the result at
 full size each. Either pane can move into a window of its own.
 
 1. Click the small square icon with four corner marks at the top right of a
-   pane (**Undock pane**).
+   pane (**Undock pane**; resting the pointer on it shows that name).
 2. A second window opens with that pane. Its title bar reads
    "FocusForge — Frame" or "FocusForge — Composite".
 3. The other pane now fills the whole canvas of the main window.
@@ -287,7 +282,7 @@ its title bar, and minimize or maximize it with the buttons at its top
 right.
 
 To bring the pane back, either click the icon at the top right of its pane
-(**Dock pane**) or close the second window with its **x**. The main window shows both panes again.
+(**Dock pane**, also named when the pointer rests on it) or close the second window with its **x**. The main window shows both panes again.
 
 > **Note:** Only one pane can be in its own window at a time. While one is
 > out, the other pane's undock icon is hidden rather than dimmed.

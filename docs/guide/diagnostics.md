@@ -101,8 +101,8 @@ instead, for example:
 ### Read the file list
 
 The list at the top shows exactly the files the bundle will hold, each with
-its size: in whole kilobytes below a megabyte (so a small file reads
-"0 KB"), with one decimal above. The list scrolls inside its box when it
+its size: in whole bytes below a kilobyte (a small file reads "312 B"), in
+whole kilobytes below a megabyte, with one decimal above. The list scrolls inside its box when it
 holds more rows than fit.
 
 FocusForge gathers the list in the background, from the moment it starts,
@@ -114,7 +114,7 @@ and the **Save to** field can be used meanwhile.
 | Entry | What it holds |
 | --- | --- |
 | `adapter.json` | the graphics adapter FocusForge last selected and its limits, read from the log |
-| `configuration.json` | the settings a new run would use right now, and where each value came from |
+| `configuration.json` | the settings a new run would use right now, and where each value came from, including which `settings.toml` was read (the one under `--config-dir` when you gave it) |
 | `system.json` | the operating system, processor cores and memory figures |
 | `version.json` | the FocusForge version and build, the creation time, and any files left out |
 | `logs/…` | `focusforge.jsonl` and its older rotated files |
@@ -169,10 +169,9 @@ old one.
 
 *A path that already exists: the button changes to **Overwrite and create**.*
 
-> **Note:** If you typed a path of your own, the field keeps showing it after
-> the bundle is written, but the next bundle goes to the newly proposed dated
-> name in the data folder. Type your path again if you want the next bundle
-> there.
+> **Note:** After a bundle is written the field shows the next dated name in
+> the data folder, also when you typed a path of your own. Type your path
+> again if you want the next bundle there.
 
 ## What the bundle leaves out
 

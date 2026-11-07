@@ -84,13 +84,14 @@ Once you have kept a fuse, the project's checkpoints were made from the
 current frames. Removing a frame then means fusing the whole stack again, so
 FocusForge asks first:
 
-![The dialog Remove and fuse again? It says: The whole stack is fused from scratch. This project already holds 1 checkpoint, and confirming keeps every one of them. Below it: You can also start a new project with the same settings instead. Buttons: Cancel, Exclude instead, Remove and re-fuse.](../assets/manual/images-panel/images-remove-warning.png)
+![The dialog Remove and fuse again? It says: The whole stack is fused from scratch. This project already holds 1 checkpoint, and confirming keeps every one of them. Below it: You can also start a new project with the same settings instead. Buttons: Cancel, New project instead, Exclude instead, Remove and re-fuse.](../assets/manual/images-panel/images-remove-warning.png)
 
 *Removing a frame from a project that already holds a checkpoint.*
 
 | Button | What happens |
 |---|---|
 | **Cancel** (or the **x** at the top right, or Escape) | Nothing changes. The frame stays. |
+| **New project instead** | This project stays exactly as it was and a new tab opens with the same frames and settings but no checkpoints; remove the frame there. |
 | **Exclude instead** | The frame stays in the list but is excluded from the next fuse. No new fuse starts. |
 | **Remove and re-fuse** | The frame is removed and the whole stack is fused again from scratch. When the run ends you get the usual **Keep** or **Discard** question; keeping adds a new checkpoint. Your earlier checkpoints all stay. |
 
@@ -175,7 +176,7 @@ fused from. With at least one checkpoint, each asks first:
 
 | You did | Title | Buttons |
 |---|---|---|
-| Chose an entry in the sort menu | "Sort by capture time and fuse again?" | **Cancel**, **New project instead**, **Sort and re-fuse** |
+| Chose an entry in the sort menu | "Sort by name and fuse again?" or "Sort by capture time and fuse again?", after the entry you chose | **Cancel**, **New project instead**, **Sort and re-fuse** |
 | Dragged a row | "Reorder and fuse again?" | **Cancel**, **New project instead**, **Move and re-fuse** |
 | Added frames | "Add frames and fuse again?" | **Cancel**, **New project instead**, **Add and re-fuse** |
 
@@ -184,10 +185,6 @@ your earlier checkpoints stay. **New project instead** leaves this project
 exactly as it was and opens a new tab, named after it with " copy" added,
 holding the same frames and the same settings but no checkpoints. Make your
 change there.
-
-> **Note:** The sort question is titled "Sort by capture time and fuse
-> again?" even when you chose **Name**. Confirming sorts by the entry you
-> picked.
 
 ## Choose how the list looks
 

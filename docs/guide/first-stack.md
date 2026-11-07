@@ -69,7 +69,7 @@ the window, it reads "Dropping is unavailable on native Wayland" instead.
 
 Press `Ctrl+N`, or click **New project** in the side rail of the projects
 overview (open it with **Projects**, the grid button at the left end of the
-tab strip). A folder chooser opens, titled "Open folder or project". Choose the
+tab strip). A folder chooser opens, titled "Choose a folder". Choose the
 folder that holds your frames (or a folder of several stacks) and confirm.
 
 ### Reopen a saved project: Open project…
@@ -139,12 +139,13 @@ When you open a folder (with **New project**, by dropping it, or with
 If the folder holds exactly one stack, it opens straight away. If it holds
 more, the window asks first:
 
-![The question "This folder reads as 2 stacks of 6 frames." with the buttons Open as one project, Open as 2 projects and Cancel, and a close icon at the top right.](../assets/manual/first-stack/grouping-question.png)
+![The question "This folder holds 2 stacks of 3 frames each." with the buttons Open as one project, Open as 2 projects and Cancel, and a close icon at the top right.](../assets/manual/first-stack/grouping-question.png)
 
 *A folder with two subfolders of three frames each.*
 
-The second number counts all the frames in the folder, so "2 stacks of 6
-frames" means six frames in total, split into two stacks. Choose one answer:
+The question counts the frames of each stack: "This folder holds 2 stacks of
+3 frames each.", or "This folder holds 2 stacks (3 and 4 frames)." when the
+stacks differ in size. Choose one answer:
 
 | Button | What happens |
 |---|---|
@@ -185,7 +186,7 @@ same.
 
 ### "No frames here"
 
-![The dialog "No frames here" with the text "FocusForge reads TIFF (.tif, .tiff), JPEG (.jpg, .jpeg) and camera RAW files. This folder holds none." and the button Pick another folder….](../assets/manual/first-stack/refusal-no-frames.png)
+![The dialog "No frames here" with the text "FocusForge reads TIFF (.tif, .tiff), JPEG (.jpg, .jpeg) and camera RAW files. This folder holds none." and the buttons Cancel and Pick another folder….](../assets/manual/first-stack/refusal-no-frames.png)
 
 *A folder without any frames FocusForge can read.*
 
@@ -194,7 +195,7 @@ stack. The dialog reads "FocusForge reads TIFF (.tif, .tiff), JPEG (.jpg,
 .jpeg) and camera RAW files. This folder holds none."
 
 - Click **Pick another folder…** to choose a different folder right away.
-- Press `Escape` to close the dialog without choosing.
+- Click **Cancel**, or press `Escape`, to close the dialog without choosing.
 
 The projects overview also lists the folder as a "Not a project" card
 ("LEFT ALONE", "not read · not changed"): FocusForge did not touch it.
@@ -206,6 +207,33 @@ stack, with one of these messages:
 |---|---|
 | "These files mix camera RAW and TIFF. A stack is one kind of file." (the kinds named are the ones you picked: "camera RAW and JPEG", or "camera RAW, JPEG and TIFF") | Pick files of one kind: only RAW, only JPEG or only TIFF. |
 | "These files are in different folders. A stack's frames share one folder." | Move the frames into one folder, or open the folder that holds them with **New project**. |
+
+### "These frames cannot be read"
+
+A TIFF frame that FocusForge cannot read is refused when the folder or the
+files are opened, before any tab exists, instead of failing later at
+**Fuse stack**. The dialog has one button, **Close**, and names the file, never
+the folder:
+
+| Message | Meaning |
+|---|---|
+| "`<name>` is a BigTIFF file, which FocusForge cannot read. Save the frames as standard TIFF and open them again." | The frame is a BigTIFF file (the 64-bit variant of TIFF). |
+| "`<name>` uses a TIFF layout FocusForge cannot read. Save the frames as standard 8- or 16-bit TIFF and open them again." | The frame is stored in a layout other than standard 8- or 16-bit grey or colour TIFF. |
+| "`<name>` is not a TIFF file, though its name says so." | The file ends in .tif or .tiff but does not start like a TIFF file. |
+| "`<name>` is damaged: its TIFF header does not read." | The start of the file is unreadable. |
+| "`<name>` could not be read: …" | The file could not be opened or read; the operating system's reason follows. |
+
+The projects overview lists the folder as a "Not a project" card. Re-export
+the frames from your raw converter or photo editor as standard TIFF, then
+open them again.
+
+### "A frame is no longer there"
+
+Pressing **Fuse stack** on a project whose frame has been moved or deleted
+shows this dialog with the path of the missing file. On a project saved to a
+file it offers **Locate frames…**, which asks for the folder that holds the
+frames now, next to **Cancel**; on a project that was never saved it offers
+**Close** only.
 
 ### "This project cannot be opened"
 
@@ -436,7 +464,12 @@ stops and says so:
 - The bottom bar reads "Failed", in red.
 - **Retry** takes the place of **Fuse stack**. It starts the same fuse again.
 - A notification names the step that failed: "Setup failed" (the frames or
-  the settings could not be used), "Alignment failed" or "Fusion failed". It
+  the settings could not be used), "Alignment failed", or "Preparing failed",
+  "Fusing failed", "Developing failed" or "Writing failed". Its message opens
+  with a sentence naming the unreadable file, for example "02.tif could not
+  be read. It may be damaged, or it changed after the folder was opened.",
+  followed by the reason on the next line. The project's card reads, for
+  example, "FAILED WHILE PREPARING". The notification
   shows as a short pop-up message while the window is in front, and stays in
   the notification center behind the bell, where its full message names the
   file and the reason.
@@ -473,7 +506,9 @@ stack as its own tab (after asking, if there are several); a `.ffp` path
 reopens a saved project. `--open` can be given more than once: each path is
 opened in turn, the next one waiting for the one before it to finish. A path
 that fails to open shows the same dialog as in the window, rather than
-closing it.
+closing it. Paths without `--open` are accepted too, so
+`focusforge-gui frames/ other/` opens like a drop of those paths; this is what
+a file manager's "Open with" passes.
 
 Other options start the window in a chosen state; `focusforge-gui --help`
 lists them all.
