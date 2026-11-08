@@ -48,6 +48,7 @@ focusforge-cli [-v]... [-q] <COMMAND>
 |---|---|
 | `-v` | increase log detail; repeat it for more detail |
 | `-q, --quiet` | log errors only |
+| `--version` | print the version and build profile, e.g. `focusforge-cli 0.2.0-rc.1 (release)`; a debug build prints `(debug)` |
 
 - Repeat `-v` for more detail: once for informational messages, twice for
   debug detail. Omit it for warnings and errors only.
@@ -251,7 +252,8 @@ and caches whole frames within the host memory budget.
 
 `stack` accepts mixed uncompressed, LZW-compressed, Deflate-compressed, and
 tiled 8-bit or 16-bit unsigned chunky TIFF frames (8-bit samples are widened
-to the 16-bit range), and 8-bit JPEG frames. RAW files use `rawler` and are
+to the 16-bit range), and 8-bit JPEG frames. A JPEG frame's EXIF orientation is applied on
+reading, so a rotated frame joins the stack upright. RAW files use `rawler` and are
 fused as unclipped 32-bit float samples that clip once, to 16 bits, at
 export. A stack cannot mix TIFF, JPEG and RAW frames. Unsupported layouts or unreadable RAW files
 stop the run with the frame and reason named.
