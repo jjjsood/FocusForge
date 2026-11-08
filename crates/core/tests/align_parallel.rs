@@ -26,7 +26,7 @@ use focusforge_core::algorithm::{AlignOutcome, TileReader};
 use focusforge_core::align::warp::warp_from_tile;
 use focusforge_core::align::{
     AlignDriverOptions, FailurePolicy, FrameAlignment, PyramidalEcc, Transform, align_stack_with,
-    bytes_per_registration, bytes_shared_reference,
+    bytes_per_chain_hop, bytes_per_frame_build, bytes_per_registration, bytes_shared_reference,
 };
 use focusforge_core::params::{ParamValue, StackContext};
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
@@ -193,9 +193,10 @@ fn chain_hops_engage_the_pool_at_the_default_budget() {
 /// Chain and anchor runs at the shipped defaults over `fixtures/mantis-512`
 /// return the same frames, reference and policy for every requested worker
 /// count and every memory budget. The worker-count budgets are the driver's own
-/// sum: the shared reference data and `N` registrations for anchor, `N` hops
-/// (each its own shared data and registration) for chain, so each lands on `N`
-/// workers whatever the per-registration figure.
+/// sum: the shared reference data and `N` registrations for anchor, one frame
+/// build and `N` hops (each its own shared data, registration and level-0
+/// windows) for chain, so each lands on `N` workers whatever the
+/// per-registration figure.
 #[test]
 fn output_is_identical_across_worker_counts_and_budgets() {
     let stack = open_fixture();
@@ -207,7 +208,10 @@ fn output_is_identical_across_worker_counts_and_budgets() {
         HostBudget::explicit(if anchor {
             bytes_shared_reference(stack_ctx) + workers * per_worker
         } else {
-            workers * (bytes_shared_reference(stack_ctx) + per_worker)
+            bytes_per_frame_build(stack_ctx)
+                + workers
+                    * (bytes_per_chain_hop(stack_ctx, DEFAULT_TILE_SIZE)
+                        + stack.read_scratch_bytes(width, DEFAULT_TILE_SIZE))
         })
     };
     let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
@@ -440,8 +444,7 @@ fn parallel_chain_failure_policy_matches_serial() {
             shifted(8.0, 3.0),
         ],
     };
-    let hop = bytes_shared_reference(stack_ctx)
-        + bytes_per_registration(stack_ctx, DEFAULT_TILE_SIZE)
+    let hop = bytes_per_chain_hop(stack_ctx, DEFAULT_TILE_SIZE)
         + make_reader().read_scratch_bytes(width, DEFAULT_TILE_SIZE);
 
     for policy in [FailurePolicy::Strict, FailurePolicy::IdentityFallback] {
@@ -460,7 +463,7 @@ fn parallel_chain_failure_policy_matches_serial() {
             .expect("a chain run completes even with a failing hop")
         };
         let serial = run(1);
-        let parallel = run(2 * hop);
+        let parallel = run(bytes_per_frame_build(stack_ctx) + 2 * hop);
         assert_eq!(serial.worker_limit, 1);
         assert!(
             parallel.worker_limit > 1,

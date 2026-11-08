@@ -12,7 +12,7 @@ use common::align::{
     CountingReader, Drift, ESCALATION_READS, anchor_defaults, assert_fingerprints_match,
     drifting_focus_stack, frame_fingerprint, lowered_max_iterations, open_fixture,
     open_stack_context, outcome_fingerprint, reference_reads, resolved_defaults, samples_digest,
-    shifted_frame_3, stack_context, two_frame_reader, uncached_outcomes,
+    shifted_frame_3, stack_context, streamed_band_reads, two_frame_reader, uncached_outcomes,
 };
 
 use std::sync::Arc;
@@ -23,15 +23,17 @@ use focusforge_core::algorithm::{
 };
 use focusforge_core::align::{
     AlignDriverOptions, FailurePolicy, PyramidalEcc, Transform, align_stack_with,
+    bytes_per_chain_hop, bytes_per_frame_build,
 };
 use focusforge_core::io::TiffStack;
 use focusforge_core::params::{ParamDesc, ParamValue, ParamValues, StackContext};
-use focusforge_core::tile::HostBudget;
+use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
+use focusforge_core::tile::{HostBudget, Rect};
 
 /// A stub [`AlignAlgorithm`] that counts its own `prepare_run` calls and
 /// otherwise produces a trivial, always-converged outcome -- identity for
 /// the reference frame, a fixed translation otherwise. Used only by
-/// `chain_mode_prepares_nothing`, which asserts on the call count rather
+/// `chain_mode_builds_each_frame_once`, which asserts on the call count rather
 /// than on any transform.
 struct CountingPrepareAlign {
     prepare_calls: AtomicUsize,
@@ -290,8 +292,30 @@ fn prepared_for_another_stack_size_is_ignored() {
     assert_mismatched_prepared_is_ignored((&large, 4, &cfg), (&small, 1, &cfg), &[0, 2]);
 }
 
+/// Counts, per frame, the reads of full-width bands shorter than the frame:
+/// the reads that stream a frame into its pyramid.
+struct BandReader<'a> {
+    inner: &'a dyn TileReader,
+    frame: (u32, u32),
+    bands: Vec<AtomicUsize>,
+}
+
+impl TileReader for BandReader<'_> {
+    fn read_tile_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        if rect.width == self.frame.0 && rect.height < self.frame.1 {
+            self.bands[frame].fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.read_tile_into(frame, rect, out)
+    }
+}
+
 #[test]
-fn chain_mode_prepares_nothing() {
+fn chain_mode_builds_each_frame_once() {
     let stack = open_fixture();
     let stack_ctx = stack_context(&stack);
     let mut cfg = lowered_max_iterations(&stack_ctx);
@@ -309,11 +333,11 @@ fn chain_mode_prepares_nothing() {
         FailurePolicy::Strict,
         &AlignDriverOptions::default(),
     )
-    .expect("chain run completes");
+    .expect("a chain run completes when prepare_run returns nothing");
     assert_eq!(
         chain_algo.prepare_calls.load(Ordering::SeqCst),
-        0,
-        "chain mode must never call prepare_run"
+        1,
+        "chain mode must call prepare_run exactly once per run"
     );
 
     cfg.insert(
@@ -335,6 +359,55 @@ fn chain_mode_prepares_nothing() {
         1,
         "anchor mode must call prepare_run exactly once per run"
     );
+
+    // Tall enough that a frame streams in several bands, which no other read
+    // of it resembles.
+    let size = (200u32, 1100u32);
+    let drift = Drift {
+        shift: (1.5, -1.0),
+        scale: 0.002,
+    };
+    let (frames, _) = drifting_focus_stack(size, 7, &drift, 15.0);
+    let tall = StackContext::new(7, size.0, size.1, 1);
+    let mut cfg = lowered_max_iterations(&tall);
+    cfg.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum("chain".to_string()),
+    );
+    let bands_per_frame = streamed_band_reads(&tall);
+    assert!(bands_per_frame > 1);
+    for workers in [1u64, 2, 4, 8] {
+        let reader = BandReader {
+            inner: &frames,
+            frame: size,
+            bands: (0..tall.frame_count).map(|_| AtomicUsize::new(0)).collect(),
+        };
+        let budget =
+            bytes_per_frame_build(tall) + workers * bytes_per_chain_hop(tall, DEFAULT_TILE_SIZE);
+        let run = align_stack_with(
+            &PyramidalEcc,
+            tall,
+            &reader,
+            &cfg,
+            FailurePolicy::Strict,
+            &AlignDriverOptions {
+                budget: HostBudget::explicit(budget),
+                ..Default::default()
+            },
+        )
+        .expect("chain run completes");
+        assert_eq!(run.alignment.reference, 3);
+        let counts: Vec<usize> = reader
+            .bands
+            .iter()
+            .map(|n| n.load(Ordering::SeqCst))
+            .collect();
+        assert_eq!(
+            counts,
+            vec![bands_per_frame; tall.frame_count],
+            "{workers} workers: band reads per frame"
+        );
+    }
 }
 
 #[test]

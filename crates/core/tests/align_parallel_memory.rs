@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use focusforge_core::algorithm::{AlgorithmError, AlignAlgorithm, AlignContext, TileReader};
 use focusforge_core::align::{
-    AlignDriverOptions, FailurePolicy, PyramidalEcc, align_stack_with, bytes_per_registration,
-    bytes_shared_reference,
+    AlignDriverOptions, FailurePolicy, PyramidalEcc, align_stack_with, bytes_per_chain_hop,
+    bytes_per_frame_build, bytes_per_registration, bytes_shared_reference,
 };
 use focusforge_core::io::TiffStack;
 use focusforge_core::params::{ParamValue, ParamValues, StackContext};
@@ -258,10 +258,17 @@ fn three_frame_stacks() -> [(&'static str, TiffStack, StackContext); 2] {
 fn serial_peak_stays_within_shared_plus_one_registration() {
     let _guard = SERIAL.lock().unwrap();
     for (name, stack, ctx) in three_frame_stacks() {
-        let accounted =
+        let anchor_accounted =
             bytes_shared_reference(ctx) + bytes_per_registration(ctx, DEFAULT_TILE_SIZE);
+        let chain_accounted =
+            bytes_per_frame_build(ctx) + bytes_per_chain_hop(ctx, DEFAULT_TILE_SIZE);
         for mode in ["translation", "rotation-scale"] {
             for policy in ["anchor", "chain"] {
+                let accounted = if policy == "anchor" {
+                    anchor_accounted
+                } else {
+                    chain_accounted
+                };
                 let cfg = config(&ctx, mode, policy);
                 let options = AlignDriverOptions {
                     budget: HostBudget::explicit(1),
@@ -290,21 +297,22 @@ fn serial_peak_stays_within_shared_plus_one_registration() {
     }
 }
 
-/// A chain run holds at most one hop per worker: a budget of exactly two hops
-/// runs the two hops of a three-frame stack together.
+/// A chain run holds at most one frame build plus one hop per worker: a budget
+/// of exactly a frame build and two hops runs the two hops of a three-frame
+/// stack together.
 #[test]
 fn chain_peak_stays_within_one_hop_per_worker() {
     let _guard = SERIAL.lock().unwrap();
     let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
     for (name, stack, ctx) in three_frame_stacks() {
         let (width, _) = stack.dimensions();
-        let hop = bytes_shared_reference(ctx)
-            + bytes_per_registration(ctx, DEFAULT_TILE_SIZE)
+        let hop = bytes_per_chain_hop(ctx, DEFAULT_TILE_SIZE)
             + stack.read_scratch_bytes(width, DEFAULT_TILE_SIZE);
+        let frame_build = bytes_per_frame_build(ctx);
         for mode in ["translation", "rotation-scale"] {
             let cfg = config(&ctx, mode, "chain");
             let options = AlignDriverOptions {
-                budget: HostBudget::explicit(2 * hop),
+                budget: HostBudget::explicit(frame_build + 2 * hop),
                 ..Default::default()
             };
             let before = LIVE.load(Ordering::SeqCst);
@@ -322,12 +330,13 @@ fn chain_peak_stays_within_one_hop_per_worker() {
             assert_eq!(run.worker_limit, 2.min(parallelism), "{name} {mode}");
             assert_eq!(
                 run.accounted_bytes,
-                run.worker_limit as u64 * hop,
+                frame_build + run.worker_limit as u64 * hop,
                 "{name} {mode}"
             );
             assert!(
                 peak <= run.accounted_bytes,
-                "{name} {mode}: peak live heap {peak} B exceeds {} hops of {hop} B",
+                "{name} {mode}: peak live heap {peak} B exceeds a frame build and {} hops of \
+                 {hop} B",
                 run.worker_limit
             );
         }
