@@ -150,6 +150,7 @@ fn retouch_help_names_mode_and_opacity() {
         "`mode` (`normal`, `lighten`, `darken` or `detail`; default `normal`)",
         "`opacity` (0 < x \u{2264} 1; default 1.0)",
         "An opacity too small to register still records a state but changes no sample",
+        "`lighten` changes a pixel only where the source's sum over all its samples is greater than the image's there, `darken` only where it is smaller; either then blends every sample by the same amount.",
     ] {
         assert!(help.contains(needle), "{needle} missing from {help}");
     }

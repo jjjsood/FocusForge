@@ -8,6 +8,7 @@
 //! exact point-to-segment distance, so it is a pure function of the stroke and
 //! the pixel. Alpha is Q16 (`0..=65536`); the blend rounds to nearest.
 
+use std::cmp::Ordering;
 use std::num::NonZeroU32;
 
 use crate::algorithm::TileReader;
@@ -318,20 +319,62 @@ pub fn blend_sample(out: u16, src: u16, alpha: u32) -> u16 {
 pub trait Blend: Sample {
     /// `out` mixed toward `src` by the Q16 `alpha`: `out` at 0, `src` at 65536.
     fn blend(out: Self, src: Self, alpha: u32) -> Self;
+
+    /// How the sum over all samples of `src` compares with that of `out`
+    /// (the two slices are one pixel each); `None` when either sum is NaN.
+    /// Lighten and Darken decide on this order.
+    fn sum_order(src: &[Self], out: &[Self]) -> Option<Ordering>;
 }
 
 impl Blend for u16 {
     fn blend(out: Self, src: Self, alpha: u32) -> Self {
         blend_sample(out, src, alpha)
     }
+
+    fn sum_order(src: &[Self], out: &[Self]) -> Option<Ordering> {
+        let sum = |pixel: &[Self]| pixel.iter().map(|&s| u64::from(s)).sum::<u64>();
+        Some(sum(src).cmp(&sum(out)))
+    }
 }
 
 impl Blend for f32 {
+    /// Sums in `f64` in channel order, unclamped, so in-range values add
+    /// without rounding.
+    fn sum_order(src: &[Self], out: &[Self]) -> Option<Ordering> {
+        let sum = |pixel: &[Self]| pixel.iter().map(|&s| f64::from(s)).sum::<f64>();
+        sum(src).partial_cmp(&sum(out))
+    }
+
     fn blend(out: Self, src: Self, alpha: u32) -> Self {
         debug_assert!(alpha <= OPAQUE, "alpha is Q16 in 0..=65536");
         let alpha = alpha as f32 / OPAQUE as f32;
         out * (1.0 - alpha) + src * alpha
     }
+}
+
+/// `out` (the pre-stroke pixel) mixed toward `src` by the Q16 `alpha`, every
+/// sample by the same `alpha`. Normal always mixes; Lighten only where
+/// [`Blend::sum_order`] puts `src` strictly above `out`, Darken strictly
+/// below (a tie or NaN sum leaves `out`). Detail is refused with
+/// [`RetouchError::ModeNotRendered`] and writes nothing.
+pub fn blend_pixel<S: Blend>(
+    mode: BrushMode,
+    out: &mut [S],
+    src: &[S],
+    alpha: u32,
+) -> Result<(), RetouchError> {
+    let acts = match mode {
+        BrushMode::Normal => true,
+        BrushMode::Lighten => S::sum_order(src, out) == Some(Ordering::Greater),
+        BrushMode::Darken => S::sum_order(src, out) == Some(Ordering::Less),
+        BrushMode::Detail => return Err(RetouchError::ModeNotRendered { mode }),
+    };
+    if acts {
+        for (o, &s) in out.iter_mut().zip(src) {
+            *o = S::blend(*o, s, alpha);
+        }
+    }
+    Ok(())
 }
 
 /// Whether a stroke with Q16 `alpha` shows its own source at a pixel: more
@@ -429,7 +472,7 @@ pub fn apply<S: Blend>(
     spp: usize,
 ) -> Result<(), RetouchError> {
     let stroke = validate(op, info)?;
-    if stroke.mode != BrushMode::Normal {
+    if stroke.mode == BrushMode::Detail {
         return Err(RetouchError::ModeNotRendered { mode: stroke.mode });
     }
     if !info.contains(out_rect) || out_rect.intersect(region) != Some(region) {
@@ -464,12 +507,13 @@ pub fn apply<S: Blend>(
             ((y - out_rect.y) as usize * out_rect.width as usize + (x - out_rect.x) as usize) * spp;
         let src_at =
             ((y - region.y) as usize * region.width as usize + (x - region.x) as usize) * spp;
-        for (o, &s) in out[out_at..out_at + spp]
-            .iter_mut()
-            .zip(&src[src_at..src_at + spp])
-        {
-            *o = S::blend(*o, s, a);
-        }
+        blend_pixel(
+            stroke.mode,
+            &mut out[out_at..out_at + spp],
+            &src[src_at..src_at + spp],
+            a,
+        )
+        .expect("a Detail stroke was refused before the walk");
     });
     Ok(())
 }
@@ -627,11 +671,356 @@ mod tests {
         }
     }
 
+    /// A one-pixel map under a stroke that covers it fully, blended with `src`
+    /// over `out` in `mode` at full opacity.
+    fn one_pixel<S: Blend>(mode: BrushMode, out: &[S], src: &[S]) -> Vec<S> {
+        let op = Op::BrushStroke {
+            source_id: 0,
+            path: vec![pt(0, 0)],
+            radius: 2.0,
+            softness: 0.0,
+            mode,
+            opacity: 1.0,
+        };
+        let spp = out.len();
+        let mut pixels = out.to_vec();
+        let whole = rect(0, 0, 1, 1);
+        apply(&op, info(1, 1), whole, &mut pixels, whole, src, spp).unwrap();
+        pixels
+    }
+
     #[test]
-    fn unimplemented_modes_are_refused_at_blend() {
+    fn lighten_darken_equal_sums_and_gray() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        // One sample: that sample decides.
+        assert_eq!(<u16 as Blend>::sum_order(&[9], &[7]), Some(Greater));
+        assert_eq!(<u16 as Blend>::sum_order(&[7], &[9]), Some(Less));
+        assert_eq!(<u16 as Blend>::sum_order(&[7], &[7]), Some(Equal));
+        // Two samples: the sum decides although one channel disagrees.
+        assert_eq!(<u16 as Blend>::sum_order(&[10, 0], &[3, 6]), Some(Greater));
+        // Four samples: alpha counts like the colour channels.
+        let src = [0, 0, 0, 65535];
+        let out = [100, 100, 100, 0];
+        assert_eq!(<u16 as Blend>::sum_order(&src, &out), Some(Greater));
+        assert_eq!(<u16 as Blend>::sum_order(&out, &src), Some(Less));
+        // Equal sums over different channels are a tie.
+        assert_eq!(
+            <u16 as Blend>::sum_order(&[1, 5, 3], &[3, 3, 3]),
+            Some(Equal)
+        );
+        assert_eq!(
+            <f32 as Blend>::sum_order(&[1.0, 5.0, 3.0], &[3.0, 3.0, 3.0]),
+            Some(Equal)
+        );
+
+        // Equal sums over different channels, 1 to 4 samples: no mode acts.
+        for (out, src) in [
+            (vec![5u16], vec![5]),
+            (vec![1, 9], vec![9, 1]),
+            (vec![1, 5, 3], vec![3, 3, 3]),
+            (vec![1, 5, 3, 7], vec![7, 3, 5, 1]),
+        ] {
+            for mode in [BrushMode::Lighten, BrushMode::Darken] {
+                assert_eq!(one_pixel(mode, &out, &src), out, "{mode:?} {out:?}");
+            }
+        }
+        // Gray: the one sample decides. 4 samples: alpha decides with the rest.
+        assert_eq!(one_pixel(BrushMode::Lighten, &[5u16], &[8]), [8]);
+        assert_eq!(one_pixel(BrushMode::Darken, &[5u16], &[8]), [5]);
+        assert_eq!(one_pixel(BrushMode::Lighten, &[5u16, 5], &[0, 9]), [5, 5]);
+        assert_eq!(one_pixel(BrushMode::Darken, &[5u16, 5], &[0, 9]), [0, 9]);
+        let (out, src) = ([9u16, 9, 9, 0], [0u16, 0, 0, 40]);
+        assert_eq!(one_pixel(BrushMode::Lighten, &out, &src), src);
+        assert_eq!(one_pixel(BrushMode::Darken, &out, &src), out);
+    }
+
+    #[test]
+    fn lighten_darken_f32_compare_unclamped() {
+        use std::cmp::Ordering::Greater;
+        // Negative and above-range samples compare as they are.
+        assert_eq!(
+            <f32 as Blend>::sum_order(&[-5.0, -5.0], &[-20.0, 3.0]),
+            Some(Greater)
+        );
+        assert_eq!(
+            <f32 as Blend>::sum_order(&[70000.0, 0.0, 0.0], &[65535.0, 4000.0, 0.0]),
+            Some(Greater)
+        );
+        // The sum is exact: an f32 accumulator would round both sums to 196605.
+        let ulp = 1.0 / 256.0;
+        assert_eq!(
+            <f32 as Blend>::sum_order(&[65535.0; 3], &[65535.0, 65535.0, 65535.0 - ulp]),
+            Some(Greater)
+        );
+        // A NaN sum on either side orders nothing.
+        assert_eq!(
+            <f32 as Blend>::sum_order(&[f32::NAN, 1.0], &[0.0, 0.0]),
+            None
+        );
+        assert_eq!(
+            <f32 as Blend>::sum_order(&[0.0, 0.0], &[1.0, f32::NAN]),
+            None
+        );
+
+        // Full alpha lands on the source, outside 0..=65535 too.
+        let (out, src) = ([-30.0f32, 1.0, 2.0], [70000.0f32, -9.0, 3.0]);
+        assert_eq!(one_pixel(BrushMode::Lighten, &out, &src), src);
+        assert_eq!(one_pixel(BrushMode::Darken, &out, &src), out);
+        let (out, src) = ([70000.0f32, 0.0], [-5.0f32, 4.0]);
+        assert_eq!(one_pixel(BrushMode::Darken, &out, &src), src);
+        assert_eq!(one_pixel(BrushMode::Lighten, &out, &src), out);
+        // A NaN sum acts in neither mode.
+        for (out, src) in [([f32::NAN, 1.0], [5.0, 5.0]), ([1.0, 1.0], [f32::NAN, 5.0])] {
+            for mode in [BrushMode::Lighten, BrushMode::Darken] {
+                let got = one_pixel(mode, &out, &src);
+                assert_eq!(
+                    got.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+                    out.map(f32::to_bits),
+                    "{mode:?}"
+                );
+            }
+        }
+    }
+
+    /// A 40 x 30 map and the samples of a 20 x 16 source region at (8, 6), in
+    /// which some pixels are brighter than the map and some darker.
+    fn varied_maps(spp: usize) -> (Vec<u16>, Vec<u16>) {
+        let base = (0..40 * 30 * spp)
+            .map(|i| (i * 37 % 65536) as u16)
+            .collect();
+        let src = (0..20 * 16 * spp)
+            .map(|i| ((i as u64 * 2_654_435_761) >> 7) as u16)
+            .collect();
+        (base, src)
+    }
+
+    fn mode_stroke(mode: BrushMode, opacity: f32) -> Op {
+        Op::BrushStroke {
+            source_id: 2,
+            path: vec![pt(10, 10), pt(25, 15)],
+            radius: 8.0,
+            softness: 0.5,
+            mode,
+            opacity,
+        }
+    }
+
+    /// The Q16 alpha `op` gives `(x, y)` after the opacity scaling.
+    fn scaled_alpha(op: &Op, info: ZMapInfo, x: u32, y: u32) -> u32 {
+        let Op::BrushStroke { opacity, .. } = op;
+        let q = u64::from(super::opacity_q16(*opacity));
+        ((u64::from(alpha(op, info, x, y).unwrap()) * q + 32768) >> 16) as u32
+    }
+
+    #[test]
+    fn mode_output_is_the_one_formula() {
+        let info = info(40, 30);
+        let (out_rect, region) = (rect(0, 0, 40, 30), rect(8, 6, 20, 16));
+        let spp = 3;
+        let (base, src) = varied_maps(spp);
+        for mode in [BrushMode::Normal, BrushMode::Lighten, BrushMode::Darken] {
+            for opacity in [0.5f32, 1.0] {
+                let op = mode_stroke(mode, opacity);
+                let mut out = base.clone();
+                apply(&op, info, out_rect, &mut out, region, &src, spp).unwrap();
+                let mut changed = 0;
+                for y in 6..22u32 {
+                    for x in 8..28u32 {
+                        let a = scaled_alpha(&op, info, x, y);
+                        let i = (y as usize * 40 + x as usize) * spp;
+                        let at = ((y - 6) as usize * 20 + (x - 8) as usize) * spp;
+                        let mut want = base[i..i + spp].to_vec();
+                        if a > 0 {
+                            blend_pixel(mode, &mut want, &src[at..at + spp], a).unwrap();
+                        }
+                        let label = format!("{mode:?} opacity {opacity} ({x}, {y})");
+                        assert_eq!(out[i..i + spp], want[..], "{label}");
+                        changed += usize::from(want[..] != base[i..i + spp]);
+                    }
+                }
+                assert!(changed > 0, "{mode:?} opacity {opacity} changes something");
+            }
+        }
+        let mut pixel = [7u16; 3];
+        let result = blend_pixel(BrushMode::Detail, &mut pixel, &[9; 3], OPAQUE);
+        assert!(
+            matches!(
+                result,
+                Err(RetouchError::ModeNotRendered {
+                    mode: BrushMode::Detail
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(pixel, [7; 3], "Detail writes nothing");
+    }
+
+    #[test]
+    fn lighten_moves_every_channel_by_one_alpha() {
+        // The source is darker in the middle channel but brighter by sum.
+        let (out, src) = ([100u16, 50000, 100], [40000u16, 10, 40000]);
+        let a = 20000;
+        let mut lightened = out;
+        blend_pixel(BrushMode::Lighten, &mut lightened, &src, a).unwrap();
+        for c in 0..3 {
+            assert_eq!(lightened[c], blend_sample(out[c], src[c], a), "channel {c}");
+        }
+        assert!(lightened[1] < out[1], "the darker channel moves down too");
+        let mut darkened = out;
+        blend_pixel(BrushMode::Darken, &mut darkened, &src, a).unwrap();
+        assert_eq!(darkened, out, "Darken leaves a brighter-by-sum pixel");
+        // Swapped roles: the source is darker by sum.
+        let mut darkened = src;
+        blend_pixel(BrushMode::Darken, &mut darkened, &out, a).unwrap();
+        let want = [0, 1, 2].map(|c| blend_sample(src[c], out[c], a));
+        assert_eq!(darkened, want, "Darken blends a darker-by-sum source");
+        let mut lightened = src;
+        blend_pixel(BrushMode::Lighten, &mut lightened, &out, a).unwrap();
+        assert_eq!(lightened, src, "Lighten leaves a darker-by-sum pixel");
+    }
+
+    fn sum16(pixel: &[u16]) -> u32 {
+        pixel.iter().map(|&s| u32::from(s)).sum()
+    }
+
+    #[test]
+    fn lighten_darken_u16_follow_the_channel_sum() {
+        let info = info(40, 30);
+        let (out_rect, region) = (rect(0, 0, 40, 30), rect(8, 6, 20, 16));
+        for spp in 1..=4usize {
+            let (base, src) = varied_maps(spp);
+            for mode in [BrushMode::Lighten, BrushMode::Darken] {
+                for opacity in [0.5f32, 1.0] {
+                    let op = mode_stroke(mode, opacity);
+                    let mut out = base.clone();
+                    apply(&op, info, out_rect, &mut out, region, &src, spp).unwrap();
+                    let mut changed = 0;
+                    let mut skipped = 0;
+                    for y in 0..30u32 {
+                        for x in 0..40u32 {
+                            let i = (y as usize * 40 + x as usize) * spp;
+                            let before = &base[i..i + spp];
+                            let mut want = before.to_vec();
+                            let in_region = (8..28).contains(&x) && (6..22).contains(&y);
+                            let a = scaled_alpha(&op, info, x, y);
+                            if in_region && a > 0 {
+                                let at = ((y - 6) as usize * 20 + (x - 8) as usize) * spp;
+                                let s = &src[at..at + spp];
+                                let qualifies = match mode {
+                                    BrushMode::Lighten => sum16(s) > sum16(before),
+                                    _ => sum16(s) < sum16(before),
+                                };
+                                if qualifies {
+                                    for c in 0..spp {
+                                        want[c] = blend_sample(before[c], s[c], a);
+                                    }
+                                } else {
+                                    skipped += 1;
+                                }
+                            }
+                            let label = format!("spp {spp} {mode:?} opacity {opacity} ({x}, {y})");
+                            assert_eq!(out[i..i + spp], want[..], "{label}");
+                            changed += usize::from(want[..] != *before);
+                        }
+                    }
+                    let label = format!("spp {spp} {mode:?} opacity {opacity}");
+                    assert!(changed > 0, "{label} changes something");
+                    assert!(skipped > 0, "{label} leaves covered pixels alone");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lighten_darken_scale_by_opacity() {
+        let info = info(40, 30);
+        let (out_rect, region) = (rect(0, 0, 40, 30), rect(8, 6, 20, 16));
+        let spp = 3;
+        let (base, src) = varied_maps(spp);
+        let mut normal = base.clone();
+        apply(
+            &mode_stroke(BrushMode::Normal, 0.5),
+            info,
+            out_rect,
+            &mut normal,
+            region,
+            &src,
+            spp,
+        )
+        .unwrap();
+        for mode in [BrushMode::Lighten, BrushMode::Darken] {
+            let op = mode_stroke(mode, 0.5);
+            let mut out = base.clone();
+            apply(&op, info, out_rect, &mut out, region, &src, spp).unwrap();
+            let mut covered = 0;
+            for y in 6..22u32 {
+                for x in 8..28u32 {
+                    let i = (y as usize * 40 + x as usize) * spp;
+                    let at = ((y - 6) as usize * 20 + (x - 8) as usize) * spp;
+                    let (s, before) = (&src[at..at + spp], &base[i..i + spp]);
+                    let qualifies = match mode {
+                        BrushMode::Lighten => sum16(s) > sum16(before),
+                        _ => sum16(s) < sum16(before),
+                    };
+                    let want = if qualifies {
+                        &normal[i..i + spp]
+                    } else {
+                        before
+                    };
+                    assert_eq!(out[i..i + spp], *want, "{mode:?} ({x}, {y})");
+                    let full = alpha(&op, info, x, y).unwrap() == OPAQUE;
+                    covered += usize::from(full && qualifies);
+                }
+            }
+            assert!(covered > 0, "{mode:?}: a fully covered pixel qualifies");
+        }
+    }
+
+    #[test]
+    fn darken_decides_on_the_pre_stroke_result() {
+        let info = info(40, 30);
+        let (out_rect, region) = (rect(0, 0, 40, 30), rect(8, 6, 20, 16));
+        let spp = 3;
+        let (base, src) = varied_maps(spp);
+        let other: Vec<u16> = (0..20 * 16 * spp)
+            .map(|i| (i * 53 % 65536) as u16)
+            .collect();
+        let op = mode_stroke(BrushMode::Darken, 1.0);
+        let mut stacked = base.clone();
+        let first = mode_stroke(BrushMode::Normal, 1.0);
+        apply(&first, info, out_rect, &mut stacked, region, &src, spp).unwrap();
+        let after_normal = stacked.clone();
+        apply(&op, info, out_rect, &mut stacked, region, &other, spp).unwrap();
+        // The same Darken stroke deciding against the untouched map instead.
+        let mut wrong = after_normal.clone();
+        for y in 6..22u32 {
+            for x in 8..28u32 {
+                let i = (y as usize * 40 + x as usize) * spp;
+                let at = ((y - 6) as usize * 20 + (x - 8) as usize) * spp;
+                let a = scaled_alpha(&op, info, x, y);
+                let s = &other[at..at + spp];
+                let (mid, orig) = (&after_normal[i..i + spp], &base[i..i + spp]);
+                let want = if a > 0 && sum16(s) < sum16(mid) {
+                    [0, 1, 2].map(|c| blend_sample(mid[c], s[c], a))
+                } else {
+                    [mid[0], mid[1], mid[2]]
+                };
+                assert_eq!(stacked[i..i + spp], want, "({x}, {y})");
+                if a > 0 && sum16(s) < sum16(orig) {
+                    for c in 0..spp {
+                        wrong[i + c] = blend_sample(mid[c], s[c], a);
+                    }
+                }
+            }
+        }
+        assert_ne!(stacked, wrong, "the pre-stroke result changes the outcome");
+    }
+
+    #[test]
+    fn detail_mode_is_refused_at_blend() {
         let info = info(32, 32);
         let whole = rect(0, 0, 32, 32);
-        for mode in [BrushMode::Lighten, BrushMode::Darken, BrushMode::Detail] {
+        for mode in [BrushMode::Detail] {
             // The refusal does not depend on the stroke reaching the map.
             for at in [pt(1, 1), pt(500, 500)] {
                 let op = Op::BrushStroke {

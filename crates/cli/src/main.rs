@@ -379,8 +379,11 @@ enum Command {
         /// linearly to nothing at `radius`. A stroke may also carry `mode`
         /// (`normal`, `lighten`, `darken` or `detail`; default `normal`) and
         /// `opacity` (0 < x ≤ 1; default 1.0). An opacity too small to
-        /// register still records a state but changes no sample. Every op
-        /// is checked before anything is written; positions in error
+        /// register still records a state but changes no sample. `lighten`
+        /// changes a pixel only where the source's sum over all its samples
+        /// is greater than the image's there, `darken` only where it is
+        /// smaller; either then blends every sample by the same amount.
+        /// Every op is checked before anything is written; positions in error
         /// messages count from 0 in list order.
         #[arg(long, value_name = "FILE")]
         ops: PathBuf,

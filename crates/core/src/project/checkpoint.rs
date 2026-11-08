@@ -139,8 +139,8 @@ pub enum Op {
     },
 }
 
-/// The blend mode a stroke records. Only `Normal` renders; the blend refuses
-/// the others.
+/// The blend mode a stroke records. `Normal`, `Lighten` and `Darken` render;
+/// the blend refuses `Detail`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BrushMode {
