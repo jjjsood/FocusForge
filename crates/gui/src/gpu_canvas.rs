@@ -15,7 +15,6 @@ use focusforge_core::timing::measurement_scope;
 
 use focusforge_core::TiffError;
 use focusforge_core::io::{FrameError, TiffStack};
-use focusforge_core::retouch::{ModeConditions, overlay_colors};
 use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::zmap::ZMapReader;
 use focusforge_gpu::display::{DisplayRenderer, DisplayTexture, render_overlay};
@@ -323,6 +322,7 @@ mod tests {
             table: focusforge_core::zmap::overlay_table(1, None),
             ops: Arc::from([]),
             alpha: focusforge_core::display::alpha_from_opacity(0.65),
+            origin: None,
         };
         assert!(
             planes_and_frame
@@ -873,9 +873,7 @@ impl CanvasRenderer {
         let header = composite.header(0);
         let size = (header.width, header.height);
         let overlay = overlay.filter(|_| header.samples_per_pixel == 3);
-        let indices = overlay
-            .and(self.zmap.clone())
-            .map(|zmap| zmap as Arc<dyn PaneReader>);
+        let indices = overlay.and(self.zmap.clone());
         let state = EditState {
             generation,
             overlay: overlay.cloned(),
@@ -926,7 +924,7 @@ impl CanvasRenderer {
         draw: &PaneDraw,
         source_size: (u32, u32),
         reader: Arc<dyn PaneReader>,
-        indices: Option<Arc<dyn PaneReader>>,
+        indices: Option<Arc<ZMapReader>>,
         state: EditState,
     ) -> Option<PaneJob> {
         let max_texture_dimension = self.device.as_ref()?.limits().max_texture_dimension_2d;
@@ -977,8 +975,8 @@ impl CanvasRenderer {
     }
 
     /// Renders `samples` (read for `job`) into the job's pane and returns
-    /// the pane's image. `sealed_indices` is the sealed Z-Map over the same
-    /// texels (empty when the job read none). `edited`, present on a job
+    /// the pane's image. `colors` is the overlay's colour per texel (empty
+    /// when the job has no overlay). `edited`, present on a job
     /// issued under an edit generation, overlays the composite with the
     /// resident tiles' pixel wherever one is held; the job's
     /// own overlay blends the rainbow over a three-sample composite. `None`,
@@ -989,7 +987,7 @@ impl CanvasRenderer {
         &mut self,
         job: &PaneJob,
         samples: &[u16],
-        sealed_indices: &[u16],
+        colors: &[[u8; 3]],
         edited: Option<&EditedView>,
     ) -> Option<slint::Image> {
         let (device, queue) = self.device_queue()?;
@@ -1035,26 +1033,15 @@ impl CanvasRenderer {
                     merged
                 });
                 let composite = merged.as_deref().unwrap_or(samples);
-                match (&job.state.overlay, self.zmap.as_deref()) {
-                    (Some(overlay), Some(zmap)) if !sealed_indices.is_empty() => {
-                        let mut colors = vec![[0u8; 3]; sealed_indices.len()];
-                        overlay_colors(
-                            &overlay.ops,
-                            zmap.info(),
-                            rect,
-                            step,
-                            &ModeConditions::default(),
-                            &overlay.table,
-                            sealed_indices,
-                            &mut colors,
-                        );
+                match &job.state.overlay {
+                    Some(overlay) if !colors.is_empty() => {
                         texture.ensure_and_render_overlay(
                             &device,
                             &queue,
                             width,
                             height,
                             composite,
-                            &colors,
+                            colors,
                             overlay.alpha,
                         );
                     }
@@ -1132,7 +1119,10 @@ impl CanvasRenderer {
             .read_into(&mut scratch)
             .and_then(|()| job.read_sealed_indices(&mut indices))
             .ok()
-            .and_then(|()| self.publish_edited(&job, &scratch, &indices, edited));
+            .and_then(|()| {
+                let colors = job.overlay_colors(&indices);
+                self.publish_edited(&job, &scratch, &colors, edited)
+            });
         self.sample_scratch = scratch;
         image
     }

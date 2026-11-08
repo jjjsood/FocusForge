@@ -27,7 +27,7 @@ use crate::analytics::{self, AnalyticsView, CountError, CountPriority, RowValue}
 use crate::appearance_settings::{self, AppearanceSettings, SourcePresentation};
 use crate::brush;
 use crate::calculator::{Calculator, CalculatorView};
-use crate::canvas::{FrameView, OverlayDraw, PaneSource};
+use crate::canvas::{FrameView, OverlayDraw, PaneSource, SharedOrigin};
 use crate::checkpoints;
 use crate::diagnostics::{
     DiagnosticsEntryView, DiagnosticsScan, DiagnosticsScanEntry, DiagnosticsStatus,
@@ -670,6 +670,12 @@ struct ProjectTab {
     /// whenever the selected row or planes are replaced (a restore, a new
     /// checkpoint).
     edit: Option<job::EditState>,
+    /// The readers that tell where this tab's Lighten and Darken strokes act,
+    /// once opened for the current row and frames.
+    origin: Option<Arc<job::OriginReaders>>,
+    /// Whether opening or reading [`Self::origin`] failed for the current
+    /// row and frames; they are not opened again until those change.
+    origin_failed: bool,
     /// Bumped whenever the session this tab holds, or is opening, is dropped:
     /// an opening session lands only while its generation is still this one.
     session_generation: u64,
@@ -776,6 +782,46 @@ impl EditSlot {
     fn opening(&self, tab_id: u64, generation: u64) -> bool {
         self.in_flight.contains(&(tab_id, generation))
     }
+}
+
+/// The origin readers being opened and where their workers park the results:
+/// tab id, the session generation each was started for, the checkpoint the
+/// worker renders into the plane cache (if any), and the readers or why they
+/// failed.
+#[derive(Default)]
+struct OriginSlot {
+    in_flight: Vec<(u64, u64, Option<String>)>,
+    /// Set when a worker starts, until [`AppController::take_origin_started`].
+    started: bool,
+    parked: Arc<Mutex<Vec<ParkedOrigin>>>,
+}
+
+type ParkedOrigin = (u64, u64, Result<Arc<job::OriginReaders>, String>);
+
+impl OriginSlot {
+    fn opening(&self, tab_id: u64, generation: u64) -> bool {
+        self.in_flight
+            .iter()
+            .any(|(tab, started, _)| (*tab, *started) == (tab_id, generation))
+    }
+
+    /// The checkpoints the running workers render into the plane cache.
+    fn rendering(&self) -> Vec<String> {
+        self.in_flight
+            .iter()
+            .filter_map(|(.., id)| id.clone())
+            .collect()
+    }
+}
+
+/// Where an origin worker finds the composite the strokes were drawn over.
+enum OriginComposite {
+    Cached(PathBuf),
+    Render {
+        project_path: PathBuf,
+        scratch_root: PathBuf,
+        id: String,
+    },
 }
 
 /// Whether the active tab has an editor session, is opening one, or cannot.
@@ -949,6 +995,8 @@ impl ProjectTab {
             run: job::RunState::Idle,
             request: None,
             edit: None,
+            origin: None,
+            origin_failed: false,
             session_generation: 0,
             failure: None,
         }
@@ -1200,6 +1248,8 @@ impl ProjectTab {
     /// lands. Returns whether an installed session was dropped.
     fn drop_session(&mut self) -> bool {
         self.session_generation += 1;
+        self.origin = None;
+        self.origin_failed = false;
         self.edit.take().is_some()
     }
 
@@ -1557,6 +1607,7 @@ struct ShellState {
     render: RenderSlot,
     thumbnails: ThumbnailSlot,
     edits: EditSlot,
+    origin: OriginSlot,
     /// The open export modal, if any -- [`AppController::checkpoint_export_requested`].
     export_dialog: Option<ExportDialog>,
     /// The last confirmed export format and settings, which the next modal
@@ -2383,6 +2434,186 @@ impl AppController {
         std::mem::take(&mut self.state.edits.started)
     }
 
+    /// Opens the active tab's origin readers on a worker when the overlay is
+    /// on and a Lighten or Darken stroke is among its strokes, unless they are
+    /// open, opening or failed for the current row and frames. A saved
+    /// op-bearing row's fused ancestor is rendered into the plane cache first
+    /// when it is not there.
+    pub fn ensure_origin_readers(&mut self) {
+        self.start_origin_readers(false);
+    }
+
+    /// [`Self::ensure_origin_readers`]; `picking` asks for the readers for an
+    /// eyedropper read, which needs a session, with the overlay off too.
+    fn start_origin_readers(&mut self, picking: bool) {
+        let Some(tab) = self.state.active() else {
+            return;
+        };
+        let wanted = if picking {
+            tab.edit.is_some()
+        } else {
+            self.state.overlay.on
+        };
+        if !wanted
+            || tab.origin.is_some()
+            || tab.origin_failed
+            || self.state.origin.opening(tab.id, tab.session_generation)
+            || !tab.overlay_ops().iter().any(|op| {
+                matches!(
+                    op,
+                    job::Op::BrushStroke {
+                        mode: job::BrushMode::Lighten | job::BrushMode::Darken,
+                        ..
+                    }
+                )
+            })
+        {
+            return;
+        }
+        let Some((frames, registration)) = tab.fused() else {
+            return;
+        };
+        let (tab_id, generation) = (tab.id, tab.session_generation);
+        let Some(composite) = self.origin_composite() else {
+            return;
+        };
+        let rendering = match &composite {
+            OriginComposite::Render { id, .. } => Some(id.clone()),
+            OriginComposite::Cached(_) => None,
+        };
+        let slot = &mut self.state.origin;
+        slot.in_flight.push((tab_id, generation, rendering));
+        slot.started = true;
+        let parked = Arc::clone(&slot.parked);
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let composite = match composite {
+                    OriginComposite::Cached(path) => path,
+                    OriginComposite::Render {
+                        project_path,
+                        scratch_root,
+                        id,
+                    } => {
+                        job::render_checkpoint_planes(&project_path, &scratch_root, &id)
+                            .map_err(|err| err.to_string())?
+                            .0
+                    }
+                };
+                job::OriginReaders::open(&composite, &frames, registration, job::host_budget())
+                    .map_err(|err| err.to_string())
+            }))
+            .map_err(|_| "the origin worker panicked".to_string())
+            .and_then(|opened| opened)
+            .map(Arc::new);
+            parked
+                .lock()
+                .expect("no thread panicked while holding the parked origin readers")
+                .push((tab_id, generation, result));
+        });
+    }
+
+    /// The composite the active tab's strokes were drawn over: its row's
+    /// planes when they carry no strokes, else the fused ancestor's, cached or
+    /// to be rendered. `None` while the planes are not ready, or while a
+    /// render of the ancestor already writes the cache.
+    fn origin_composite(&mut self) -> Option<OriginComposite> {
+        let scratch_root = self.scratch_root();
+        let tab = self.state.active()?;
+        if tab.base_ops().is_empty() {
+            return match self.active_tab_planes() {
+                TabPlanes::Ready(composite, _) => Some(OriginComposite::Cached(composite)),
+                TabPlanes::Pending | TabPlanes::None => None,
+            };
+        }
+        let GuiProject::Opened(project) = &tab.project else {
+            return None;
+        };
+        let ancestor = project
+            .history()
+            .ancestors(&tab.plane_key()?)
+            .ok()?
+            .into_iter()
+            .find(|checkpoint| checkpoint.ops.is_empty())?
+            .id
+            .clone();
+        match job::cached_checkpoint_planes(project, &scratch_root, &ancestor) {
+            Ok(job::CheckpointPlanes::Ready(composite, _)) => {
+                Some(OriginComposite::Cached(composite))
+            }
+            Ok(job::CheckpointPlanes::NeedsRender) => {
+                // Two writers of one checkpoint's planes share a partial file.
+                let rendered_elsewhere = self
+                    .state
+                    .render
+                    .in_flight
+                    .as_ref()
+                    .is_some_and(|(_, id)| *id == ancestor)
+                    || self.state.origin.rendering().contains(&ancestor);
+                (!rendered_elsewhere).then(|| OriginComposite::Render {
+                    project_path: project.path().to_path_buf(),
+                    scratch_root,
+                    id: ancestor,
+                })
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the origin readers' composite could not be located");
+                None
+            }
+        }
+    }
+
+    /// Installs the parked origin readers without waiting on a worker. They
+    /// land only on a tab that still exists at the generation they were
+    /// started for; a failed open is logged once and not retried until the
+    /// row or frames change. Returns `true` once none is being opened.
+    pub fn settle_origin_readers(&mut self) -> bool {
+        let parked = std::mem::take(
+            &mut *self
+                .state
+                .origin
+                .parked
+                .lock()
+                .expect("no thread panicked while holding the parked origin readers"),
+        );
+        let scratch_root = self.scratch_root();
+        for (tab_id, generation, result) in parked {
+            let mut rendered = None;
+            self.state.origin.in_flight.retain(|(tab, started, id)| {
+                let ours = (*tab, *started) == (tab_id, generation);
+                if ours {
+                    rendered.clone_from(id);
+                }
+                !ours
+            });
+            let Some(index) = self.tab_index(tab_id) else {
+                continue;
+            };
+            let tab = &mut self.state.projects[index];
+            if tab.session_generation != generation {
+                continue;
+            }
+            match result {
+                Ok(readers) => {
+                    if let Some(id) = &rendered {
+                        tab.note_viewed(&scratch_root, id);
+                    }
+                    tab.origin = Some(readers);
+                }
+                Err(reason) => {
+                    tracing::warn!(error = %reason, "the origin readers could not be opened");
+                    tab.origin_failed = true;
+                }
+            }
+        }
+        self.state.origin.in_flight.is_empty()
+    }
+
+    /// Whether origin readers started opening since the last call -- the
+    /// bridge's cue to start polling [`Self::settle_origin_readers`].
+    pub fn take_origin_started(&mut self) -> bool {
+        std::mem::take(&mut self.state.origin.started)
+    }
+
     /// Discards the active tab's own in-progress stroke, if any: restores
     /// and re-renders the tiles its ticks touched without it, so leaving the
     /// editor or switching tab mid-drag never leaves a half stroke on a tab
@@ -2467,6 +2698,7 @@ impl AppController {
         let sources = tab.fused()?.0.len();
         let mut draw = OverlayDraw::for_opacity(sources as u32, self.state.overlay.opacity);
         draw.ops = tab.overlay_ops().into();
+        draw.origin = tab.origin.clone().map(SharedOrigin);
         Some(draw)
     }
 
@@ -3478,7 +3710,7 @@ impl AppController {
         let hovered = picking
             .then(|| {
                 let (pane, local) = self.anchor_pane();
-                self.source_index_at(pane, local)
+                self.source_index_at(pane, local).ok().flatten()
             })
             .flatten()
             .filter(|&source| source != job::NO_SOURCE);
@@ -3592,27 +3824,48 @@ impl AppController {
     /// the latest stroke covering the pixel by more than half, else the
     /// stored Z-Map's index. `None` off the image or with nothing to read;
     /// callers decide what `NO_SOURCE` means to them.
-    fn source_index_at(&self, pane: PaneSource, local: (f32, f32)) -> Option<u16> {
-        let tab = self.state.active()?;
-        let viewport = tab.viewport.as_ref()?;
-        let (sx, sy) = viewport.to_source_in(local, self.pane_rect(pane)?);
+    fn source_index_at(
+        &self,
+        pane: PaneSource,
+        local: (f32, f32),
+    ) -> Result<Option<u16>, job::RetouchError> {
+        let Some(tab) = self.state.active() else {
+            return Ok(None);
+        };
+        let (Some(viewport), Some(rect), Some(edit)) = (
+            tab.viewport.as_ref(),
+            self.pane_rect(pane),
+            tab.edit.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        let (sx, sy) = viewport.to_source_in(local, rect);
+        let info = edit.info();
         if sx < 0.0 || sy < 0.0 {
-            return None;
+            return Ok(None);
         }
         let (x, y) = (sx.floor() as u32, sy.floor() as u32);
-        let edit = tab.edit.as_ref()?;
-        let info = edit.info();
         if x >= info.width() || y >= info.height() {
-            return None;
+            return Ok(None);
         }
-        job::top_source(
-            &edit.drawn_ops(),
-            info,
+        let ops = edit.drawn_ops();
+        let pixel = job::Rect {
             x,
             y,
-            &job::ModeConditions::default(),
-        )
-        .or_else(|| edit.stored_source(x, y))
+            width: 1,
+            height: 1,
+        };
+        let conditions = if job::needs_mode_conditions(&ops, info, pixel) {
+            match (&tab.origin, tab.origin_failed) {
+                (Some(origin), false) => {
+                    origin.conditions(&ops, info, pixel, std::num::NonZeroU32::MIN)?
+                }
+                _ => return Ok(None),
+            }
+        } else {
+            job::ModeConditions::default()
+        };
+        Ok(job::top_source(&ops, info, x, y, &conditions).or_else(|| edit.stored_source(x, y)))
     }
 
     /// `Alt + click`, or the armed pipette's `Start`: reads the frame the
@@ -3620,8 +3873,17 @@ impl AppController {
     /// brush source.
     /// `NO_SOURCE` and a point off the image leave the source unchanged.
     fn pick_source_at(&mut self, pane: PaneSource, local: (f32, f32)) {
-        let Some(source) = self.source_index_at(pane, local) else {
-            return;
+        self.start_origin_readers(true);
+        let source = match self.source_index_at(pane, local) {
+            Ok(Some(source)) => source,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, "the frame under the pointer could not be read");
+                if let Some(tab) = self.state.active_mut() {
+                    tab.origin_failed = true;
+                }
+                return;
+            }
         };
         if source == job::NO_SOURCE {
             return;
@@ -9338,6 +9600,7 @@ impl AppController {
     fn active_tab_planes(&mut self) -> TabPlanes {
         let scratch_root = self.scratch_root();
         let render_free = self.state.render.in_flight.is_none();
+        let origin_rendering = self.state.origin.rendering();
         let Some(tab) = self.state.active_mut() else {
             return TabPlanes::None;
         };
@@ -9392,7 +9655,7 @@ impl AppController {
                 TabPlanes::None
             }
             Ok(job::CheckpointPlanes::NeedsRender) => {
-                if render_free {
+                if render_free && !origin_rendering.contains(&key) {
                     let project_path = project.path().to_path_buf();
                     tab.row_planes = Some(RowPlanes::Pending);
                     let tab_id = tab.id;

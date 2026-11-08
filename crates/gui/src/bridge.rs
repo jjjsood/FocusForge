@@ -275,12 +275,7 @@ impl Canvas {
                     false,
                     0,
                 );
-                renderer.publish_edited(
-                    &prepared.job,
-                    &prepared.samples,
-                    &prepared.indices,
-                    edited,
-                );
+                renderer.publish_edited(&prepared.job, &prepared.samples, &prepared.colors, edited);
             }
         }
         if let Some(preparer) = self.preparer.as_ref() {
@@ -623,15 +618,17 @@ pub fn repaint(
             batch.publication,
         )
     });
-    let (feed, render_started, session_started, message_lines) = {
+    let (feed, render_started, session_started, origin_started, message_lines) = {
         let loaded = canvas.borrow().tab();
         let mut controller = controller.lock().unwrap();
         controller.fit_if_unfitted();
         let feed = controller.canvas_feed(loaded);
+        controller.ensure_origin_readers();
         (
             feed,
             controller.take_render_started(),
             controller.take_session_started(),
+            controller.take_origin_started(),
             controller.composite_message_lines(),
         )
     };
@@ -640,6 +637,9 @@ pub fn repaint(
     }
     if session_started {
         poll_edit_session(app.as_weak(), controller.clone(), canvas.clone());
+    }
+    if origin_started {
+        poll_origin_readers(app.as_weak(), controller.clone(), canvas.clone());
     }
     if controller.lock().unwrap().take_thumbnails_started() {
         poll_thumbnails(app.as_weak(), controller.clone());
@@ -776,6 +776,26 @@ fn poll_edit_session(
             repaint(&app, &controller, &canvas);
         } else {
             poll_edit_session(app_weak, controller, canvas);
+        }
+    });
+}
+
+/// Polls [`AppController::settle_origin_readers`] every [`job::POLL`] until no
+/// origin readers are being opened, then repaints -- their arrival changes
+/// what the composite overlay shows.
+fn poll_origin_readers(
+    app_weak: slint::Weak<AppWindow>,
+    controller: Arc<Mutex<AppController>>,
+    canvas: Rc<RefCell<Canvas>>,
+) {
+    slint::Timer::single_shot(job::POLL, move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if controller.lock().unwrap().settle_origin_readers() {
+            repaint(&app, &controller, &canvas);
+        } else {
+            poll_origin_readers(app_weak, controller, canvas);
         }
     });
 }

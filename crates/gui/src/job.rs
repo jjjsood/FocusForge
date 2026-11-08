@@ -8,6 +8,7 @@
 //! The one module in this crate besides `entry.rs`/`settings_panel.rs`/the
 //! canvas files allowed to name `focusforge_core`.
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -36,8 +37,9 @@ pub use focusforge_core::project::export::{
 };
 use focusforge_core::project::{self, Project, ProjectError};
 use focusforge_core::registry::{self, LookupError};
+use focusforge_core::retouch::blend;
 use focusforge_core::retouch::blend::Blend;
-use focusforge_core::retouch::{RetouchError, blend};
+use focusforge_core::retouch::replay_mode_conditions;
 use focusforge_core::tile::SampleFormat;
 pub use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::zmap::{ZMapError, ZMapInfo, ZMapReader};
@@ -53,7 +55,9 @@ pub use focusforge_core::project::{BrushMode, Op};
 pub use focusforge_core::project::{
     HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, kept_entries, now_unix,
 };
-pub use focusforge_core::retouch::{ModeConditions, footprint, top_source};
+pub use focusforge_core::retouch::{
+    ModeConditions, RetouchError, footprint, needs_mode_conditions, top_source,
+};
 pub use focusforge_core::update::{
     CheckFailure, HttpReleaseSource, ReleaseSource, UpdateCheck, check as check_for_update,
     parse_version,
@@ -2323,6 +2327,75 @@ impl EditState {
     }
 }
 
+/// Opens `composite` and the frame set it is edited from, which must hold
+/// the same sample type.
+fn open_base_and_sources(
+    composite: &Path,
+    frames: &[PathBuf],
+    budget: HostBudget,
+) -> Result<(Arc<TiffStack>, Arc<dyn FrameReader>), EditSessionError> {
+    let base = Arc::new(TiffStack::open_staged(composite)?);
+    let sources: Arc<dyn FrameReader> = Arc::from(open_frame_set(frames, budget)?.reader);
+    if base.sample_format() != sources.sample_format() {
+        return Err(EditSessionError::SampleFormatMismatch {
+            path: composite.to_path_buf(),
+            composite: base.sample_format(),
+            sources: sources.sample_format(),
+        });
+    }
+    Ok((base, sources))
+}
+
+/// What deciding whether a Lighten or Darken stroke acts reads: the composite
+/// the strokes were drawn over, the stroke source frames and their
+/// registration.
+pub struct OriginReaders {
+    ancestor: Arc<TiffStack>,
+    sources: Arc<dyn FrameReader>,
+    registration: Registration,
+}
+
+impl OriginReaders {
+    /// Opens `ancestor_composite` (the fused composite, before any stroke) and
+    /// `frames`; the composite and the frames must hold one sample type.
+    pub fn open(
+        ancestor_composite: &Path,
+        frames: &[PathBuf],
+        registration: Registration,
+        budget: HostBudget,
+    ) -> Result<Self, EditSessionError> {
+        let (ancestor, sources) = open_base_and_sources(ancestor_composite, frames, budget)?;
+        Ok(Self {
+            ancestor,
+            sources,
+            registration,
+        })
+    }
+
+    /// Replays `ops` over the ancestor composite and returns where each
+    /// Lighten or Darken stroke acts on the `step` lattice of `rect`.
+    pub fn conditions(
+        &self,
+        ops: &[Op],
+        info: ZMapInfo,
+        rect: Rect,
+        step: NonZeroU32,
+    ) -> Result<ModeConditions, RetouchError> {
+        let spp = self.sources.frame(0).samples_per_pixel as usize;
+        with_registered_sources(&*self.sources, &self.registration, |frames, origin| {
+            let base = &*self.ancestor;
+            match self.ancestor.sample_format() {
+                SampleFormat::U16 => {
+                    replay_mode_conditions::<u16>(ops, info, rect, step, base, frames, origin, spp)
+                }
+                SampleFormat::F32 => {
+                    replay_mode_conditions::<f32>(ops, info, rect, step, base, frames, origin, spp)
+                }
+            }
+        })
+    }
+}
+
 /// Builds an [`EditState`] over the whole map: `composite` is the image edits
 /// blend over, the resident cache is gridded at `tile_size` px, `base_ops`
 /// are the ops `composite` already shows (oldest first), and `chain` (a row's
@@ -2347,7 +2420,7 @@ pub fn open_edit_session(
         width: 1,
         height: 1,
     };
-    let base = Arc::new(TiffStack::open_staged(composite)?);
+    let (base, sources) = open_base_and_sources(composite, frames, budget)?;
     let header = base.header(0);
     let mut first = vec![0u16; header.samples_per_pixel as usize];
     base.read_tile_into(0, pixel, &mut first)?;
@@ -2371,14 +2444,6 @@ pub fn open_edit_session(
             })
             .ok()
     });
-    let sources: Arc<dyn FrameReader> = Arc::from(open_frame_set(frames, budget)?.reader);
-    if base.sample_format() != sources.sample_format() {
-        return Err(EditSessionError::SampleFormatMismatch {
-            path: composite.to_path_buf(),
-            composite: base.sample_format(),
-            sources: sources.sample_format(),
-        });
-    }
     let samples_per_pixel = sources.frame(0).samples_per_pixel;
     let tiles = crate::canvas::ResidentTiles::new(
         tile_size,

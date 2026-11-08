@@ -4121,9 +4121,13 @@ fn displayed_whole(controller: &mut AppController) -> Vec<u16> {
 /// The head checkpoint of the saved project at `path`, rendered whole by the
 /// one function every export and view goes through.
 fn saved_render(path: &Path) -> Vec<u16> {
+    saved_render_at(path, &saved(path).checkpoint().id.clone())
+}
+
+/// Checkpoint `id` of the saved project at `path`, rendered whole.
+fn saved_render_at(path: &Path, id: &str) -> Vec<u16> {
     let mut project = saved(path);
-    let id = project.checkpoint().id.clone();
-    let image = project::CheckpointImage::prepare(&project, &id).expect("the checkpoint prepares");
+    let image = project::CheckpointImage::prepare(&project, id).expect("the checkpoint prepares");
     let full = image.full();
     let mut out = vec![0u16; (full.width * full.height * 3) as usize];
     image
@@ -4731,6 +4735,7 @@ fn overlay_for(sources: u32, opacity: f32) -> OverlayDraw {
         table: focusforge_core::zmap::overlay_table(sources, None),
         ops: Arc::from([]),
         alpha: focusforge_core::display::alpha_from_opacity(opacity),
+        origin: None,
     }
 }
 
@@ -4850,6 +4855,7 @@ fn overlay_controls_match_the_render_parameters() {
             table: focusforge_core::zmap::overlay_table(3, None),
             ops: Arc::from([]),
             alpha: focusforge_core::display::alpha_from_opacity(0.3),
+            origin: None,
         }),
         "matches display::overlay_cpu's own blend, with no solo source"
     );
@@ -5202,19 +5208,365 @@ fn overlay_pixels(c: &AppController, zmap: &Path) -> Vec<[u8; 3]> {
         width: info.width(),
         height: info.height(),
     };
-    let stored = read_whole_zmap(zmap);
-    let mut colors = vec![[0u8; 3]; stored.len()];
-    focusforge_core::retouch::overlay_colors(
-        &draw.ops,
-        info,
-        whole,
-        NonZeroU32::MIN,
-        &focusforge_core::retouch::ModeConditions::default(),
-        &draw.table,
-        &stored,
-        &mut colors,
+    draw.colors(info, whole, NonZeroU32::MIN, &read_whole_zmap(zmap))
+}
+
+/// Polls until the active tab's origin readers are open, have failed to
+/// open, or are not wanted.
+fn settle_origin_readers(c: &mut AppController) {
+    let start = Instant::now();
+    loop {
+        c.ensure_origin_readers();
+        if c.settle_origin_readers() {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the origin readers did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn alt_click_at(c: &mut AppController, (x, y): (u32, u32)) {
+    let (sx, sy) = at(x as f32, y as f32);
+    c.pointer(PointerKind::Down, Button::Left, sx, sy, ALT);
+    c.pointer(PointerKind::Up, Button::Left, sx, sy, ALT);
+}
+
+/// A frame other than `not`, so a pick that changes nothing is told apart
+/// from one that lands on `not`.
+fn frame_other_than(not: &[u16]) -> usize {
+    (0..3)
+        .find(|f| !not.contains(&(*f as u16)))
+        .expect("a frame outside the excluded ones")
+}
+
+/// A hard-edged single dab.
+fn dab(source_id: u16, centre: (u32, u32), radius: f32, mode: BrushMode, opacity: f32) -> Op {
+    Op::BrushStroke {
+        source_id,
+        path: vec![Point {
+            x: centre.0 as i32,
+            y: centre.1 as i32,
+        }],
+        radius,
+        softness: 0.0,
+        mode,
+        opacity,
+    }
+}
+
+/// Whether `(x, y)` lies at least `margin` px inside the disc of `radius`
+/// around `centre`.
+fn deep_inside(centre: (u32, u32), radius: f32, margin: f32, (x, y): (u32, u32)) -> bool {
+    let (dx, dy) = (x as f32 - centre.0 as f32, y as f32 - centre.1 as f32);
+    (dx * dx + dy * dy).sqrt() <= radius - margin
+}
+
+/// The map pixels in row-major order.
+fn map_pixels() -> impl Iterator<Item = (u32, u32)> {
+    (0..MAP_HEIGHT).flat_map(|y| (0..MAP_WIDTH).map(move |x| (x, y)))
+}
+
+fn map_index((x, y): (u32, u32)) -> usize {
+    (y * MAP_WIDTH + x) as usize
+}
+
+/// An editor holding one Lighten dab, with pixels deep inside it where it
+/// changes the sealed composite and where it does not, each over a stored
+/// source other than the stroke's.
+struct LightenCase {
+    zmap: PathBuf,
+    stroke_source: u16,
+    acts: ((u32, u32), u16),
+    idle: ((u32, u32), u16),
+}
+
+fn lighten_case(name: &str, opacity: f32) -> (AppController, LightenCase) {
+    const RADIUS: f32 = 10.0;
+    let (mut c, root) = open_editor(name);
+    let sealed = Sealed::read(&mut c, &root);
+    let (composite, zmap) = c.materialize_active_tab_planes().unwrap();
+    let stored = read_whole_zmap(&zmap);
+    // The first source and place where the stroke is brighter than the
+    // composite in some pixels and not in others.
+    let candidates = (0..3)
+        .flat_map(|source| [(16, 18), (29, 30), (42, 42)].map(move |centre| (source, centre)));
+    for (stroke_source, centre) in candidates {
+        let op = dab(stroke_source, centre, RADIUS, BrushMode::Lighten, opacity);
+        let rendered = pending_render(&composite, &root, &sealed, vec![op.clone()]);
+        let (mut acts, mut idle) = (None, None);
+        for p in map_pixels() {
+            let (i, source) = (map_index(p), stored[map_index(p)]);
+            if !deep_inside(centre, RADIUS, 2.0, p)
+                || source == NO_SOURCE
+                || source == stroke_source
+            {
+                continue;
+            }
+            let changed = rendered[i * 3..i * 3 + 3] != sealed.composite[i * 3..i * 3 + 3];
+            let slot = if changed { &mut acts } else { &mut idle };
+            slot.get_or_insert((p, source));
+        }
+        if let (Some(acts), Some(idle)) = (acts, idle) {
+            common::paint(&mut c, op);
+            common::settle_region_renders(&mut c);
+            return (
+                c,
+                LightenCase {
+                    zmap,
+                    stroke_source,
+                    acts,
+                    idle,
+                },
+            );
+        }
+    }
+    panic!("no Lighten dab acts at some of its pixels and not at others");
+}
+
+#[test]
+fn overlay_and_pipette_skip_a_lighten_stroke_where_it_does_not_act() {
+    for (index, (opacity, overlay_on)) in [(1.0, true), (0.6, false)].into_iter().enumerate() {
+        let (mut c, case) = lighten_case(&format!("lighten_skips_{index}"), opacity);
+        let frames = c.frame_count().unwrap();
+        c.set_overlay_on(overlay_on);
+        if !overlay_on {
+            // A pick requests the readers when the overlay is off.
+            alt_click_at(&mut c, case.idle.0);
+        }
+        settle_origin_readers(&mut c);
+        let expected = [
+            (case.idle.0, case.idle.1),
+            (case.acts.0, case.stroke_source),
+        ];
+        if overlay_on {
+            let table = focusforge_core::zmap::overlay_table(frames, None);
+            let pixels = overlay_pixels(&c, &case.zmap);
+            for (p, shown) in expected {
+                assert_eq!(
+                    pixels[map_index(p)],
+                    table[usize::from(shown)],
+                    "opacity {opacity}: the overlay at {p:?}"
+                );
+            }
+        }
+        for (p, shown) in expected {
+            c.select_frame(frame_other_than(&[shown]));
+            alt_click_at(&mut c, p);
+            assert_eq!(
+                c.brush_source(),
+                Some(shown),
+                "opacity {opacity}: Alt + click at {p:?}"
+            );
+        }
+        c.toggle_pipette();
+        for ((x, y), shown) in expected {
+            let (sx, sy) = at(x as f32, y as f32);
+            c.pointer(PointerKind::Move, Button::Left, sx, sy, NO_MODS);
+            assert_eq!(
+                c.brush_cursor_view().unwrap().pick_color,
+                job::source_color(shown, frames),
+                "opacity {opacity}: the armed cursor at ({x}, {y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn pipette_keeps_source_when_condition_read_fails() {
+    let (mut c, root) = open_editor("origin_read_fails");
+    let zmap = c.held_checkpoints().last().unwrap().zmap.clone();
+    let stored = read_whole_zmap(&zmap);
+    let table = focusforge_core::zmap::overlay_table(c.frame_count().unwrap(), None);
+    c.set_overlay_on(true);
+    let (normal_at, lighten_at) = ((14, 14), (40, 40));
+    common::paint(&mut c, dab(2, normal_at, 5.0, BrushMode::Normal, 1.0));
+    common::paint(&mut c, dab(1, lighten_at, 5.0, BrushMode::Lighten, 1.0));
+    common::settle_region_renders(&mut c);
+    // The session's mapped frames outlive the file; the readers open it again.
+    fs::remove_file(root.join("01.tif")).unwrap();
+
+    c.ensure_origin_readers();
+    assert!(c.take_origin_started(), "the readers start opening");
+    settle_origin_readers(&mut c);
+    assert!(
+        c.overlay_draw().unwrap().origin.is_none(),
+        "the failed open leaves no readers"
     );
-    colors
+    let pixels = overlay_pixels(&c, &zmap);
+    assert_eq!(
+        pixels[map_index(lighten_at)],
+        table[usize::from(stored[map_index(lighten_at)])],
+        "the stored colour stays under the Lighten stroke"
+    );
+    assert_eq!(
+        pixels[map_index(normal_at)],
+        table[2],
+        "a Normal stroke still shows its source"
+    );
+
+    let selected = frame_other_than(&[1, stored[map_index(lighten_at)]]);
+    c.select_frame(selected);
+    alt_click_at(&mut c, lighten_at);
+    assert_eq!(
+        c.brush_source(),
+        Some(selected as u16),
+        "a pick under the Lighten stroke changes nothing"
+    );
+    for _ in 0..3 {
+        settle_origin_readers(&mut c);
+        assert!(!c.take_origin_started(), "a failed open is not retried");
+    }
+}
+
+#[test]
+fn overlay_waits_for_lighten_darken_samples() {
+    // Open session: stored colours until the readers settle.
+    let (mut c, case) = lighten_case("origin_waits", 1.0);
+    let table = focusforge_core::zmap::overlay_table(c.frame_count().unwrap(), None);
+    c.set_overlay_on(true);
+    let (acts, acts_stored) = case.acts;
+    let waiting = c.overlay_draw().unwrap();
+    assert!(waiting.origin.is_none());
+    assert_eq!(
+        overlay_pixels(&c, &case.zmap)[map_index(acts)],
+        table[usize::from(acts_stored)],
+        "the stored colour shows while the readers are not open"
+    );
+    let selected = frame_other_than(&[case.stroke_source]);
+    c.select_frame(selected);
+    alt_click_at(&mut c, acts);
+    assert_eq!(
+        c.brush_source(),
+        Some(selected as u16),
+        "a pick waits for the readers too"
+    );
+    settle_origin_readers(&mut c);
+    let ready = c.overlay_draw().unwrap();
+    assert!(ready.origin.is_some());
+    assert_ne!(ready, waiting, "the readers' arrival changes the draw");
+    assert_eq!(
+        overlay_pixels(&c, &case.zmap)[map_index(acts)],
+        table[usize::from(case.stroke_source)],
+        "the replayed origin shows once they are open"
+    );
+
+    // Only Normal strokes: no readers.
+    let (mut normal, _) = open_editor("origin_normal_only");
+    normal.set_overlay_on(true);
+    common::paint(&mut normal, dab(2, (20, 20), 5.0, BrushMode::Normal, 1.0));
+    normal.ensure_origin_readers();
+    alt_click_at(&mut normal, (20, 20));
+    assert!(!normal.take_origin_started(), "no Lighten or Darken stroke");
+    assert!(normal.overlay_draw().unwrap().origin.is_none());
+
+    saved_lighten_replays_from_the_fused_ancestor();
+}
+
+/// A saved Lighten stroke over a saved Normal one, reopened with no session
+/// and no cached planes: the overlay shows its source exactly where the
+/// row's render differs from its parent's.
+fn saved_lighten_replays_from_the_fused_ancestor() {
+    const NORMAL: ((u32, u32), f32) = ((20, 30), 14.0);
+    const LIGHTEN: ((u32, u32), f32) = ((36, 30), 14.0);
+    let name = "origin_saved_checkpoint";
+    let mut c = scratch_controller(name);
+    let root = open_fused_tab(&mut c, &format!("{name}_frames"), 3);
+    common::enter_editor(&mut c);
+    // Sources for which Lighten acts over the Normal stroke in some pixels
+    // and rests in others.
+    let sealed = Sealed::read(&mut c, &root);
+    let composite = c.materialize_active_tab_planes().unwrap().0;
+    let (normal_source, lighten_source) = (0..3)
+        .flat_map(|n| (0..3).map(move |l| (n, l)))
+        .filter(|(n, l)| n != l)
+        .find(|&(n, l)| {
+            let normal = dab(n, NORMAL.0, NORMAL.1, BrushMode::Normal, 0.8);
+            let lighten = dab(l, LIGHTEN.0, LIGHTEN.1, BrushMode::Lighten, 1.0);
+            let below = pending_render(&composite, &root, &sealed, vec![normal.clone()]);
+            let above = pending_render(&composite, &root, &sealed, vec![normal, lighten]);
+            let mut seen = [false; 3];
+            for p in map_pixels().filter(|&p| deep_inside(LIGHTEN.0, LIGHTEN.1, 2.0, p)) {
+                let i = map_index(p) * 3;
+                let acted = above[i..i + 3] != below[i..i + 3];
+                let in_normal = deep_inside(NORMAL.0, NORMAL.1, 2.0, p);
+                if !in_normal && deep_inside(NORMAL.0, NORMAL.1 + 2.0, 0.0, p) {
+                    continue;
+                }
+                match (acted, in_normal) {
+                    (_, false) => {}
+                    (true, true) => seen[1] = true,
+                    (false, true) => seen[2] = true,
+                }
+            }
+            seen[1] && seen[2]
+        })
+        .expect("sources whose Lighten stroke acts over a Normal one in some pixels and rests in others");
+    let path = save_to_proposed(&mut c);
+    let normal = dab(normal_source, NORMAL.0, NORMAL.1, BrushMode::Normal, 0.8);
+    common::paint(&mut c, normal);
+    assert!(c.save_active_project(|_| None));
+    let parent = saved(&path).checkpoint().id.clone();
+    let lighten = dab(
+        lighten_source,
+        LIGHTEN.0,
+        LIGHTEN.1,
+        BrushMode::Lighten,
+        1.0,
+    );
+    common::paint(&mut c, lighten);
+    assert!(c.save_active_project(|_| None));
+    let row = saved(&path).checkpoint().id.clone();
+    let row_render = saved_render_at(&path, &row);
+    let parent_render = saved_render_at(&path, &parent);
+
+    let mut r = reopen(&path, "origin_saved_checkpoint_reopened");
+    r.set_overlay_on(true);
+    assert!(r.edit_session().is_none(), "no session");
+    assert_eq!(r.materialize_active_tab_planes(), None, "the row renders");
+    common::settle_render(&mut r);
+    let (_, zmap) = r.materialize_active_tab_planes().unwrap();
+    let stored = read_whole_zmap(&zmap);
+    let table = focusforge_core::zmap::overlay_table(3, None);
+    let waiting = overlay_pixels(&r, &zmap);
+    settle_origin_readers(&mut r);
+    assert!(r.overlay_draw().unwrap().origin.is_some());
+    let ready = overlay_pixels(&r, &zmap);
+
+    let (mut acts_inside, mut idle_inside) = (0, 0);
+    for p in map_pixels().filter(|&p| deep_inside(LIGHTEN.0, LIGHTEN.1, 2.0, p)) {
+        let i = map_index(p);
+        let in_normal = deep_inside(NORMAL.0, NORMAL.1, 2.0, p);
+        let near_normal = deep_inside(NORMAL.0, NORMAL.1 + 2.0, 0.0, p);
+        let below = match (in_normal, near_normal) {
+            (true, _) => table[usize::from(normal_source)],
+            (false, false) => table[usize::from(stored[i])],
+            (false, true) => continue,
+        };
+        let acted = row_render[i * 3..i * 3 + 3] != parent_render[i * 3..i * 3 + 3];
+        assert_eq!(
+            waiting[i], below,
+            "stored colours before the readers: {p:?}"
+        );
+        assert_eq!(
+            ready[i],
+            if acted {
+                table[usize::from(lighten_source)]
+            } else {
+                below
+            },
+            "the replayed origin at {p:?}"
+        );
+        match (acted, in_normal) {
+            (_, false) => {}
+            (true, true) => acts_inside += 1,
+            (false, true) => idle_inside += 1,
+        }
+    }
+    assert!(acts_inside > 0, "Lighten acts over the Normal stroke");
+    assert!(idle_inside > 0, "Lighten rests over the Normal stroke");
 }
 
 #[test]
