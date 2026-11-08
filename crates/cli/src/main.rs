@@ -379,9 +379,9 @@ enum Command {
         /// linearly to nothing at `radius`. A stroke may also carry `mode`
         /// (`normal`, `lighten`, `darken` or `detail`; default `normal`) and
         /// `opacity` (0 < x ≤ 1; default 1.0). An opacity too small to
-        /// register still records a state but changes no sample. Every op is checked before
-        /// anything is written; positions in error messages count from 0 in
-        /// list order.
+        /// register still records a state but changes no sample. Every op
+        /// is checked before anything is written; positions in error
+        /// messages count from 0 in list order.
         #[arg(long, value_name = "FILE")]
         ops: PathBuf,
         /// The state to append under -- any unique prefix of its id.
