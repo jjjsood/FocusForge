@@ -356,8 +356,8 @@ fn the_brush_stroke_round_trips() {
     );
 }
 
-/// The stroke list in `fixtures/retouch/stroke-list.json`, as written before
-/// strokes carried a mode or an opacity.
+/// The stroke list in `fixtures/retouch/stroke-list.json`, whose strokes carry
+/// neither a mode nor an opacity.
 fn stroke_list_fixture() -> String {
     std::fs::read_to_string(common::fixtures_dir().join("retouch/stroke-list.json"))
         .expect("the stroke list fixture must read")
@@ -413,16 +413,16 @@ fn brush_stroke_mode_opacity_absent_fields_read_as_defaults() {
 }
 
 #[test]
-fn brush_stroke_mode_opacity_default_keeps_todays_bytes_and_id() {
-    let pre_change = r#"[{"brush-stroke":{"source_id":2,"path":[{"x":120,"y":256},{"x":380,"y":256}],"radius":18.0,"softness":0.3}}]"#;
-    let ops: Vec<Op> = serde_json::from_str(pre_change).unwrap();
+fn brush_stroke_mode_opacity_default_keeps_its_bytes_and_id() {
+    let without_fields = r#"[{"brush-stroke":{"source_id":2,"path":[{"x":120,"y":256},{"x":380,"y":256}],"radius":18.0,"softness":0.3}}]"#;
+    let ops: Vec<Op> = serde_json::from_str(without_fields).unwrap();
     let bytes = serde_json::to_vec(&ops).unwrap();
-    assert_eq!(String::from_utf8(bytes.clone()).unwrap(), pre_change);
+    assert_eq!(String::from_utf8(bytes.clone()).unwrap(), without_fields);
 
     let id = |ops_json: &[u8]| {
         Checkpoint::derive_child_id("parent", "fingerprint", &blake3::hash(ops_json).to_hex(), 7)
     };
-    assert_eq!(id(&bytes), id(pre_change.as_bytes()));
+    assert_eq!(id(&bytes), id(without_fields.as_bytes()));
 }
 
 #[test]
