@@ -17,7 +17,16 @@ if (-not $url -or -not $expectedHash) { throw 'missing WiX pin' }
 $toolDirectory = Join-Path $root '.scratch/package-windows/tools'
 New-Item -ItemType Directory -Force -Path $toolDirectory | Out-Null
 $package = Join-Path $toolDirectory 'wix.4.0.5.nupkg'
-Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $package
+for ($attempt = 1; ; $attempt++) {
+  try { Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $package -TimeoutSec 300 -OperationTimeoutSeconds 60; break }
+  catch {
+    $status = $_.Exception.Response.StatusCode
+    if (($status -and [int]$status -lt 500) -or $attempt -ge 4) { throw }
+    $delay = 5 * [math]::Pow(2, $attempt - 1)
+    Write-Warning "download of $url failed ($($_.Exception.Message)); retrying in ${delay}s"
+    Start-Sleep -Seconds $delay
+  }
+}
 if ((Get-FileHash -Algorithm SHA256 $package).Hash.ToLowerInvariant() -ne $expectedHash) { throw 'WiX checksum mismatch' }
 $wixDirectory = Join-Path $toolDirectory 'wix'
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $wixDirectory

@@ -174,7 +174,7 @@ deb_dependencies=$(dpkg-deb --field "$out/focusforge_${version}_amd64.deb" Depen
 checker_image=$(docker build -q --build-arg DEB_DEPENDENCIES="$deb_dependencies" - <<EOF
 FROM $image
 ARG DEB_DEPENDENCIES
-RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq binutils file python3 dpkg && apt-get satisfy -y "\$DEB_DEPENDENCIES"
+RUN apt-get -o Acquire::Retries=3 update -qq && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y -qq binutils file python3 dpkg && apt-get -o Acquire::Retries=3 satisfy -y "\$DEB_DEPENDENCIES"
 EOF
 )
 rm -rf "$work"

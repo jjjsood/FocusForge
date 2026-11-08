@@ -711,7 +711,7 @@ def symbol_download_cases() -> None:
     class Reply(io.BytesIO):
         def __enter__(self) -> "Reply": return self
         def __exit__(self, *args: object) -> None: self.close()
-    def fixture(directory: Path, archive_sha: str | None = None, wrong_manifest: bool = False) -> tuple[dict, dict[str, bytes]]:
+    def fixture(directory: Path, archive_sha: str | None = None) -> tuple[dict, dict[str, bytes]]:
         payload = directory / "tool.tar.xz"
         with tarfile.open(payload, "w:xz") as archive:
             body = directory / "minidump-stackwalk"; body.write_bytes(b"tool"); archive.add(body, arcname="minidump-stackwalk")
@@ -720,7 +720,7 @@ def symbol_download_cases() -> None:
         manifest = json.dumps(listed).encode()
         pins = {"stackwalk": {"version": "0.0", "manifest_url": "https://example.invalid/manifest.json", "manifest_sha256": hashlib.sha256(manifest).hexdigest(), "artifact": [{"target": target, "url": f"https://example.invalid/{payload.name}", "sha256": hashlib.sha256(data).hexdigest(), "executable": "minidump-stackwalk"}]}}
         payload.unlink(); body.unlink()
-        served = {"https://example.invalid/manifest.json": b"{}" if wrong_manifest else manifest, f"https://example.invalid/{payload.name}": data}
+        served = {"https://example.invalid/manifest.json": manifest, f"https://example.invalid/{payload.name}": data}
         return pins, served
     def run(outcomes: list[Exception], served: dict[str, bytes], pins: dict, directory: Path) -> tuple[object, list[str], list[float], str]:
         script, calls, sleeps = list(outcomes), [], []
@@ -756,19 +756,61 @@ def symbol_download_cases() -> None:
         assert len(lines) == 3, errors
         result, calls, sleeps, _ = run([failure(404)], served, pins, Path(temporary) / "missing")
         assert isinstance(result, urllib.error.HTTPError) and result.code == 404 and len(calls) == 1 and not sleeps, (result, calls)
+    manifest_url = "https://example.invalid/manifest.json"
     with tempfile.TemporaryDirectory() as temporary:
-        pins, served = fixture(Path(temporary), wrong_manifest=True)
-        result, calls, sleeps, _ = run([], served, pins, Path(temporary) / "cache")
+        pins, served = fixture(Path(temporary))
+        good_manifest, served[manifest_url] = served[manifest_url], b"{}"
+        cache = Path(temporary) / "cache"
+        result, calls, sleeps, _ = run([], served, pins, cache)
         assert isinstance(result, ValueError) and "release manifest checksum mismatch" in str(result) and len(calls) == 1 and not sleeps, (result, calls)
+        assert not list(cache.glob("*manifest.json")), list(cache.iterdir())
+        served[manifest_url] = good_manifest
+        result, calls, sleeps, _ = run([], served, pins, cache)
+        assert isinstance(result, Path) and result.is_file() and len(calls) == 2 and not sleeps, (result, calls)
     with tempfile.TemporaryDirectory() as temporary:
         pins, served = fixture(Path(temporary), archive_sha="0" * 64)
         result, calls, sleeps, _ = run([], served, pins, Path(temporary) / "cache")
         assert isinstance(result, ValueError) and "does not match pinned archive" in str(result) and len(calls) == 1 and not sleeps, (result, calls)
     with tempfile.TemporaryDirectory() as temporary:
         pins, served = fixture(Path(temporary))
+        good = served["https://example.invalid/tool.tar.xz"]
         served["https://example.invalid/tool.tar.xz"] = b"corrupt"
-        result, calls, sleeps, _ = run([], served, pins, Path(temporary) / "cache")
+        cache = Path(temporary) / "cache"
+        result, calls, sleeps, _ = run([], served, pins, cache)
         assert isinstance(result, ValueError) and "archive checksum mismatch" in str(result) and len(calls) == 2 and not sleeps, (result, calls)
+        assert not list(cache.glob("*.tar.xz")), list(cache.iterdir())
+        served["https://example.invalid/tool.tar.xz"] = good
+        result, calls, sleeps, _ = run([], served, pins, cache)
+        assert isinstance(result, Path) and result.is_file() and len(calls) == 1 and not sleeps, (result, calls)
+    with tempfile.TemporaryDirectory() as temporary:
+        pins, served = fixture(Path(temporary))
+        cache = Path(temporary) / "cache"
+        cache.mkdir()
+        (cache / "stackwalk-0.0-manifest.json").write_bytes(b"stale")
+        result, calls, sleeps, _ = run([], served, pins, cache)
+        assert isinstance(result, Path) and result.is_file() and calls == [manifest_url, "https://example.invalid/tool.tar.xz"] and not sleeps, (result, calls)
+
+
+def linux_download_retry_cases() -> None:
+    """Linux package downloads retry transient failures only, and every pinned fetch is checked on its own."""
+    package_path, checker_path = ROOT / "tools/package-linux.sh", ROOT / "tools/check-package-linux.sh"
+    call(["bash", "-n", str(package_path), str(checker_path)])
+    package, checker = package_path.read_text(), checker_path.read_text()
+    assert len(re.findall(r"^\s*fetch\(\)", package, re.M)) == 1
+    curls = [line for line in package.splitlines() if re.search(r"\bcurl\s+--", line)]
+    assert len(curls) == 2 and any("sh.rustup.rs" in line for line in curls) and any(line.lstrip().startswith("fetch()") for line in curls), curls
+    for line in curls:
+        assert "--retry 3" in line and "--retry-connrefused" in line and "--retry-all-errors" not in line, line
+        assert "--connect-timeout" in line and "--speed-time" in line and "--speed-limit" in line, line
+    lines = package.splitlines()
+    fetches = [index for index, line in enumerate(lines) if re.match(r"\s*fetch\s+\"", line)]
+    assert len(fetches) == 3, fetches
+    for index in fetches:
+        destination = lines[index].split()[-1]
+        assert "sha256sum -c -" in lines[index + 1] and destination in lines[index + 1], (lines[index], lines[index + 1])
+    for name, text, count in (("package-linux.sh", package, 2), ("check-package-linux.sh", checker, 3)):
+        assert not re.search(r"apt-get\s+(?:update|install|satisfy)", text), name
+        assert len(re.findall(r"apt-get -o Acquire::Retries=3 (?:update|install|satisfy)", text)) == count, name
 
 
 def symbol_tool_placement_cases() -> None:
@@ -1516,6 +1558,57 @@ def wix_version_cases() -> None:
             assert (result.returncode == 0) == success, (case, result.stderr)
 
 
+def wix_download_cases() -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "PowerShell 7+ is required for WiX download cases"
+    source = (ROOT / "tools/package-windows.ps1").read_text()
+    match = re.search(r"(for \(\$attempt = 1;.*?throw 'WiX checksum mismatch' \})", source, re.S)
+    assert match, "WiX download snippet not found"
+    good = hashlib.sha256(b"good").hexdigest()
+    prelude = f"""param([string]$Case)
+$ErrorActionPreference='Stop'
+$url='https://example.invalid/wix.nupkg'; $expectedHash='{good}'
+$package=Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+$global:Calls=0; $global:Sleeps=@()
+$global:Plan=@{{ success=@('503','timeout','connection','ok'); persistent=@('503','503','503','503','503'); missing=@('404','ok'); wrong=@('wrong','ok') }}[$Case]
+function Start-Sleep {{ param([double]$Seconds) $global:Sleeps += $Seconds }}
+function Invoke-WebRequest {{
+  param([switch]$UseBasicParsing, [string]$Uri, [string]$OutFile, [int]$TimeoutSec, [int]$OperationTimeoutSeconds)
+  $step = $global:Plan[$global:Calls++]
+  switch -Regex ($step) {{
+    '^[0-9]+$' {{ $e = [Exception]::new("HTTP $step"); Add-Member -InputObject $e -NotePropertyName Response -NotePropertyValue ([pscustomobject]@{{StatusCode=[int]$step}}); throw $e }}
+    'timeout' {{ throw [TimeoutException]::new('timed out') }}
+    'connection' {{ throw [System.Net.Sockets.SocketException]::new() }}
+    'ok' {{ [IO.File]::WriteAllText($OutFile, 'good') }}
+    'wrong' {{ [IO.File]::WriteAllText($OutFile, 'bad') }}
+  }}
+}}
+try {{
+"""
+    epilogue = """
+  $code = 0
+} catch { Write-Output "error: $($_.Exception.Message)"; $code = 1 }
+Write-Output "calls=$($global:Calls) sleeps=$($global:Sleeps -join ',')"
+exit $code
+"""
+    with tempfile.TemporaryDirectory() as temp:
+        runner = Path(temp) / "wix-download.ps1"
+        runner.write_text(prelude + match.group(1) + epilogue)
+        def run(case: str) -> tuple[int, str]:
+            result = subprocess.run([pwsh, "-NoProfile", "-File", str(runner), case], text=True, capture_output=True)
+            return result.returncode, result.stdout + result.stderr
+        code, output = run("success")
+        assert code == 0 and "calls=4 sleeps=5,10,20" in output, output
+        assert sum("retrying" in line and "https://example.invalid/wix.nupkg" in line for line in output.splitlines()) == 3, output
+        code, output = run("persistent")
+        assert code == 1 and "calls=4 sleeps=5,10,20" in output and "HTTP 503" in output, output
+        assert sum("retrying" in line and "https://example.invalid/wix.nupkg" in line for line in output.splitlines()) == 3, output
+        code, output = run("missing")
+        assert code == 1 and "calls=1 sleeps=" in output and "retrying" not in output and "HTTP 404" in output, output
+        code, output = run("wrong")
+        assert code == 1 and "calls=1 sleeps=" in output and "retrying" not in output and "WiX checksum mismatch" in output, output
+
+
 def symbol_module() -> types.ModuleType:
     spec = importlib.util.spec_from_file_location("symbol_packager_fixture", SYMBOL_PACKAGER)
     module = importlib.util.module_from_spec(spec)
@@ -2047,11 +2140,11 @@ def main(argv: list[str]) -> int:
     if not no_pwsh and not shutil.which("pwsh"):
         print("PowerShell 7+ is required on PATH; pass --no-pwsh to run the cases that do not need it", file=sys.stderr)
         return 1
-    pwsh_groups = (wix_version_cases, windows_checker_mock)
+    pwsh_groups = (wix_version_cases, wix_download_cases, windows_checker_mock)
     groups = (
         producer, producer_cleanup_mock, checker, cli_asset_helper_cases, gate_checks, gate_retry_cases, graph,
-        native_boundaries, symbol_download_cases, symbol_tool_placement_cases, symbol_tool_cases, linux_known_main_cases, linux_crash_roundtrip_cases, source_privacy_cases,
-        hosted_runner_path_cases, macos_source_cases, windows_identity_cases, wix_version_cases, macos_checker_mock,
+        native_boundaries, symbol_download_cases, linux_download_retry_cases, symbol_tool_placement_cases, symbol_tool_cases, linux_known_main_cases, linux_crash_roundtrip_cases, source_privacy_cases,
+        hosted_runner_path_cases, macos_source_cases, windows_identity_cases, wix_version_cases, wix_download_cases, macos_checker_mock,
         macos_producer_mock, linux_producer_fresh_root, windows_checker_mock, smoke_callers,
     )
     for group in groups:

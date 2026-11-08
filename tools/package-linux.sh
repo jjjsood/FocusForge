@@ -167,13 +167,13 @@ version=$1; app_url=$2; app_sha=$3; runtime_url=$4; runtime_sha=$5; revision=$6;
 deb_version=${version/-/\~}
 trap 'chown -R "$owner_uid:$owner_gid" /out /symbol-tools' EXIT
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq build-essential ca-certificates curl xz-utils file binutils dpkg-dev squashfs-tools pkg-config libfontconfig1-dev python3 > /out/apt-install.log
+apt-get -o Acquire::Retries=3 update -qq
+apt-get -o Acquire::Retries=3 install -y -qq build-essential ca-certificates curl xz-utils file binutils dpkg-dev squashfs-tools pkg-config libfontconfig1-dev python3 > /out/apt-install.log
 dump_syms=$(python3 /src/tools/package-symbols.py install dump_syms x86_64-unknown-linux-gnu /symbol-tools)
 python3 /src/tools/package-symbols.py install stackwalk x86_64-unknown-linux-gnu /symbol-tools > /dev/null
 dpkg_version=$(dpkg-deb --version | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 test "$dpkg_version" = 1.21.1
-fetch() { curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 -o "$2" "$1"; }
+fetch() { curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 --retry 3 --retry-connrefused --connect-timeout 30 --speed-limit 1024 --speed-time 60 -o "$2" "$1"; }
 fetch "$app_url" /out/appimagetool.AppImage
 printf '%s  %s\n' "$app_sha" /out/appimagetool.AppImage | sha256sum -c -
 fetch "$runtime_url" /out/runtime-x86_64
@@ -185,7 +185,7 @@ while IFS=$'\t' read -r name url sha; do
   printf '%s  %s\n' "$sha" "/out/type2-legal-inputs/$name" | sha256sum -c -
 done < /out/type2-legal-inputs.tsv
 chmod +x /out/appimagetool.AppImage
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /out/rustup-init.sh
+curl --proto '=https' --tlsv1.2 --retry 3 --retry-connrefused --connect-timeout 30 --speed-limit 1024 --speed-time 60 -sSf https://sh.rustup.rs -o /out/rustup-init.sh
 sh /out/rustup-init.sh -y --default-toolchain 1.95.0 --profile minimal
 . "$HOME/.cargo/env"
 mkdir /work
