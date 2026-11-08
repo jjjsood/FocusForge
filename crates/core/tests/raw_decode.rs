@@ -8,14 +8,14 @@ use focusforge_core::algorithm::{AlgorithmError, TileReader};
 use focusforge_core::equalize::{EqualizeSettings, UNIT_GAIN};
 use focusforge_core::host::HostFacts;
 use focusforge_core::io::Rect;
-use focusforge_core::io::{FrameError, FrameReader, RawError, RawStack};
+use focusforge_core::io::{FrameError, FrameReader, RawError, RawStack, open_frame_set};
 use focusforge_core::job::{JobControl, JobStage};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::pipeline::{
     FreeSpaceProbe, FuseOutcome, FuseOutput, FuseProduct, FuseRequest, PipelineError, RunStage,
     StageObserver, VolumeShortfall, VolumeSpace,
 };
-use focusforge_core::tile::HostBudget;
+use focusforge_core::tile::{HostBudget, MemoryBound};
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
 use rawler::rawsource::RawSource;
 use sha2::{Digest, Sha256};
@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::common::target_tmp;
-use crate::raw_dng::{DngSpec, write_dng};
+use crate::raw_dng::{DngSpec, copy_padded, write_dng};
 
 #[test]
 fn raw_reader_opens_an_empty_path_list_as_a_named_error() {
@@ -2278,6 +2278,77 @@ fn cache_refusal_message_names_the_file_in_mb_at_both_sites() {
 }
 
 #[test]
+fn capped_budget_opens_at_the_largest_reservation_and_refuses_one_byte_below() {
+    let source = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]),
+        false,
+    );
+    let root = target_tmp();
+    let sets: [Vec<PathBuf>; 2] = [
+        vec![PathBuf::from(source.path())],
+        (0..3)
+            .map(|index| root.path().join(format!("{index:02}.dng")))
+            .collect(),
+    ];
+    copy_padded(source.path(), &sets[1][0], 0);
+    copy_padded(source.path(), &sets[1][1], 4_000);
+    copy_padded(source.path(), &sets[1][2], 0);
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: 8,
+        height: 8,
+    };
+    for paths in &sets {
+        let (largest_path, largest) = paths
+            .iter()
+            .map(|path| (path, std::fs::metadata(path).expect("DNG size").len()))
+            .max_by_key(|(_, len)| *len)
+            .expect("frames");
+        let r = 8 * 8 * 30 + largest;
+        let opened = open_frame_set(paths, HostBudget::explicit(r)).expect("R opens");
+        for frame in 0..paths.len() {
+            opened
+                .reader
+                .read_tile_into(frame, rect, &mut [0; 8 * 8 * 3])
+                .unwrap_or_else(|error| panic!("frame {frame} at R: {error}"));
+        }
+
+        let refused = |budget: HostBudget| match open_frame_set(paths, budget) {
+            Err(FrameError::Raw(error)) => error,
+            Ok(_) => panic!("a budget below R must refuse at open"),
+            Err(error) => panic!("expected a RAW refusal, got {error}"),
+        };
+        let error = refused(HostBudget::explicit(r - 1));
+        let text = error.to_string();
+        let RawError::CacheTooSmall {
+            path,
+            bound,
+            required,
+            bounded_by,
+        } = error
+        else {
+            panic!("expected CacheTooSmall, got {text}");
+        };
+        assert_eq!((bound, required), (r - 1, r), "{text}");
+        assert_eq!(bounded_by, MemoryBound::Limit { divisor: 1 });
+        assert_eq!(&path, largest_path);
+        assert!(text.contains(&path.display().to_string()), "{text}");
+        assert!(
+            text.contains(&format!("needs {} MB", r.div_ceil(1_000_000))),
+            "{text}"
+        );
+        assert!(!text.contains("bytes"), "{text}");
+
+        let facts = HostFacts::new(r, r, None, None, 1);
+        let host = HostBudget::host_derived(&facts);
+        assert!(host.bytes() < r);
+        let text = refused(host).to_string();
+        assert!(text.contains("not enough free RAM"), "{text}");
+    }
+}
+
+#[test]
 fn raw_develops_overlap() {
     let dng = write_dng(
         &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]),
@@ -2302,6 +2373,14 @@ fn raw_develops_overlap() {
 
     let (stack, result) = pass(4 * one, 4);
     assert_eq!(result.expect("four reservations fit"), 4);
+    assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
+    assert_eq!(developed.load(Ordering::SeqCst), 4);
+    let (stack, result) = pass(2 * one, 4);
+    assert_eq!(result.expect("exactly two reservations fit two"), 2);
+    assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
+    assert_eq!(developed.load(Ordering::SeqCst), 4);
+    let (stack, result) = pass(2 * one - 1, 4);
+    assert_eq!(result.expect("one byte under two reservations fits one"), 1);
     assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
     assert_eq!(developed.load(Ordering::SeqCst), 4);
     let (stack, result) = pass(one + one / 2, 4);

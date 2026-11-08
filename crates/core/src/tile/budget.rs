@@ -55,7 +55,8 @@ use crate::tile::scheduler::{DEFAULT_MAX_BYTES_IN_FLIGHT, in_flight_for_budget};
 pub const HOST_BUDGET_SHARE_PERCENT: u64 = 40;
 
 /// The decoded-frame cache receives `1 / DECODED_CACHE_SHARE_DIVISOR` of a
-/// capped host budget; the scheduler keeps the rest.
+/// capped host budget; the scheduler keeps the rest. A RAW cache takes at
+/// least its largest frame's decode reservation instead.
 pub const DECODED_CACHE_SHARE_DIVISOR: u64 = 4;
 
 /// What limited a memory bound, so a refusal can tell the user which

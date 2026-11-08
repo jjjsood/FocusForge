@@ -559,6 +559,7 @@ focusforge-cli align [OPTIONS] <DIR>
 Computes and reports each frame's transform against a reference frame,
 without fusing anything — the same alignment stage `stack` runs internally,
 reachable on its own so a result is checkable before any fusion runs.
+`<DIR>` holds TIFF, JPEG or camera RAW frames, listed the way `stack` lists them.
 
 Options:
 

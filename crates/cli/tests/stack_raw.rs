@@ -79,6 +79,58 @@ fn cache_refusal_message_states_the_limit_in_mb() {
 }
 
 #[test]
+fn raw_dry_run_reports_the_run_budget() {
+    let input = common::tmp_dir("stack_raw_dry_run_budget");
+    let cwd = common::tmp_dir("stack_raw_dry_run_budget_cwd");
+    let source = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![512; 64]),
+        false,
+    );
+    for index in 0..2 {
+        std::fs::copy(source.path(), input.join(format!("{index:02}.dng")))
+            .expect("copy RAW frame");
+    }
+    let reservation = 8 * 8 * 30 + std::fs::metadata(source.path()).expect("DNG size").len();
+    let dry_run = |budget: u64| {
+        let mut args = vec![
+            "stack".to_string(),
+            input.display().to_string(),
+            "-o".to_string(),
+            cwd.display().to_string(),
+            "--algorithm".to_string(),
+            "laplacian".to_string(),
+            "--no-align".to_string(),
+            "--no-crop".to_string(),
+            "--dry-run".to_string(),
+            "--json".to_string(),
+            "--max-host-memory".to_string(),
+            budget.to_string(),
+        ];
+        if cfg!(feature = "gpu") {
+            args.push("--cpu".to_string());
+        }
+        run(&cwd, &args)
+    };
+
+    let budget = 2 * reservation;
+    let output = dry_run(budget);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("the dry run prints JSON");
+    assert_eq!(plan["max_bytes_in_flight"], budget, "{plan}");
+
+    let refused = dry_run(reservation - 1);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("MB of working memory"), "{stderr}");
+    assert!(stderr.contains(".dng"), "{stderr}");
+}
+
+#[test]
 fn identical_raw_frames_stack_to_the_frame() {
     let cwd = common::tmp_dir("stack_raw_identical");
     let source = write_dng(
