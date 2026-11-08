@@ -86,7 +86,7 @@ pub fn footprint(op: &Op, info: ZMapInfo) -> Result<Option<Rect>, RetouchError> 
 }
 
 /// `rect` widened by `margin` on every side, clamped to the map.
-fn grow(rect: Rect, margin: u32, info: ZMapInfo) -> Rect {
+pub fn grow(rect: Rect, margin: u32, info: ZMapInfo) -> Rect {
     let x0 = rect.x.saturating_sub(margin);
     let y0 = rect.y.saturating_sub(margin);
     let x1 = rect.x.saturating_add(rect.width).saturating_add(margin);
