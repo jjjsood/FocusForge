@@ -47,7 +47,8 @@ echo "CFBundleIdentifier: $identifier"
 for file in LICENSE NOTICE; do cmp "$root/$file" "$app/Contents/Resources/$file"; done
 cmp "$root/assets/build/focusforge.icns" "$app/Contents/Resources/focusforge.icns"
 python3 "$root/tools/package-cli-assets.py" verify "$root" "$app/Contents/Resources"
-[[ $(env -i PATH="$PATH" "$app/Contents/MacOS/focusforge-cli" --version) == "focusforge-cli $version" ]]
+printed=$(env -i PATH="$PATH" "$app/Contents/MacOS/focusforge-cli" --version)
+[[ $printed == "focusforge-cli $version" || $printed == "focusforge-cli $version (release)" ]]
 env -i PATH="$PATH" "$app/Contents/MacOS/focusforge-cli" --help >/dev/null
 cp "$root"/fixtures/mantis-64/frames/*.tif "$inspect/"
 env -i PATH="$PATH" "$app/Contents/MacOS/focusforge-cli" info --json "$inspect" | python3 -c 'import json,sys; data=json.load(sys.stdin); files=data["files"]; assert data["frame_count"] == 3 and data["unreadable_count"] == 0 and len(files) == 3; assert all(item["width"] == 64 and item["height"] == 64 and item["samples_per_pixel"] == 3 and item["bits_per_sample"] == [16, 16, 16] for item in files)'

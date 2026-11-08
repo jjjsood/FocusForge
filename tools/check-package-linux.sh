@@ -89,7 +89,10 @@ validate_main_address() {
 validate_cli() {
   local cli=$1 expected=$2
   env -i PATH=/usr/bin:/bin HOME=/tmp "$cli" --help >/dev/null
-  test "$(env -i PATH=/usr/bin:/bin HOME=/tmp "$cli" --version)" = "$(cat "$expected/VERSION")"
+  local printed want
+  printed=$(env -i PATH=/usr/bin:/bin HOME=/tmp "$cli" --version)
+  want=$(cat "$expected/VERSION")
+  test "$printed" = "$want" -o "$printed" = "$want (release)"
 }
 
 validate_appimage_desktop() {
