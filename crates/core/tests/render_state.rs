@@ -13,8 +13,8 @@ use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter, frame_paths};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
-    self, BlobKind, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op,
-    Plane, Point, Project, ProjectError, SealRequest,
+    self, BlobKind, BrushMode, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind,
+    Metrics, Op, Plane, Point, Project, ProjectError, SealRequest,
 };
 use focusforge_core::retouch::blend;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
@@ -193,6 +193,8 @@ fn build(name: &str) -> Built {
             ],
             radius: 40.0,
             softness: 0.5,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }],
         None,
         1,
@@ -407,6 +409,8 @@ fn pending_stroke(source_id: u16, path: &[(i32, i32)], radius: f32, softness: f3
         path: path.iter().map(|&(x, y)| Point { x, y }).collect(),
         radius,
         softness,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }
 }
 
@@ -660,6 +664,8 @@ fn f32_held_saved_and_pending_render_agree() {
         path: vec![Point { x: 6, y: 11 }, Point { x: 30, y: 11 }],
         radius: 6.0,
         softness: 0.5,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     };
     let edited = project::append_ops_onto(&project_path, &root, vec![stroke.clone()], None, 1)
         .expect("the stroke must append")

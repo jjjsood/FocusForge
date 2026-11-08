@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use focusforge_core::align::Registration;
 use focusforge_core::io::Rect;
-use focusforge_core::project::{self, Op, Point, Project};
+use focusforge_core::project::{self, BrushMode, Op, Point, Project};
 use focusforge_core::zmap::ZMapReader;
 use focusforge_gpu::blend::Blender;
 use focusforge_gpu::device::SharedDevice;
@@ -580,6 +580,8 @@ fn one_dab(source_id: u16) -> Op {
         path: vec![Point { x: 20, y: 20 }],
         radius: 4.0,
         softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }
 }
 
@@ -1735,6 +1737,8 @@ fn pressing_the_checkpoints_scrollbar_thumb_grabs_it_without_jumping() {
             path: vec![Point { x: 1, y: 1 }],
             radius: 0.5,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         };
         append_ops_at(&project_path, vec![op], None, noon + i * 60)
             .unwrap_or_else(|err| panic!("checkpoint {i} must append: {err}"));
@@ -4209,6 +4213,8 @@ fn drag_produces_one_brush_stroke() {
             path: vec![Point { x: 10, y: 10 }, Point { x: 40, y: 30 }],
             radius,
             softness: 0.25,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }],
         "one op, its straight path resampled down to its two ends"
     );
@@ -4221,6 +4227,8 @@ fn drag_produces_one_brush_stroke() {
             path: vec![Point { x: 20, y: 21 }],
             radius,
             softness: 0.25,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }),
         "a press-release with no motion is a one-point op"
     );
@@ -4402,6 +4410,8 @@ fn brush_controls_convert_to_storage_units() {
                 path: vec![Point { x: 17, y: 42 }],
                 radius: view.size / 2.0,
                 softness: view.soft / 100.0,
+                mode: BrushMode::Normal,
+                opacity: 1.0,
             }),
             "pressed at {press_at:?}"
         );
@@ -5085,6 +5095,8 @@ fn zmap_unreadable_leaves_the_image_working() {
             path: vec![Point { x: 20, y: 20 }],
             radius: 4.0,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         },
     );
     assert_eq!(ops(&c).len(), 1, "a stroke appends");
@@ -5991,6 +6003,8 @@ fn live_stroke_previews_each_new_segment() {
         path,
         radius,
         softness,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     };
 
     // A quarter-pixel trace, some steps sub-pixel, wandering across tiles.
@@ -7187,6 +7201,8 @@ fn modal_opening_mid_stroke_leaves_no_live_drag() {
             path: vec![Point { x: 10, y: 10 }, Point { x: 20, y: 15 }],
             radius: c.brush_toolbar_view().size / 2.0,
             softness: c.brush_toolbar_view().soft_fraction,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }],
         "the stroke ends on the next pointer-up, with nothing added after the modal opened"
     );
@@ -7304,6 +7320,8 @@ fn paint(controller: &mut AppController, x: i32) {
             path: vec![Point { x, y: 20 }],
             radius: 4.0,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         })
         .expect("a dab inside the map applies");
 }
@@ -8099,6 +8117,8 @@ fn live_soft_edge_is_a_blend_not_a_dither() {
         path: rounded(&[(20.0, 30.0), (36.0, 30.0)]),
         radius,
         softness,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     };
     let source = sealed.frame_view(1);
 
@@ -8176,6 +8196,8 @@ fn live_tick_reblends_only_its_footprint(name: &str, device: Option<&SharedDevic
         path,
         radius,
         softness,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     };
 
     // Segments that double back over each other, so alpha would compound
@@ -8340,12 +8362,16 @@ fn brush_stroke_appends_soft_op() {
                 path: vec![Point { x: 12, y: 20 }, Point { x: 18, y: 30 }],
                 radius,
                 softness: 0.0,
+                mode: BrushMode::Normal,
+                opacity: 1.0,
             },
             Op::BrushStroke {
                 source_id: 2,
                 path: vec![Point { x: 36, y: 20 }, Point { x: 42, y: 30 }],
                 radius,
                 softness: 1.0,
+                mode: BrushMode::Normal,
+                opacity: 1.0,
             },
         ]
     );

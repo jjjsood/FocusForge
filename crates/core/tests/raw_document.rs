@@ -22,8 +22,8 @@ use focusforge_core::project::export::{
     PngCompression, TiffBits, TiffCompression, to_8bit,
 };
 use focusforge_core::project::{
-    self, BlobKind, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op,
-    PendingState, Point, Project, ProjectError, SealRequest,
+    self, BlobKind, BrushMode, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind,
+    Metrics, Op, PendingState, Point, Project, ProjectError, SealRequest,
 };
 use focusforge_core::tile::{Sample, SampleFormat};
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
@@ -211,6 +211,8 @@ fn stroked_raw(name: &str) -> StrokedRaw {
         path: vec![Point { x: 4, y: 11 }, Point { x: 32, y: 11 }],
         radius: 40.0,
         softness: 0.5,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     };
     let edited = project::append_ops_onto(&project_path, &root, vec![stroke.clone()], None, 1)
         .expect("the stroke must append")
@@ -469,6 +471,8 @@ fn one_render_for_held_saved_and_pending() {
         path: vec![Point { x: 4, y: 11 }, Point { x: 32, y: 11 }],
         radius: 40.0,
         softness: 0.5,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     };
     let edited = project::append_ops_onto(&project_path, &root, vec![stroke.clone()], None, 1)
         .expect("the stroke must append")

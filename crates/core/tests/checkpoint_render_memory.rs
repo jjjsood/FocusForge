@@ -18,7 +18,7 @@ use focusforge_core::project::export::{
     TiffCompression,
 };
 use focusforge_core::project::{
-    self, CheckpointImage, Metrics, Op, Point, Project, ProjectError, SealRequest,
+    self, BrushMode, CheckpointImage, Metrics, Op, Point, Project, ProjectError, SealRequest,
 };
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
@@ -185,6 +185,8 @@ fn seal_op_bearing(name: &str, height: u32) -> (PathBuf, String, String) {
             path: vec![Point { x: 4, y: 4 }],
             radius: 6.0,
             softness: 0.5,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }],
         None,
         1,

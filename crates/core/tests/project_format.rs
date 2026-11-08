@@ -17,8 +17,8 @@ use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
-    self, BlobKind, Checkpoint, HASH_ALGORITHM, Metrics, Op, Plane, Point, Project, SealRequest,
-    SourceResolution, blob,
+    self, BlobKind, BrushMode, Checkpoint, HASH_ALGORITHM, Metrics, Op, Plane, Point, Project,
+    SealRequest, SourceResolution, blob,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 
@@ -244,6 +244,8 @@ fn manifest_carries_no_format_version() {
             path: vec![Point { x: 1, y: 1 }],
             radius: 2.0,
             softness: 0.5,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }],
         None,
     )
@@ -342,6 +344,8 @@ fn the_brush_stroke_round_trips() {
         path: vec![Point { x: -3, y: 4 }, Point { x: 10, y: 20 }],
         radius: 12.5,
         softness: 0.25,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }];
     let text = serde_json::to_string(&ops).unwrap();
     let back: Vec<Op> = serde_json::from_str(&text).unwrap();
@@ -350,6 +354,118 @@ fn the_brush_stroke_round_trips() {
         text.contains("brush-stroke"),
         "externally-tagged brush-stroke missing: {text}"
     );
+}
+
+/// The stroke list in `fixtures/retouch/stroke-list.json`, as written before
+/// strokes carried a mode or an opacity.
+fn stroke_list_fixture() -> String {
+    std::fs::read_to_string(common::fixtures_dir().join("retouch/stroke-list.json"))
+        .expect("the stroke list fixture must read")
+}
+
+fn stroke(mode: BrushMode, opacity: f32) -> Op {
+    Op::BrushStroke {
+        source_id: 3,
+        path: vec![Point { x: -4, y: 9 }, Point { x: 30, y: -2 }],
+        radius: 6.5,
+        softness: 0.0,
+        mode,
+        opacity,
+    }
+}
+
+#[test]
+fn brush_stroke_mode_opacity_absent_fields_read_as_defaults() {
+    let default = stroke(BrushMode::Normal, 1.0);
+
+    let literal: Vec<Op> = serde_json::from_str(
+        r#"[{"brush-stroke":{"source_id":3,"path":[{"x":-4,"y":9},{"x":30,"y":-2}],"radius":6.5,"softness":0}}]"#,
+    )
+    .unwrap();
+    assert_eq!(literal, vec![default.clone()]);
+
+    let fixture: Vec<Op> = serde_json::from_str(&stroke_list_fixture()).unwrap();
+    assert_eq!(fixture.len(), 3);
+    for op in &fixture {
+        assert!(
+            matches!(op, Op::BrushStroke { mode: BrushMode::Normal, opacity, .. } if *opacity == 1.0),
+            "a fixture stroke without the fields must read normal / 1.0: {op:?}"
+        );
+    }
+
+    let (_dir, project_path) = sealed("project_format_stroke_defaults");
+    let appended = project::append_ops(&project_path, vec![default.clone()], None).unwrap();
+    let entry = format!("checkpoints/{}.json", appended.checkpoint);
+    let raw: serde_json::Value = serde_json::from_slice(
+        &Index::read(&project_path)
+            .unwrap()
+            .read_entry(&project_path, &entry)
+            .unwrap(),
+    )
+    .unwrap();
+    let written = raw["ops"][0]["brush-stroke"].as_object().unwrap();
+    assert!(
+        !written.contains_key("mode") && !written.contains_key("opacity"),
+        "a default stroke's checkpoint entry carries neither key: {raw}"
+    );
+    let reopened = Project::open(&project_path).unwrap();
+    assert_eq!(reopened.checkpoint().ops, vec![default]);
+}
+
+#[test]
+fn brush_stroke_mode_opacity_default_keeps_todays_bytes_and_id() {
+    let pre_change = r#"[{"brush-stroke":{"source_id":2,"path":[{"x":120,"y":256},{"x":380,"y":256}],"radius":18.0,"softness":0.3}}]"#;
+    let ops: Vec<Op> = serde_json::from_str(pre_change).unwrap();
+    let bytes = serde_json::to_vec(&ops).unwrap();
+    assert_eq!(String::from_utf8(bytes.clone()).unwrap(), pre_change);
+
+    let id = |ops_json: &[u8]| {
+        Checkpoint::derive_child_id("parent", "fingerprint", &blake3::hash(ops_json).to_hex(), 7)
+    };
+    assert_eq!(id(&bytes), id(pre_change.as_bytes()));
+}
+
+#[test]
+fn brush_stroke_mode_opacity_non_default_round_trips() {
+    let modes = [
+        (BrushMode::Normal, "normal"),
+        (BrushMode::Lighten, "lighten"),
+        (BrushMode::Darken, "darken"),
+        (BrushMode::Detail, "detail"),
+    ];
+    for (mode, name) in modes {
+        for opacity in [1.0_f32, 0.25, 1e-6] {
+            let op = stroke(mode, opacity);
+            let text = serde_json::to_string(&op).unwrap();
+            assert_eq!(serde_json::from_str::<Op>(&text).unwrap(), op, "{text}");
+
+            let value = serde_json::to_value(&op).unwrap();
+            let fields = value["brush-stroke"].as_object().unwrap();
+            let written_mode = (mode != BrushMode::Normal).then(|| serde_json::json!(name));
+            assert_eq!(fields.get("mode"), written_mode.as_ref(), "{text}");
+            assert_eq!(fields.contains_key("opacity"), opacity != 1.0, "{text}");
+        }
+    }
+
+    let lighten = serde_json::to_value(stroke(BrushMode::Lighten, 1.0)).unwrap();
+    assert!(
+        lighten["brush-stroke"].get("opacity").is_none(),
+        "{lighten}"
+    );
+    let half = serde_json::to_value(stroke(BrushMode::Normal, 0.5)).unwrap();
+    assert_eq!(half["brush-stroke"]["opacity"], serde_json::json!(0.5));
+    assert!(half["brush-stroke"].get("mode").is_none(), "{half}");
+}
+
+#[test]
+fn brush_stroke_mode_opacity_refuses_an_unknown_mode() {
+    for bad in ["screen", "Normal"] {
+        let text = format!(
+            r#"{{"brush-stroke":{{"source_id":1,"path":[],"radius":2.0,"softness":0.5,"mode":"{bad}"}}}}"#
+        );
+        let err = serde_json::from_str::<Op>(&text).unwrap_err();
+        assert!(err.to_string().contains("unknown variant"), "{bad}: {err}");
+    }
 }
 
 #[test]

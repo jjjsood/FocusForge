@@ -19,8 +19,8 @@ use focusforge_core::params::ParamValues;
 use focusforge_core::project::container::Index;
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
-    self, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, Point,
-    Project, ProjectError, SealRequest, partial_path,
+    self, BrushMode, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics,
+    Op, Point, Project, ProjectError, SealRequest, partial_path,
 };
 use focusforge_core::retouch::blend::{self, Blend};
 use focusforge_core::tile::{HostBudget, Sample};
@@ -78,6 +78,8 @@ fn stroke(source_id: u16, path: &[(i32, i32)], radius: f32, softness: f32) -> Op
         path: path.iter().map(|&(x, y)| Point { x, y }).collect(),
         radius,
         softness,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }
 }
 

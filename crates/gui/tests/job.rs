@@ -18,7 +18,7 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{self, FuseOutcome, FuseOutput, FuseRequest, StageObserver};
-use focusforge_core::project::{self, Op, Point, Project};
+use focusforge_core::project::{self, BrushMode, Op, Point, Project};
 use focusforge_core::registry;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use focusforge_gui::canvas::CanvasFeed;
@@ -4263,6 +4263,8 @@ fn dab(x: i32) -> job::Op {
         path: vec![Point { x, y: 10 }],
         radius: 0.5,
         softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }
 }
 
@@ -8067,6 +8069,8 @@ fn raw_stroke() -> Op {
         path: vec![Point { x: 4, y: 11 }, Point { x: 32, y: 11 }],
         radius: 40.0,
         softness: 0.5,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }
 }
 

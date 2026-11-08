@@ -322,7 +322,7 @@ impl Blender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use focusforge_core::project::Point;
+    use focusforge_core::project::{BrushMode, Point};
     use focusforge_core::zmap::ZMapInfo;
 
     fn pt(x: i32, y: i32) -> Point {
@@ -335,6 +335,8 @@ mod tests {
             path,
             radius,
             softness,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }
     }
 

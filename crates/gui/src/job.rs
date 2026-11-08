@@ -49,7 +49,7 @@ pub use focusforge_core::align::{Registration, Transform};
 pub use focusforge_core::equalize::UNIT_GAIN;
 pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage, StageCacheError};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
-pub use focusforge_core::project::Op;
+pub use focusforge_core::project::{BrushMode, Op};
 pub use focusforge_core::project::{
     HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, kept_entries, now_unix,
 };

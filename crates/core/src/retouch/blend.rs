@@ -40,6 +40,8 @@ pub(super) fn validate<'a>(op: &'a Op, info: ZMapInfo) -> Result<Stroke<'a>, Ret
         path,
         radius,
         softness,
+        mode: _,
+        opacity: _,
     } = op;
     if path.is_empty() {
         return Err(RetouchError::EmptyPath);
@@ -512,6 +514,8 @@ mod tests {
             path,
             radius,
             softness,
+            mode: crate::project::BrushMode::Normal,
+            opacity: 1.0,
         }
     }
 

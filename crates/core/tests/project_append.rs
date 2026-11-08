@@ -12,7 +12,7 @@ use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
-    self, AppendRequest, Metrics, Op, ParentRef, Point, Project, SealRequest,
+    self, AppendRequest, BrushMode, Metrics, Op, ParentRef, Point, Project, SealRequest,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
@@ -463,6 +463,8 @@ fn stroke(source_id: u16, x: i32, y: i32) -> Op {
         ],
         radius: 5.0,
         softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }
 }
 

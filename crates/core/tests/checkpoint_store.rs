@@ -16,7 +16,7 @@ use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
-    self, AppendRequest, Metrics, Op, Point, Project, ProjectError, SealRequest,
+    self, AppendRequest, BrushMode, Metrics, Op, Point, Project, ProjectError, SealRequest,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 
@@ -197,6 +197,8 @@ fn stroke(source_id: u16, x: i32, y: i32, radius: f32) -> Op {
         path: vec![Point { x, y }],
         radius,
         softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }
 }
 

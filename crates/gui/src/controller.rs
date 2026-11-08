@@ -1188,6 +1188,8 @@ impl ProjectTab {
                 path: stroke.path_so_far(),
                 radius: stroke.radius(),
                 softness: stroke.softness(),
+                mode: job::BrushMode::Normal,
+                opacity: 1.0,
             });
         }
         ops
@@ -3720,12 +3722,16 @@ impl AppController {
             path: segment,
             radius,
             softness,
+            mode: job::BrushMode::Normal,
+            opacity: 1.0,
         };
         let so_far = job::Op::BrushStroke {
             source_id,
             path: stroke.path_so_far(),
             radius,
             softness,
+            mode: job::BrushMode::Normal,
+            opacity: 1.0,
         };
         let region = job::footprint(&op, edit.info())
             .expect("a live stroke's own points are pre-clamped to what validate accepts");
@@ -3768,6 +3774,8 @@ impl AppController {
             path: stroke.finish(),
             radius: stroke.radius(),
             softness: stroke.softness(),
+            mode: job::BrushMode::Normal,
+            opacity: 1.0,
         };
         let has_footprint = job::footprint(&op, edit.info()).ok().flatten().is_some();
         let mut touched = stroke.tick_rects;

@@ -16,8 +16,8 @@ use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
-    self, AppendRequest, BlobKind, Metrics, Op, Opened, Plane, Point, Project, ProjectError,
-    SealRequest, blob,
+    self, AppendRequest, BlobKind, BrushMode, Metrics, Op, Opened, Plane, Point, Project,
+    ProjectError, SealRequest, blob,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
@@ -194,6 +194,8 @@ fn stroke(source_id: u16, x: i32, y: i32, radius: f32) -> Op {
         path: vec![Point { x, y }],
         radius,
         softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }
 }
 
@@ -384,6 +386,8 @@ fn verification_is_lazy_but_never_skipped() {
         ],
         radius: 12.0,
         softness: 0.3,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }];
     let sealed_ops =
         project::append_ops_at(&project_path, ops, None, 1_000).expect("append must succeed");
@@ -1006,6 +1010,8 @@ fn append_stroke(project_path: &Path) {
         path: vec![project::Point { x: 4, y: 4 }],
         radius: 2.0,
         softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     };
     project::append_ops_onto(project_path, &head, vec![stroke], None, 1)
         .expect("the stroke must append");

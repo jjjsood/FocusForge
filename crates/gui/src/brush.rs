@@ -265,7 +265,7 @@ fn rdp(points: &[(f32, f32)], epsilon: f32) -> Vec<(f32, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use focusforge_core::project::Op;
+    use focusforge_core::project::{BrushMode, Op};
     use focusforge_core::retouch::blend::alpha;
     use focusforge_core::zmap::ZMapInfo;
 
@@ -289,6 +289,8 @@ mod tests {
             path,
             radius: 2.5,
             softness: 0.4,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }
     }
 

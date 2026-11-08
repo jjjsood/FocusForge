@@ -121,12 +121,46 @@ pub enum Op {
     /// Blend frame `source_id` into the result along `path` through a soft
     /// round mask of `radius` pixels and `softness` in `0.0..=1.0`. Strokes
     /// apply in list order; the result image is the document.
+    ///
+    /// `mode` and `opacity` read as [`BrushMode::Normal`] and `1.0` when
+    /// absent, and each is left out of the serialized stroke while it holds
+    /// that default, so a default stroke keeps its bytes (and the id hashed
+    /// from them). Rendering ignores them.
     BrushStroke {
         source_id: u16,
         path: Vec<Point>,
         radius: f32,
         softness: f32,
+        #[serde(default, skip_serializing_if = "BrushMode::is_normal")]
+        mode: BrushMode,
+        #[serde(default = "full_opacity", skip_serializing_if = "is_full_opacity")]
+        opacity: f32,
     },
+}
+
+/// The blend mode a stroke records. Rendering ignores it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BrushMode {
+    #[default]
+    Normal,
+    Lighten,
+    Darken,
+    Detail,
+}
+
+impl BrushMode {
+    fn is_normal(&self) -> bool {
+        *self == BrushMode::Normal
+    }
+}
+
+fn full_opacity() -> f32 {
+    1.0
+}
+
+fn is_full_opacity(opacity: &f32) -> bool {
+    *opacity == 1.0
 }
 
 /// Every checkpoint of a project, indexed by id, with each one's parent and

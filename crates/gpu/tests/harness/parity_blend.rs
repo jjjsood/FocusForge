@@ -5,7 +5,7 @@
 //! worst |delta| is exactly 0.
 
 use focusforge_core::algorithm::TileReader;
-use focusforge_core::project::{Op, Point};
+use focusforge_core::project::{BrushMode, Op, Point};
 use focusforge_core::retouch::blend;
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::ZMapInfo;
@@ -36,6 +36,8 @@ fn stroke(path: Vec<Point>, radius: f32, softness: f32) -> Op {
         path,
         radius,
         softness,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }
 }
 

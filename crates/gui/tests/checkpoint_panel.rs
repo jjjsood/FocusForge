@@ -16,8 +16,8 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::{
-    HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, Point, Project, ProjectError,
-    SealRequest, append_ops_at, append_ops_onto, render_checkpoint, seal_at,
+    BrushMode, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, Point, Project,
+    ProjectError, SealRequest, append_ops_at, append_ops_onto, render_checkpoint, seal_at,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use focusforge_gui::bridge::Canvas;
@@ -149,6 +149,8 @@ fn write_chain(project_path: &Path, times: &[i64]) {
             path: vec![Point { x: 1, y: 1 }],
             radius: 0.5,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         };
         append_ops_at(project_path, vec![op], None, at)
             .unwrap_or_else(|err| panic!("checkpoint {i} must append: {err}"));
@@ -178,6 +180,8 @@ fn rows_match_the_core_listing() {
             path: vec![Point { x, y: 0 }],
             radius: 0.5,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         };
         append_ops_onto(&project_path, parent, vec![op], None, t0 + 60).unwrap();
     }
@@ -348,6 +352,8 @@ fn build_edited(name: &str) -> Edited {
             path: vec![Point { x: 2, y: 1 }],
             radius: 1.5,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }],
         None,
         t0 + 60,
@@ -508,6 +514,8 @@ fn stroke(x: i32, y: i32, source_id: u16) -> Op {
         path: vec![Point { x, y }],
         radius: 0.5,
         softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }
 }
 
