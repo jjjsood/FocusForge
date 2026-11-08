@@ -54,6 +54,21 @@ use crate::tile::scheduler::{DEFAULT_MAX_BYTES_IN_FLIGHT, in_flight_for_budget};
 /// modelled peak at or under it.
 pub const HOST_BUDGET_SHARE_PERCENT: u64 = 40;
 
+/// The decoded-frame cache receives `1 / DECODED_CACHE_SHARE_DIVISOR` of a
+/// capped host budget; the scheduler keeps the rest.
+pub const DECODED_CACHE_SHARE_DIVISOR: u64 = 4;
+
+/// What limited a memory bound, so a refusal can tell the user which
+/// resource to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryBound {
+    /// The bound derives from the host's free RAM:
+    /// `free RAM * share_percent / (100 * divisor)`.
+    FreeRam { share_percent: u64, divisor: u64 },
+    /// The bound derives from a fixed memory limit: `limit / divisor`.
+    Limit { divisor: u64 },
+}
+
 /// The share of the *starting* available memory this process may eat before
 /// the back-off rule's RSS half fires: three quarters of the headroom the
 /// host said it had when the run started is gone, and the remaining quarter
@@ -165,6 +180,13 @@ pub struct DecodedCacheBudget {
     pub scheduler: HostBudget,
 }
 
+impl DecodedCacheBudget {
+    /// What bounds the decoded-frame cache share.
+    pub fn cache_bound(&self) -> MemoryBound {
+        self.cache.memory_bound_of(DECODED_CACHE_SHARE_DIVISOR)
+    }
+}
+
 impl HostBudget {
     /// Derives a budget from host facts: [`HOST_BUDGET_SHARE_PERCENT`] of
     /// what the host currently reports available when the facts were
@@ -218,7 +240,7 @@ impl HostBudget {
     /// the exact remainder while retaining this budget's source and pressure
     /// behavior.
     pub fn partition_for_decoded_cache(self) -> DecodedCacheBudget {
-        let cache_bytes = self.bytes / 4;
+        let cache_bytes = self.bytes / DECODED_CACHE_SHARE_DIVISOR;
         DecodedCacheBudget {
             cache: HostBudget {
                 bytes: cache_bytes,
@@ -228,6 +250,32 @@ impl HostBudget {
                 bytes: self.bytes - cache_bytes,
                 ..self
             },
+        }
+    }
+
+    /// What bounds a read made against this whole budget: free RAM for a
+    /// host-derived budget, a fixed limit for an explicit, capped or fallback
+    /// one.
+    pub fn memory_bound(&self) -> MemoryBound {
+        self.memory_bound_of(1)
+    }
+
+    fn memory_bound_of(&self, divisor: u64) -> MemoryBound {
+        match self.provenance {
+            Provenance::Host => MemoryBound::FreeRam {
+                share_percent: HOST_BUDGET_SHARE_PERCENT,
+                divisor,
+            },
+            _ => MemoryBound::Limit { divisor },
+        }
+    }
+
+    /// This budget less `bytes` (floored at 0), keeping its provenance and
+    /// probe state.
+    pub fn reduced_by(self, bytes: u64) -> Self {
+        HostBudget {
+            bytes: self.bytes.saturating_sub(bytes),
+            ..self
         }
     }
 
@@ -503,6 +551,57 @@ mod tests {
         let facts = probed_facts(10_000_000, Some(1_000));
         let original = HostBudget::host_derived(&facts);
         assert_eq!(original.capped_to(None), original);
+    }
+
+    #[test]
+    fn memory_bound_maps_provenance_to_free_ram_or_limit() {
+        let host = HostBudget::host_derived(&probed_facts(10_000_000, Some(1_000)));
+        assert_eq!(
+            host.memory_bound(),
+            MemoryBound::FreeRam {
+                share_percent: HOST_BUDGET_SHARE_PERCENT,
+                divisor: 1
+            }
+        );
+        let limit = MemoryBound::Limit { divisor: 1 };
+        assert_eq!(HostBudget::explicit(5).memory_bound(), limit);
+        assert_eq!(
+            HostBudget::host_derived(&HostFacts::fallback()).memory_bound(),
+            limit
+        );
+        assert_eq!(host.capped_to(Some(1_000)).memory_bound(), limit);
+    }
+
+    #[test]
+    fn memory_bound_of_the_cache_share_carries_the_partition_divisor() {
+        let host = HostBudget::host_derived(&probed_facts(10_000_000, Some(1_000)));
+        assert_eq!(
+            host.partition_for_decoded_cache().cache_bound(),
+            MemoryBound::FreeRam {
+                share_percent: HOST_BUDGET_SHARE_PERCENT,
+                divisor: 4
+            }
+        );
+        assert_eq!(
+            HostBudget::explicit(40)
+                .partition_for_decoded_cache()
+                .cache_bound(),
+            MemoryBound::Limit { divisor: 4 }
+        );
+    }
+
+    #[test]
+    fn reduced_by_keeps_provenance_and_saturates_at_zero() {
+        let host = HostBudget::host_derived(&probed_facts(10_000_000, Some(1_000)));
+        let reduced = host.reduced_by(1_000);
+        assert_eq!(reduced.bytes(), host.bytes() - 1_000);
+        assert_eq!(reduced.provenance(), Provenance::Host);
+        assert!(reduced.arms_back_off());
+        assert_eq!(host.reduced_by(u64::MAX).bytes(), 0);
+        assert_eq!(
+            HostBudget::explicit(10).reduced_by(3).provenance(),
+            Provenance::Explicit
+        );
     }
 
     #[test]

@@ -595,7 +595,7 @@ pub fn run(
             }
         })
     };
-    let develop_budget = options.budget.bytes();
+    let develop_budget = options.budget;
     options.budget = opened.scheduler_budget;
     let frame_reader: &dyn FrameReader = &*opened.reader;
     let frame_names: Vec<String> = request

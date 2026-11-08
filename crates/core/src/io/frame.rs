@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::algorithm::{AlgorithmError, TileReader};
 use crate::params::StackContext;
+use crate::tile::HostBudget;
 
 /// One frame's identity for resume comparison, geometry, and layout facts.
 #[derive(Debug, Clone, PartialEq)]
@@ -104,7 +105,7 @@ pub trait FrameReader: TileReader + Send + Sync {
     fn develop_once(
         &self,
         _scratch_root: &Path,
-        _budget: u64,
+        _budget: HostBudget,
         _workers: usize,
         _cancelled: &(dyn Fn() -> bool + Sync),
         _developed: &AtomicUsize,

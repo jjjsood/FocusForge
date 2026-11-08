@@ -13,7 +13,7 @@ use focusforge_core::io::{
     ByteOrder, FrameDesc, FrameError, ReaderKind, Refusal, TiffError, TiffHeader, TiffStack,
     classify_header, frame_paths, open_frame_set,
 };
-use focusforge_core::tile::HostBudget;
+use focusforge_core::tile::{HostBudget, MemoryBound};
 use raw_dng::{DngSpec, write_dng};
 
 #[test]
@@ -64,10 +64,29 @@ fn budget_partition_is_applied_once() {
             path,
             bound,
             required,
+            bounded_by,
         })) => {
             assert_eq!(bound, 0);
             assert!(required > bound);
             assert!(path.ends_with("00.tif"));
+            assert_eq!(bounded_by, MemoryBound::Limit { divisor: 4 });
+            let text = TiffError::DecodedCacheTooSmall {
+                path: path.clone(),
+                bound,
+                required,
+                bounded_by,
+            }
+            .to_string();
+            let need = required.div_ceil(1_000_000);
+            assert_eq!(
+                text,
+                format!(
+                    "{}: needs {need} MB of working memory, but the memory limit allows 0 MB \
+                     for it. Raise the memory limit to at least {} MB or close other programs.",
+                    path.display(),
+                    (required * 4).div_ceil(1_000_000)
+                )
+            );
         }
         Ok(_) => panic!("undersized decoded cache must refuse"),
         Err(error) => panic!("expected decoded-cache error, got {error}"),

@@ -357,8 +357,8 @@ fn bound_below_one_segment_is_refused() {
     let error = DecodedTiffStack::open(path, 13_823).unwrap_err();
     let message = error.to_string();
     assert!(matches!(error, TiffError::DecodedCacheTooSmall { .. }));
-    assert!(message.contains("13823"));
-    assert!(message.contains("13824"));
+    assert!(message.contains("allows 0 MB"), "{message}");
+    assert!(message.contains("needs 1 MB"), "{message}");
     assert!(DecodedTiffStack::open(compressed_set("mantis-64-deflate-p1-tile-ii"), 13_824).is_ok());
 }
 

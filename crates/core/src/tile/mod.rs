@@ -20,7 +20,7 @@ pub mod scratch;
 
 pub use budget::{
     Clock, HOST_BUDGET_SHARE_PERCENT, HostBudget, HostBudgetGate, HostPermit, HostSources,
-    ManualClock, MonotonicClock, PRESSURE_CONFIRMATIONS, PRESSURE_POLL_INTERVAL_MS,
+    ManualClock, MemoryBound, MonotonicClock, PRESSURE_CONFIRMATIONS, PRESSURE_POLL_INTERVAL_MS,
     PRESSURE_SHARE_PERCENT,
 };
 pub use consumer::{TileConsumer, TileJob};

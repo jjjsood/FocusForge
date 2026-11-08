@@ -6,6 +6,7 @@ mod raw_dng;
 
 use focusforge_core::algorithm::{AlgorithmError, TileReader};
 use focusforge_core::equalize::{EqualizeSettings, UNIT_GAIN};
+use focusforge_core::host::HostFacts;
 use focusforge_core::io::Rect;
 use focusforge_core::io::{FrameError, FrameReader, RawError, RawStack};
 use focusforge_core::job::{JobControl, JobStage};
@@ -14,6 +15,7 @@ use focusforge_core::pipeline::{
     FreeSpaceProbe, FuseOutcome, FuseOutput, FuseProduct, FuseRequest, PipelineError, RunStage,
     StageObserver, VolumeShortfall, VolumeSpace,
 };
+use focusforge_core::tile::HostBudget;
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
 use rawler::rawsource::RawSource;
 use sha2::{Digest, Sha256};
@@ -626,7 +628,13 @@ fn raw_scratch_error_on_corpus_frames() {
         let developed = RawStack::open_files(std::slice::from_ref(&path)).expect("sample opens");
         let root = target_tmp();
         developed
-            .develop_once(root.path(), u64::MAX, 1, &|| false, &AtomicUsize::new(0))
+            .develop_once(
+                root.path(),
+                HostBudget::explicit(u64::MAX),
+                1,
+                &|| false,
+                &AtomicUsize::new(0),
+            )
             .expect("the pass develops the frame");
         let (width, height) = cached.dimensions();
         let rect = Rect {
@@ -2051,7 +2059,13 @@ fn raw_develop_pass_reads_match_cached_reads() {
     let developed = RawStack::open_files(&paths).expect("DNG stack opens");
     let root = target_tmp();
     developed
-        .develop_once(root.path(), u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+        .develop_once(
+            root.path(),
+            HostBudget::explicit(u64::MAX),
+            2,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
         .expect("the pass develops every frame");
     assert_eq!(developed.develop_counts(), Some(vec![1; 3]));
     let rects = [
@@ -2159,7 +2173,13 @@ fn raw_scratch_file_size_matches_encoding() {
     let scratch = root.path().join("scratch");
     std::fs::create_dir(&scratch).expect("scratch root");
     stack
-        .develop_once(&scratch, u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+        .develop_once(
+            &scratch,
+            HostBudget::explicit(u64::MAX),
+            2,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
         .expect("the pass develops every frame");
     let frame_bytes = stack.scratch_frame_bytes().expect("frame bytes fit");
     assert_eq!(frame_bytes, 48 * 20 * 6);
@@ -2178,7 +2198,13 @@ fn raw_scratch_keeps_values_above_white() {
     let developed = open_pair(&files);
     let root = target_tmp();
     developed
-        .develop_once(root.path(), u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+        .develop_once(
+            root.path(),
+            HostBudget::explicit(u64::MAX),
+            2,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
         .expect("the pass develops every frame");
     let rect = Rect {
         x: 0,
@@ -2199,6 +2225,59 @@ fn raw_scratch_keeps_values_above_white() {
 }
 
 #[test]
+fn cache_refusal_message_names_the_file_in_mb_at_both_sites() {
+    let dng = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]),
+        false,
+    );
+    let one = 8 * 8 * 30 + std::fs::metadata(dng.path()).expect("DNG size").len();
+    let path = PathBuf::from(dng.path());
+    let need = format!("needs {} MB", one.div_ceil(1_000_000));
+    let check = |text: String, wanted: &str| {
+        assert!(text.contains(&dng.path().display().to_string()), "{text}");
+        assert!(text.contains(&need), "{text}");
+        assert!(text.contains(wanted), "{text}");
+        assert!(text.contains("convert the frames to TIFF"), "{text}");
+        assert!(!text.contains("bytes"), "{text}");
+        assert!(!text.contains("cache bound"), "{text}");
+        assert!(!text.contains(&one.to_string()), "{text}");
+    };
+
+    let reader = RawStack::open_files_with_budget(std::slice::from_ref(&path), 1)
+        .expect("metadata fits without decode");
+    let error = reader
+        .read_tile_into(
+            0,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            &mut [0; 3],
+        )
+        .expect_err("a one-byte cache refuses");
+    check(error.to_string(), "memory limit allows 0 MB");
+
+    let root = target_tmp();
+    let stack = RawStack::open_files(std::slice::from_ref(&path)).expect("DNG stack opens");
+    let develop = |budget: HostBudget| {
+        stack
+            .develop_once(root.path(), budget, 1, &|| false, &AtomicUsize::new(0))
+            .expect_err("a budget below one reservation refuses")
+            .to_string()
+    };
+    check(
+        develop(HostBudget::explicit(one - 1)),
+        "Raise the memory limit to at least",
+    );
+    let facts = HostFacts::new(3000, 1000, None, None, 1);
+    let text = develop(HostBudget::host_derived(&facts));
+    check(text.clone(), "not enough free RAM");
+    assert!(!text.contains("memory limit"), "{text}");
+}
+
+#[test]
 fn raw_develops_overlap() {
     let dng = write_dng(
         &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]),
@@ -2211,7 +2290,13 @@ fn raw_develops_overlap() {
     let pass = |budget: u64, workers: usize| {
         let stack = RawStack::open_files(&paths).expect("DNG stack opens");
         developed.store(0, Ordering::SeqCst);
-        let result = stack.develop_once(root.path(), budget, workers, &|| false, &developed);
+        let result = stack.develop_once(
+            root.path(),
+            HostBudget::explicit(budget),
+            workers,
+            &|| false,
+            &developed,
+        );
         (stack, result)
     };
 
@@ -2445,7 +2530,13 @@ fn raw_scratch_unwritable_is_a_named_error() {
     let blocker = tempfile::NamedTempFile::new_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("a regular file at the scratch root");
     let error = stack
-        .develop_once(blocker.path(), u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+        .develop_once(
+            blocker.path(),
+            HostBudget::explicit(u64::MAX),
+            2,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
         .expect_err("a scratch root that is a file cannot hold a directory");
     assert!(
         error
@@ -2524,7 +2615,13 @@ fn scratch_space_needed_matches_written_scratch() {
         std::fs::create_dir(&scratch).expect("scratch root");
         let needed = stack.develop_scratch_bytes().expect("the figure fits");
         stack
-            .develop_once(&scratch, u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+            .develop_once(
+                &scratch,
+                HostBudget::explicit(u64::MAX),
+                2,
+                &|| false,
+                &AtomicUsize::new(0),
+            )
             .expect("the pass develops every frame");
         let (width, height) = stack.dimensions();
         assert_eq!(

@@ -15,10 +15,12 @@ use rawler::rawsource::RawSource;
 
 use super::frame_cache::{CacheFault, CachedFrame, FrameCache, TileFault, check_tile};
 use super::grouping::parse_exif_datetime;
-use super::{FrameDesc, FrameError, FrameReader, RawIdentity, map_read_only};
+use super::{
+    FrameDesc, FrameError, FrameReader, RawIdentity, cache_refusal_message, map_read_only,
+};
 use crate::algorithm::{AlgorithmError, TileReader};
 use crate::equalize::UNIT_GAIN;
-use crate::tile::{Rect, Sample, SampleFormat, ScratchDir, TileError};
+use crate::tile::{HostBudget, MemoryBound, Rect, Sample, SampleFormat, ScratchDir, TileError};
 
 mod look;
 pub use look::LookTransform;
@@ -172,7 +174,7 @@ pub enum RawError {
         got: usize,
     },
     /// The cache cannot hold one developed frame and its decode reservation.
-    #[error("{}: RAW cache bound {bound} bytes is below required {required} bytes", path.display())]
+    #[error("{}", cache_refusal_message(path, *bound, *required, *bounded_by, true))]
     CacheTooSmall {
         /// Source file.
         path: PathBuf,
@@ -180,6 +182,8 @@ pub enum RawError {
         bound: u64,
         /// Conservative required reservation.
         required: u64,
+        /// What limited `bound`.
+        bounded_by: MemoryBound,
     },
     /// RAW geometry overflows a byte count.
     #[error("{}: RAW geometry overflows a byte count", path.display())]
@@ -306,6 +310,8 @@ impl Developed<'_> {
 pub struct RawStack {
     frames: Vec<RawFrame>,
     cache: FrameCache<LinearFrame>,
+    /// What limited the cache capacity.
+    cache_bound: MemoryBound,
     /// Develops started per frame, counting failed ones.
     develops: Vec<AtomicU64>,
     look: OnceLock<LookTransform>,
@@ -319,8 +325,19 @@ impl RawStack {
         Self::open_files_with_budget(paths, DEFAULT_RAW_CACHE_BYTES)
     }
 
-    /// Opens one or more RAW files with a bound on developed-frame retention.
+    /// Opens one or more RAW files with a fixed byte limit on developed-frame
+    /// retention.
     pub fn open_files_with_budget(paths: &[PathBuf], cache_bytes: u64) -> Result<Self, RawError> {
+        Self::open_files_bounded(paths, cache_bytes, MemoryBound::Limit { divisor: 1 })
+    }
+
+    /// Opens one or more RAW files; `cache_bound` says what limited
+    /// `cache_bytes`, for the refusal text.
+    pub(crate) fn open_files_bounded(
+        paths: &[PathBuf],
+        cache_bytes: u64,
+        cache_bound: MemoryBound,
+    ) -> Result<Self, RawError> {
         let Some(first_path) = paths.first() else {
             return Err(RawError::NoFrames);
         };
@@ -381,6 +398,7 @@ impl RawStack {
             develops: frames.iter().map(|_| AtomicU64::new(0)).collect(),
             frames,
             cache: FrameCache::new(cache_bytes),
+            cache_bound,
             look: OnceLock::new(),
             scratch: OnceLock::new(),
         })
@@ -439,6 +457,7 @@ impl RawStack {
                     path: path.clone(),
                     bound,
                     required,
+                    bounded_by: self.cache_bound,
                 },
                 CacheFault::Overflow => RawError::BudgetOverflow { path: path.clone() },
             })
@@ -558,7 +577,7 @@ impl FrameReader for RawStack {
     fn develop_once(
         &self,
         scratch_root: &Path,
-        budget: u64,
+        budget: HostBudget,
         workers: usize,
         cancelled: &(dyn Fn() -> bool + Sync),
         developed: &AtomicUsize,
@@ -574,16 +593,18 @@ impl FrameReader for RawStack {
             }
         }
         let (frame, required) = largest.expect("a RAW stack holds at least one frame");
-        if budget < required {
+        let budget_bytes = budget.bytes();
+        if budget_bytes < required {
             return Err(FrameError::from(RawError::CacheTooSmall {
                 path: frame.metadata.path.clone(),
-                bound: budget,
+                bound: budget_bytes,
                 required,
+                bounded_by: budget.memory_bound(),
             })
             .into());
         }
         let threads = workers
-            .min(usize::try_from(budget / required.max(1)).unwrap_or(usize::MAX))
+            .min(usize::try_from(budget_bytes / required.max(1)).unwrap_or(usize::MAX))
             .min(self.frames.len())
             .max(1);
 

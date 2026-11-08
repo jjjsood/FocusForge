@@ -44,6 +44,41 @@ fn run(dir: &std::path::Path, args: &[String]) -> std::process::Output {
 }
 
 #[test]
+fn cache_refusal_message_states_the_limit_in_mb() {
+    let cwd = common::tmp_dir("stack_raw_cache_refusal");
+    let mut args = vec![
+        "stack".to_string(),
+        common::fixtures_dir()
+            .join("blackmagic-micro-dng")
+            .display()
+            .to_string(),
+        "-o".to_string(),
+        cwd.display().to_string(),
+        "--algorithm".to_string(),
+        "laplacian".to_string(),
+        "--no-align".to_string(),
+        "--no-crop".to_string(),
+        "--max-host-memory".to_string(),
+        "1".to_string(),
+    ];
+    if cfg!(feature = "gpu") {
+        args.push("--cpu".to_string());
+    }
+    let output = run(&cwd, &args);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("frame.dng"), "{stderr}");
+    assert!(stderr.contains("MB of working memory"), "{stderr}");
+    assert!(stderr.contains("memory limit allows 0 MB"), "{stderr}");
+    assert!(
+        stderr.contains("Raise the memory limit to at least"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("bytes"), "{stderr}");
+    assert!(!stderr.contains("cache bound"), "{stderr}");
+}
+
+#[test]
 fn identical_raw_frames_stack_to_the_frame() {
     let cwd = common::tmp_dir("stack_raw_identical");
     let source = write_dng(
@@ -808,5 +843,8 @@ fn corpus_frame_stacks_on_default_backend() {
     assert!(!low_memory.status.success());
     let low_memory_stderr = String::from_utf8_lossy(&low_memory.stderr);
     eprintln!("corpus low_memory_refusal={low_memory_stderr}");
-    assert!(low_memory_stderr.contains("RAW cache bound"));
+    assert!(
+        low_memory_stderr.contains("memory limit"),
+        "{low_memory_stderr}"
+    );
 }
