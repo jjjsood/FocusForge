@@ -255,10 +255,17 @@ fn score_plane_matches_cpu() {
     let gpu_scores =
         download_f32(device, queue, &gpu_scores_buffer, cpu_scores.len()).expect("download_f32");
 
-    assert_eq!(
-        gpu_scores, cpu_scores,
-        "the two-pass windowed score must be bit-identical to score_plane"
-    );
+    // The kernel sums in `f32` (error up to 68 * 2^-24 relative); `score_plane` sums in
+    // fixed point (error up to (2r+1)^2 * spp * 2^-21 absolute).
+    let side = f64::from(2 * radius + 1);
+    let quantization = side * side * f64::from(level0.samples_per_pixel()) * 2f64.powi(-21);
+    for (pixel, (&gpu, &cpu)) in gpu_scores.iter().zip(&cpu_scores).enumerate() {
+        let gap = (f64::from(gpu) - f64::from(cpu)).abs();
+        assert!(
+            gap <= quantization + f64::from(cpu) * 2.0 * 68.0 * 2f64.powi(-24),
+            "pixel {pixel}: gpu {gpu} against score_plane {cpu}"
+        );
+    }
 }
 
 /// One whole-tile fusion comparison: the CPU result

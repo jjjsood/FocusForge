@@ -3,8 +3,8 @@
 //! `laplacian`: the first real [`StackAlgorithm`], selecting per pyramid
 //! level and per pixel by Laplacian magnitude across frames, and emitting
 //! both the fused composite and the Z-Map that names the winning source
-//! frame. Every rounding, ordering and tie-break choice below is binding: a
-//! bit-parity GPU twin must reproduce them exactly.
+//! frame. Every rounding, ordering and tie-break choice below is binding: the
+//! GPU twin reproduces the selection and the composite within 1 LSB at 16-bit.
 //!
 //! # Selection rule
 //!
@@ -61,31 +61,21 @@
 //! `tests::selection_reach_fits_the_measured_margin` for the inequality
 //! pinned at every level count `1..=MAX_LEVELS`.
 //!
-//! Accumulation is a **separable two-pass** sum, not the nested `dy`/`dx`/`c`
-//! loop of a fixed 3x3 window -- `O(radius)` per pixel where the nested form
-//! is `O(radius^2)` (68 adds per pixel at `radius = 8`, three channels,
-//! versus the nested form's 867), and the shape a compute shader wants
-//! (two dispatches, or one with a shared-memory row cache). This is a
-//! **deliberate re-pin** of the single-nested-accumulator order the
-//! original 3x3 rule used, measured to move 0 of 262,144 winners at
-//! radius 1, 1 at radius 6 and 2 at radius 8 when the reordering is applied
-//! to the same data -- evidence that the selection is decided by real score
-//! margins, not by which order `f32` happens to add in.
+//! Accumulation is a **separable sliding sum** in fixed point, with a cost per
+//! pixel independent of the radius. Integer addition is exact, so a score is a
+//! function of its window's samples alone: independent of where a sweep starts,
+//! of the tile geometry and of the thread count, which the tiling exactness
+//! below needs. Error and ties: [`score_plane`].
 //!
 //! ```text
-//! row[y][x]   = sum_{dx=-r..=r} sum_{c=0..spp}
-//!               |L_k[(y, clamp(x+dx)) * spp + c]|      (dx asc, then c asc)
-//! score[y][x] = sum_{dy=-r..=r} row[clamp(y+dy)][x]     (dy asc)
+//! q[y][x]     = sum_{c=0..spp} round(|L_k[(y, x) * spp + c]| * 2^20)
+//! row[y][x]   = sum_{dx=-r..=r} q[y][clamp(x+dx)]
+//! score[y][x] = (sum_{dy=-r..=r} row[clamp(y+dy)][x]) * 2^-20   (one f32 rounding)
 //! ```
 //!
-//! Both passes clamp-to-edge, the same rule [`crate::fuse::pyramid::reduce`]
-//! and [`crate::fuse::pyramid::expand`] use, and both accumulate into one
-//! `f32` in the pinned ascending order above because `f32` addition is not
-//! associative (`crate::fuse::pyramid`'s own module docs, `:40-46`). This
-//! two-pass order, together with `W(N)`/`r_k` and the `max(1, ...)` and
-//! `headroom` clamps above, is everything a GPU twin needs to
-//! reproduce this rule at <= 1 LSB: there is no other rounding, ordering or
-//! tie-break choice hiding in the implementation.
+//! Both sweeps clamp-to-edge, the rule [`crate::fuse::pyramid::reduce`] and
+//! [`crate::fuse::pyramid::expand`] use. The GPU twin sums in `f32` and agrees
+//! with this score to a few `f32` ulps; the CPU score defines the rule.
 //!
 //! # The Z-Map
 //!
@@ -235,54 +225,84 @@ pub(crate) fn window_score_ceiling(samples_per_pixel: u32, radii: &[u32]) -> f64
     )
 }
 
+/// Fixed-point scale of the score accumulators: `|L|` is rounded to a multiple
+/// of `2^-SCORE_FRACTION_BITS` before it is summed.
+const SCORE_FRACTION_BITS: i32 = 20;
+
+/// Largest magnitude a single `|L|` sample contributes (`2^30`, far above the
+/// `65535` of a 16-bit plane and the `~2e8` of a radius-16 score plane): bounds
+/// the `i64` window sums for radii up to 16 and spp up to 4.
+const SCORE_SAMPLE_CAP: f32 = 1_073_741_824.0;
+
+/// One `|L|` sample as a multiple of `2^-SCORE_FRACTION_BITS`.
+fn quantize_magnitude(v: f32) -> i64 {
+    (v.abs().clamp(0.0, SCORE_SAMPLE_CAP) * (1u32 << SCORE_FRACTION_BITS) as f32).round() as i64
+}
+
 /// The windowed sharpness score of every pixel of one Laplacian level: a
-/// `(2*radius+1)`-square, clamp-to-edge sum of `|L|` over every channel, in
-/// the pinned **separable two-pass** accumulation order this module's docs
-/// pin -- row sums (`dx` ascending, then `c` ascending) into a scratch
-/// plane, then column sums (`dy` ascending) of that scratch plane into the
-/// result. `O(radius)` per pixel, not `O(radius^2)`: at `radius = 8` this is
-/// 68 adds per pixel (three-channel) rather than the nested form's 867. One
+/// `(2*radius+1)`-square, clamp-to-edge sum of `|L|` over every channel, one
 /// `f32` per pixel, never per sample.
+///
+/// Each `|L|` is rounded to a multiple of `2^-20`, summed in `i64` by a
+/// sliding sum and converted to `f32` once: independent of the sweep start,
+/// tile geometry and thread count. Error against the exact sum: at most
+/// `(2*radius+1)^2 * spp * 2^-21` plus half an `f32` ulp (`4e-4` at radius 8,
+/// three channels). Frames tie only when their sums round to the same `f32`.
 ///
 /// `pub` so [`crate::fuse::weighted_average`] and [`crate::fuse::depth_map`] call this exact
 /// function (at their own radii) instead of reimplementing a second windowed sum -- keeping all
 /// three algorithms comparable on the same fixture and measure -- and so `crates/gpu`'s parity
 /// tests can call the identical CPU twin their WGSL kernel is compared against.
 pub fn score_plane(level: &Plane, radius: u32) -> Vec<f32> {
-    let width = level.width();
-    let height = level.height();
-    let spp = level.samples_per_pixel();
+    let width = level.width() as usize;
+    let height = level.height() as usize;
+    let spp = level.samples_per_pixel() as usize;
     let data = level.data();
-    let r = radius as i64;
-    let pixel_count = (width as usize) * (height as usize);
+    let r = radius as usize;
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
 
-    // Pass 1: row sums, `dx` ascending then `c` ascending.
-    let mut row_sums = vec![0.0f32; pixel_count];
-    for y in 0..height {
-        for x in 0..width {
-            let mut acc = 0.0f32;
-            for dx in -r..=r {
-                let sx = clamp_edge(x as i64 + dx, width);
-                for c in 0..spp {
-                    let idx = ((y * width + sx) * spp + c) as usize;
-                    acc += data[idx].abs();
-                }
-            }
-            row_sums[(y * width + x) as usize] = acc;
+    // Row sweep: window sums along x of the per-pixel channel sums.
+    let mut rows = vec![0i64; width * height];
+    let mut magnitude = vec![0i64; width];
+    for (src, out) in data
+        .chunks_exact(width * spp)
+        .zip(rows.chunks_exact_mut(width))
+    {
+        for (m, pixel) in magnitude.iter_mut().zip(src.chunks_exact(spp)) {
+            *m = pixel.iter().map(|&v| quantize_magnitude(v)).sum();
+        }
+        let mut sum: i64 = (0..=2 * r)
+            .map(|i| magnitude[i.saturating_sub(r).min(width - 1)])
+            .sum();
+        out[0] = sum;
+        for x in 1..width {
+            sum += magnitude[(x + r).min(width - 1)] - magnitude[(x - 1).saturating_sub(r)];
+            out[x] = sum;
         }
     }
 
-    // Pass 2: column sums of the row sums, `dy` ascending.
-    let mut scores = vec![0.0f32; pixel_count];
-    for y in 0..height {
-        for x in 0..width {
-            let mut acc = 0.0f32;
-            for dy in -r..=r {
-                let sy = clamp_edge(y as i64 + dy, height);
-                acc += row_sums[(sy * width + x) as usize];
-            }
-            scores[(y * width + x) as usize] = acc;
+    // Column sweep: window sums along y of the row sums, one accumulator per column.
+    let row = |y: usize| &rows[y * width..(y + 1) * width];
+    let mut column = vec![0i64; width];
+    for i in 0..=2 * r {
+        for (c, &v) in column
+            .iter_mut()
+            .zip(row(i.saturating_sub(r).min(height - 1)))
+        {
+            *c += v;
         }
+    }
+    let scale = 1.0 / (1u32 << SCORE_FRACTION_BITS) as f32;
+    let mut scores = Vec::with_capacity(width * height);
+    scores.extend(column.iter().map(|&c| c as f32 * scale));
+    for y in 1..height {
+        let (add, sub) = (row((y + r).min(height - 1)), row((y - 1).saturating_sub(r)));
+        for ((c, &a), &s) in column.iter_mut().zip(add).zip(sub) {
+            *c += a - s;
+        }
+        scores.extend(column.iter().map(|&c| c as f32 * scale));
     }
     scores
 }
@@ -1206,5 +1226,134 @@ mod tests {
             Laplacian.heat_scale(&cfg, 3),
             Some((65535 * 3 * side * side) as f64)
         );
+    }
+
+    /// Signed, fractional, spread over about +-32768: the shape of a
+    /// Laplacian level, with values an `f32` running sum cannot add exactly.
+    fn signed_plane(w: u32, h: u32, spp: u32, seed: u32) -> Plane {
+        let mut plane = Plane::from_u16(&vec![0u16; (w * h * spp) as usize], w, h, spp).unwrap();
+        for (i, v) in plane.data_mut().iter_mut().enumerate() {
+            let hash = (i as u32 + seed).wrapping_mul(2654435761);
+            *v = (hash >> 12) as f32 * 0.0625 * 0.37 - 20000.0;
+        }
+        plane
+    }
+
+    /// The window sum the score is defined by, in `f64`.
+    fn exact_score(plane: &Plane, radius: u32) -> Vec<f64> {
+        let (w, h, spp) = (plane.width(), plane.height(), plane.samples_per_pixel());
+        let r = i64::from(radius);
+        let mut out = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = 0.0f64;
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        let (sx, sy) = (
+                            clamp_edge(i64::from(x) + dx, w),
+                            clamp_edge(i64::from(y) + dy, h),
+                        );
+                        for c in 0..spp {
+                            let i = ((sy * w + sx) * spp + c) as usize;
+                            acc += f64::from(plane.data()[i].abs());
+                        }
+                    }
+                }
+                out.push(acc);
+            }
+        }
+        out
+    }
+
+    /// The previous nested `f32` accumulation, the naive reference.
+    fn naive_score(plane: &Plane, radius: u32) -> Vec<f32> {
+        let (w, h, spp) = (plane.width(), plane.height(), plane.samples_per_pixel());
+        let r = i64::from(radius);
+        let mut rows = vec![0.0f32; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = 0.0f32;
+                for dx in -r..=r {
+                    let sx = clamp_edge(i64::from(x) + dx, w);
+                    for c in 0..spp {
+                        acc += plane.data()[((y * w + sx) * spp + c) as usize].abs();
+                    }
+                }
+                rows[(y * w + x) as usize] = acc;
+            }
+        }
+        let mut out = vec![0.0f32; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = 0.0f32;
+                for dy in -r..=r {
+                    acc += rows[(clamp_edge(i64::from(y) + dy, h) * w + x) as usize];
+                }
+                out[(y * w + x) as usize] = acc;
+            }
+        }
+        out
+    }
+
+    /// Pinned tolerances: against the exact sum the score errs by at most the
+    /// input quantization, `(2r+1)^2 * spp * 2^-21`, plus the final rounding
+    /// to `f32` (half an ulp, `2^-24` relative); against the naive `f32`
+    /// accumulation, which itself errs by up to `68 * 2^-24` relative at
+    /// radius 8, by twice that.
+    #[test]
+    fn running_sum_scores_match_the_exact_and_the_naive_window_sum() {
+        for (w, h, spp, radius) in [(37, 29, 3, 8), (37, 29, 1, 1), (41, 23, 3, 0), (5, 3, 3, 8)] {
+            let plane = signed_plane(w, h, spp, 7);
+            let scores = score_plane(&plane, radius);
+            let exact = exact_score(&plane, radius);
+            let naive = naive_score(&plane, radius);
+            let side = f64::from(2 * radius + 1);
+            let quantization = side * side * f64::from(spp) * 2f64.powi(-21);
+            for p in 0..scores.len() {
+                let err = (f64::from(scores[p]) - exact[p]).abs();
+                assert!(
+                    err <= quantization + exact[p] * 2f64.powi(-24),
+                    "{w}x{h} spp {spp} r {radius} pixel {p}: {} against exact {}",
+                    scores[p],
+                    exact[p]
+                );
+                let gap = (f64::from(scores[p]) - f64::from(naive[p])).abs();
+                assert!(
+                    gap <= quantization + exact[p] * 2.0 * 68.0 * 2f64.powi(-24),
+                    "{w}x{h} spp {spp} r {radius} pixel {p}: {} against naive {}",
+                    scores[p],
+                    naive[p]
+                );
+            }
+        }
+    }
+
+    /// A pixel's score depends on its window alone, not on where the row or
+    /// column sweep started: a crop reproduces the interior bit for bit.
+    #[test]
+    fn running_sum_scores_do_not_depend_on_where_the_sweep_starts() {
+        let (w, h, spp, radius) = (64u32, 48u32, 3u32, 8u32);
+        let plane = signed_plane(w, h, spp, 11);
+        let full = score_plane(&plane, radius);
+        let (x0, y0, cw, ch) = (13u32, 9u32, 40u32, 31u32);
+        let mut crop = Plane::from_u16(&vec![0u16; (cw * ch * spp) as usize], cw, ch, spp).unwrap();
+        for y in 0..ch {
+            for x in 0..cw {
+                for c in 0..spp {
+                    crop.data_mut()[((y * cw + x) * spp + c) as usize] =
+                        plane.data()[(((y0 + y) * w + x0 + x) * spp + c) as usize];
+                }
+            }
+        }
+        let part = score_plane(&crop, radius);
+        for y in radius..ch - radius {
+            for x in radius..cw - radius {
+                assert_eq!(
+                    part[(y * cw + x) as usize].to_bits(),
+                    full[((y0 + y) * w + x0 + x) as usize].to_bits(),
+                    "pixel ({x}, {y}) of the crop"
+                );
+            }
+        }
     }
 }
