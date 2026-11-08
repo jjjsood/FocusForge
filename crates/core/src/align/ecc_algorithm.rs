@@ -231,10 +231,10 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         ParamDesc {
             id: "mode".to_string(),
             label: "Mode".to_string(),
-            help: "Translation-only (2 DOF) or rotation+scale (4 DOF, for \
-                   focus breathing) -- selects which degrees of freedom the \
-                   solver moves inside the one projective Transform; the \
-                   unmoved degrees of freedom stay at their identity values."
+            help: "Translation only follows a camera that shifts between \
+                   shots, while Rotation + Scale also follows the slight turn \
+                   and change of size that refocusing causes (focus \
+                   breathing)."
                 .to_string(),
             kind: ParamKind::Enum {
                 variants: vec![
@@ -252,32 +252,29 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "max-iterations".to_string(),
             label: "Max Iterations".to_string(),
-            help: "The per-level iteration cap. A level that reaches it stops \
-                   short of `epsilon-px` and reports `HitCap`, keeping its last \
-                   transform rather than failing; when its last ten steps were \
-                   flat or oscillating it reports `Stalled` and keeps the best \
-                   correlation transform instead. \
-                   Frames that converge earlier stop on `epsilon-px` and pay \
-                   nothing. On a 61-frame 44.8 MP stack no level needed more \
-                   than 202 iterations."
+            help: "The most correction steps alignment spends on each pyramid \
+                   level of a frame, after which it keeps the best match \
+                   found so far instead of failing, so raising it only costs \
+                   time on frames that are hard to align."
                 .to_string(),
             kind: ParamKind::Int { min: 1, max: 1000 },
             default: ParamValue::Int(400),
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "epsilon-px".to_string(),
             label: "Epsilon (px)".to_string(),
-            help: "Maximum corner displacement in level pixels -- the \
-                   per-iteration step measure the solver converges to, not \
-                   a correlation threshold. Applies at full resolution; \
-                   coarser levels stop at 100 times it."
+            help: "How small, in pixels at full size, a correction step has \
+                   to get before alignment treats a frame as settled, so a \
+                   smaller value aligns more precisely and takes longer."
                 .to_string(),
             kind: ParamKind::Float {
                 min: 1e-9,
@@ -289,16 +286,16 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "pyramid-depth".to_string(),
             label: "Pyramid Depth".to_string(),
-            help: "How many coarser pyramid levels to register through \
-                   before refining at full resolution. `auto` derives the \
-                   depth from the loaded frames: the deepest one whose \
-                   coarsest level keeps the shorter side at 64 px or more, \
-                   so frames shorter than 127 px register at full \
-                   resolution only (0) and a 512 px frame gets 3."
+            help: "How many reduced copies of each frame alignment works \
+                   through before the full-size pass, where automatic picks \
+                   the deepest that keeps the smallest copy at least 64 px \
+                   on its shorter side, so frames under 127 px align at full \
+                   size only and a 512 px frame gets 3."
                 .to_string(),
             kind: ParamKind::Int {
                 min: 0,
@@ -308,6 +305,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: Some(Arc::new(auto_pyramid_depth)),
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "reference-policy".to_string(),
@@ -332,6 +330,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "reference-frame".to_string(),
@@ -359,6 +358,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
     ]
 });

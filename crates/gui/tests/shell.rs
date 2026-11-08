@@ -1133,16 +1133,7 @@ fn px_for_rows(rows: usize) -> f32 {
 /// way the running app fills them.
 fn input_map_window(width: u32, height: u32, controller: &AppController) -> AppWindow {
     let app = app_at(width, height);
-    let rows: Vec<focusforge_gui::InputRow> = controller
-        .input_rows()
-        .into_iter()
-        .map(|r| focusforge_gui::InputRow {
-            input: r.input.into(),
-            stacking: r.stacking.into(),
-            editor: r.editor.into(),
-        })
-        .collect();
-    app.set_input_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    focusforge_gui::bridge::push_input_map_view(&app, controller);
     app.set_settings_open(true);
     app.set_settings_section("input-map".into());
     app
@@ -1236,6 +1227,124 @@ fn input_map_tab_shows_the_controller_rows() {
                 .map(|row| [row.input, row.stacking, row.editor]),
         );
         assert_eq!(input_map_cells(&tab), expected);
+    }
+}
+
+/// The status lines at the top of the tab, top to bottom: the provenance
+/// line, then one per refusal.
+fn input_map_status_lines(tab: &ElementHandle) -> Vec<String> {
+    by_position(tab.query_descendants().match_type_name("FFStatusText"))
+        .iter()
+        .map(|line| line.accessible_label().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Installs what `input_config::load` made of `config_dir` on `controller`
+/// the way the running app does.
+fn install_loaded(controller: &mut AppController, config_dir: &std::path::Path) {
+    let loaded = focusforge_gui::input_config::load(config_dir);
+    controller.install_input_table(loaded.table);
+    controller.install_input_source(&loaded.provenance, &loaded.problems);
+}
+
+/// A controller never given a source shows the built-in line; one given a
+/// settings file with a changed binding names that file and the count.
+#[test]
+fn input_map_tab_shows_where_the_bindings_come_from() {
+    let fresh = AppController::new();
+    let app = input_map_window(1440, 900, &fresh);
+    assert_eq!(
+        input_map_status_lines(&input_map_tab(&app)),
+        ["Built-in bindings."]
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.toml");
+    fs::write(
+        &path,
+        "[input]\n[[input.bindings]]\ntrigger = \"shift+wheel\"\nstacking = \"pan\"\n",
+    )
+    .unwrap();
+    let mut controller = AppController::new();
+    install_loaded(&mut controller, dir.path());
+    let app = input_map_window(1440, 900, &controller);
+    assert_eq!(
+        input_map_status_lines(&input_map_tab(&app)),
+        [format!(
+            "Read from {}: 1 binding differs from the built-in ones.",
+            path.display()
+        )]
+    );
+
+    let no_table = tempfile::tempdir().unwrap();
+    fs::write(no_table.path().join("settings.toml"), "[recent]\n").unwrap();
+    let mut controller = AppController::new();
+    install_loaded(&mut controller, no_table.path());
+    let app = input_map_window(1440, 900, &controller);
+    assert_eq!(
+        input_map_status_lines(&input_map_tab(&app)),
+        ["Built-in bindings."],
+        "a settings file without an [input] table supplies no bindings"
+    );
+
+    let unchanged = tempfile::tempdir().unwrap();
+    fs::write(unchanged.path().join("settings.toml"), "[input]\n").unwrap();
+    let mut controller = AppController::new();
+    install_loaded(&mut controller, unchanged.path());
+    let app = input_map_window(1440, 900, &controller);
+    assert_eq!(
+        input_map_status_lines(&input_map_tab(&app)),
+        [format!(
+            "Read from {}: 0 bindings differ from the built-in ones.",
+            unchanged.path().join("settings.toml").display()
+        )]
+    );
+}
+
+/// A refused `[input]` table opens on the built-in rows with the built-in
+/// line and one failure line per problem, as `load` words it.
+#[test]
+fn input_map_tab_names_a_refused_table() {
+    let cases = [
+        (
+            "unknown trigger",
+            "[input]\n[[input.bindings]]\ntrigger = \"banana-drag\"\nstacking = \"pan\"\n",
+        ),
+        (
+            "duplicate trigger",
+            "[input]\n[[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"pan\"\n\
+             [[input.bindings]]\ntrigger = \"wheel\"\nstacking = \"zoom-at-cursor\"\n",
+        ),
+        ("unparsable TOML", "[input\n"),
+    ];
+    let tab_source =
+        fs::read_to_string(common::ui_dir().join("shell/settings_modal/input_map_tab.slint"))
+            .unwrap();
+    assert!(
+        tab_source.contains("tone: \"failure\""),
+        "the refusal lines draw in the failure tone"
+    );
+
+    for (label, body) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("settings.toml"), body).unwrap();
+        let loaded = focusforge_gui::input_config::load(dir.path());
+        assert!(!loaded.problems.is_empty(), "{label}: the table is refused");
+        let mut expected = vec!["Built-in bindings.".to_string()];
+        expected.extend(loaded.problems.iter().map(ToString::to_string));
+
+        let mut controller = AppController::new();
+        install_loaded(&mut controller, dir.path());
+        let app = input_map_window(1440, 900, &controller);
+        let tab = input_map_tab(&app);
+        assert_eq!(input_map_status_lines(&tab), expected, "{label}");
+
+        let rows: Vec<[String; 3]> = AppController::new()
+            .input_rows()
+            .into_iter()
+            .map(|row| [row.input, row.stacking, row.editor])
+            .collect();
+        assert_eq!(&input_map_cells(&tab)[1..], rows, "{label}: built-in rows");
     }
 }
 
@@ -1878,6 +1987,33 @@ fn transport() {
     assert_rect(&app, "FFToolbar::cancel-button", (186.0, 43.0, 116.0, 26.0));
 }
 
+/// The stacking toolbar carries the run's transport only: no "Save checkpoint"
+/// text in any run state, while the editor toolbar keeps its real button.
+#[test]
+fn stacking_toolbar_has_no_save_checkpoint_caption() {
+    let app = app_at(1440, 900);
+    app.set_show_empty_state(false);
+    app.set_mode("stacking".into());
+    for state in ["idle", "running", "paused", "failed", "queued"] {
+        app.set_toolbar_run_state(state.into());
+        for label in ["Save checkpoint", "Fuse stack · Save checkpoint"] {
+            assert_eq!(
+                ElementHandle::find_by_accessible_label(&app, label).count(),
+                0,
+                "{label:?} must not be drawn in the {state} state"
+            );
+        }
+    }
+    app.set_mode("editor".into());
+    let buttons = ElementHandle::find_by_accessible_label(&app, "Save checkpoint")
+        .filter(|e| e.accessible_role() == Some(AccessibleRole::Button))
+        .count();
+    assert_eq!(
+        buttons, 1,
+        "the editor toolbar keeps its Save checkpoint button"
+    );
+}
+
 /// The bottom bar's progress track, in reading order (stage -> step -> bar
 /// -> ETA), at the base width and at the 1200px minimum: the bar's width is
 /// dynamic, always ending `Theme.space-4` before the ETA.
@@ -2139,9 +2275,36 @@ fn performance_placeholders(tab: &ElementHandle) -> Vec<String> {
     .collect()
 }
 
-/// The tab draws what the controller's view holds: the switch, both cap
-/// fields (or their placeholders) and the three read-only figures, whichever
-/// way the stored settings are.
+fn performance_unit_menus(tab: &ElementHandle) -> Vec<ElementHandle> {
+    by_position(
+        tab.query_descendants()
+            .match_accessible_role(AccessibleRole::Combobox),
+    )
+}
+
+/// The row of an open unit list that reads `label`.
+fn open_unit_option(tab: &ElementHandle, label: &str) -> ElementHandle {
+    tab.query_descendants()
+        .match_id("FFMenuList::option-row")
+        .find_all()
+        .into_iter()
+        .find(|row| row.accessible_label().as_deref() == Some(label))
+        .unwrap_or_else(|| panic!("no {label:?} row in an open unit list"))
+}
+
+fn performance_texts(tab: &ElementHandle) -> Vec<String> {
+    by_position(
+        tab.query_descendants()
+            .match_accessible_role(AccessibleRole::Text),
+    )
+    .iter()
+    .map(|text| text.accessible_label().unwrap_or_default().to_string())
+    .collect()
+}
+
+/// The tab draws what the controller's view holds: the switch, a number and a
+/// unit for each memory limit (or the placeholder), and the backend row,
+/// whichever way the stored settings are.
 #[test]
 fn performance_tab_shows_the_controller_view() {
     let mut on = AppController::new();
@@ -2151,7 +2314,10 @@ fn performance_tab_shows_the_controller_view() {
     capped.set_host_memory_cap("2GiB");
     capped.set_vram_cap("512MiB");
 
-    for (controller, gpu, caps) in [(on, true, ["", ""]), (capped, false, ["2GiB", "512MiB"])] {
+    for (controller, gpu, caps, placeholders) in [
+        (on, true, None, vec!["Not probed yet"]),
+        (capped, false, Some((["2", "512"], ["GiB", "MiB"])), vec![]),
+    ] {
         let view = controller.performance_view();
         assert_eq!(view.gpu, gpu);
         let shared: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
@@ -2159,26 +2325,65 @@ fn performance_tab_shows_the_controller_view() {
         let tab = performance_tab(&app);
 
         assert_eq!(performance_switch_is_on(&tab), gpu);
-        let texts: Vec<String> = performance_cap_inputs(&tab)
+        let numbers: Vec<String> = performance_cap_inputs(&tab)
             .iter()
             .map(|input| input.accessible_value().unwrap_or_default().to_string())
             .collect();
-        assert_eq!(texts, caps);
-        let placeholders = performance_placeholders(&tab);
-        if gpu {
-            assert_eq!(placeholders, ["No cap", "No cap"]);
-        } else {
-            assert!(placeholders.is_empty(), "{placeholders:?}");
-        }
         assert_eq!(
-            performance_row_texts(&tab),
+            numbers,
+            [view.host_cap.text.clone(), view.vram_cap.text.clone()]
+        );
+        let units: Vec<(String, String)> = performance_unit_menus(&tab)
+            .iter()
+            .map(|menu| {
+                (
+                    menu.accessible_label().unwrap_or_default().to_string(),
+                    menu.accessible_value().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            units,
             [
-                view.backend.as_str(),
-                view.host_budget.as_str(),
-                view.vram_budget.as_str()
+                (
+                    "Host memory unit".to_string(),
+                    view.host_cap.unit.label().to_string()
+                ),
+                (
+                    "VRAM unit".to_string(),
+                    view.vram_cap.unit.label().to_string()
+                ),
             ]
         );
-        assert_eq!(view.vram_budget, "Not probed yet");
+        match caps {
+            Some((expected_numbers, expected_units)) => {
+                assert_eq!(numbers, expected_numbers);
+                assert_eq!(
+                    [view.host_cap.unit.label(), view.vram_cap.unit.label()],
+                    expected_units
+                );
+            }
+            None => {
+                assert!(
+                    !numbers[0].is_empty() && numbers[0].bytes().all(|b| b.is_ascii_digit()),
+                    "the host row shows the default budget: {numbers:?}"
+                );
+                assert_eq!(numbers[1], "", "the VRAM row has no number before a probe");
+            }
+        }
+        assert_eq!(performance_placeholders(&tab), placeholders);
+        assert_eq!(performance_row_texts(&tab), [view.backend.as_str()]);
+        let texts = performance_texts(&tab);
+        for label in ["Host memory", "VRAM"] {
+            assert!(
+                texts.iter().any(|text| text == label),
+                "no {label:?} in {texts:?}"
+            );
+        }
+        assert!(
+            texts.iter().all(|text| !text.contains("budget")),
+            "the tab has no budget row: {texts:?}"
+        );
     }
 }
 
@@ -2203,11 +2408,16 @@ fn performance_tab_composes_only_shared_components() {
         "FFSettingsSection {",
         "FFSettingsRow {",
         "FFToggle {",
-        "FFTextField {",
+        "FFSizeField {",
+        "FFErrorRow {",
+        "FFMenuList {",
         "FFRowText {",
         "FFStatusText {",
     ] {
         assert!(tab.contains(shared), "the tab does not draw {shared}");
+    }
+    for gone in ["FFTextField {", "Host budget", "VRAM budget"] {
+        assert!(!tab.contains(gone), "the tab still has {gone}");
     }
 }
 
@@ -2264,7 +2474,7 @@ fn storage_tab_shows_the_controller_view() {
     fs::write(config.join("settings.toml"), "").unwrap();
     let mut controller = AppController::new();
     controller.install_recent(Vec::new(), config);
-    controller.set_diagnostics_dirs(Some(data.clone()), None);
+    controller.set_diagnostics_dirs(Some(data.clone()));
     controller.set_scratch_root_for_test(data.join("scratch"));
 
     let view = controller.storage_view();
@@ -2373,13 +2583,28 @@ fn type_into(app: &AppWindow, text: &str) {
     }
 }
 
-/// Clicking the switch asks for the opposite setting, and typing in a cap
-/// field reports every edit with the cursor's new position.
+fn press_key(app: &AppWindow, key: slint::platform::Key) {
+    use slint::platform::WindowEvent;
+    let text: slint::SharedString = key.into();
+    app.window()
+        .dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+    app.window()
+        .dispatch_event(WindowEvent::KeyReleased { text });
+}
+
+/// Clicking the switch asks for the opposite setting. Typing in a number
+/// reports every accepted digit with the cursor's new position and commits
+/// nothing; leaving the number or pressing Enter commits once each, and
+/// picking a unit reports it.
 #[test]
 fn performance_controls_report_to_their_callbacks() {
+    use slint::platform::{Key, PointerEventButton, WindowEvent};
+
     let controller = AppController::new();
     let shared: SharedController = std::sync::Arc::new(std::sync::Mutex::new(controller));
     let app = performance_window(&shared);
+    app.window()
+        .dispatch_event(WindowEvent::WindowActiveChanged(true));
     let tab = performance_tab(&app);
 
     let toggled = std::rc::Rc::new(std::cell::RefCell::new(Vec::<bool>::new()));
@@ -2397,6 +2622,16 @@ fn performance_controls_report_to_their_callbacks() {
         let edits = vram_edits.clone();
         move |text| edits.borrow_mut().push(text.to_string())
     });
+    let commits = std::rc::Rc::new(std::cell::Cell::new(0));
+    app.on_performance_cap_committed({
+        let commits = commits.clone();
+        move || commits.set(commits.get() + 1)
+    });
+    let host_units = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    app.on_performance_host_unit_selected({
+        let units = host_units.clone();
+        move |unit| units.borrow_mut().push(unit.to_string())
+    });
     let cursors = std::rc::Rc::new(std::cell::RefCell::new(Vec::<(char, f32, f32)>::new()));
     app.on_performance_host_cap_cursor_moved({
         let cursors = cursors.clone();
@@ -2412,16 +2647,36 @@ fn performance_controls_report_to_their_callbacks() {
         .match_id("FFToggle::area")
         .find_first()
         .expect("the switch has a touch area")
-        .mock_single_click(slint::platform::PointerEventButton::Left);
+        .mock_single_click(PointerEventButton::Left);
     assert_eq!(*toggled.borrow(), [!before]);
 
     let inputs = performance_cap_inputs(&tab);
-    inputs[0].mock_single_click(slint::platform::PointerEventButton::Left);
-    type_into(&app, "2G");
-    inputs[1].mock_single_click(slint::platform::PointerEventButton::Left);
+    let shown = inputs[0].accessible_value().unwrap_or_default();
+    inputs[0].mock_single_click(PointerEventButton::Left);
+    type_into(&app, "2G5");
+    assert_eq!(
+        *host_edits.borrow(),
+        [format!("{shown}2"), format!("{shown}25")],
+        "the letter is not accepted into the number"
+    );
+    slint::platform::update_timers_and_animations();
+    assert_eq!(commits.get(), 0, "typing commits nothing");
+
+    inputs[1].mock_single_click(PointerEventButton::Left);
+    slint::platform::update_timers_and_animations();
+    assert_eq!(commits.get(), 1, "leaving the host number commits once");
     type_into(&app, "5");
-    assert_eq!(*host_edits.borrow(), ["2", "2G"]);
     assert_eq!(*vram_edits.borrow(), ["5"]);
+    assert_eq!(commits.get(), 1, "typing commits nothing");
+    press_key(&app, Key::Return);
+    assert_eq!(commits.get(), 2, "Enter commits once");
+
+    assert!(host_units.borrow().is_empty(), "no unit was picked yet");
+    let mut state = app.get_performance();
+    state.host_cap.unit_open = true;
+    app.set_performance(state);
+    open_unit_option(&tab, "GiB").mock_single_click(PointerEventButton::Left);
+    assert_eq!(*host_units.borrow(), ["GiB"]);
 
     let cursors = cursors.borrow();
     let host: Vec<_> = cursors.iter().filter(|c| c.0 == 'h').collect();
@@ -2434,10 +2689,92 @@ fn performance_controls_report_to_their_callbacks() {
         vram.last().is_some_and(|c| c.1 > 0.0),
         "typing moves the VRAM cursor right: {vram:?}"
     );
-    let visible = 136.0 - 2.0 * 6.0;
+    let visible = 112.0 - 2.0 * 6.0;
     assert!(
         cursors.iter().all(|c| (c.2 - visible).abs() < EPS),
         "the visible width is the field less its two insets: {cursors:?}"
+    );
+}
+
+/// Confirming a number the system cannot give clamps the row, and the field
+/// shows the clamped value rather than the digits that were typed.
+#[test]
+fn cap_field_shows_the_clamped_value_after_an_edit() {
+    use focusforge_gui::SettingsSection;
+    use slint::platform::{Key, PointerEventButton};
+
+    let rig = settings_escape::rig();
+    rig.open_settings(SettingsSection::Performance);
+    focusforge_gui::bridge::push_performance_view(&rig.app, &rig.controller);
+    let tab = performance_tab(&rig.app);
+    let host = performance_cap_inputs(&tab).remove(0);
+
+    let shown = host.accessible_value().unwrap_or_default();
+    host.mock_single_click(PointerEventButton::Left);
+    type_into(&rig.app, "99999999");
+    assert_eq!(
+        host.accessible_value().as_deref(),
+        Some(format!("{shown}99999999").as_str())
+    );
+    press_key(&rig.app, Key::Return);
+
+    let view = rig.controller.lock().unwrap().performance_view();
+    assert_ne!(view.host_cap.text, "99999999", "the number was clamped");
+    assert!(
+        view.host_cap.limit.starts_with("Max "),
+        "{:?}",
+        view.host_cap.limit
+    );
+    assert_eq!(
+        host.accessible_value().as_deref(),
+        Some(view.host_cap.text.as_str()),
+        "the field shows the view's number, not the typed digits"
+    );
+    let lines: Vec<String> = by_position(
+        tab.query_descendants()
+            .match_type_name("FFErrorRow")
+            .match_descendants()
+            .match_accessible_role(AccessibleRole::Text),
+    )
+    .iter()
+    .map(|line| line.accessible_label().unwrap_or_default().to_string())
+    .collect();
+    assert_eq!(
+        lines,
+        [view.host_cap.limit.as_str()],
+        "the line names the maximum"
+    );
+}
+
+/// A unit picked while a typed number is unconfirmed commits it in that unit;
+/// a clamp there shows the clamped value in the field too.
+#[test]
+fn cap_field_shows_the_clamped_value_after_a_unit_pick() {
+    use focusforge_gui::SettingsSection;
+    use slint::platform::PointerEventButton;
+
+    let rig = settings_escape::rig();
+    rig.open_settings(SettingsSection::Performance);
+    focusforge_gui::bridge::push_performance_view(&rig.app, &rig.controller);
+    let tab = performance_tab(&rig.app);
+    let host = performance_cap_inputs(&tab).remove(0);
+
+    host.mock_single_click(PointerEventButton::Left);
+    type_into(&rig.app, "99999999");
+    rig.controller.lock().unwrap().toggle_host_unit_list();
+    focusforge_gui::bridge::push_performance_view(&rig.app, &rig.controller);
+    open_unit_option(&tab, "GiB").mock_single_click(PointerEventButton::Left);
+
+    let view = rig.controller.lock().unwrap().performance_view();
+    assert!(
+        view.host_cap.limit.starts_with("Max "),
+        "{:?}",
+        view.host_cap.limit
+    );
+    assert_eq!(
+        host.accessible_value().as_deref(),
+        Some(view.host_cap.text.as_str()),
+        "the field shows the view's number, not the typed digits"
     );
 }
 
@@ -2571,15 +2908,16 @@ fn about_tab_shows_the_build_metadata() {
         "the source is the repository without its scheme"
     );
     let notice = |version: &str| -> Vec<String> {
-        vec![
-            "FOCUSFORGE".to_string(),
-            format!("Version | {version}"),
-            "License | GPL-3.0".to_string(),
-            "NOTICE".to_string(),
-            "Copyright © 2026 Johannes Sood".to_string(),
-            ABOUT_REDISTRIBUTE.to_string(),
-            ABOUT_WARRANTY.to_string(),
-        ]
+        let mut rows = about_rows_around(version, "", &[]);
+        rows.extend(
+            [
+                "Copyright © 2026 Johannes Sood",
+                ABOUT_REDISTRIBUTE,
+                ABOUT_WARRANTY,
+            ]
+            .map(String::from),
+        );
+        rows
     };
     assert_eq!(rest, notice(version));
 
@@ -2591,6 +2929,162 @@ fn about_tab_shows_the_build_metadata() {
     let (source_row, rest) = rows.split_last().unwrap();
     assert_eq!(source_row, "Source | example.org/x");
     assert_eq!(rest, notice("9.9.9"));
+}
+
+/// The rows from the top of the tab through the NOTICE heading: the Check now
+/// row (an empty label and value column around its button), its status line,
+/// then `result`.
+fn about_rows_around(version: &str, status: &str, result: &[&str]) -> Vec<String> {
+    let mut rows: Vec<String> = [
+        "FOCUSFORGE",
+        &format!("Version | {version}"),
+        "License | GPL-3.0",
+        "UPDATES",
+        "Check for updates at start",
+        " |  | Check now",
+        status,
+    ]
+    .map(String::from)
+    .into();
+    rows.extend(result.iter().map(|row| row.to_string()));
+    rows.push("NOTICE".into());
+    rows
+}
+
+/// The spinners inside the About tab.
+fn spinners(app: &AppWindow) -> usize {
+    let tab = ElementQuery::from_root(app)
+        .match_descendants()
+        .match_type_name("FFAboutTab")
+        .find_first()
+        .expect("no FFAboutTab element found");
+    tab.query_descendants()
+        .match_type_name("FFSpinner")
+        .find_all()
+        .len()
+}
+
+/// The update controls draw what the controller's state says: the status slot
+/// and the spinner while checking, the two-line result row for a newer
+/// version, one line for a failure, and the save error with its follow-up.
+#[test]
+fn about_tab_draws_the_update_states() {
+    use focusforge_gui::UpdateControlsState;
+    let version = env!("CARGO_PKG_VERSION");
+    let app = about_window();
+    // Rows below the viewport are not drawn, so a state's rows are read down
+    // to the NOTICE heading, which every state keeps in view.
+    let draw = |state: UpdateControlsState| {
+        app.set_update_controls(state);
+        let mut rows = about_rows(&app);
+        let notice = rows.iter().position(|row| row == "NOTICE").unwrap();
+        rows.truncate(notice + 1);
+        rows
+    };
+    let idle = UpdateControlsState {
+        check_on_start: true,
+        check_enabled: true,
+        status_tone: "none".into(),
+        ..Default::default()
+    };
+
+    assert_eq!(draw(idle.clone()), about_rows_around(version, "", &[]));
+    assert_eq!(spinners(&app), 0, "idle");
+
+    let checking = draw(UpdateControlsState {
+        checking: true,
+        check_enabled: false,
+        status: "Checking for updates…".into(),
+        ..idle.clone()
+    });
+    assert_eq!(
+        checking,
+        about_rows_around(version, "Checking for updates…", &[])
+    );
+    assert_eq!(spinners(&app), 1, "checking");
+
+    let up_to_date = draw(UpdateControlsState {
+        status: "FocusForge is up to date.".into(),
+        status_tone: "success".into(),
+        ..idle.clone()
+    });
+    assert_eq!(
+        up_to_date,
+        about_rows_around(version, "FocusForge is up to date.", &[])
+    );
+    assert_eq!(spinners(&app), 0, "up to date");
+
+    let newer = draw(UpdateControlsState {
+        result_text: "FocusForge 999.0.0 is available.".into(),
+        skip_enabled: true,
+        ..idle.clone()
+    });
+    assert_eq!(
+        newer,
+        about_rows_around(
+            version,
+            "",
+            &[
+                "FocusForge 999.0.0 is available.",
+                "Open download page | Skip this version"
+            ]
+        ),
+        "the result is two lines: the text, then the link beside the Skip button"
+    );
+    assert_eq!(spinners(&app), 0, "newer");
+
+    let failed = draw(UpdateControlsState {
+        failure: "Could not check for updates: connection refused".into(),
+        ..idle.clone()
+    });
+    assert_eq!(
+        failed,
+        about_rows_around(
+            version,
+            "",
+            &["Could not check for updates: connection refused"]
+        ),
+        "the failure is one line"
+    );
+    assert_eq!(spinners(&app), 0, "failed");
+
+    let save_error = draw(UpdateControlsState {
+        save_error: "settings.toml: not valid TOML, left untouched".into(),
+        ..idle
+    });
+    assert_eq!(
+        save_error,
+        about_rows_around(
+            version,
+            "",
+            &[
+                "settings.toml: not valid TOML, left untouched",
+                "The change is active for this session."
+            ]
+        )
+    );
+    assert_eq!(spinners(&app), 0, "save error");
+
+    // The longest state overflows the viewport; scrolled to the end, Source
+    // is still the last row.
+    let tab = ElementQuery::from_root(&app)
+        .match_descendants()
+        .match_type_name("FFAboutTab")
+        .find_first()
+        .expect("no FFAboutTab element found");
+    let (pos, size) = (tab.absolute_position(), tab.size());
+    app.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+            position: slint::LogicalPosition::new(
+                pos.x + size.width / 2.0,
+                pos.y + size.height / 2.0,
+            ),
+            delta_x: 0.0,
+            delta_y: -400.0,
+        });
+    let rows = about_rows(&app);
+    let last = rows.last().expect("the tab draws rows");
+    assert!(last.starts_with("Source | "), "{last:?}");
 }
 
 /// The tab is layout over shared components: its sections, rows and texts are
@@ -2610,7 +3104,16 @@ fn about_tab_composes_only_shared_components() {
     ] {
         assert!(!tab.contains(needle), "the tab sets {needle:?}");
     }
-    for shared in ["FFSettingsSection {", "FFSettingsRow {", "FFRowText {"] {
+    for shared in [
+        "FFSettingsSection {",
+        "FFSettingsRow {",
+        "FFRowText {",
+        "FFSettingsActionRow {",
+        "FFToggle {",
+        "FFLinkText {",
+        "FFScrollbar {",
+        "Flickable {",
+    ] {
         assert!(tab.contains(shared), "the tab does not draw {shared}");
     }
 }
@@ -3340,6 +3843,11 @@ mod notification {
             "the first record is up"
         );
         assert_eq!(rig.app.get_toast_kind(), "failure");
+        assert_eq!(
+            rig.app.get_toast_link_label(),
+            "Open notification",
+            "a record without a url keeps the default link text"
+        );
 
         // The `Open notification` link.
         rig.click(64.0 + 80.0, 92.0 + 44.0);
@@ -3481,8 +3989,20 @@ mod notification {
                 .all(|n| n.kind == Kind::Warning)
         );
 
+        for (note, file) in controller.notifications().iter().zip(["01.tif", "02.tif"]) {
+            assert_eq!(note.title, "Brightness not fully matched");
+            assert_eq!(
+                note.message,
+                format!("{file} could not be brought to the same brightness as the other frames.")
+            );
+            let lower = note.message.to_lowercase();
+            for banned in ["target limited", "bound", "residual", "gain of", "frame 0"] {
+                assert!(!lower.contains(banned), "{banned:?} in {:?}", note.message);
+            }
+        }
+
         let rig = rig(controller, 1440, 900);
-        assert_eq!(rig.app.get_toast_title(), "Brightness target limited");
+        assert_eq!(rig.app.get_toast_title(), "Brightness not fully matched");
         assert_eq!(rig.app.get_toast_kind(), "warning");
         let (x, y) = Rig::bell(900.0);
         rig.click(x, y);
@@ -3511,7 +4031,7 @@ mod notification {
     #[test]
     fn a_crash_toast_carries_the_crash_kind() {
         let mut controller = AppController::new();
-        controller.set_diagnostics_dirs(Some(crash_data_dir("shell_crash_toast")), None);
+        controller.set_diagnostics_dirs(Some(crash_data_dir("shell_crash_toast")));
         controller.scan_crash_notice();
         let rig = rig(controller, 1440, 900);
         assert!(rig.app.get_toast_open());
@@ -3524,7 +4044,7 @@ mod notification {
     #[test]
     fn crash_diagnostics_opens_settings_on_the_diagnostics_section() {
         let mut controller = AppController::new();
-        controller.set_diagnostics_dirs(Some(crash_data_dir("shell_crash_diagnostics")), None);
+        controller.set_diagnostics_dirs(Some(crash_data_dir("shell_crash_diagnostics")));
         controller.scan_crash_notice();
         let rig = rig(controller, 1440, 900);
         assert_eq!(rig.app.get_settings_section().as_str(), "performance");
@@ -3569,7 +4089,7 @@ mod notification {
         let crashes = data.join("crashes");
         let writable = fs::metadata(&crashes).unwrap().permissions();
         let mut controller = AppController::new();
-        controller.set_diagnostics_dirs(Some(data), None);
+        controller.set_diagnostics_dirs(Some(data));
         controller.scan_crash_notice();
         let rig = rig(controller, 1440, 900);
         let id = rig.ids()[0];
@@ -3703,6 +4223,63 @@ mod settings_escape {
     }
 
     #[test]
+    fn escape_from_a_cap_field_closes_settings_and_commits_it() {
+        let rig = rig();
+        rig.controller.lock().unwrap().set_host_cap_unit("MiB");
+        rig.open_settings(SettingsSection::Performance);
+        focusforge_gui::bridge::push_performance_view(&rig.app, &rig.controller);
+        let tab = performance_tab(&rig.app);
+        let host = performance_cap_inputs(&tab).remove(0);
+
+        host.mock_single_click(PointerEventButton::Left);
+        for _ in 0..12 {
+            press_key(&rig.app, Key::Backspace);
+            press_key(&rig.app, Key::Delete);
+        }
+        type_into(&rig.app, "200");
+        assert!(rig.app.get_settings_open());
+        rig.escape();
+
+        assert!(
+            !rig.app.get_settings_open(),
+            "Escape closes Settings while a number holds focus"
+        );
+        let row = rig.controller.lock().unwrap().performance_view().host_cap;
+        assert_eq!(
+            (row.text.as_str(), row.unit.label(), row.invalid),
+            ("200", "MiB", false)
+        );
+    }
+
+    #[test]
+    fn escape_closes_an_open_unit_list_before_settings() {
+        let rig = rig();
+        rig.open_settings(SettingsSection::Performance);
+        focusforge_gui::bridge::push_performance_view(&rig.app, &rig.controller);
+        let tab = performance_tab(&rig.app);
+        performance_unit_menus(&tab)[0].invoke_accessible_default_action();
+        assert!(rig.controller.lock().unwrap().unit_list_open());
+        assert!(
+            rig.app.get_performance().host_cap.unit_open,
+            "the list is drawn open"
+        );
+
+        rig.escape();
+        assert!(
+            rig.app.get_settings_open(),
+            "the first Escape keeps Settings"
+        );
+        assert!(!rig.controller.lock().unwrap().unit_list_open());
+        assert!(!rig.app.get_performance().host_cap.unit_open);
+
+        rig.escape();
+        assert!(
+            !rig.app.get_settings_open(),
+            "the second Escape closes Settings"
+        );
+    }
+
+    #[test]
     fn escape_closes_settings_and_leaves_the_overlay_to_the_next_escape() {
         let rig = rig();
         rig.controller.lock().unwrap().toggle_projects_overlay();
@@ -3748,7 +4325,8 @@ mod dialog_close {
             on_question_open_as_one => "question-open-as-one",
             on_question_open_as_many => "question-open-as-many",
             on_question_cancelled => "question-cancelled",
-            on_refusal_pick_another_folder => "refusal-pick-another-folder",
+            on_refusal_dismissed => "refusal-dismissed",
+            on_refusal_confirmed => "refusal-confirmed",
             on_mismatch_open_anyway => "mismatch-open-anyway",
             on_mismatch_locate_frames => "mismatch-locate-frames",
             on_mismatch_cancelled => "mismatch-cancelled",
@@ -3758,6 +4336,7 @@ mod dialog_close {
             on_export_cancelled => "export-cancelled",
             on_frame_warning_cancelled => "frame-warning-cancelled",
             on_frame_warning_secondary_pressed => "frame-warning-secondary-pressed",
+            on_frame_warning_tertiary_pressed => "frame-warning-tertiary-pressed",
             on_frame_warning_confirmed => "frame-warning-confirmed",
             on_divergence_discarded => "divergence-discarded",
             on_divergence_kept => "divergence-kept",
@@ -4746,4 +5325,92 @@ mod fading_overlays {
             Theme::get(&app).set_reduce_motion(false);
         }
     }
+}
+
+/// The "Save to" field keeps showing the controller's destination after
+/// the user has typed into it: the fresh name after a write and the
+/// re-derived default after the data folder changes.
+#[test]
+fn diagnostics_destination_field_follows_the_controller_after_an_edit() {
+    use focusforge_gui::SettingsSection;
+    use focusforge_gui::diagnostics::DiagnosticsStatus;
+    use i_slint_backend_testing::mock_elapsed_time;
+    use std::time::Duration;
+
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let rig = settings_escape::rig();
+    rig.controller
+        .lock()
+        .unwrap()
+        .set_diagnostics_dirs(Some(first.path().to_path_buf()));
+    rig.open_settings(SettingsSection::Diagnostics);
+    focusforge_gui::bridge::push_diagnostics_view(&rig.app, &rig.controller);
+
+    let field_text = |rig: &settings_escape::Rig| {
+        mock_elapsed_time(Duration::from_millis(50));
+        ElementQuery::from_root(&rig.app)
+            .match_id("FFDiagnosticsPanel::dest-field")
+            .find_first()
+            .expect("the Save to field")
+            .query_descendants()
+            .match_id("FFTextField::input")
+            .find_first()
+            .expect("the field's input")
+            .accessible_value()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let destination = |rig: &settings_escape::Rig| {
+        rig.controller
+            .lock()
+            .unwrap()
+            .diagnostics_view()
+            .destination
+    };
+
+    rig.click_element("FFDiagnosticsPanel::dest-field");
+    type_into(&rig.app, "-first");
+    assert_eq!(
+        field_text(&rig),
+        destination(&rig),
+        "typing edits the field"
+    );
+    let typed = destination(&rig);
+    assert!(typed.contains("-first"), "{typed}");
+
+    rig.controller
+        .lock()
+        .unwrap()
+        .finish_bundle_write(DiagnosticsStatus::Written);
+    focusforge_gui::bridge::push_diagnostics_view(&rig.app, &rig.controller);
+    let fresh = destination(&rig);
+    assert_ne!(fresh, typed, "a write moves the destination on");
+    assert_eq!(field_text(&rig), fresh, "the field shows the fresh name");
+
+    rig.click_element("FFDiagnosticsPanel::dest-field");
+    type_into(&rig.app, "-second");
+    assert_eq!(field_text(&rig), destination(&rig));
+    let typed_again = destination(&rig);
+
+    rig.controller
+        .lock()
+        .unwrap()
+        .set_diagnostics_dirs(Some(second.path().to_path_buf()));
+    focusforge_gui::bridge::push_diagnostics_view(&rig.app, &rig.controller);
+    let rederived = destination(&rig);
+    assert_ne!(rederived, typed_again);
+    assert!(rederived.starts_with(second.path().to_str().unwrap()));
+    assert_eq!(
+        field_text(&rig),
+        rederived,
+        "the field shows the new default"
+    );
+
+    type_into(&rig.app, "x");
+    assert_eq!(
+        field_text(&rig),
+        destination(&rig),
+        "typing after a push still edits the field"
+    );
 }

@@ -244,7 +244,7 @@ def cli_asset_helper_cases() -> None:
         shutil.copytree(ROOT / "assets/man", source / "assets/man")
         shutil.copytree(ROOT / "assets/completions", source / "assets/completions")
         expected = helper.sources(source)
-        assert len(expected) == 21
+        assert len(expected) == 22
         staged = []
         for destination in (
             directory / "appimage/usr",
@@ -614,8 +614,8 @@ def native_boundaries() -> None:
         and any(file.attrib.get("Source", "").startswith("$(var.CliAssets)") for file in component if file.tag.endswith("File"))
     ]
     assert wix.tag.endswith("Wix") and "UpgradeCode" in package.attrib and root_files == {("focusforge-cli.exe", "$(var.Cli)", "yes"), ("focusforge-gui.exe", "$(var.Gui)", "yes"), ("LICENSE", "$(var.License)", "yes"), ("NOTICE", "$(var.Notice)", "yes"), ("focusforge.ico", "$(var.Icon)", "yes")}
-    assert len(asset_sources) == 21 and "$(var.CliAssets)\\powershell\\completions\\_focusforge-cli.ps1" in asset_sources
-    assert len(asset_components) == 21 and all(
+    assert len(asset_sources) == 22 and "$(var.CliAssets)\\powershell\\completions\\_focusforge-cli.ps1" in asset_sources
+    assert len(asset_components) == 22 and all(
         len([file for file in component if file.tag.endswith("File")]) == 1
         and next(file for file in component if file.tag.endswith("File")).attrib.get("KeyPath") == "yes"
         for component in asset_components
@@ -1085,6 +1085,7 @@ def hosted_runner_path_cases() -> None:
         (windows, r"D:\a\FocusForge\FocusForge\vendor\minidump-writer\src\lib.rs", "dependency/lib.rs"),
         (windows, r"\\?\C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\slint-1.17.1\ui\lib.rs", "dependency/lib.rs"),
         (windows, r"minkernel\crts\ucrt\src\appcrt\tran\amd64\fmod.asm", "dependency/fmod.asm"),
+        (windows, "C:/Users/b/p/ring/pregenerated/aesni-x86_64-nasm.asm", "dependency/aesni-x86_64-nasm.asm"),
         (windows, r"MinKernel\CRTs\ucrt\inc\corecrt_internal.h", "dependency/corecrt_internal.h"),
         (windows, r"VCCRT\vcruntime\inc\internal_shared.h", "dependency/internal_shared.h"),
         (windows, r"OSS\ARM-software\optimized-routines\20.05.00\src\math\pow.c", "dependency/pow.c"),
@@ -1110,6 +1111,8 @@ def hosted_runner_path_cases() -> None:
         (windows, r"C:\Program Files\Microsoft Visual Studio\..\..\Users\runneradmin\secret.h"),
         (windows, r"private\notes.h"),
         (windows, r"minkernel\other\notes.h"),
+        (windows, "C:/Users/b/p/ring/pregenerated/../secret.asm"),
+        (windows, "C:/Users/b/p/other/pregenerated/x.asm"),
         (windows, r"minkernel\crts\..\..\secret.h"),
         (windows, r"OSS\other\notes.h"),
         (windows, r"onecorex\notes.h"),

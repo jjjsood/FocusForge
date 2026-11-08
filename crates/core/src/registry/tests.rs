@@ -481,7 +481,7 @@ fn role_first_display_names() {
 }
 
 #[test]
-fn fusion_and_crop_help_is_one_plain_sentence() {
+fn parameter_help_is_one_plain_sentence() {
     let mut described: Vec<(String, &ParamDesc)> = crate::project::PROJECT_PARAMS
         .iter()
         .map(|p| ("project".to_string(), p))
@@ -489,10 +489,13 @@ fn fusion_and_crop_help_is_one_plain_sentence() {
     for entry in stack_algorithms().iter().filter(|a| !a.test_only()) {
         described.extend(entry.params().iter().map(|p| (entry.id().to_string(), p)));
     }
+    for entry in align_algorithms().iter().filter(|a| !a.test_only()) {
+        described.extend(entry.params().iter().map(|p| (entry.id().to_string(), p)));
+    }
     assert_eq!(
         described.len(),
-        5 + 1 + 2 + 2,
-        "the five project parameters plus the three schemas"
+        5 + 1 + 2 + 2 + 6,
+        "the five project parameters plus the fusion and alignment schemas"
     );
     for (owner, p) in described {
         let help = p.help.as_str();
@@ -504,6 +507,17 @@ fn fusion_and_crop_help_is_one_plain_sentence() {
             !help.trim_end_matches('.').contains(". "),
             "more than one sentence: {at}"
         );
+        for token in [
+            "HitCap",
+            "Stalled",
+            "DOF",
+            "Transform",
+            "epsilon-px",
+            "level pixels",
+            "code values",
+        ] {
+            assert!(!help.contains(token), "{token:?} in {at}");
+        }
     }
 }
 

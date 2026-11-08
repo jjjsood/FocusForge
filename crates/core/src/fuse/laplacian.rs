@@ -177,6 +177,9 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         advanced: true,
         auto: Some(Arc::new(auto_levels)),
         host_default: None,
+        stack_max: Some(Arc::new(|ctx: &StackContext| {
+            i64::from(max_levels(ctx.width, ctx.height).max(1))
+        })),
     }]
 });
 
@@ -717,6 +720,41 @@ mod tests {
             TilePlan::new(w, h, DEFAULT_TILE_SIZE, levels as u32).unwrap_or_else(|e| {
                 panic!("auto-proposed levels={levels} must plan for {w}x{h}: {e}")
             });
+        }
+    }
+
+    #[test]
+    fn levels_the_window_offers_always_plan() {
+        let algo = Laplacian;
+        let desc = &algo.params()[0];
+
+        for &(w, h, bound) in &[
+            (64u32, 64u32, 4i64),
+            (512, 512, 7),
+            (300, 7000, 6),
+            (8192, 5464, 10),
+        ] {
+            let ctx = StackContext::new(8, w, h, 3);
+            let ParamKind::Int { min, max } = desc.kind_for(Some(&ctx)) else {
+                panic!("levels is an Int")
+            };
+            assert_eq!((min, max), (1, bound), "{w}x{h}");
+
+            for levels in min..=max {
+                let support = algo.tile_support(&cfg_with_levels(levels));
+                let plan = TilePlan::new(w, h, support.default_tile_size(), support)
+                    .unwrap_or_else(|e| panic!("levels={levels} must plan for {w}x{h}: {e}"));
+                for tile in plan.tiles() {
+                    let read = tile.read();
+                    assert!(
+                        i64::from(max_levels(read.width, read.height)) >= levels,
+                        "tile {} read {}x{} cannot carry levels={levels} on {w}x{h}",
+                        tile.index(),
+                        read.width,
+                        read.height
+                    );
+                }
+            }
         }
     }
 

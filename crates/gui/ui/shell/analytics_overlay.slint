@@ -10,7 +10,6 @@ import { FFSectionHeading } from "../components/ff_section_heading.slint";
 import { FFStatusText } from "../components/ff_status_text.slint";
 import { FFAnalyticsRow } from "../components/ff_analytics_row.slint";
 import { FFLoadingPanel } from "../components/ff_loading_panel.slint";
-import { FFErrorRow } from "../components/ff_error_row.slint";
 import { FFScrollbar } from "../components/ff_scrollbar.slint";
 
 export struct AnalyticsRowView {
@@ -19,12 +18,15 @@ export struct AnalyticsRowView {
     mm-text: string,
     fraction: float,
     count: int,
+    // "pending" | "partial" | "final"
+    value-state: string,
 }
 
 export component FFAnalyticsOverlay inherits Rectangle {
     in property <bool> open: false;
-    // "computing" | "rows" | "failed"; `rows` is empty unless it is "rows".
-    in property <string> state: "computing";
+    // "waiting" | "counting" | "rows" | "failed"; `rows` is empty in the
+    // waiting and failed states.
+    in property <string> state: "waiting";
     in property <[AnalyticsRowView]> rows: [];
     in property <string> error: "";
     callback close-requested();
@@ -68,6 +70,7 @@ export component FFAnalyticsOverlay inherits Rectangle {
                     mm-text: row.mm-text;
                     fraction: row.fraction;
                     count: row.count;
+                    value-state: row.value-state;
                 }
             }
         }
@@ -79,16 +82,24 @@ export component FFAnalyticsOverlay inherits Rectangle {
             viewport-height: scroller.height;
             offset: -scroller.viewport-y;
         }
-        if root.state == "computing": FFLoadingPanel {
+        if root.state == "waiting": FFLoadingPanel {
             x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            caption: "Counting sharp areas...";
-        }
-        if root.state == "failed": FFErrorRow {
-            x: Theme.space-4;
-            y: 58px;
+            y: scroller.y + (scroller.height - self.height) / 2;
             width: parent.width - 2 * Theme.space-4;
-            message: root.error;
+            framed: false;
+            show-spinner: false;
+            title: "No stack loaded";
+            caption: "Load a stack to count its sharp areas.";
+        }
+        if root.state == "failed": FFLoadingPanel {
+            x: (parent.width - self.width) / 2;
+            y: scroller.y + (scroller.height - self.height) / 2;
+            width: parent.width - 2 * Theme.space-4;
+            framed: false;
+            show-spinner: false;
+            tone: "failed";
+            title: "Counting failed";
+            caption: root.error;
         }
     }
 }

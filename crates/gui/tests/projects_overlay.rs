@@ -19,7 +19,10 @@ use focusforge_gui::overlay::CardView;
 use focusforge_gui::recent::RecentEntry;
 use focusforge_gui::{AppController, ChromeKey, OpenOutcome};
 
-use common::{controller_with_frames, copy_frame_from, open_frames_from, open_mantis64_tab, tree};
+use common::{
+    controller_with_frames, copy_frame_from, element_center, open_frames_from, open_mantis64_tab,
+    tree,
+};
 
 // ---------------------------------------------------------------------
 // Fixture helpers -- copies only, mirroring `tests/job.rs` and
@@ -547,6 +550,68 @@ fn a_failed_run_updates_its_own_card() {
     assert!(cards[1].current, "the failed tab is still the active one");
     assert_eq!(cards[2].kind, "open");
     assert_eq!(controller.gallery_count_text(), "3 open");
+}
+
+#[test]
+fn a_failed_run_titles_match_the_card_stage() {
+    use focusforge_gui::job::{FailedOperation, Phase, failure_copy};
+
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree("titles_scratch"));
+    let dir = open_mantis64_tab(&mut controller, "titles", 2);
+    // Pixel data cut short: the header reads, the prepare pass fails.
+    let frame = dir.join("01.tif");
+    let bytes = std::fs::read(&frame).unwrap();
+    std::fs::write(&frame, &bytes[..bytes.len() / 2]).unwrap();
+    assert!(controller.start_fuse());
+    settle_with_thumbnails(&mut controller, Duration::from_secs(60));
+    let title = &controller
+        .notifications()
+        .last()
+        .expect("a failure record")
+        .title;
+    assert_eq!(title, "Preparing failed");
+    let cards = controller.project_cards();
+    assert_eq!(
+        card_by_kind(&cards, "failed").stage,
+        "FAILED WHILE PREPARING"
+    );
+
+    let phases = [
+        Phase::Developing,
+        Phase::Preparing,
+        Phase::Aligning,
+        Phase::Fusing,
+        Phase::Writing,
+    ];
+    for operation in [
+        FailedOperation::Setup,
+        FailedOperation::Alignment,
+        FailedOperation::Fusion,
+    ] {
+        for phase in phases {
+            let copy = failure_copy(operation, phase, None);
+            let word = copy
+                .title
+                .strip_suffix(" failed")
+                .unwrap_or_else(|| panic!("{:?} is not '<stage> failed'", copy.title));
+            let stage = copy
+                .stage
+                .strip_prefix("FAILED WHILE ")
+                .unwrap_or_else(|| panic!("{:?} is not 'FAILED WHILE <stage>'", copy.stage));
+            let expected = match operation {
+                FailedOperation::Setup => ("Setup", "SETTING UP"),
+                FailedOperation::Alignment => ("Alignment", "ALIGNING"),
+                _ => match phase {
+                    Phase::Developing => ("Developing", "DEVELOPING"),
+                    Phase::Preparing => ("Preparing", "PREPARING"),
+                    Phase::Aligning | Phase::Fusing => ("Fusing", "FUSING"),
+                    Phase::Writing => ("Writing", "WRITING"),
+                },
+            };
+            assert_eq!((word, stage), expected, "{operation:?} in {phase:?}");
+        }
+    }
 }
 
 #[test]
@@ -1468,12 +1533,6 @@ fn gallery_lays_out_and_scrolls() {
 // Scrolling and progress reuse every picture; a hidden overlay publishes
 // nothing until it opens again.
 // ---------------------------------------------------------------------
-
-fn element_center(handle: &i_slint_backend_testing::ElementHandle) -> slint::LogicalPosition {
-    let pos = handle.absolute_position();
-    let size = handle.size();
-    slint::LogicalPosition::new(pos.x + size.width / 2.0, pos.y + size.height / 2.0)
-}
 
 /// `(row_updates, thumbnail_bytes)` so far.
 fn overlay_counters() -> (u64, u64) {

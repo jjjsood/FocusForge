@@ -1949,17 +1949,98 @@ fn no_backend_keeps_the_requested_tile_size() {
 }
 
 #[test]
-fn a_cap_below_the_levels_minimum_fails_with_no_interior() {
-    let Err(err) = held_run("cap_64", 448, 5, Some(capped_backend(64))) else {
-        panic!("a 64-pixel cap leaves no interior at five levels");
-    };
+fn deep_levels_past_the_device_cap_fuse_on_the_host() {
+    const CAP: u32 = 64;
+    let mut explicit = ParamValues::new();
+    explicit.insert("levels".to_string(), ParamValue::Int(4));
+    let algorithm = registry::find_stack("laplacian").expect("laplacian must be registered");
+    let minimum = algorithm.tile_support(&explicit).min_tile_size();
     assert!(
-        matches!(
-            err,
-            PipelineError::Tile(TileError::NoInterior { tile_size: 64, .. })
-        ),
-        "unexpected error: {err}"
+        CAP < minimum,
+        "the cap {CAP} must sit below the minimum {minimum}"
     );
+    let expected = format!(
+        "the GPU accepts tiles up to {CAP} px and 4 levels need {minimum} px; \
+         continuing on the CPU path"
+    );
+
+    let run = |label: &str,
+               tile_size: Option<u32>,
+               backend: Option<&'static dyn TileBackend>,
+               observer: &dyn StageObserver| {
+        let mut request = base_request(label, mantis_64_frames(3), explicit.clone());
+        request.output = FuseOutput::Hold(scratch(&format!("{label}_hold")));
+        request.tile_size = tile_size;
+        request.backend = backend;
+        let FuseOutcome::Completed(report) =
+            focusforge_core::pipeline::run(&request, observer, JobControl::new(), None)
+                .unwrap_or_else(|err| {
+                    panic!("{label}: a cap below the minimum must not fail: {err}")
+                })
+        else {
+            panic!("{label}: expected a completed run");
+        };
+        held_run_of(report)
+    };
+
+    for (name, tile_size) in [("default", None), ("explicit_512", Some(512))] {
+        let plain = run(
+            &format!("deep_plain_{name}"),
+            tile_size,
+            None,
+            &NoopObserver,
+        );
+        assert!(plain.report.gpu_fallback.is_none(), "{name}");
+
+        let backend = leaked_backend(CAP, None);
+        let observer = NoticeObserver::default();
+        let capped = run(
+            &format!("deep_capped_{name}"),
+            tile_size,
+            Some(backend),
+            &observer,
+        );
+        assert_eq!(
+            capped.report.gpu_fallback.as_deref(),
+            Some(expected.as_str()),
+            "{name}"
+        );
+        assert_eq!(
+            *observer.notices.lock().unwrap(),
+            std::slice::from_ref(&expected),
+            "{name}"
+        );
+        assert_eq!(capped.report.tile_size, plain.report.tile_size, "{name}");
+        assert!(
+            capped.report.tile_size > CAP,
+            "{name}: the uncapped size is kept"
+        );
+        assert!(
+            backend.asked.lock().unwrap().is_empty(),
+            "{name}: the notice replaces the shortfall query"
+        );
+        assert!(
+            capped.composite == plain.composite,
+            "{name}: composite on the host"
+        );
+        assert!(capped.zmap == plain.zmap, "{name}: Z-Map on the host");
+    }
+}
+
+#[test]
+fn an_explicit_tile_size_below_the_levels_minimum_is_refused_whatever_the_cap() {
+    for backend in [None, Some(capped_backend(64))] {
+        let Err(err) = held_run("explicit_64", 64, 5, backend) else {
+            panic!("a 64 px tile leaves no interior at five levels");
+        };
+        assert!(
+            matches!(
+                err,
+                PipelineError::Tile(TileError::NoInterior { tile_size: 64, .. })
+            ),
+            "unexpected error: {err}"
+        );
+    }
 }
 
 #[test]

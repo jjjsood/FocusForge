@@ -17,7 +17,7 @@ create-missing = false
 [output.html]
 site-url = "/FocusForge/"
 git-repository-url = "https://github.com/jjjsood/FocusForge"
-edit-url-template = "https://github.com/jjjsood/FocusForge/edit/main/{path}"
+edit-url-template = "https://github.com/jjjsood/FocusForge/edit/develop/{path}"
 default-theme = "light"
 preferred-dark-theme = "coal"
 additional-css = ["theme/focusforge.css"]

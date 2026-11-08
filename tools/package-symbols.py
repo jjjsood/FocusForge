@@ -240,6 +240,8 @@ def builder_location(value: str) -> str:
         # The debugger visualizers a PDB lists beside its sources.
         (r"/lib/rustlib/(etc/[^/]+\.natvis)$", "/rustc/toolchain/{}"),
         (r"^[A-Za-z]:(/rustc/.+)$", "{}"),
+        # `ring` ships assembled objects whose debug info names its author's build tree.
+        (r"^[A-Za-z]:/Users/b/p/ring/(pregenerated/[^/]+\.asm)$", "/root/.cargo/registry/src/ring/{}"),
     ):
         match = re.search(pattern, path)
         if match:

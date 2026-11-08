@@ -21,6 +21,7 @@ import { FFResetAll } from "components/ff_reset_all.slint";
 import { FFMoreToggle } from "components/ff_more_toggle.slint";
 import { FFRowLabel } from "components/ff_row_label.slint";
 import { FFRowText } from "components/ff_row_text.slint";
+import { FFLinkText } from "components/ff_link_text.slint";
 import { FFButton } from "components/ff_button.slint";
 import { FFProgressBar } from "components/ff_progress_bar.slint";
 import { FFPanePlaceholder } from "components/ff_pane_placeholder.slint";
@@ -55,6 +56,7 @@ import { FFToast } from "components/ff_toast.slint";
 import { FFNotificationRow } from "components/ff_notification_row.slint";
 import { FFModalPanel } from "components/ff_modal_panel.slint";
 import { FFTextField } from "components/ff_text_field.slint";
+import { FFSizeField } from "components/ff_size_field.slint";
 import { FFNavRail } from "components/ff_nav_rail.slint";
 import { FFNavRailEntry } from "components/ff_nav_rail_entry.slint";
 import { FFSettingsSection } from "components/ff_settings_section.slint";
@@ -98,27 +100,6 @@ component CenterGround inherits Rectangle {
         padding-right: Theme.space-4;
         alignment: start;
         @children
-    }
-}
-
-// A text field in a settings row's value slot. The slot keeps the field's
-// unemphasised size, so its focus growth stays centred.
-component CapFieldSlot inherits Rectangle {
-    in property <string> text: "";
-    in property <string> placeholder: "";
-    in property <string> tone: "neutral";
-    in property <bool> enabled: true;
-    width: ShellGeometry.settings-field-width;
-    height: ShellGeometry.field-height;
-
-    FFTextField {
-        x: (parent.width - self.width) / 2;
-        y: (parent.height - self.height) / 2;
-        text: root.text;
-        placeholder: root.placeholder;
-        tone: root.tone;
-        enabled: root.enabled;
-        field-width: parent.width;
     }
 }
 
@@ -258,6 +239,17 @@ export component ThemeSheet inherits Window {
     background: Theme.surface-base;
     default-font-family: Theme.font-family;
 
+    // The typed size field's focus state needs the window to be shown first.
+    in-out property <bool> size-field-unfocused: true;
+    Timer {
+        interval: 400ms;
+        running: root.size-field-unfocused;
+        triggered => {
+            typed-size-field.focus();
+            root.size-field-unfocused = false;
+        }
+    }
+
     Timer {
         interval: 2s;
         running: root.demo-loop;
@@ -332,10 +324,10 @@ export component ThemeSheet inherits Window {
             footer-height: 0px;
         }
 
-        GroupHeading { text: "Analytics rows: heading, subtitle, rows without and with a rail position (2 of 58, count 0, largest 58)"; }
+        GroupHeading { text: "Analytics rows: heading, subtitle, final rows without and with a rail position (2 of 58, count 0, largest 58), then a partial and a pending row"; }
         Rectangle {
             width: 892px;
-            height: 5 * ShellGeometry.analytics-row-height + 2 * ShellGeometry.analytics-row-height + 3 * Theme.space-6;
+            height: 7 * ShellGeometry.analytics-row-height + 2 * ShellGeometry.analytics-row-height + 3 * Theme.space-6;
             background: Theme.surface-canvas;
             FFSectionHeading { x: Theme.space-4; y: Theme.space-3; width: 400px; flat: true; strong: true; label: "SHARP AREAS PER IMAGE"; }
             FFStatusText { x: Theme.space-4; y: Theme.space-6; width: 400px; height: 16px; text: "Image areas that are sharpest in this image"; }
@@ -347,6 +339,32 @@ export component ThemeSheet inherits Window {
                 FFAnalyticsRow { chip: Theme.status-success; name: "frame-with-a-long-file-name-0003.tif"; fraction: 0.0; count: 0; }
                 FFAnalyticsRow { chip: Theme.accent-default; name: "03.tif"; mm-text: "1.250 mm"; fraction: 14.0 / 72.0; count: 14; }
                 FFAnalyticsRow { chip: Theme.status-failure; name: "04.tif"; mm-text: "-10.000 mm"; fraction: 1.0; count: 72; }
+                FFAnalyticsRow { chip: Theme.status-warning; name: "05.tif"; fraction: 0.6; value-state: "partial"; }
+                FFAnalyticsRow { chip: Theme.status-success; name: "06.tif"; value-state: "pending"; }
+            }
+        }
+
+        GroupHeading { text: "Analytics messages, unframed: waiting (no stack), counting failed"; }
+        Rectangle {
+            width: 892px;
+            height: 160px;
+            background: Theme.surface-canvas;
+            FFLoadingPanel {
+                x: 0.25 * parent.width - self.width / 2;
+                y: (parent.height - self.height) / 2;
+                framed: false;
+                show-spinner: false;
+                title: "No stack loaded";
+                caption: "Load a stack to count its sharp areas.";
+            }
+            FFLoadingPanel {
+                x: 0.75 * parent.width - self.width / 2;
+                y: (parent.height - self.height) / 2;
+                framed: false;
+                show-spinner: false;
+                tone: "failed";
+                title: "Counting failed";
+                caption: "could not read frame_003.tif";
             }
         }
         FFCalculatorIllustration { plane-count: 13; }
@@ -355,6 +373,20 @@ export component ThemeSheet inherits Window {
         FFCalculatorIllustration { objective: true; plane-count: 2; }
         FFCalculatorIllustration { plane-count: 7; }
         FFCalculatorIllustration { objective: true; plane-count: 30; }
+
+        GroupHeading { text: "Calculator illustration art-scale: 1.0 as drawn, and 1.3 under a 1.3 scale"; }
+        Rectangle {
+            width: 770px + Theme.space-6 + 770px * 1.3;
+            height: 240px * 1.3;
+            FFCalculatorIllustration { x: 0px; y: 0px; art-scale: 1.0; }
+            FFCalculatorIllustration {
+                x: 770px + Theme.space-6;
+                y: 0px;
+                art-scale: 1.3;
+                transform-scale: 1.3;
+                transform-origin: { x: 0px, y: 0px };
+            }
+        }
 
         GroupHeading { text: "Calculator inset (overlap 0.25, 0.9 with a violation line room), summary band, legend"; }
         HorizontalLayout {
@@ -525,7 +557,7 @@ export component ThemeSheet inherits Window {
             FFHeatLegend { }
         }
 
-        GroupHeading { text: "FFToast: info, warning, failure / crash, hover, focus"; }
+        GroupHeading { text: "FFToast: info, warning, failure / crash, hover, focus, custom link label"; }
         VerticalLayout {
             spacing: Theme.space-4;
             HorizontalLayout {
@@ -541,6 +573,11 @@ export component ThemeSheet inherits Window {
                 FFToast { toast-open: true; kind: "crash"; title: "Previous session stopped"; }
                 FFToast { toast-open: true; kind: "warning"; title: "Brightness target limited"; hovered: true; }
                 FFToast { toast-open: true; kind: "warning"; title: "Brightness target limited"; focused: true; }
+            }
+            HorizontalLayout {
+                spacing: Theme.space-6;
+                alignment: start;
+                FFToast { toast-open: true; kind: "info"; title: "FocusForge 1.2.3 is available"; link-label: "Open download page"; }
             }
             HorizontalLayout {
                 spacing: Theme.space-6;
@@ -807,7 +844,87 @@ export component ThemeSheet inherits Window {
             }
         }
 
-        GroupHeading { text: "Settings: Performance rows, default (toggle on, backend, empty caps showing the placeholder, budgets, note)"; }
+        GroupHeading { text: "Settings: size field rows, default / typed (focused) / failure"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "LIMITS";
+                FFSettingsRow {
+                    label: "Host memory";
+                    align-end: true;
+                    FFSizeField { text: "48"; unit: "GiB"; }
+                }
+                FFSettingsRow {
+                    label: "Host memory";
+                    align-end: true;
+                    typed-size-field := FFSizeField { text: "512"; unit: "MiB"; }
+                }
+                FFSettingsRow {
+                    label: "Host memory";
+                    align-end: true;
+                    divider: false;
+                    FFSizeField { text: "0"; unit: "GiB"; tone: "failure"; }
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: size field rows, unavailable (one disabled box) / not probed (placeholder, unit enabled)"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "LIMITS";
+                FFSettingsRow {
+                    label: "VRAM";
+                    align-end: true;
+                    FFSizeField { unavailable: true; }
+                }
+                FFSettingsRow {
+                    label: "VRAM";
+                    align-end: true;
+                    divider: false;
+                    FFSizeField { placeholder: "Not probed yet"; unit: "GiB"; }
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: size field row with its limit line (12 px error row, right-aligned), then the unit list open"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "LIMITS";
+                FFSettingsRow {
+                    label: "Host memory";
+                    align-end: true;
+                    divider: false;
+                    FFSizeField { text: "48"; unit: "GiB"; }
+                }
+                FFErrorRow { horizontal-alignment: right; message: "Max 48.0 GiB possible."; }
+                FFDivider { }
+            }
+        }
+        size-list-ground := Rectangle {
+            width: ShellGeometry.settings-content-width + 2 * Theme.space-4;
+            height: 140px;
+
+            SettingsGround {
+                FFSettingsSection {
+                    heading: "LIMITS";
+                    FFSettingsRow {
+                        label: "Host memory";
+                        align-end: true;
+                        open-size-field := FFSizeField { text: "48"; unit: "GiB"; external-list: true; unit-open: true; }
+                    }
+                }
+            }
+            FFMenuList {
+                x: open-size-field.absolute-position.x - size-list-ground.absolute-position.x + open-size-field.unit-x;
+                y: open-size-field.absolute-position.y - size-list-ground.absolute-position.y + open-size-field.height;
+                width: open-size-field.unit-width;
+                choices: ["MiB", "GiB"];
+                choice-ids: ["MiB", "GiB"];
+                show-choice-ids: false;
+                selected: "GiB";
+            }
+        }
+
+        GroupHeading { text: "Settings: Performance rows, default (toggle on, backend, Host memory and VRAM at their default numbers)"; }
         SettingsGround {
             VerticalLayout {
                 spacing: ShellGeometry.settings-section-gap;
@@ -824,39 +941,23 @@ export component ThemeSheet inherits Window {
                         FFRowText { text: "gpu — NVIDIA GeForce RTX 5070 Ti"; overflow: elide; }
                     }
                 }
-                VerticalLayout {
-                    spacing: Theme.space-4;
-
-                    FFSettingsSection {
-                        heading: "LIMITS";
-                        FFSettingsRow {
-                            label: "Host memory cap";
-                            align-end: true;
-                            CapFieldSlot { placeholder: "No cap"; }
-                        }
-                        FFSettingsRow {
-                            label: "VRAM cap";
-                            align-end: true;
-                            CapFieldSlot { placeholder: "No cap"; }
-                        }
-                        FFSettingsRow {
-                            label: "Host budget";
-                            FFRowText { text: "48.0 GiB"; }
-                        }
-                        FFSettingsRow {
-                            label: "VRAM budget";
-                            FFRowText { text: "15.4 GiB"; }
-                        }
+                FFSettingsSection {
+                    heading: "LIMITS";
+                    FFSettingsRow {
+                        label: "Host memory";
+                        align-end: true;
+                        FFSizeField { text: "48"; unit: "GiB"; }
                     }
-                    FFStatusText {
-                        height: ShellGeometry.settings-status-height;
-                        text: "Caps only lower the probed budgets. Changes apply from the next start.";
+                    FFSettingsRow {
+                        label: "VRAM";
+                        align-end: true;
+                        FFSizeField { text: "15"; unit: "GiB"; }
                     }
                 }
             }
         }
 
-        GroupHeading { text: "Settings: Performance rows, states (toggle off, long backend elided, cap typed, cap failure tone, budget not probed yet)"; }
+        GroupHeading { text: "Settings: Performance rows, states (toggle off, wide label, long backend elided, Host memory over its maximum with the limit line, VRAM not probed yet, note)"; }
         SettingsGround {
             VerticalLayout {
                 spacing: ShellGeometry.settings-section-gap;
@@ -869,38 +970,47 @@ export component ThemeSheet inherits Window {
                         FFToggle { }
                     }
                     FFSettingsRow {
+                        label: "A label longer than its column";
+                        align-end: true;
+                        wide-label: true;
+                        FFToggle { on: true; }
+                    }
+                    FFSettingsRow {
                         label: "Backend";
                         FFRowText {
-                            text: "cpu — no usable GPU adapter: no suitable adapter was found; continuing on the CPU path";
+                            text: "cpu — no usable GPU adapter; continuing on the CPU path";
                             overflow: elide;
                         }
                     }
                 }
-                FFSettingsSection {
-                    heading: "LIMITS";
-                    FFSettingsRow {
-                        label: "Host memory cap";
-                        align-end: true;
-                        CapFieldSlot { placeholder: "No cap"; text: "2GiB"; }
+                VerticalLayout {
+                    spacing: Theme.space-4;
+
+                    FFSettingsSection {
+                        heading: "LIMITS";
+                        FFSettingsRow {
+                            label: "Host memory";
+                            align-end: true;
+                            divider: false;
+                            FFSizeField { text: "48"; unit: "GiB"; }
+                        }
+                        FFErrorRow { horizontal-alignment: right; message: "Max 48.0 GiB possible."; }
+                        FFDivider { }
+                        FFSettingsRow {
+                            label: "VRAM";
+                            align-end: true;
+                            FFSizeField { placeholder: "Not probed yet"; unit: "GiB"; }
+                        }
                     }
-                    FFSettingsRow {
-                        label: "VRAM cap";
-                        align-end: true;
-                        CapFieldSlot { placeholder: "No cap"; text: "8G"; tone: "failure"; }
-                    }
-                    FFSettingsRow {
-                        label: "Host budget";
-                        FFRowText { text: "48.0 GiB"; }
-                    }
-                    FFSettingsRow {
-                        label: "VRAM budget";
-                        FFRowText { text: "Not probed yet"; muted: true; }
+                    FFStatusText {
+                        height: ShellGeometry.settings-status-height;
+                        text: "Caps only lower the probed budgets. Changes apply from the next start.";
                     }
                 }
             }
         }
 
-        GroupHeading { text: "Settings: Performance rows, no adapter (toggle on and disabled, cpu backend, VRAM cap disabled with Unavailable, budget Unavailable, note)"; }
+        GroupHeading { text: "Settings: Performance rows, no adapter (toggle on and disabled, cpu backend, VRAM unavailable)"; }
         SettingsGround {
             VerticalLayout {
                 spacing: ShellGeometry.settings-section-gap;
@@ -917,33 +1027,17 @@ export component ThemeSheet inherits Window {
                         FFRowText { text: "cpu — no GPU adapter found"; }
                     }
                 }
-                VerticalLayout {
-                    spacing: Theme.space-4;
-
-                    FFSettingsSection {
-                        heading: "LIMITS";
-                        FFSettingsRow {
-                            label: "Host memory cap";
-                            align-end: true;
-                            CapFieldSlot { placeholder: "No cap"; }
-                        }
-                        FFSettingsRow {
-                            label: "VRAM cap";
-                            align-end: true;
-                            CapFieldSlot { placeholder: "Unavailable"; enabled: false; }
-                        }
-                        FFSettingsRow {
-                            label: "Host budget";
-                            FFRowText { text: "48.0 GiB"; }
-                        }
-                        FFSettingsRow {
-                            label: "VRAM budget";
-                            FFRowText { text: "Unavailable"; muted: true; }
-                        }
+                FFSettingsSection {
+                    heading: "LIMITS";
+                    FFSettingsRow {
+                        label: "Host memory";
+                        align-end: true;
+                        FFSizeField { text: "48"; unit: "GiB"; }
                     }
-                    FFStatusText {
-                        height: ShellGeometry.settings-status-height;
-                        text: "Caps only lower the probed budgets. Changes apply from the next start.";
+                    FFSettingsRow {
+                        label: "VRAM";
+                        align-end: true;
+                        FFSizeField { unavailable: true; }
                     }
                 }
             }
@@ -972,6 +1066,12 @@ export component ThemeSheet inherits Window {
                     helper: "Deletes cached fuse stages.";
                     button-text: "Clearing…";
                     enabled: false;
+                }
+                FFSettingsActionRow {
+                    button-text: "Check now";
+                    enabled: false;
+                    busy: true;
+                    status-text: "Checking for updates…";
                 }
                 FFSettingsActionRow {
                     label: "Stage cache";
@@ -1038,6 +1138,26 @@ export component ThemeSheet inherits Window {
                     label: "Accent";
                     divider: false;
                     FFRowText { text: "example.org/project"; accent: true; }
+                }
+            }
+        }
+
+        GroupHeading { text: "Settings: link text, rest / hover / focus"; }
+        SettingsGround {
+            FFSettingsSection {
+                heading: "LINK TEXT";
+                FFSettingsRow {
+                    label: "Rest";
+                    FFLinkText { text: "Open download page"; }
+                }
+                FFSettingsRow {
+                    label: "Hover";
+                    FFLinkText { text: "Open download page"; hovered: true; }
+                }
+                FFSettingsRow {
+                    label: "Focus";
+                    divider: false;
+                    FFLinkText { text: "Open download page"; focused: true; }
                 }
             }
         }
@@ -1527,6 +1647,16 @@ export component ThemeSheet inherits Window {
         }
         FFRowLabel {
             width: 320px;
+            label-text: "Score Radius (invalid)";
+            FFSlider { scale: "linear"; fraction: 0.4; value-text: "4"; invalid: true; }
+        }
+        FFRowLabel {
+            width: 320px;
+            label-text: "Sharp-source preference";
+            FFSlider { scale: "linear"; fraction: 0.4286; value-text: "4.0"; }
+        }
+        FFRowLabel {
+            width: 320px;
             label-text: "Epsilon (px)";
             FFSlider { scale: "logarithmic"; fraction: 0.5556; value-text: "0.0001"; }
         }
@@ -1809,6 +1939,14 @@ export component ThemeSheet inherits Window {
             confirm-label: "Add and re-fuse";
         }
 
+        GroupHeading { text: "Dialog footer: both secondary buttons"; }
+        FFDialogFooter {
+            width: 640px;
+            tertiary-label: "New project instead";
+            secondary-label: "Exclude instead";
+            confirm-label: "Remove and re-fuse";
+        }
+
         GroupHeading { text: "Dialog footer: renamed cancel button"; }
         FFDialogFooter {
             width: 480px;
@@ -1836,7 +1974,7 @@ export component ThemeSheet inherits Window {
 
         GroupHeading { text: "Dialog: warning, Remove's own footer"; }
         Rectangle {
-            width: 500px;
+            width: 640px;
             height: 320px;
             clip: true;
             FFDialog {
@@ -1844,9 +1982,11 @@ export component ThemeSheet inherits Window {
                 height: 100%;
                 open: true;
                 tone: "warning";
+                panel-width: 640px;
                 title: "Remove and fuse again?";
                 body: "This project already holds 2 checkpoints, and confirming keeps every one of them.";
                 info: "You can also start a new project with the same settings instead.";
+                tertiary-label: "New project instead";
                 secondary-label: "Exclude instead";
                 confirm-label: "Remove and re-fuse";
             }

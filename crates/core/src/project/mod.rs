@@ -268,6 +268,7 @@ pub static ALIGN_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         advanced: false,
         auto: None,
         host_default: None,
+        stack_max: None,
     }]
 });
 
@@ -285,6 +286,7 @@ pub static FINISH_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         advanced: false,
         auto: None,
         host_default: None,
+        stack_max: None,
     }]
 });
 
@@ -296,24 +298,24 @@ pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
         ParamDesc {
             id: "equalize".to_string(),
             label: "Equalize brightness".to_string(),
-            help: "Gives every frame one gain, the same on every channel, \
-                   bringing its mean brightness to one target shared by all \
-                   frames before they are aligned; scales encoded code values \
-                   as delivered and is not a linear-light correction."
+            help: "Evens out brightness between frames before they are \
+                   aligned by giving each frame one gain, the same on every \
+                   channel, that brings its average brightness to a target \
+                   shared by all frames, leaving the source files unchanged."
                 .to_string(),
             kind: ParamKind::Bool,
             default: ParamValue::Bool(true),
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "equalize-max-gain".to_string(),
             label: "Max brightness gain".to_string(),
-            help: "Only used when brightness equalization is on; limits a \
-                   frame's gain on both sides, so 1.25 allows gains from 0.8 \
-                   to 1.25; scales encoded code values as delivered and is \
-                   not a linear-light correction."
+            help: "Only used when brightness equalization is on: the largest \
+                   change in brightness a frame may get in either direction, \
+                   so 1.25 allows gains from 0.8 to 1.25."
                 .to_string(),
             kind: ParamKind::Float {
                 min: 1.01,
@@ -325,16 +327,15 @@ pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "equalize-target".to_string(),
             label: "Target brightness (stops)".to_string(),
-            help: "Only used when brightness equalization is on; 0.0 keeps the \
-                   mean encoded brightness of the stacked sources and this \
-                   value scales that shared target in stops (one stop doubles \
-                   it), the same for every source; scales encoded code values \
-                   as delivered and is not a linear-light correction, and \
-                   source files stay unchanged."
+            help: "Only used when brightness equalization is on: 0.0 keeps \
+                   the average brightness of the stacked sources, and each \
+                   stop up or down doubles or halves that shared target for \
+                   every frame, leaving the source files unchanged."
                 .to_string(),
             kind: ParamKind::Float {
                 min: -0.5,
@@ -346,6 +347,7 @@ pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
     ]
 });
@@ -1119,26 +1121,31 @@ mod tests {
     fn the_equalization_help_states_what_it_is_and_is_not() {
         for id in ["equalize", "equalize-max-gain", "equalize-target"] {
             let help = desc(id).help.to_lowercase();
-            assert!(help.contains("encoded code values"), "{id}: {help}");
-            assert!(
-                help.contains("not a linear-light correction"),
-                "{id}: {help}"
-            );
+            assert!(!help.contains("linear-light"), "{id}: {help}");
+            assert!(!help.contains("code values"), "{id}: {help}");
         }
         let switch = desc("equalize").help.to_lowercase();
+        assert!(
+            switch.contains("one gain")
+                && switch.contains("same on every channel")
+                && switch.contains("shared by all frames")
+                && switch.contains("before they are aligned")
+                && switch.contains("source files unchanged"),
+            "{switch}"
+        );
         assert!(!switch.contains("depends on the fusion method"), "{switch}");
+        assert!(
+            !switch.contains("reference") && !switch.contains("mid-tone"),
+            "{switch}"
+        );
         let bound = &desc("equalize-max-gain").help;
         assert!(bound.contains("0.8") && bound.contains("1.25"), "{bound}");
         let target = &desc("equalize-target").help;
         assert!(
-            target.contains("0.0 keeps the mean encoded brightness of the stacked sources")
-                && target.contains("stops")
-                && target.contains("source files stay unchanged"),
+            target.contains("0.0 keeps the average brightness of the stacked sources")
+                && target.contains("stop")
+                && target.contains("source files unchanged"),
             "{target}"
-        );
-        assert!(
-            !switch.contains("reference") && !switch.contains("mid-tone"),
-            "{switch}"
         );
     }
 

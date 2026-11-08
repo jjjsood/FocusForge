@@ -54,6 +54,10 @@ pub use focusforge_core::project::{
     HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, kept_entries, now_unix,
 };
 pub use focusforge_core::retouch::{footprint, top_source};
+pub use focusforge_core::update::{
+    CheckFailure, HttpReleaseSource, ReleaseSource, UpdateCheck, check as check_for_update,
+    parse_version,
+};
 pub use focusforge_core::zmap::{NO_SOURCE, source_color};
 
 /// Which operation a failure belongs to, classified from the typed
@@ -80,6 +84,43 @@ impl FailedOperation {
             FailedOperation::Fusion => "Fusion failed",
             FailedOperation::Save => "Save failed",
         }
+    }
+}
+
+/// The words a failed run shows: the notification's title, the project card's
+/// stage line and the plain sentence the notification's message opens with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureCopy {
+    pub title: String,
+    pub stage: String,
+    pub lead: String,
+}
+
+/// Title, card stage and lead sentence for a run that failed in `operation`
+/// while on `phase`, derived together so they always name the same stage. A
+/// setup or alignment failure names that class; any other names the phase,
+/// with the align phase read as fusing (crop, staging and the resume ledger
+/// run under it). `file` is the run's frame the error names, if any.
+pub fn failure_copy(operation: FailedOperation, phase: Phase, file: Option<&str>) -> FailureCopy {
+    let (word, stage) = match (operation, phase) {
+        (FailedOperation::Setup, _) => ("Setup", "SETTING UP"),
+        (FailedOperation::Alignment, _) => ("Alignment", "ALIGNING"),
+        (_, Phase::Aligning | Phase::Fusing) => ("Fusing", "FUSING"),
+        (_, Phase::Developing) => ("Developing", "DEVELOPING"),
+        (_, Phase::Preparing) => ("Preparing", "PREPARING"),
+        (_, Phase::Writing) => ("Writing", "WRITING"),
+    };
+    let lead = match (file, operation) {
+        (Some(file), _) => format!(
+            "{file} could not be read. It may be damaged, or it changed after the folder was opened."
+        ),
+        (None, FailedOperation::Setup) => "The run could not start.".to_string(),
+        (None, _) => format!("The run stopped while {}.", word.to_lowercase()),
+    };
+    FailureCopy {
+        title: format!("{word} failed"),
+        stage: format!("FAILED WHILE {stage}"),
+        lead,
     }
 }
 
@@ -2406,6 +2447,8 @@ pub struct Settled {
     /// What this run's alignment did, `Some` for a completed run.
     pub alignment: Option<AlignSummary>,
     pub operation: Option<FailedOperation>,
+    /// The run's frame whose path the failure's error text names.
+    pub failed_file: Option<String>,
 }
 
 /// What one completed run's alignment did: where its transforms came from,
@@ -2492,9 +2535,11 @@ pub(crate) fn divergence_body(names: &[String]) -> String {
 /// error both become [`RunState::Failed`], a clean cancel returns to
 /// [`RunState::Idle`] (the engine already preserved its own resumable state
 /// on disk, per its own "reported, never controlled" contract), and a
-/// completion hands back the held checkpoint.
+/// completion hands back the held checkpoint. A pipeline error that names one
+/// of the run's `frames` (the longest matching path) carries that file's name.
 pub fn settle(
     result: std::thread::Result<Result<FuseOutcome, PipelineError>>,
+    frames: &[PathBuf],
     observer: &GuiObserver,
 ) -> Settled {
     match result {
@@ -2519,6 +2564,7 @@ pub fn settle(
                 diverged,
                 alignment: Some(alignment),
                 operation: None,
+                failed_file: None,
             }
         }
         Ok(Ok(FuseOutcome::Cancelled { .. })) => Settled {
@@ -2527,15 +2573,23 @@ pub fn settle(
             diverged: Vec::new(),
             alignment: None,
             operation: None,
+            failed_file: None,
         },
         Ok(Err(err)) => {
             let operation = FailedOperation::from(&err);
+            let text = err.to_string();
+            let failed_file = frames
+                .iter()
+                .filter(|frame| text.contains(&frame.display().to_string()))
+                .max_by_key(|frame| frame.as_os_str().len())
+                .map(|frame| crate::images::file_name(frame));
             Settled {
-                state: RunState::Failed(err.to_string()),
+                state: RunState::Failed(text),
                 held: None,
                 diverged: Vec::new(),
                 alignment: None,
                 operation: Some(operation),
+                failed_file,
             }
         }
         Err(_) => Settled {
@@ -2544,6 +2598,7 @@ pub fn settle(
             diverged: Vec::new(),
             alignment: None,
             operation: Some(FailedOperation::Fusion),
+            failed_file: None,
         },
     }
 }

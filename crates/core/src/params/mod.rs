@@ -122,6 +122,10 @@ pub type AutoFn = Arc<dyn Fn(&StackContext) -> ParamValue + Send + Sync>;
 /// [`resolve_in`] lets `auto` win.
 pub type HostFn = Arc<dyn Fn(&HostFacts) -> ParamValue + Send + Sync>;
 
+/// A closure deriving the largest value an `Int` parameter can take on the
+/// stack being processed. See [`ParamDesc::kind_for`].
+pub type StackMaxFn = Arc<dyn Fn(&StackContext) -> i64 + Send + Sync>;
+
 /// One algorithm setting, described as data rather than as a struct field:
 /// its identity, its allowed shape, its default, and an optional hook that
 /// derives a value from the stack instead of the plain default.
@@ -149,6 +153,28 @@ pub struct ParamDesc {
     /// reason `auto` does -- see [`HostFn`].
     #[serde(skip)]
     pub host_default: Option<HostFn>,
+    /// Not data, so never serialized: dropped to `None` on deserialize. For
+    /// an `Int` parameter, the largest value the stack being processed
+    /// supports; the declared `kind` range stays the loadable one. Read it
+    /// through [`ParamDesc::kind_for`].
+    #[serde(skip)]
+    pub stack_max: Option<StackMaxFn>,
+}
+
+impl ParamDesc {
+    /// The declared `kind`, with an `Int` `max` lowered to what `stack_max`
+    /// allows for `ctx`: never raised above the declared maximum and never
+    /// below `min`. Without a context, or without a `stack_max` hook, it is
+    /// the declared kind.
+    pub fn kind_for(&self, ctx: Option<&StackContext>) -> ParamKind {
+        match (&self.kind, &self.stack_max, ctx) {
+            (ParamKind::Int { min, max }, Some(bound), Some(ctx)) => ParamKind::Int {
+                min: *min,
+                max: bound(ctx).min(*max).max(*min),
+            },
+            _ => self.kind.clone(),
+        }
+    }
 }
 
 impl fmt::Debug for ParamDesc {
@@ -162,6 +188,7 @@ impl fmt::Debug for ParamDesc {
             .field("advanced", &self.advanced)
             .field("auto", &self.auto.as_ref().map(|_| "..."))
             .field("host_default", &self.host_default.as_ref().map(|_| "..."))
+            .field("stack_max", &self.stack_max.as_ref().map(|_| "..."))
             .finish()
     }
 }
@@ -323,7 +350,26 @@ pub type ResolvedParams = BTreeMap<String, Resolved>;
 /// (widened to `f64`, then range-checked); a `Float` value is never
 /// accepted where the descriptor declares `Int`, in either direction.
 fn check(desc: &ParamDesc, value: &ParamValue) -> Result<(), ParamViolation> {
-    match (&desc.kind, value) {
+    check_kind(desc, &desc.kind, value)
+}
+
+/// The plain check against the kind [`ParamDesc::kind_for`] narrows to for `ctx`:
+/// a value the declared range loads can still lie beyond what this stack
+/// supports.
+pub fn check_for(
+    desc: &ParamDesc,
+    value: &ParamValue,
+    ctx: Option<&StackContext>,
+) -> Result<(), ParamViolation> {
+    check_kind(desc, &desc.kind_for(ctx), value)
+}
+
+fn check_kind(
+    desc: &ParamDesc,
+    kind: &ParamKind,
+    value: &ParamValue,
+) -> Result<(), ParamViolation> {
+    match (kind, value) {
         (ParamKind::Float { min, max, .. }, ParamValue::Float(f)) => {
             if !f.is_finite() {
                 return Err(ParamViolation::NotFinite {
@@ -548,6 +594,7 @@ mod tests {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         }
     }
 
@@ -561,6 +608,7 @@ mod tests {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         }
     }
 
@@ -574,6 +622,7 @@ mod tests {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         }
     }
 
@@ -595,6 +644,7 @@ mod tests {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         }
     }
 
@@ -919,6 +969,57 @@ mod tests {
             check(&int_desc, &ParamValue::Float(2.0)),
             Err(ParamViolation::TypeMismatch { .. })
         ));
+    }
+
+    fn bounded_by_width(max: i64) -> ParamDesc {
+        let mut desc = int_desc("depth", 1, max, 3);
+        desc.stack_max = Some(Arc::new(|ctx: &StackContext| i64::from(ctx.width / 100)));
+        desc
+    }
+
+    #[test]
+    fn kind_for_lowers_an_int_max_to_the_stack_bound_and_never_raises_it() {
+        let ctx = |width| StackContext::new(4, width, 64, 3);
+        let max_of = |desc: &ParamDesc, ctx: Option<&StackContext>| match desc.kind_for(ctx) {
+            ParamKind::Int { max, .. } => max,
+            other => panic!("expected Int, got {other:?}"),
+        };
+
+        let desc = bounded_by_width(16);
+        assert_eq!(max_of(&desc, Some(&ctx(700))), 7);
+        assert_eq!(
+            max_of(&desc, Some(&ctx(5000))),
+            16,
+            "a bound above the declared max"
+        );
+        assert_eq!(
+            max_of(&desc, Some(&ctx(50))),
+            1,
+            "a bound below min stops at min"
+        );
+        assert_eq!(max_of(&desc, None), 16, "no stack, no narrowing");
+
+        let plain = int_desc("depth", 1, 16, 3);
+        assert_eq!(plain.kind_for(Some(&ctx(700))), plain.kind);
+    }
+
+    #[test]
+    fn check_for_rejects_a_value_above_the_stack_bound_that_check_accepts() {
+        let desc = bounded_by_width(16);
+        let ctx = StackContext::new(4, 700, 64, 3);
+
+        assert!(check(&desc, &ParamValue::Int(12)).is_ok());
+        assert!(check_for(&desc, &ParamValue::Int(7), Some(&ctx)).is_ok());
+        assert_eq!(
+            check_for(&desc, &ParamValue::Int(12), Some(&ctx)),
+            Err(ParamViolation::OutOfRange {
+                id: "depth".to_string(),
+                value: 12.0,
+                min: 1.0,
+                max: 7.0,
+            })
+        );
+        assert!(check_for(&desc, &ParamValue::Int(12), None).is_ok());
     }
 
     #[test]

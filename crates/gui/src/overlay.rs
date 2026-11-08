@@ -80,6 +80,27 @@ pub fn sources_missing_body(missing: usize, total: usize) -> String {
     )
 }
 
+/// The grouping question's body: one sentence naming each stack's frame
+/// count -- "2 stacks of 3 frames each." when all sizes match, otherwise
+/// "2 stacks (3 and 4 frames)." and, from three stacks on, "(3, 4 and 5
+/// frames)".
+pub fn grouping_body(stack_sizes: &[usize]) -> String {
+    let stacks = stack_sizes.len();
+    let Some((&last, head)) = stack_sizes.split_last() else {
+        return "This folder holds no stacks.".to_owned();
+    };
+    if head.iter().all(|&size| size == last) {
+        let word = if last == 1 { "frame" } else { "frames" };
+        return format!("This folder holds {stacks} stacks of {last} {word} each.");
+    }
+    let head = head
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("This folder holds {stacks} stacks ({head} and {last} frames).")
+}
+
 /// The fingerprint-mismatch dialog's own title.
 pub const MISMATCH_TITLE: &str = "The source frames are not the same";
 

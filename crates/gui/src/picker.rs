@@ -23,7 +23,7 @@ use crate::job::{DNG_EXTENSIONS, ExportFormat, JPEG_EXTENSIONS, PNG_EXTENSIONS, 
 /// backend, rfd#320).
 pub fn pick_entry() -> Option<PathBuf> {
     rfd::FileDialog::new()
-        .set_title("Open folder or project")
+        .set_title("Choose a folder")
         .pick_folder()
 }
 

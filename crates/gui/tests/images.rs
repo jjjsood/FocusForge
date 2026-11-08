@@ -20,7 +20,8 @@ use focusforge_gui::source_previews::{self, PreviewError};
 use focusforge_gui::{AppController, OpenAs, OpenOutcome, ShellMode};
 
 use common::{
-    controller_with_frames, controller_with_frames_from, copy_frame, save_to_proposed, tree,
+    controller_with_frames, controller_with_frames_from, copy_frame, element_center,
+    save_to_proposed, tree,
 };
 
 fn write_timed(dir: &Path, name: &str, when: Option<&str>) -> PathBuf {
@@ -809,17 +810,31 @@ fn add_and_reorder_offer_a_new_project_with_the_same_settings() {
     assert!(!move_warning.exclude_instead_button);
 }
 
+// tier: mantis-64; layer: GUI controller
 #[test]
-fn remove_offers_exclude_instead_and_mentions_a_new_project() {
-    let mut controller = controller_with_frames("remove_offers_exclude", 2);
+fn sorting_by_name_after_a_checkpoint_asks_about_name() {
+    let mut controller = controller_with_frames("sort_by_name_asks_about_name", 2);
     assert!(controller.start_fuse());
     settle_to_stacking(&mut controller, Duration::from_secs(120));
+    let names = |controller: &AppController| -> Vec<String> {
+        controller
+            .images_panel()
+            .rows
+            .iter()
+            .map(|row| row.name.clone())
+            .collect()
+    };
+    let before = names(&controller);
 
-    controller.remove_frame(0);
-    let warning = controller.pending_frame_change().unwrap();
-    assert!(warning.exclude_instead_button);
-    assert!(!warning.new_project_button);
-    assert!(warning.info.contains("new project"));
+    controller.set_frame_sort(FrameSort::Name);
+    let warning = controller
+        .pending_frame_change()
+        .expect("sorting a checkpointed project raises the question");
+    assert_eq!(warning.title, "Sort by name and fuse again?");
+
+    controller.cancel_frame_change();
+    assert!(controller.pending_frame_change().is_none());
+    assert_eq!(names(&controller), before);
 }
 
 #[test]
@@ -1867,12 +1882,6 @@ fn sort_menu_and_drag_are_stacking_mode_only() {
 // controller-level test of `frame_drag_pointer` alone cannot see the
 // pointer capture outlive the row it started on.
 // ---------------------------------------------------------------------
-
-fn element_center(handle: &i_slint_backend_testing::ElementHandle) -> slint::LogicalPosition {
-    let pos = handle.absolute_position();
-    let size = handle.size();
-    slint::LogicalPosition::new(pos.x + size.width / 2.0, pos.y + size.height / 2.0)
-}
 
 /// A point inside the first row's source-name region at window height `y`.
 fn source_drag_point(app: &focusforge_gui::AppWindow, y: f32) -> slint::LogicalPosition {
@@ -4192,6 +4201,130 @@ fn switching_tabs_dismisses_a_stale_frame_set_warning() {
         controller.pending_frame_change().is_none(),
         "switching back does not resurrect the dismissed warning"
     );
+}
+
+/// `(x, y, width, height)` in window coordinates.
+type Rect = (f32, f32, f32, f32);
+
+/// `FFModalPanel::panel` and every `FFButton` of the open warning's footer.
+fn frame_warning_rects(app: &focusforge_gui::AppWindow) -> (Rect, Vec<Rect>) {
+    use i_slint_backend_testing::{ElementHandle, ElementQuery};
+
+    let rect = |element: &ElementHandle| {
+        let position = element.absolute_position();
+        let size = element.size();
+        (position.x, position.y, size.width, size.height)
+    };
+    let panel = ElementQuery::from_root(app)
+        .match_id("FFModalPanel::panel")
+        .find_first()
+        .expect("the open warning's panel is in the tree");
+    let footer = ElementQuery::from_root(app)
+        .match_type_name("FFDialogFooter")
+        .find_first()
+        .expect("the open warning shows its footer");
+    let buttons = footer
+        .query_descendants()
+        .match_type_name("FFButton")
+        .find_all();
+    (rect(&panel), buttons.iter().map(rect).collect())
+}
+
+// tier: synthetic; layer: GUI view
+#[test]
+fn frame_set_warning_footer_fits_every_button() {
+    use slint::ComponentHandle;
+
+    common::init_window_backend();
+    // (secondary, tertiary, confirm, expected panel width)
+    let cases = [
+        (
+            "Exclude instead",
+            "New project instead",
+            "Remove and re-fuse",
+            640.0,
+        ),
+        ("Keep existing", "", "Replace", 480.0),
+    ];
+    for (secondary, tertiary, confirm, panel_width) in cases {
+        let app = focusforge_gui::AppWindow::new().unwrap();
+        app.window().set_size(slint::PhysicalSize::new(1440, 900));
+        app.set_frame_warning_title("A frame-set question".into());
+        app.set_frame_warning_body("Body".into());
+        app.set_frame_warning_info("Info".into());
+        app.set_frame_warning_secondary_label(secondary.into());
+        app.set_frame_warning_tertiary_label(tertiary.into());
+        app.set_frame_warning_confirm_label(confirm.into());
+        app.set_frame_warning_open(true);
+
+        let (panel, buttons) = frame_warning_rects(&app);
+        assert_eq!(panel.2, panel_width, "{secondary}: the panel's width");
+        let expected = if tertiary.is_empty() { 3 } else { 4 };
+        assert_eq!(
+            buttons.len(),
+            expected,
+            "{secondary}: Cancel plus the labels set"
+        );
+        for (i, button) in buttons.iter().enumerate() {
+            assert!(
+                button.0 >= panel.0
+                    && button.0 + button.2 <= panel.0 + panel.2
+                    && button.1 >= panel.1
+                    && button.1 + button.3 <= panel.1 + panel.3,
+                "{secondary}: button {i} {button:?} lies inside the panel {panel:?}"
+            );
+            if let Some(next) = buttons.get(i + 1) {
+                assert!(
+                    button.0 + button.2 <= next.0,
+                    "{secondary}: button {i} {button:?} ends before button {} {next:?}",
+                    i + 1
+                );
+            }
+        }
+    }
+}
+
+// tier: mantis-64; layer: GUI view
+#[test]
+fn remove_question_new_project_button_opens_a_second_tab() {
+    use slint::ComponentHandle;
+    use std::sync::{Arc, Mutex};
+
+    common::init_window_backend();
+    let app = focusforge_gui::AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+
+    let mut controller = controller_with_frames("remove_question_new_project_button", 2);
+    assert!(controller.start_fuse());
+    settle_to_stacking(&mut controller, Duration::from_secs(120));
+    controller.remove_frame(0);
+    assert!(controller.pending_frame_change().is_some());
+
+    let controller = Arc::new(Mutex::new(controller));
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        common::empty_canvas(),
+        std::rc::Rc::new(std::cell::RefCell::new(None)),
+    );
+    app.set_project_loaded(true);
+    focusforge_gui::bridge::push_images_panel(&app, &controller.lock().unwrap());
+    assert_eq!(app.get_frame_warning_secondary_label(), "Exclude instead");
+    assert_eq!(
+        app.get_frame_warning_tertiary_label(),
+        "New project instead"
+    );
+
+    app.invoke_frame_warning_tertiary_pressed();
+
+    let mut controller = controller.lock().unwrap();
+    assert!(controller.pending_frame_change().is_none());
+    assert_eq!(controller.project_tabs().len(), 2, "a second tab opened");
+    controller.select_project(0);
+    assert_eq!(controller.images_panel().rows.len(), 2);
+    assert_eq!(controller.checkpoint_count(), Some(1));
+    controller.select_project(1);
+    assert_eq!(controller.checkpoint_count(), Some(0));
 }
 
 #[test]

@@ -419,6 +419,43 @@ fn mixed_raw_tiff_groups_round_trip_with_names_order_and_count() {
     assert!(proposed[2].contains("tiff/"), "{proposed:?}");
 }
 
+#[test]
+fn dry_run_writes_no_run_manifest() {
+    let single = common::tmp_dir("groups_cli_dry_run_no_manifest_single");
+    frame(&single, "01.tif", Some("2026:08:29 18:42:41"));
+    let mixed = common::tmp_dir("groups_cli_dry_run_no_manifest_mixed");
+    let raw = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]),
+        true,
+    );
+    std::fs::copy(raw.path(), mixed.join("00.dng")).expect("copy RAW frame");
+    frame(&mixed, "01.tif", Some("2026:08:29 18:42:41"));
+
+    for (label, input) in [("single", &single), ("mixed", &mixed)] {
+        let out_dir = common::tmp_dir(&format!("groups_cli_dry_run_no_manifest_{label}_out"));
+        let cwd = common::tmp_dir(&format!("groups_cli_dry_run_no_manifest_{label}_cwd"));
+        let out = run_cli_in(
+            &cwd,
+            &[
+                "stack",
+                input.to_str().unwrap(),
+                "-o",
+                out_dir.to_str().unwrap(),
+                "--algorithm",
+                "dummy-stack",
+                "--no-align",
+                "--no-crop",
+                "--dry-run",
+            ],
+        );
+        assert_eq!(out.code, Some(0), "{label}: stderr: {}", out.stderr);
+        assert!(
+            !out_dir.join("manifest.json").exists(),
+            "{label}: a dry run writes no run manifest"
+        );
+    }
+}
+
 /// The proposal block of a captured stderr: the `grouping ` line and every
 /// indented line under it.
 fn grouping_lines(stderr: &str) -> Vec<String> {

@@ -392,7 +392,7 @@ exercise_live_holder_timeout() {
   reap_holder "$holder"
 }
 
-# Separate targets build side by side; the slot cap and the RAM cap still queue them.
+# One build slot by default queues separate targets; two slots let them build side by side; the RAM cap queues too.
 exercise_build_slots() {
   local pool="$TMP/slot pool" ready="$TMP/slot-ready" meminfo="$TMP/meminfo" holder
   mkdir -p "$pool/a" "$pool/b"
@@ -401,8 +401,8 @@ exercise_build_slots() {
   run_lock "$pool/a" flock 5 build -- sh -c 'printf held >"$1"; sleep 1' sh "$ready" >/dev/null 2>&1 &
   holder=$!
   require_ready "slot holder" "$holder" "$ready" || { reap_holder "$holder"; return; }
-  expect_status "separate target builds alongside" 0 run_lock "$pool/b" flock 0 build -- true
-  FF_BUILD_SLOTS=1 expect_status "slot cap queues separate target" 4 run_lock "$pool/b" flock 0 build -- true
+  expect_status "default slot queues separate target" 4 run_lock "$pool/b" flock 0 build -- true
+  FF_BUILD_SLOTS=2 expect_status "two slots build separate targets alongside" 0 run_lock "$pool/b" flock 0 build -- true
   wait "$holder"
   printf 'MemTotal: %s kB\nMemAvailable: %s kB\n' 62914560 10485760 >"$meminfo"
   FF_LOCK_MEMINFO="$meminfo" FF_BUILD_RAM_CAP_GB=50 \

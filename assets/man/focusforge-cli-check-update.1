@@ -1,0 +1,26 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH focusforge-cli-check-update 1  "check-update 0.2.0-rc.1" 
+.SH NAME
+focusforge\-cli\-check\-update \- Ask the release server whether a newer FocusForge release exists
+.SH SYNOPSIS
+\fBfocusforge\-cli check\-update\fR [\fB\-\-json\fR] [\fB\-v \fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Ask the release server whether a newer FocusForge release exists.
+.PP
+Makes one request that carries only the program version. Exit status: 0 when this version is up to date, 3 when a newer release is available, 1 when the check failed.
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Emit the JSON report instead of human\-readable text
+.TP
+\fB\-v\fR
+Increase log detail (repeatable)
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Log errors only
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH VERSION
+v0.2.0\-rc.1

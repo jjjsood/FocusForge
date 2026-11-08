@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::analytics::{self, AnalyticsView, CountError};
+use crate::analytics::{self, AnalyticsView, CountError, CountPriority, RowValue};
 use crate::appearance_settings::{self, AppearanceSettings, SourcePresentation};
 use crate::brush;
 use crate::calculator::{Calculator, CalculatorView};
@@ -42,7 +42,7 @@ use crate::input_map::{
 use crate::job::{self, ExportFormat, ExportOptions, params_for};
 use crate::notifications::{Banner, CrashEvidence, Kind, Notification, Notifications, Source};
 use crate::overlay::{self, CardView, FailureCard, FailureKind};
-use crate::performance_settings::{self, DeviceState, PerformanceSettings, RejectedCaps};
+use crate::performance_settings::{self, CapNotes, CapUnit, DeviceState, PerformanceSettings};
 use crate::recent;
 use crate::settings_panel::{
     self, PanelModel, ParamValue, ParamValues, ParamViolation, StackContext, slider_value,
@@ -50,6 +50,7 @@ use crate::settings_panel::{
 use crate::source_previews::{
     MAX_CACHE_BYTES, PreviewError, PreviewPixels, PreviewRequest, PreviewWorker,
 };
+use crate::update_settings::{self, PreviewRelease, UpdateSettings};
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
 use focusforge_gpu::blend::Blender;
 
@@ -168,8 +169,33 @@ pub struct StorageView {
     pub status_tone: StorageTone,
 }
 
+/// Everything the About tab's update controls show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateControlsView {
+    pub check_on_start: bool,
+    /// Whether Check now can be pressed: false while a check runs.
+    pub check_enabled: bool,
+    /// True only while a Check now request is in flight.
+    pub checking: bool,
+    pub status: String,
+    pub status_tone: StorageTone,
+    /// A newer version or a failure is shown below the Check now row.
+    pub result_visible: bool,
+    /// `FocusForge {version} is available.` with a newer version, else empty.
+    pub result_text: String,
+    /// The newer version is the one the user skipped.
+    pub skipped: bool,
+    pub skip_enabled: bool,
+    /// `Could not check for updates: {reason}` after a failed check, else
+    /// empty.
+    pub failure: String,
+    /// The write error of the last settings save, empty without one.
+    pub save_error: String,
+}
+
 /// Shown while a run is live and the clear is refused.
 const STORAGE_REFUSAL: &str = "A run is active.";
+const BUILT_IN_BINDINGS_LINE: &str = "Built-in bindings.";
 
 /// An error's text without a trailing ` (os error N)` and a closing period,
 /// so a line built from it ends in exactly one period.
@@ -250,6 +276,12 @@ pub enum ShellEvent {
         generation: u64,
         scan: DiagnosticsScan,
     },
+    /// Raised by [`AppController::start_update_check`]'s background thread
+    /// once the check has settled.
+    UpdateChecked(job::UpdateCheck),
+    /// Raised by [`AppController::check_for_updates_now`]'s background thread
+    /// once the check has settled.
+    UpdateCheckedNow(job::UpdateCheck),
     /// The open project set changed: a tab opened, closed or was selected.
     ProjectsChanged,
     /// Only the tab strip's scroll state moved -- its offset, overflow
@@ -359,6 +391,9 @@ struct DragState {
 #[derive(Debug, Clone, Default)]
 struct InputState {
     table: InputTable,
+    /// The provenance line and one line per refused `[input]` problem;
+    /// `None` until a source is installed.
+    source: Option<(String, Vec<String>)>,
     space_held: bool,
     /// `Alt` as the last hover move reported it -- shows the pipette cursor
     /// while held; it arms nothing.
@@ -490,14 +525,13 @@ pub struct BrushCursorView {
     pub composite_position: (f32, f32),
 }
 
-/// The diagnostics panel's own state: the two directories a bundle is
+/// The diagnostics panel's own state: the data directory a bundle is
 /// built from, the include-minidumps choice, the write destination and
 /// where a write attempt stands. The message shown for each status is
 /// fixed wording, not stored state -- `diagnostics_view()` derives it.
 #[derive(Debug, Clone, Default)]
 struct DiagnosticsState {
     data_dir: Option<PathBuf>,
-    config_dir: Option<PathBuf>,
     include_minidumps: bool,
     destination: PathBuf,
     status: DiagnosticsStatus,
@@ -652,6 +686,23 @@ struct TabFailure {
     kind: FailureKind,
     stage: String,
     reason: String,
+}
+
+/// What a refusal dialog offers beside dismissing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalAction {
+    /// Choose another folder to open.
+    PickFolder,
+    /// Locate the frames of the tab with this id.
+    LocateTab(u64),
+    /// Nothing beyond closing the dialog.
+    Close,
+}
+
+/// A refusal's own title and the action its dialog offers.
+struct Refusal {
+    title: String,
+    action: RefusalAction,
 }
 
 /// The missing-sources dialog's own payload: which tab it names, its
@@ -1307,8 +1358,17 @@ pub struct CloseGuardCopy {
     pub confirm_label: String,
 }
 
-/// A finished count's generation and its counts or error text, parked for settle.
-type AnalyticsOutcome = Arc<Mutex<Option<(u64, Result<Vec<u32>, String>)>>>;
+/// What a count's worker has reached.
+enum AnalyticsSnapshot {
+    /// The counts after a finished tile.
+    Partial(Vec<u32>),
+    /// The finished count, or its error text.
+    Done(Result<Vec<u32>, String>),
+}
+
+/// The latest snapshot and the generation it belongs to, parked for settle;
+/// a newer snapshot replaces an unsettled one.
+type AnalyticsOutcome = Arc<Mutex<Option<(u64, AnalyticsSnapshot)>>>;
 
 /// The Analytics overlay's open flag, rows and the count in flight.
 #[derive(Default)]
@@ -1324,6 +1384,8 @@ struct AnalyticsState {
     control: Option<Arc<job::JobControl>>,
     outcome: AnalyticsOutcome,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// Finished counts by tab id, with the frames they were counted over.
+    cache: HashMap<u64, (Vec<PathBuf>, Vec<u32>)>,
 }
 
 /// The shell's state, carried `Send + Sync` so a worker thread inherits the
@@ -1370,11 +1432,9 @@ struct ShellState {
     pending_mismatch: Option<PendingOpen>,
     /// The most recent refusal's already-rendered message, if any.
     last_refusal: Option<String>,
-    /// The most recent refusal's own title, `Some` only for a project or
-    /// locate refusal -- `None` keeps the folder-empty dialog's fixed
-    /// "No frames here" title and `Pick another folder…` action.
-    refusal_title: Option<String>,
-    /// Whether the "No frames here" refusal dialog is open -- raised by
+    /// The most recent refusal's title and the action its dialog offers.
+    refusal: Option<Refusal>,
+    /// Whether the refusal dialog is open -- raised by
     /// [`AppController::refuse_message`], cleared by
     /// [`AppController::dismiss_refusal`].
     refusal_open: bool,
@@ -1695,7 +1755,7 @@ impl PendingFrameChange {
                 crate::images::FrameSetChangeKind::Add
             }
             PendingFrameChange::Move { .. } => crate::images::FrameSetChangeKind::Move,
-            PendingFrameChange::Sort(_) => crate::images::FrameSetChangeKind::Sort,
+            PendingFrameChange::Sort(order) => crate::images::FrameSetChangeKind::Sort(*order),
             PendingFrameChange::Remove(_) => crate::images::FrameSetChangeKind::Remove,
         }
     }
@@ -1760,6 +1820,16 @@ fn display_image(tab: &ProjectTab) -> Option<ImageSize> {
     fused_image_size(tab).or(tab.image)
 }
 
+/// The device budget as this session has learned it. Reads settled state
+/// only: it never opens an adapter.
+fn device_state() -> DeviceState {
+    match focusforge_gpu::harness::settled_backend() {
+        None => DeviceState::NotProbed,
+        Some(Ok(backend)) => DeviceState::Ready(backend.probed_budget().bytes()),
+        Some(Err(_)) => DeviceState::NoAdapter,
+    }
+}
+
 /// A one-sided margin so a scrolled cursor never sits flush against the
 /// field's own edge, capped at half the visible width for a very narrow
 /// field.
@@ -1782,6 +1852,26 @@ fn clamp_field_scroll(cursor_x: f32, current_offset: f32, viewport_width: f32) -
     }
 }
 
+/// Opens a URL in the system browser.
+type UrlOpener = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Builds the release source for one Check now request.
+pub type ReleaseSourceFactory = Arc<dyn Fn() -> Box<dyn job::ReleaseSource + Send> + Send + Sync>;
+
+/// What the last Check now request found.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum UpdateStatus {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Newer {
+        version: String,
+        url: String,
+    },
+    Failed(String),
+}
+
 /// The plain-Rust controller every Slint callback in the crate forwards to.
 /// No method signature here names a Slint type.
 #[derive(Default)]
@@ -1794,6 +1884,11 @@ pub struct AppController {
     /// press, never through the sink: macOS reads the current event, which is
     /// the mouse-down only while the press is still being dispatched.
     native_drag: Option<Arc<dyn Fn(WindowTarget) + Send + Sync>>,
+    url_opener: Option<UrlOpener>,
+    release_source: Option<ReleaseSourceFactory>,
+    updates: UpdateSettings,
+    updates_save_error: Option<String>,
+    update_status: UpdateStatus,
     job: JobSlot,
     /// Test-only override for the window's scratch root: unset, a run's
     /// ledger, staging, held checkpoints and plane cache live under the
@@ -1830,6 +1925,12 @@ pub struct AppController {
     open_hold: Duration,
     /// How long every Analytics count waits before it reads anything.
     analytics_hold: Duration,
+    /// The tile size of every Analytics count; the default when `None`.
+    analytics_tile_size: Option<u32>,
+    /// How long every Analytics count waits after each finished tile.
+    analytics_tile_pause: Duration,
+    /// Whether a loaded stack's count starts in the background.
+    analytics_background: bool,
     /// The Performance tab's settings, read by every run this controller
     /// starts. A controller from [`AppController::new`] has GPU processing
     /// off, so a headless test never probes an adapter; the window installs
@@ -1848,9 +1949,14 @@ pub struct AppController {
     preview_failures: HashMap<PreviewRequest, String>,
     published_preview_bytes: AtomicU64,
     peak_published_preview_bytes: AtomicU64,
-    /// Cap field text that did not parse, shown until the next edit; the
-    /// cap in `performance` stays as it was.
-    rejected_caps: RejectedCaps,
+    /// What each Performance cap row shows beyond the stored cap: refused
+    /// text, the limit line, a unit picked with no number. The cap in
+    /// `performance` stays as it was.
+    host_notes: CapNotes,
+    vram_notes: CapNotes,
+    /// A cap row's unit list is open; at most one is.
+    host_unit_open: bool,
+    vram_unit_open: bool,
     /// The VRAM cap was edited after this session's device budget settled,
     /// so the edit applies from the next launch.
     vram_pending: bool,
@@ -1860,6 +1966,9 @@ pub struct AppController {
     /// [`Self::host_memory_cap_cursor_moved`] and [`Self::vram_cap_cursor_moved`].
     host_cap_scroll_x: f32,
     vram_cap_scroll_x: f32,
+    /// Cap number typed since the last commit; see [`Self::commit_cap_drafts`].
+    host_cap_draft: Option<String>,
+    vram_cap_draft: Option<String>,
     /// The Storage tab's newest clear result: its status line and tone.
     storage_result: Option<(String, StorageTone)>,
     /// The blend kernel on the display device, handed to every edit session
@@ -2107,6 +2216,17 @@ impl AppController {
     /// Installs the hook that starts a native window move for `target`.
     pub fn set_native_drag(&mut self, drag: Arc<dyn Fn(WindowTarget) + Send + Sync>) {
         self.native_drag = Some(drag);
+    }
+
+    /// Installs the hook that opens a URL in the system browser.
+    pub fn set_url_opener(&mut self, opener: UrlOpener) {
+        self.url_opener = Some(opener);
+    }
+
+    /// Installs the factory that builds the release source for each Check
+    /// now request; without one the button starts nothing.
+    pub fn set_release_source(&mut self, factory: ReleaseSourceFactory) {
+        self.release_source = Some(factory);
     }
 
     fn emit(&self, event: ShellEvent) {
@@ -2850,6 +2970,7 @@ impl AppController {
     ) {
         let (options, metadata) = (choice.options(), choice.metadata_options());
         self.state.export.in_flight = Some(tab_id);
+        self.apply_analytics_priority();
         self.state.export.started = true;
         self.state.export.outcome = Arc::new(Mutex::new(None));
         let outcome = Arc::clone(&self.state.export.outcome);
@@ -2878,6 +2999,7 @@ impl AppController {
             return self.state.export.in_flight.is_none();
         };
         self.state.export.in_flight = None;
+        self.apply_analytics_priority();
         match outcome {
             Ok(()) => {
                 if let Some(dialog) = self.state.export_dialog.take() {
@@ -3096,6 +3218,30 @@ impl AppController {
     /// once at startup, before any gesture is dispatched.
     pub fn install_input_table(&mut self, table: InputTable) {
         self.state.input.table = table;
+    }
+
+    /// Installs the provenance line and one line per problem that
+    /// `input_config::load` (or the defaults write) reported.
+    pub fn install_input_source(
+        &mut self,
+        provenance: &crate::input_config::Provenance,
+        problems: &[crate::input_config::ConfigError],
+    ) {
+        let line = match provenance {
+            crate::input_config::Provenance::Defaults => BUILT_IN_BINDINGS_LINE.to_string(),
+            crate::input_config::Provenance::File { path, overridden } => {
+                let differ = match overridden {
+                    1 => "1 binding differs".to_string(),
+                    n => format!("{n} bindings differ"),
+                };
+                format!(
+                    "Read from {}: {differ} from the built-in ones.",
+                    path.display()
+                )
+            }
+        };
+        let problems = problems.iter().map(ToString::to_string).collect();
+        self.state.input.source = Some((line, problems));
     }
 
     /// Applies `event` ([`Self::apply_action`]) and raises
@@ -4157,12 +4303,23 @@ impl AppController {
         self.state.input.table.display_rows()
     }
 
+    /// The Input map's provenance line and its refusal lines; the built-in
+    /// line and no refusals until a source is installed.
+    pub fn input_source(&self) -> (String, Vec<String>) {
+        self.state
+            .input
+            .source
+            .clone()
+            .unwrap_or_else(|| (BUILT_IN_BINDINGS_LINE.to_string(), Vec::new()))
+    }
+
     pub fn open_settings(&mut self) -> bool {
         self.state.settings_open = true;
         true
     }
 
     pub fn close_settings(&mut self) -> bool {
+        self.leave_cap_rows();
         self.state.settings_open = false;
         false
     }
@@ -4337,16 +4494,18 @@ impl AppController {
         self.state.last_refusal.as_deref()
     }
 
-    /// The active refusal's own title, `None` while the folder-empty
-    /// refusal is showing -- it keeps its own fixed "No frames here" title
-    /// and `Pick another folder…` action; every other refusal shows this
-    /// title with a `Close` button instead.
+    /// The most recent refusal's own title, `Some` once any refusal was raised.
     pub fn refusal_title(&self) -> Option<&str> {
-        self.state.refusal_title.as_deref()
+        self.state.refusal.as_ref().map(|r| r.title.as_str())
     }
 
-    /// Closes the refusal dialog -- its own "Pick another folder…" button,
-    /// or `Close` for every other refusal; `Esc` closes either.
+    /// The action the most recent refusal's dialog offers beside dismissing it.
+    pub fn refusal_action(&self) -> Option<RefusalAction> {
+        self.state.refusal.as_ref().map(|r| r.action)
+    }
+
+    /// Closes the refusal dialog -- `Cancel`, `Close` or `Esc`; the action's
+    /// own button closes it first.
     pub fn dismiss_refusal(&mut self) {
         self.state.refusal_open = false;
     }
@@ -4476,12 +4635,17 @@ impl AppController {
                 let missing = if let GuiProject::Opened(p) = &project {
                     self.record_saved_project(p.path());
                     let (missing, total) = entry::missing_sources(p);
-                    (missing > 0)
-                        .then(|| (missing, total, p.validation().accepted_mismatch.is_some()))
+                    (missing > 0).then(|| {
+                        (
+                            missing,
+                            total,
+                            p.validation().accepted_mismatch.is_some(),
+                            entry::project_file_name(p.path()),
+                        )
+                    })
                 } else {
                     None
                 };
-                let file_name = entry::tab_title(&project);
                 let preloaded = thumbnails.next();
                 let decode = preloaded.is_none();
                 let (picture, meta) = match preloaded {
@@ -4491,7 +4655,7 @@ impl AppController {
                 self.next_tab_id += 1;
                 let id = self.next_tab_id;
                 let mut tab = ProjectTab::new(project, id, picture, meta);
-                if let Some((missing, total, accepted_mismatch)) = missing {
+                if let Some((missing, total, accepted_mismatch, file_name)) = missing {
                     tab.failure = Some(TabFailure {
                         kind: FailureKind::SourcesMissing,
                         stage: "NOTHING TO SHOW".to_string(),
@@ -4514,6 +4678,7 @@ impl AppController {
                     self.request_tab_thumbnail(self.state.projects.len() - 1);
                 }
             }
+            self.sync_analytics_to_active_tab();
         }
         self.settle_tab_scroll();
         self.state.settings_scroll_y = 0.0;
@@ -4533,30 +4698,39 @@ impl AppController {
             EntryError::Unreadable { path }
             | EntryError::NoReadableFrames { path }
             | EntryError::MixedKinds { path, .. }
-            | EntryError::SeveralFolders { path } => {
+            | EntryError::SeveralFolders { path }
+            | EntryError::UnreadableFrame { path, .. } => {
                 self.record_failure(not_a_project_card(path.clone()));
             }
             _ => {}
         }
-        self.refuse_message(message);
-        self.state.refusal_title = match &err {
-            EntryError::ProjectRefused { .. } => Some("This project cannot be opened".to_string()),
-            EntryError::MixedKinds { .. } | EntryError::SeveralFolders { .. } => {
-                Some("These images are not one stack".to_string())
+        let (title, action) = match &err {
+            EntryError::NoReadableFrames { .. } | EntryError::Unreadable { .. } => {
+                ("No frames here", RefusalAction::PickFolder)
             }
-            _ => None,
+            EntryError::Read { .. } => ("This folder cannot be read", RefusalAction::PickFolder),
+            EntryError::ProjectRefused { .. } => {
+                ("This project cannot be opened", RefusalAction::Close)
+            }
+            EntryError::MixedKinds { .. } | EntryError::SeveralFolders { .. } => {
+                ("These images are not one stack", RefusalAction::Close)
+            }
+            EntryError::UnreadableFrame { .. } => {
+                ("These frames cannot be read", RefusalAction::Close)
+            }
         };
+        self.refuse_message(title, action, message);
         OpenOutcome::Refused(err)
     }
 
-    /// Refuses with an already-rendered message and no [`EntryError`] behind
-    /// it -- what a re-fuse's own frame-reachability check uses, since
-    /// nothing there is an entry-path failure. Clears any earlier refusal's
-    /// own title, so a caller with one of its own sets it right after this
-    /// call; every other refusal keeps the folder-empty dialog's fixed copy.
-    pub fn refuse_message(&mut self, message: String) {
+    /// Raises the refusal dialog with its own `title`, the `action` it
+    /// offers and an already-rendered `message`.
+    fn refuse_message(&mut self, title: &str, action: RefusalAction, message: String) {
         self.state.last_refusal = Some(message.clone());
-        self.state.refusal_title = None;
+        self.state.refusal = Some(Refusal {
+            title: title.to_string(),
+            action,
+        });
         self.state.refusal_open = true;
         self.emit(ShellEvent::EntryRefused(message));
     }
@@ -4706,6 +4880,10 @@ impl AppController {
         self.cancel_frame_drag();
         self.state.last_close = Some(now);
         let closed = self.state.projects.remove(index);
+        self.state.analytics.cache.remove(&closed.id);
+        if self.state.analytics.tab == Some(closed.id) {
+            self.stop_analytics_count();
+        }
         if self.state.pending_close == Some(closed.id) {
             self.state.pending_close = None;
         }
@@ -4954,11 +5132,6 @@ impl AppController {
         self.state.analytics.open
     }
 
-    /// Whether there is a stack to count: the Analytics button's `enabled`.
-    pub fn analytics_enabled(&self) -> bool {
-        self.state.active().is_some()
-    }
-
     /// What the Analytics overlay shows.
     pub fn analytics_view(&self) -> &AnalyticsView {
         &self.state.analytics.view
@@ -4969,39 +5142,71 @@ impl AppController {
         self.analytics_hold = hold;
     }
 
-    /// Opens the Analytics overlay over the active stack and starts counting
-    /// on a worker, closing the projects overlay, the calculator and the
-    /// notification center; closes it when it is open. Returns the worker's
-    /// join handle when a count started; [`Self::settle_analytics`] applies
-    /// its result.
+    /// Makes every Analytics count read in tiles of `size`.
+    pub fn set_analytics_tile_size(&mut self, size: u32) {
+        self.analytics_tile_size = Some(size);
+    }
+
+    /// Makes every Analytics count wait `pause` after each finished tile.
+    pub fn set_analytics_tile_pause(&mut self, pause: Duration) {
+        self.analytics_tile_pause = pause;
+    }
+
+    /// Starts the count of every loaded stack in the background, following
+    /// the active tab, when `on`; a controller starts with it off.
+    pub fn set_analytics_background(&mut self, on: bool) {
+        self.analytics_background = on;
+    }
+
+    /// How hard the live count works; `None` while no count exists.
+    pub fn analytics_count_priority(&self) -> Option<CountPriority> {
+        let control = self.state.analytics.control.as_ref()?;
+        Some(if control.held() {
+            CountPriority::Held
+        } else if control.admission_cap() == 1 {
+            CountPriority::Low
+        } else {
+            CountPriority::Normal
+        })
+    }
+
+    /// Opens the Analytics overlay over the active stack, closing the
+    /// projects overlay, the calculator and the notification center. It
+    /// shows the stack's finished count at once, speeds up the count already
+    /// running, or starts one on a worker; with no stack open it waits for
+    /// one. Closes it when it is open. Returns the worker's join handle when
+    /// a count started; [`Self::settle_analytics`] applies its snapshots.
     pub fn toggle_analytics(&mut self) -> Option<std::thread::JoinHandle<()>> {
         if self.state.analytics.open {
             self.close_analytics();
             return None;
         }
-        if !self.analytics_enabled() {
-            return None;
-        }
         self.close_projects_overlay();
         self.close_calculator();
         self.notifications.close_center();
+        if matches!(self.state.analytics.view, AnalyticsView::Failed(_)) {
+            self.stop_analytics_count();
+        }
         self.state.analytics.open = true;
-        self.start_analytics_count();
-        self.state.analytics.worker.take()
+        let before = self.state.analytics.generation;
+        self.sync_analytics_to_active_tab();
+        self.emit(ShellEvent::AnalyticsChanged);
+        let analytics = &mut self.state.analytics;
+        if analytics.generation != before {
+            analytics.worker.take()
+        } else {
+            None
+        }
     }
 
-    /// Closes the Analytics overlay and stops its count; a no-op while closed.
+    /// Closes the Analytics overlay and lowers its count, which keeps
+    /// running; a no-op while closed.
     pub fn close_analytics(&mut self) {
-        let analytics = &mut self.state.analytics;
-        if !analytics.open {
+        if !self.state.analytics.open {
             return;
         }
-        analytics.open = false;
-        analytics.generation += 1;
-        analytics.tab = None;
-        if let Some(control) = analytics.control.take() {
-            control.cancel();
-        }
+        self.state.analytics.open = false;
+        self.apply_analytics_priority();
         self.emit(ShellEvent::AnalyticsChanged);
     }
 
@@ -5010,8 +5215,8 @@ impl AppController {
         self.state.analytics.worker.take()
     }
 
-    /// Applies the parked count of the current generation; a result of a
-    /// closed or replaced count changes nothing.
+    /// Applies the parked snapshot of the current generation, caching a
+    /// finished count under its tab; one of an abandoned count changes nothing.
     pub fn settle_analytics(&mut self) {
         let analytics = &mut self.state.analytics;
         let parked = analytics
@@ -5019,69 +5224,151 @@ impl AppController {
             .lock()
             .expect("no thread panicked while holding the analytics outcome")
             .take();
-        let Some((generation, result)) = parked else {
+        let Some((generation, snapshot)) = parked else {
             return;
         };
-        if !analytics.open || generation != analytics.generation {
+        if generation != analytics.generation {
             return;
         }
-        analytics.view = match result {
-            Ok(counts) => AnalyticsView::Rows(analytics::build_rows(&analytics.frames, &counts)),
-            Err(message) => AnalyticsView::Failed(message),
-        };
+        analytics.view =
+            match snapshot {
+                AnalyticsSnapshot::Partial(counts) => AnalyticsView::Counting(
+                    analytics::build_rows(&analytics.frames, &counts, RowValue::Partial),
+                ),
+                AnalyticsSnapshot::Done(Ok(counts)) => {
+                    let rows = analytics::build_rows(&analytics.frames, &counts, RowValue::Final);
+                    if let Some(tab) = analytics.tab {
+                        analytics
+                            .cache
+                            .insert(tab, (analytics.frames.clone(), counts));
+                    }
+                    AnalyticsView::Rows(rows)
+                }
+                AnalyticsSnapshot::Done(Err(message)) => AnalyticsView::Failed(message),
+            };
         self.emit(ShellEvent::AnalyticsChanged);
     }
 
-    fn start_analytics_count(&mut self) {
-        let Some(tab) = self.state.active() else {
-            return;
-        };
-        let (id, frames) = (tab.id, tab.frames.clone());
-        let sink = self.sink.clone();
-        let hold = self.analytics_hold;
+    /// Abandons the count in flight; a result it parks later is dropped.
+    fn stop_analytics_count(&mut self) {
         let analytics = &mut self.state.analytics;
-        if let Some(previous) = analytics.control.take() {
-            previous.cancel();
+        if let Some(control) = analytics.control.take() {
+            control.cancel();
         }
         analytics.generation += 1;
+        analytics.tab = None;
+        analytics.frames.clear();
+    }
+
+    /// Sets how hard the live count works. Open: all workers, one while a
+    /// stacking or export job runs. Closed: one worker, held while a job runs.
+    fn apply_analytics_priority(&self) {
+        let analytics = &self.state.analytics;
+        let Some(control) = &analytics.control else {
+            return;
+        };
+        let job_running = self.job.control.is_some() || self.state.export.in_flight.is_some();
+        control.set_admission_cap((!analytics.open || job_running).then_some(1));
+        control.set_held(!analytics.open && job_running);
+    }
+
+    /// Starts a count over `frames` of tab `id`, abandoning the one in flight.
+    fn start_analytics_count(&mut self, id: u64, frames: Vec<PathBuf>) {
+        let sink = self.sink.clone();
+        let hold = self.analytics_hold;
+        let tile_pause = self.analytics_tile_pause;
+        let tile_size = self.analytics_tile_size;
+        self.stop_analytics_count();
+        let analytics = &mut self.state.analytics;
         analytics.tab = Some(id);
         analytics.frames = frames.clone();
-        analytics.view = AnalyticsView::Computing;
+        analytics.view = AnalyticsView::Counting(analytics::pending_rows(&frames));
         let control = job::JobControl::new();
         analytics.control = Some(Arc::clone(&control));
         let generation = analytics.generation;
         let slot = Arc::clone(&analytics.outcome);
         analytics.worker = Some(std::thread::spawn(move || {
             std::thread::sleep(hold);
-            // A stopped count parks nothing, so it cannot replace the result
-            // of the count that superseded it.
-            let result = match analytics::count_frames(&frames, &*control) {
-                Ok(counts) => Ok(counts),
-                Err(CountError::Failed(message)) => Err(message),
-                Err(CountError::Stopped) => return,
+            // Parks `snapshot` over an unsettled one, unless a newer count
+            // already parked; the event is sent only when the slot was empty,
+            // so a fast count leaves at most one event pending.
+            let park = |snapshot: AnalyticsSnapshot| {
+                let mut parked = slot
+                    .lock()
+                    .expect("no thread panicked while holding the analytics outcome");
+                if parked
+                    .as_ref()
+                    .is_some_and(|(newer, _)| *newer > generation)
+                {
+                    return;
+                }
+                let was_empty = parked.is_none();
+                *parked = Some((generation, snapshot));
+                drop(parked);
+                if was_empty && let Some(sink) = &sink {
+                    sink(ShellEvent::AnalyticsReady);
+                }
             };
-            *slot
-                .lock()
-                .expect("no thread panicked while holding the analytics outcome") =
-                Some((generation, result));
-            if let Some(sink) = &sink {
-                sink(ShellEvent::AnalyticsReady);
-            }
+            // A stopped count parks nothing, so it cannot replace the
+            // snapshot of the count that superseded it.
+            let result =
+                match analytics::count_frames(&frames, tile_size, &*control, &mut |counts| {
+                    park(AnalyticsSnapshot::Partial(counts.to_vec()));
+                    std::thread::sleep(tile_pause);
+                }) {
+                    Ok(counts) => Ok(counts),
+                    Err(CountError::Failed(message)) => Err(message),
+                    Err(CountError::Stopped) => return,
+                };
+            park(AnalyticsSnapshot::Done(result));
         }));
+        self.apply_analytics_priority();
         self.emit(ShellEvent::AnalyticsChanged);
     }
 
-    /// Follows the active tab while the overlay is open: recounts for a
-    /// different tab, closes when none is left.
+    /// Follows the active tab while the overlay is open or the background
+    /// count is on: keeps the count of the active stack's frame list running,
+    /// shows its finished count, or starts one; waits when no stack is left.
     fn sync_analytics_to_active_tab(&mut self) {
-        if !self.state.analytics.open {
+        if !self.state.analytics.open && !self.analytics_background {
+            self.apply_analytics_priority();
             return;
         }
-        match self.state.active().map(|tab| tab.id) {
-            None => self.close_analytics(),
-            Some(id) if Some(id) != self.state.analytics.tab => self.start_analytics_count(),
-            Some(_) => {}
+        let active = self.state.active().map(|tab| (tab.id, tab.frames.clone()));
+        let Some((id, frames)) = active else {
+            if self.state.analytics.view != AnalyticsView::Waiting {
+                self.stop_analytics_count();
+                self.state.analytics.view = AnalyticsView::Waiting;
+                self.emit(ShellEvent::AnalyticsChanged);
+            }
+            return;
+        };
+        let analytics = &mut self.state.analytics;
+        let known = analytics.tab == Some(id) && analytics.frames == frames;
+        if known
+            && matches!(
+                analytics.view,
+                AnalyticsView::Counting(_) | AnalyticsView::Failed(_)
+            )
+        {
+            // The count in flight (or its failure) stands.
+        } else if let Some((_, counts)) = analytics
+            .cache
+            .get(&id)
+            .filter(|(counted, _)| *counted == frames)
+        {
+            let rows = analytics::build_rows(&frames, counts, RowValue::Final);
+            self.stop_analytics_count();
+            let analytics = &mut self.state.analytics;
+            analytics.tab = Some(id);
+            analytics.frames = frames;
+            analytics.view = AnalyticsView::Rows(rows);
+            self.emit(ShellEvent::AnalyticsChanged);
+        } else {
+            analytics.cache.remove(&id);
+            self.start_analytics_count(id, frames);
         }
+        self.apply_analytics_priority();
     }
 
     /// The calculator's entries and read-outs for display.
@@ -5427,12 +5714,14 @@ impl AppController {
                                 );
                             }
                             None => {
-                                self.refuse_message(format!(
-                                    "{} could not be reopened after its frames were located.",
-                                    pending.file_name
-                                ));
-                                self.state.refusal_title =
-                                    Some("This project cannot be opened".to_string());
+                                self.refuse_message(
+                                    "This project cannot be opened",
+                                    RefusalAction::Close,
+                                    format!(
+                                        "{} could not be reopened after its frames were located.",
+                                        pending.file_name
+                                    ),
+                                );
                             }
                         }
                     }
@@ -5462,8 +5751,11 @@ impl AppController {
                 }
             },
             Err(refused) => {
-                self.refuse_message(refused.message());
-                self.state.refusal_title = Some("These are not the project's frames".to_string());
+                self.refuse_message(
+                    "These are not the project's frames",
+                    RefusalAction::Close,
+                    refused.message(),
+                );
             }
         }
     }
@@ -5785,7 +6077,7 @@ impl AppController {
         let Some(desc) = settings_panel::find_desc(section, &tab.fuse_id, &tab.align_id, id) else {
             return;
         };
-        let value = settings_panel::slider_value(fraction, &desc.kind);
+        let value = settings_panel::slider_value(fraction, &desc.kind_for(tab.ctx.as_ref()));
         self.set_param_value(section, id, value);
     }
 
@@ -5804,7 +6096,8 @@ impl AppController {
             .unwrap_or(&desc.default)
             .as_f64()
             .unwrap_or_default();
-        if let Some(value) = settings_panel::stepped_value(current, direction, &desc.kind) {
+        let kind = desc.kind_for(tab.ctx.as_ref());
+        if let Some(value) = settings_panel::stepped_value(current, direction, &kind) {
             self.set_param_value(section, id, value);
         }
     }
@@ -6191,6 +6484,7 @@ impl AppController {
         self.preview_failures.clear();
         self.keep_selected_image_visible();
         self.refresh_source_previews();
+        self.sync_analytics_to_active_tab();
     }
 
     fn images_content_height(&self) -> f32 {
@@ -6559,6 +6853,7 @@ impl AppController {
         let order = images::move_order(tab.frames.len(), from, to);
         tab.reorder(&order);
         tab.frame_sort = None;
+        self.sync_analytics_to_active_tab();
         self.refresh_source_previews();
         self.keep_image_visible(to);
     }
@@ -6744,6 +7039,7 @@ impl AppController {
         let order = images::sort_order(&tab.frames, sort, &tab.meta);
         tab.reorder(&order);
         tab.frame_sort = Some(sort);
+        self.sync_analytics_to_active_tab();
         self.refresh_source_previews();
     }
 
@@ -7628,18 +7924,125 @@ impl AppController {
         self.save_performance();
     }
 
-    /// Applies the host-memory cap field's text to the next run and saves it.
-    /// Empty means no cap; text that does not parse as a size leaves the
-    /// stored cap and marks the field invalid.
+    /// Holds the host-memory number as typed; nothing is stored or saved
+    /// until [`Self::commit_cap_drafts`].
+    pub fn edit_host_memory_cap(&mut self, number: &str) {
+        self.host_cap_draft = Some(number.to_string());
+    }
+
+    /// [`Self::edit_host_memory_cap`] for the VRAM cap.
+    pub fn edit_vram_cap(&mut self, number: &str) {
+        self.vram_cap_draft = Some(number.to_string());
+    }
+
+    /// Commits each cap number typed since the last commit, in the unit its
+    /// row shows. Runs when a number is confirmed, when the settings section
+    /// changes and when the settings window closes; with nothing typed it
+    /// does nothing.
+    pub fn commit_cap_drafts(&mut self) {
+        if let Some(number) = self.host_cap_draft.take() {
+            let unit = self.performance_view().host_cap.unit;
+            self.commit_host_cap(&number, unit);
+        }
+        if let Some(number) = self.vram_cap_draft.take() {
+            let unit = self.performance_view().vram_cap.unit;
+            self.commit_vram_cap(&number, unit);
+        }
+    }
+
+    /// Commits the host row in `label`'s unit at once, with the number it
+    /// shows or, when one was typed and not yet confirmed, that number.
+    pub fn set_host_cap_unit(&mut self, label: &str) {
+        self.host_unit_open = false;
+        if let Some(unit) = CapUnit::from_label(label) {
+            let number = match self.host_cap_draft.take() {
+                Some(number) => number,
+                None => self.performance_view().host_cap.text,
+            };
+            self.commit_host_cap(&number, unit);
+        }
+    }
+
+    /// [`Self::set_host_cap_unit`] for the VRAM row.
+    pub fn set_vram_cap_unit(&mut self, label: &str) {
+        self.vram_unit_open = false;
+        if let Some(unit) = CapUnit::from_label(label) {
+            let number = match self.vram_cap_draft.take() {
+                Some(number) => number,
+                None => self.performance_view().vram_cap.text,
+            };
+            self.commit_vram_cap(&number, unit);
+        }
+    }
+
+    /// Opens the host row's unit list, or closes it when open.
+    pub fn toggle_host_unit_list(&mut self) {
+        self.host_unit_open = !self.host_unit_open;
+        self.vram_unit_open = false;
+    }
+
+    /// [`Self::toggle_host_unit_list`] for the VRAM row.
+    pub fn toggle_vram_unit_list(&mut self) {
+        self.vram_unit_open = !self.vram_unit_open;
+        self.host_unit_open = false;
+    }
+
+    /// Closes whichever unit list is open; the key that does it is not the
+    /// one that closes Settings.
+    pub fn close_unit_lists(&mut self) {
+        self.host_unit_open = false;
+        self.vram_unit_open = false;
+    }
+
+    /// Whether a cap row's unit list is open.
+    pub fn unit_list_open(&self) -> bool {
+        self.host_unit_open || self.vram_unit_open
+    }
+
+    /// Stores the host cap a confirmed `number` in `unit` makes. A number at
+    /// or above the host budget is no cap; one above it also sets the line
+    /// naming the budget. A number that is not a cap marks the row invalid.
+    fn commit_host_cap(&mut self, number: &str, unit: CapUnit) {
+        self.host_notes = CapNotes::default();
+        let fitted = performance_settings::fit_cap(number, unit, Some(job::host_budget().bytes()));
+        match fitted {
+            Ok(fitted) => {
+                self.set_host_memory_cap(fitted.cap.as_ref().map_or("", |cap| &cap.text));
+                self.host_notes.limit = fitted.limit;
+            }
+            Err(_) => self.set_host_memory_cap(&format!("{}{}", number.trim(), unit.label())),
+        }
+    }
+
+    /// [`Self::commit_host_cap`] for the VRAM cap, whose maximum is the
+    /// probed device budget once a run has probed it.
+    fn commit_vram_cap(&mut self, number: &str, unit: CapUnit) {
+        self.vram_notes = CapNotes::default();
+        let fitted = performance_settings::fit_cap(number, unit, device_state().maximum());
+        match fitted {
+            Ok(fitted) => {
+                self.set_vram_cap(fitted.cap.as_ref().map_or("", |cap| &cap.text));
+                self.vram_notes.limit = fitted.limit;
+                if number.trim().is_empty() {
+                    self.vram_notes.unit = Some(unit);
+                }
+            }
+            Err(_) => self.set_vram_cap(&format!("{}{}", number.trim(), unit.label())),
+        }
+    }
+
+    /// Applies the host-memory cap text to the next run and saves it. Empty
+    /// means no cap; text that does not parse as a size leaves the stored cap
+    /// and marks the row invalid.
     pub fn set_host_memory_cap(&mut self, text: &str) {
         match performance_settings::parse_cap(text) {
             Ok(cap) => {
                 self.performance.max_host_memory = cap;
-                self.rejected_caps.host_memory = None;
+                self.host_notes.rejected = None;
                 self.save_performance();
                 self.refresh_source_previews();
             }
-            Err(_) => self.rejected_caps.host_memory = Some(text.to_string()),
+            Err(_) => self.host_notes.rejected = Some(text.to_string()),
         }
     }
 
@@ -7650,11 +8053,11 @@ impl AppController {
         match performance_settings::parse_cap(text) {
             Ok(cap) => {
                 self.performance.max_vram = cap;
-                self.rejected_caps.vram = None;
+                self.vram_notes.rejected = None;
                 self.vram_pending |= focusforge_gpu::harness::vram_cap_settled();
                 self.save_performance();
             }
-            Err(_) => self.rejected_caps.vram = Some(text.to_string()),
+            Err(_) => self.vram_notes.rejected = Some(text.to_string()),
         }
     }
 
@@ -7681,6 +8084,94 @@ impl AppController {
     pub fn install_appearance(&mut self, settings: AppearanceSettings) {
         self.appearance = settings;
         self.appearance_save_error = None;
+    }
+
+    /// Installs the `[updates]` settings loaded at startup.
+    pub fn install_updates(&mut self, settings: UpdateSettings) {
+        self.updates = settings;
+        self.updates_save_error = None;
+    }
+
+    pub fn update_settings(&self) -> &UpdateSettings {
+        &self.updates
+    }
+
+    /// Stores the switch for this session and writes `[updates]`.
+    pub fn set_update_check_on_start(&mut self, on: bool) {
+        self.updates.check_on_start = on;
+        self.save_updates();
+    }
+
+    /// Skips the newer version Check now shows; does nothing without one.
+    pub fn skip_update_version(&mut self) {
+        let UpdateStatus::Newer { version, .. } = &self.update_status else {
+            return;
+        };
+        self.updates.skipped_version = Some(version.clone());
+        self.save_updates();
+    }
+
+    fn save_updates(&mut self) {
+        self.updates_save_error = self
+            .state
+            .config_dir
+            .as_deref()
+            .and_then(|dir| update_settings::save(dir, &self.updates).err())
+            .map(|error| error.to_string());
+    }
+
+    /// Follows the link of the newer version Check now shows.
+    pub fn open_update_page(&self) {
+        if let UpdateStatus::Newer { url, .. } = &self.update_status
+            && let Some(opener) = &self.url_opener
+        {
+            opener(url);
+        }
+    }
+
+    /// What the About tab's update controls show.
+    pub fn update_controls_view(&self) -> UpdateControlsView {
+        let checking = self.update_status == UpdateStatus::Checking;
+        let (status, status_tone) = match &self.update_status {
+            UpdateStatus::Checking => ("Checking for updates…", StorageTone::None),
+            UpdateStatus::UpToDate => ("FocusForge is up to date.", StorageTone::Success),
+            _ => ("", StorageTone::None),
+        };
+        let newer_version = match &self.update_status {
+            UpdateStatus::Newer { version, .. } => version.clone(),
+            _ => String::new(),
+        };
+        let parse = job::parse_version;
+        let skipped = !newer_version.is_empty()
+            && self
+                .updates
+                .skipped_version
+                .as_deref()
+                .and_then(|skipped| parse(skipped).ok())
+                .zip(parse(&newer_version).ok())
+                .is_some_and(|(skipped, newer)| skipped.cmp_precedence(&newer).is_eq());
+        let result_text = match (newer_version.as_str(), skipped) {
+            ("", _) => String::new(),
+            (version, false) => format!("FocusForge {version} is available."),
+            (version, true) => format!("FocusForge {version} is available (skipped)."),
+        };
+        let failure = match &self.update_status {
+            UpdateStatus::Failed(reason) => format!("Could not check for updates: {reason}"),
+            _ => String::new(),
+        };
+        UpdateControlsView {
+            check_on_start: self.updates.check_on_start,
+            check_enabled: !checking,
+            checking,
+            status: status.to_owned(),
+            status_tone,
+            result_visible: !result_text.is_empty() || !failure.is_empty(),
+            skip_enabled: !newer_version.is_empty() && !skipped,
+            result_text,
+            skipped,
+            failure,
+            save_error: self.updates_save_error.clone().unwrap_or_default(),
+        }
     }
 
     pub fn source_presentation(&self) -> SourcePresentation {
@@ -7757,24 +8248,22 @@ impl AppController {
     /// budget is `NotProbed` until a run has brought the backend up, and
     /// building the view never opens an adapter.
     pub fn performance_view(&self) -> performance_settings::PerformanceView {
-        let device = match focusforge_gpu::harness::settled_backend() {
-            None => DeviceState::NotProbed,
-            Some(Ok(backend)) => DeviceState::Ready(backend.device_budget().bytes()),
-            Some(Err(_)) => DeviceState::NoAdapter,
-        };
         let backend_line = self
             .fusion_backend()
             .or_else(|| self.last_backend_line.clone());
         let mut view = performance_settings::view(
             &self.performance,
-            &self.rejected_caps,
+            &self.host_notes,
+            &self.vram_notes,
             job::host_budget().bytes(),
-            device,
+            device_state(),
             backend_line.as_deref(),
             self.vram_pending,
         );
         view.host_cap.scroll_offset = self.host_cap_scroll_x;
         view.vram_cap.scroll_offset = self.vram_cap_scroll_x;
+        view.host_cap.unit_open = self.host_unit_open;
+        view.vram_cap.unit_open = self.vram_unit_open;
         view
     }
 
@@ -7836,12 +8325,26 @@ impl AppController {
     /// Refuses a run whose recorded frame is no longer on disk, naming it
     /// in the message -- shared by [`Self::start_fuse`] and the queue
     /// promotion [`Self::settle_job`] runs. Every tab holding that frame
-    /// shows it unresolved from then on.
-    fn refuse_missing_frame(&mut self, missing: &Path) {
-        self.refuse_message(format!(
-            "{} is no longer on disk. This project cannot be fused again until it is back.",
-            missing.display()
-        ));
+    /// shows it unresolved from then on. A saved tab `id` offers to locate
+    /// its frames; a never-saved tab has no recorded hashes to check a folder
+    /// against, so it offers only `Close`.
+    fn refuse_missing_frame(&mut self, id: u64, missing: &Path) {
+        let saved = self
+            .tab_index(id)
+            .and_then(|index| self.state.projects.get(index))
+            .is_some_and(|tab| matches!(tab.project, GuiProject::Opened(_)));
+        self.refuse_message(
+            "A frame is no longer there",
+            if saved {
+                RefusalAction::LocateTab(id)
+            } else {
+                RefusalAction::Close
+            },
+            format!(
+                "{} is no longer on disk. This project cannot be fused again until it is back.",
+                missing.display()
+            ),
+        );
         for tab in &mut self.state.projects {
             if let Some(meta) = tab.meta.get_mut(missing) {
                 meta.unresolved = true;
@@ -7913,13 +8416,21 @@ impl AppController {
         let Some(tab) = self.state.projects.get(index) else {
             return false;
         };
-        if !tab.errors.is_empty() {
+        if !tab.errors.is_empty()
+            || settings_panel::has_stored_violation(
+                &tab.fuse_id,
+                &tab.fuse_values,
+                &tab.align_id,
+                &tab.align_values,
+                tab.ctx.as_ref(),
+            )
+        {
             return false;
         }
         let id = tab.id;
         let frames = tab.included_frames();
         if let Some(missing) = frames.iter().find(|path| !path.is_file()) {
-            self.refuse_missing_frame(missing);
+            self.refuse_missing_frame(id, missing);
             return false;
         }
         if !confirmed && self.ask_before_fuse(index, FuseEntry::Fuse) {
@@ -8042,7 +8553,7 @@ impl AppController {
         let algorithms = match job::resolve_request(&request) {
             Ok(algorithms) => algorithms,
             Err(message) => {
-                self.refuse_message(message);
+                self.refuse_message("This run cannot start", RefusalAction::Close, message);
                 return false;
             }
         };
@@ -8054,7 +8565,11 @@ impl AppController {
             .bytes()
             .saturating_sub(retained_preview_bytes);
         if processing_budget == 0 {
-            self.refuse_message("Source previews use the available host memory. Close or change the source view before starting processing.".to_string());
+            self.refuse_message(
+                "This run cannot start",
+                RefusalAction::Close,
+                "Source previews use the available host memory. Close or change the source view before starting processing.".to_string(),
+            );
             return false;
         }
         self.cancel_frame_drag();
@@ -8071,6 +8586,7 @@ impl AppController {
             self.heat_ramp,
         ));
         self.job.control = Some(Arc::clone(&control));
+        self.apply_analytics_priority();
         self.job.observer = Some(Arc::clone(&observer));
         self.job.frames = request.frames.clone();
         self.job.tab_id = self.state.projects.get(tab_index).map(|tab| tab.id);
@@ -8184,6 +8700,20 @@ impl AppController {
         self.close_calculator();
         self.close_analytics();
         self.notifications.open_center_at(id);
+    }
+
+    /// Follows a toast's link: a record with a download page hands it to the
+    /// URL opener and closes the toast; any other record opens the center on
+    /// it.
+    pub fn activate_toast(&mut self, id: u64) {
+        let Some(url) = self.notifications.get(id).and_then(|n| n.url.clone()) else {
+            self.open_center_at(id);
+            return;
+        };
+        if let Some(opener) = &self.url_opener {
+            opener(&url);
+        }
+        self.notifications.dismiss(id, Instant::now());
     }
 
     /// Selects record `id` and shows its full message.
@@ -8495,9 +9025,11 @@ impl AppController {
         if let Some(line) = observer.backend_line() {
             self.last_backend_line = Some(line);
         }
-        let settled = job::settle(handle.join(), &observer);
+        let run_frames = std::mem::take(&mut self.job.frames);
+        let settled = job::settle(handle.join(), &run_frames, &observer);
         self.landing = Landing::after(run_tab_id, &settled.state, &observer, Instant::now());
         self.job.control = None;
+        self.apply_analytics_priority();
         // With the owning tab gone (closed mid-run), this writes nothing --
         // no tab gains a checkpoint, and no outcome lands on whichever tab
         // happens to be active now.
@@ -8513,17 +9045,22 @@ impl AppController {
             // checkpoint just changed.
             self.state.canvas_dirty = true;
         }
-        let run_frames = std::mem::take(&mut self.job.frames);
         // Preparation finishes before any later failure, so every notice is
         // published, ahead of the failure itself.
         for (frame, text) in run_notices {
             let frame = frame
                 .and_then(|i| run_frames.get(i))
                 .map(|p| images::file_name(p));
-            let title = if frame.is_some() {
-                "Brightness target limited"
-            } else {
-                "Processing notice"
+            // The core text, with its numbers, reaches the log through the
+            // observer; the record says what happened in plain words.
+            let (title, text) = match &frame {
+                Some(file) => (
+                    "Brightness not fully matched",
+                    format!(
+                        "{file} could not be brought to the same brightness as the other frames."
+                    ),
+                ),
+                None => ("Processing notice", text),
             };
             let mut record = Notification::new(Kind::Warning, Source::Run, title, text);
             record.frame = frame;
@@ -8536,18 +9073,19 @@ impl AppController {
                 let operation = settled
                     .operation
                     .expect("settle() sets operation exactly when state is Failed");
+                let copy = job::failure_copy(operation, phase, settled.failed_file.as_deref());
                 let mut record = Notification::new(
                     Kind::Failure,
                     Source::Run,
-                    operation.summary(),
-                    message.clone(),
+                    copy.title,
+                    format!("{}\n{message}", copy.lead),
                 );
                 self.fill_project(&mut record, tab_index);
                 self.publish_notification(record);
                 if let Some(tab) = tab_index.and_then(|i| self.state.projects.get_mut(i)) {
                     tab.failure = Some(TabFailure {
                         kind: FailureKind::Failed,
-                        stage: format!("FAILED WHILE {}", phase.name().to_uppercase()),
+                        stage: copy.stage,
                         reason: message.clone(),
                     });
                 }
@@ -8600,7 +9138,7 @@ impl AppController {
                 .get(index)
                 .and_then(|tab| tab.included_frames().into_iter().find(|p| !p.is_file()));
             if let Some(missing) = missing {
-                self.refuse_missing_frame(&missing);
+                self.refuse_missing_frame(id, &missing);
                 continue;
             }
             let Some(request) = self.job_request_for(index) else {
@@ -8610,6 +9148,7 @@ impl AppController {
                 break;
             }
         }
+        self.sync_analytics_to_active_tab();
         self.refresh_source_previews();
         self.renumber_queue();
         self.emit(ShellEvent::JobChanged);
@@ -9534,16 +10073,26 @@ impl AppController {
     }
 
     pub fn select_settings_section(&mut self, section: SettingsSection) {
+        self.leave_cap_rows();
         self.state.settings_section = section;
     }
 
-    /// Feeds the diagnostics panel its data and configuration directories
-    /// and derives the default destination from the data directory:
-    /// `<data_dir>/diagnostics/<default file name>`, or the file name alone
-    /// when no data directory resolves.
-    pub fn set_diagnostics_dirs(&mut self, data_dir: Option<PathBuf>, config_dir: Option<PathBuf>) {
+    /// Commits a number typed in a cap row, then clears the limit lines and
+    /// closes the unit lists: the rows are being left.
+    fn leave_cap_rows(&mut self) {
+        self.commit_cap_drafts();
+        self.host_notes.limit = None;
+        self.vram_notes.limit = None;
+        self.close_unit_lists();
+    }
+
+    /// Feeds the diagnostics panel its data directory and derives the
+    /// default destination from it: `<data_dir>/diagnostics/<default file
+    /// name>`, or the file name alone when no data directory resolves. A
+    /// bundle's configuration entry reads the settings file under the
+    /// directory `install_recent` installed.
+    pub fn set_diagnostics_dirs(&mut self, data_dir: Option<PathBuf>) {
         self.state.diagnostics.data_dir = data_dir;
-        self.state.diagnostics.config_dir = config_dir;
         let destination = self.default_destination();
         self.set_diagnostics_destination(destination);
     }
@@ -9600,7 +10149,7 @@ impl AppController {
         let sink = self.sink.clone();
         let options = focusforge_diagnostics::bundle::Options {
             data_dir: self.state.diagnostics.data_dir.clone(),
-            config_dir: self.state.diagnostics.config_dir.clone(),
+            config_dir: self.state.config_dir.clone(),
             include_minidumps: self.state.diagnostics.include_minidumps,
         };
         let destination = self.state.diagnostics.destination.clone();
@@ -9657,7 +10206,7 @@ impl AppController {
         let sink = self.sink.clone();
         let options = focusforge_diagnostics::bundle::Options {
             data_dir: self.state.diagnostics.data_dir.clone(),
-            config_dir: self.state.diagnostics.config_dir.clone(),
+            config_dir: self.state.config_dir.clone(),
             include_minidumps: self.state.diagnostics.include_minidumps,
         };
 
@@ -9691,6 +10240,131 @@ impl AppController {
                 sink(ShellEvent::DiagnosticsScanFinished { generation, scan });
             }
         })
+    }
+
+    /// Asks the release source once, on a background thread, whether a newer
+    /// release than the running version exists, then reports through the
+    /// sink. Returns `None` and makes no request when `settings` switch the
+    /// check off.
+    pub fn start_update_check(
+        &self,
+        settings: &UpdateSettings,
+        source: Box<dyn job::ReleaseSource + Send>,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        if !settings.check_on_start {
+            return None;
+        }
+        let sink = self.sink.clone();
+        let skipped = settings.skipped_version.clone();
+        let spawned = std::thread::Builder::new()
+            .name("update-check".into())
+            .spawn(move || {
+                let outcome =
+                    job::check_for_update(&*source, env!("CARGO_PKG_VERSION"), skipped.as_deref());
+                if let Some(sink) = sink {
+                    sink(ShellEvent::UpdateChecked(outcome));
+                }
+            });
+        match spawned {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                tracing::debug!("update check not started: {err}");
+                None
+            }
+        }
+    }
+
+    /// Asks the installed release source once, on a background thread, for
+    /// the newest release, whatever the start-up switch says and without
+    /// skipping any version; reports through the sink as
+    /// [`ShellEvent::UpdateCheckedNow`]. Returns `None` and asks nothing
+    /// while a check runs or without a source.
+    pub fn check_for_updates_now(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        if self.update_status == UpdateStatus::Checking {
+            return None;
+        }
+        let source = (self.release_source.as_ref()?)();
+        let sink = self.sink.clone();
+        self.update_status = UpdateStatus::Checking;
+        let spawned = std::thread::Builder::new()
+            .name("update-check-now".into())
+            .spawn(move || {
+                let outcome = job::check_for_update(&*source, env!("CARGO_PKG_VERSION"), None);
+                if let Some(sink) = sink {
+                    sink(ShellEvent::UpdateCheckedNow(outcome));
+                }
+            });
+        match spawned {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                self.update_status = UpdateStatus::Failed(err.to_string());
+                None
+            }
+        }
+    }
+
+    /// Stores a Check now result as the status; publishes nothing.
+    pub fn finish_check_now(&mut self, outcome: job::UpdateCheck) {
+        use job::CheckFailure;
+        self.update_status = match outcome {
+            job::UpdateCheck::UpToDate => UpdateStatus::UpToDate,
+            job::UpdateCheck::Newer { version, url } => UpdateStatus::Newer {
+                version: version.to_string(),
+                url,
+            },
+            job::UpdateCheck::Failed(CheckFailure::Source(reason)) => UpdateStatus::Failed(reason),
+            job::UpdateCheck::Failed(other) => UpdateStatus::Failed(other.to_string()),
+        };
+    }
+
+    /// Puts the About tab's update controls into one literal state -- `idle`,
+    /// `checking`, `up-to-date`, `newer`, `skipped`, `failed` or `save-error`
+    /// -- without a network request, running Check now against a canned
+    /// release source for the states that show a result. Callers validate the
+    /// name first; an unknown one leaves the controls idle.
+    pub fn set_about_preview(&mut self, state: &str) -> Option<std::thread::JoinHandle<()>> {
+        let make: fn() -> PreviewRelease = match state {
+            "newer" | "skipped" => || PreviewRelease::new("999.0.0"),
+            "up-to-date" => || PreviewRelease::new("0.0.1"),
+            "checking" => PreviewRelease::slow,
+            "failed" => PreviewRelease::failing,
+            "save-error" => {
+                self.updates_save_error = Some(
+                    crate::settings::WriteError::CreateDir {
+                        path: self.state.config_dir.clone().unwrap_or_default(),
+                        source: std::io::ErrorKind::PermissionDenied.into(),
+                    }
+                    .to_string(),
+                );
+                return None;
+            }
+            _ => return None,
+        };
+        if state == "skipped" {
+            self.updates.skipped_version = Some("999.0.0".to_owned());
+        }
+        self.set_release_source(Arc::new(move || Box::new(make())));
+        self.check_for_updates_now()
+    }
+
+    /// Publishes the notice for a newer release; every other outcome is
+    /// logged and dropped.
+    pub fn finish_update_check(&mut self, outcome: job::UpdateCheck) {
+        use job::UpdateCheck;
+        match outcome {
+            UpdateCheck::Newer { version, url } => {
+                let mut record = Notification::new(
+                    Kind::Info,
+                    Source::Startup,
+                    format!("FocusForge {version} is available"),
+                    format!("FocusForge {version} has been released. Download page: {url}"),
+                );
+                record.url = Some(url);
+                self.publish_notification(record);
+            }
+            UpdateCheck::UpToDate => tracing::debug!("update check: up to date"),
+            UpdateCheck::Failed(reason) => tracing::debug!("update check failed: {reason}"),
+        }
     }
 
     /// Stores a background write's outcome -- called once

@@ -55,6 +55,7 @@
 - Export TIFF, PNG or JPEG with your camera metadata, colour profile and keywords intact
 - Hand a RAW stack's result to a raw converter as a linear DNG, with exposure and white balance adjustable there
 - If something breaks, FocusForge packs a privacy-safe report you can send in
+- Learn when a newer release exists: a quiet notice at start, or `focusforge-cli check-update`
 
 Details for each are in the [guides](docs/README.md).
 
@@ -130,6 +131,17 @@ target/release/focusforge-gui --open path/to/frames/
 Opens the same folder into a window instead of the command line, one tab
 per detected stack. See [`docs/guide/gui.md`](docs/guide/gui.md).
 
+## Network use
+
+FocusForge makes one network request: at start, in the background, it asks
+the release server whether a newer final release exists. The request is a
+single HTTPS GET that waits at most 5 seconds and carries only the client
+name `FocusForge/<version>`: no identifier, setting or file data. Nothing is
+downloaded or installed, and a failed check stays silent. Turn it off with
+**Settings → About → Check for updates at start**; with it off no request is
+made. **Check now** and `focusforge-cli check-update` run the same check on
+demand.
+
 ## Documentation
 
 The user manual is an mdBook whose source is in [`docs/`](docs/README.md). It
@@ -141,7 +153,7 @@ reads and writes.
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for layout, tests and the contribution gate;
+Open pull requests against `develop`. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for layout, tests and the contribution gate;
 [Code of Conduct](CODE_OF_CONDUCT.md), [Security policy](SECURITY.md) and [changelog](CHANGELOG.md) set community standards.
 
 ## License

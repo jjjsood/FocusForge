@@ -58,8 +58,8 @@ See: [Paint a stroke](guide/retouch.md#paint-a-stroke).
 
 ## Budget
 
-The amount of memory FocusForge allows itself for a fuse: the **Host
-budget** (40 % of the memory free when a run starts) and the **VRAM budget**
+The amount of memory FocusForge allows itself for a fuse: the host
+memory budget (40 % of the memory free when a run starts) and the VRAM budget
 on the graphics card, measured the first time a fuse uses it. FocusForge
 works through a stack in pieces so that it stays within its budget.
 See: [Memory caps and budgets](guide/settings-window.md#memory-caps-and-budgets).
@@ -77,8 +77,8 @@ and [Choose a file format](stacking/shooting-practice.md#choose-a-file-format).
 
 ## Cap
 
-A memory ceiling you set yourself on top of a [budget](#budget): **Host
-memory cap** and **VRAM cap**. A cap can only lower a budget, never raise
+A memory ceiling you set yourself on top of a [budget](#budget): the **Host
+memory** and **VRAM** limits. A cap can only lower a budget, never raise
 it; a lower cap can make a fuse slower but never changes the result.
 See: [Memory caps and budgets](guide/settings-window.md#memory-caps-and-budgets).
 

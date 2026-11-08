@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // One analytics row: a colour chip, the name, an optional rail position, a
-// bar filled to `fraction`, and the right-aligned count.
+// bar filled to `fraction`, and the right-aligned count. A value that is not
+// final shows a spinner in the count column instead of the number.
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
 import { FFProgressBar } from "ff_progress_bar.slint";
+import { FFSpinner } from "ff_spinner.slint";
 
 export component FFAnalyticsRow inherits Rectangle {
     in property <color> chip;
@@ -15,6 +17,9 @@ export component FFAnalyticsRow inherits Rectangle {
     in property <string> mm-text: "";
     in property <float> fraction: 0.0;
     in property <int> count: 0;
+    // "pending" (no report yet: sweeping bar), "partial" (bar filled from the
+    // counts so far) or "final". Pending and partial rows carry the spinner.
+    in property <string> value-state: "final";
 
     property <length> name-x: ShellGeometry.analytics-row-inset + ShellGeometry.image-chip-size + Theme.space-2;
     property <length> bar-x: root.name-x + ShellGeometry.analytics-name-width + ShellGeometry.analytics-mm-width;
@@ -58,8 +63,13 @@ export component FFAnalyticsRow inherits Rectangle {
         thickness: ShellGeometry.analytics-bar-height;
         corner-radius: Theme.radius-xs;
         fraction: root.fraction;
+        indeterminate: root.value-state == "pending";
     }
-    Text {
+    if root.value-state != "final": FFSpinner {
+        x: root.width - ShellGeometry.analytics-row-inset - self.width;
+        y: (parent.height - self.height) / 2;
+    }
+    if root.value-state == "final": Text {
         x: root.width - ShellGeometry.analytics-row-inset - ShellGeometry.analytics-count-width;
         width: ShellGeometry.analytics-count-width;
         height: 100%;

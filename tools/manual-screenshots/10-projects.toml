@@ -1,10 +1,14 @@
 # Projects, notifications and quitting (docs/guide/batch-runs.md).
 # The crash shot copies seeds/crash-record (one panic report under
 # focusforge/crashes/) into its own scratch data folder; no other shot sees it.
+#
+# Shots that print a path open copies staged under /tmp/focusforge-demo, from the checkout root:
+#   mkdir -p /tmp/focusforge-demo && cp -r fixtures/open-rejected fixtures/open-root-and-subfolder /tmp/focusforge-demo/
+#   cp .scratch/Mantis/mantis-512-fused.ffp /tmp/focusforge-demo/   # after `tools/manual-screenshots.py seed`
 
 [[shot]]
 name  = "projects-overview"
-args  = ["--open", ".scratch/Mantis/mantis-512-fused.ffp", "--open", "fixtures/mantis-512/frames", "--projects-overlay"]
+args  = ["--open", "/tmp/focusforge-demo/mantis-512-fused.ffp", "--open", "fixtures/mantis-512/frames", "--projects-overlay"]
 steps = [
   ["wait-text", "2 open", "120"],
   ["wait-text", "8 frames · 1 checkpoint", "60"],
@@ -30,7 +34,7 @@ pad   = 16
 
 [[shot]]
 name  = "projects-failure-cards"
-args  = ["--open", "fixtures/open-rejected", "--open", "fixtures/open-root-and-subfolder", "--open", "fixtures/projects/missing.ffp", "--fuse-tabs", "0"]
+args  = ["--open", "/tmp/focusforge-demo/open-rejected", "--open", "/tmp/focusforge-demo/open-root-and-subfolder", "--open", "fixtures/projects/missing.ffp", "--fuse-tabs", "0"]
 steps = [
   ["wait-id", "AppWindow::sources-missing-dialog", "120"],
   ["click-label", "Close dialog", "AppWindow::sources-missing-dialog"],
@@ -62,7 +66,7 @@ pad   = 16
 
 [[shot]]
 name  = "notify-center"
-args  = ["--open", "fixtures/open-root-and-subfolder", "--open", "fixtures/open-rejected", "--fuse-tabs", "1"]
+args  = ["--open", "/tmp/focusforge-demo/open-root-and-subfolder", "--open", "/tmp/focusforge-demo/open-rejected", "--fuse-tabs", "1"]
 steps = [
   ["wait-text", "Failed", "120"],
   ["click-id", "FFIconBar::bell"],

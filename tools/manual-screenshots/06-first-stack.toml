@@ -18,7 +18,7 @@ name  = "first-stack-grouping-question"
 args  = ["--open", "fixtures/open-two-stacks"]
 steps = [
   ["wait-id", "AppWindow::grouping-question", "90"],
-  ["wait-text", "This folder reads as 2 stacks of 6 frames.", "30"],
+  ["wait-text", "This folder holds 2 stacks of 3 frames each.", "30"],
   ["wait-id", "FFGroupingQuestion::many-button", "10"],
   ["pause", "500"],
 ]
@@ -30,7 +30,7 @@ pad   = 16
 name  = "first-stack-no-frames"
 args  = ["--open", "fixtures/retouch"]
 steps = [
-  ["wait-id", "FFRefusalDialog::pick-area", "90"],
+  ["wait-id", "AppWindow::refusal-dialog", "90"],
   ["wait-text", "This folder holds none.", "30"],
   ["pause", "500"],
 ]
@@ -52,7 +52,7 @@ out   = "assets/manual/first-stack/one-frame.png"
 name  = "first-stack-not-a-project"
 args  = ["--open", "fixtures/projects/corrupt.ffp"]
 steps = [
-  ["wait-id", "FFRefusalDialog::pick-area", "90"],
+  ["wait-id", "AppWindow::refusal-dialog", "90"],
   ["wait-text", "This project cannot be opened", "30"],
   ["wait-text", "This file is not a FocusForge project.", "10"],
   ["pause", "500"],

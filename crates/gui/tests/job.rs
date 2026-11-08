@@ -1016,9 +1016,9 @@ fn failure_summary_names_the_failed_operation() {
             .notifications()
             .last()
             .expect("the failed run must append a notification");
-        assert_eq!(notification.message, message);
-        assert_eq!(notification.title, job::FailedOperation::Setup.summary());
-        setup_summary = job::FailedOperation::Setup.summary();
+        assert!(notification.message.ends_with(&message));
+        assert_eq!(notification.title, "Setup failed");
+        setup_summary = "Setup failed";
     }
 
     let fusion_summary;
@@ -1038,9 +1038,24 @@ fn failure_summary_names_the_failed_operation() {
             .notifications()
             .last()
             .expect("the failed run must append a notification");
-        assert_eq!(notification.message, message);
-        assert_eq!(notification.title, job::FailedOperation::Fusion.summary());
-        fusion_summary = job::FailedOperation::Fusion.summary();
+        assert!(notification.message.ends_with(&message));
+        // The staging directory is made after preparation and alignment, but
+        // before the fuse stage is announced, so the phase the last progress
+        // sample names (Preparing, Aligning or Fusing) depends on whether the
+        // poll thread ticked in between. Title and card stage must agree on it
+        // whichever it was, and it is never a setup or alignment failure.
+        let cards = controller.project_cards();
+        let card = cards
+            .iter()
+            .find(|card| card.kind == "failed")
+            .expect("the failed run must leave a failed card");
+        let title = match card.stage.as_str() {
+            "FAILED WHILE PREPARING" => "Preparing failed",
+            "FAILED WHILE FUSING" => "Fusing failed",
+            other => panic!("a staging failure must read as preparing or fusing, got {other:?}"),
+        };
+        assert_eq!(notification.title, title);
+        fusion_summary = title;
     }
 
     let mut summaries = vec![alignment_summary, setup_summary, fusion_summary];
@@ -1051,6 +1066,67 @@ fn failure_summary_names_the_failed_operation() {
         3,
         "the three summaries must be pairwise distinct"
     );
+}
+
+/// The lead names the file the error text names -- here the last of four
+/// frames, not a fixed index -- with no TIFF detail, and the raw error follows
+/// on the next line while the tab's own message and the card's reason stay raw.
+#[test]
+fn a_failed_run_names_the_damaged_file_first() {
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(common::tree("lead_scratch"));
+    add_unreadable_tab(&mut controller, "lead", 4);
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, Duration::from_secs(60));
+    let raw = controller
+        .job_failure_message()
+        .expect("a failed run must carry its own message")
+        .to_string();
+    let record = controller
+        .notifications()
+        .last()
+        .expect("the failed run must append a notification");
+    let (lead, rest) = record
+        .message
+        .split_once('\n')
+        .expect("the record is a lead line, then the raw error");
+    assert_eq!(
+        lead,
+        "03.tif could not be read. It may be damaged, or it changed after the folder was opened."
+    );
+    for banned in ["IFD", "tag", "/"] {
+        assert!(!lead.contains(banned), "{banned:?} in {lead:?}");
+    }
+    assert_eq!(rest, raw);
+    let cards = controller.project_cards();
+    assert_eq!(cards[0].reason, raw);
+}
+
+/// A worker that stops without a pipeline error names no file; its record
+/// leads with the phase it stopped in, and title and stage agree.
+#[test]
+fn a_stopped_worker_failure_reads_plainly() {
+    let frames = vec![
+        PathBuf::from("/frames/00.tif"),
+        PathBuf::from("/frames/01.tif"),
+    ];
+    let settled = job::settle(
+        Err(Box::new("worker panic")),
+        &frames,
+        &job::GuiObserver::default(),
+    );
+    assert_eq!(settled.failed_file, None);
+    let operation = settled
+        .operation
+        .expect("a failed settle names its operation");
+    let copy = job::failure_copy(
+        operation,
+        job::Phase::Fusing,
+        settled.failed_file.as_deref(),
+    );
+    assert_eq!(copy.lead, "The run stopped while fusing.");
+    assert_eq!(copy.title, "Fusing failed");
+    assert_eq!(copy.stage, "FAILED WHILE FUSING");
 }
 
 #[test]
@@ -2170,7 +2246,7 @@ fn failure_notifications_outlive_the_toast() {
         .last()
         .cloned()
         .expect("the most recent failure must be recorded");
-    assert_eq!(latest.message, message_b);
+    assert!(latest.message.ends_with(&message_b));
 
     let mut retry_messages = Vec::new();
     for _ in 0..2 {
@@ -2196,11 +2272,8 @@ fn failure_notifications_outlive_the_toast() {
         "every failure must be recorded, in order"
     );
 
-    assert_eq!(notifications[0].message, message_a);
-    assert_eq!(
-        notifications[0].title,
-        job::FailedOperation::Setup.summary()
-    );
+    assert!(notifications[0].message.ends_with(&message_a));
+    assert_eq!(notifications[0].title, "Setup failed");
     assert_eq!(notifications[0].project_title, Some(title_a));
     assert_eq!(notifications[0].project_path, Some(path_a));
     assert_eq!(notifications[0].target, None);
@@ -2210,8 +2283,8 @@ fn failure_notifications_outlive_the_toast() {
         (&notifications[2], &retry_messages[0]),
         (&notifications[3], &retry_messages[1]),
     ] {
-        assert_eq!(notification.message, *message);
-        assert_eq!(notification.title, job::FailedOperation::Setup.summary());
+        assert!(notification.message.ends_with(message.as_str()));
+        assert_eq!(notification.title, "Setup failed");
         assert_eq!(notification.project_title, Some(title_b.clone()));
         assert_eq!(notification.project_path, Some(path_b.clone()));
         assert_eq!(notification.target, None);

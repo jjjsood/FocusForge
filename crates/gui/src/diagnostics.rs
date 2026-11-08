@@ -115,11 +115,15 @@ pub fn clamp_manifest_scroll(offset: f32, content_height: f32, viewport_height: 
     offset.clamp(0.0, (content_height - viewport_height).max(0.0))
 }
 
-/// Renders a byte count the way the panel's value column does: whole
-/// kilobytes below a megabyte, one decimal place above.
+/// Renders a byte count the way the panel's value column does: whole bytes
+/// below a kilobyte, whole kilobytes below a megabyte, one decimal place
+/// above.
 pub fn size_text(bytes: u64) -> String {
+    const KB: u64 = 1024;
     const MB: u64 = 1024 * 1024;
-    if bytes < MB {
+    if bytes < KB {
+        format!("{bytes} B")
+    } else if bytes < MB {
         format!("{} KB", (bytes as f64 / 1024.0).round() as u64)
     } else {
         format!("{:.1} MB", bytes as f64 / MB as f64)

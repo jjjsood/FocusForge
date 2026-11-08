@@ -26,16 +26,19 @@ crop  = "FFModalPanel::panel"
 pad   = 8
 
 [[shot]]
-name  = "settings-invalid-cap"
+name  = "settings-cap-over-maximum"
 args  = ["--open", "fixtures/mantis-512/frames", "--settings-section", "performance"]
 steps = [
   ["wait-id", "AppWindow::settings-modal"],
   ["wait-text", "Not probed yet"],
   ["click-id", "FFTextField::input", "0"],
-  ["type", "8G"],
+  ["key", "Backspace"], ["key", "Backspace"], ["key", "Backspace"],
+  ["key", "Backspace"], ["key", "Backspace"], ["key", "Backspace"],
+  ["type", "99999"],
+  ["key", "Return"],
   ["pause", "800"],
 ]
-out   = "assets/manual/settings-window/settings-invalid-cap.png"
+out   = "assets/manual/settings-window/settings-cap-over-maximum.png"
 crop  = "FFModalPanel::panel"
 pad   = 8
 
@@ -148,8 +151,34 @@ pad   = 8
 
 [[shot]]
 name  = "settings-about"
-args  = ["--open", "fixtures/mantis-512/frames", "--settings-section", "about"]
+args  = ["--open", "fixtures/mantis-512/frames", "--settings-section", "about", "--about-preview", "idle"]
+config = "seeds/updates/check-on.toml"
 steps = [["wait-id", "AppWindow::settings-modal"], ["wait-text", "github.com/jjjsood/FocusForge"], ["pause", "800"]]
 out   = "assets/manual/settings-window/settings-about.png"
 crop  = "FFModalPanel::panel"
+pad   = 8
+
+[[shot]]
+name  = "settings-about-newer"
+args  = ["--open", "fixtures/mantis-512/frames", "--settings-section", "about", "--update-notice-preview", "0.2.0"]
+config = "seeds/updates/check-on.toml"
+steps = [
+  ["wait-id", "AppWindow::settings-modal"],
+  ["wait-id", "AppWindow::toast"],
+  ["wait-gone", "AppWindow::toast", "30"],
+  ["click-label", "Check now"],
+  ["wait-text", "is available."],
+  ["pause", "800"],
+]
+out   = "assets/manual/settings-window/settings-about-newer.png"
+crop  = "FFModalPanel::panel"
+pad   = 8
+
+[[shot]]
+name  = "update-notice"
+args  = ["--open", "fixtures/mantis-512/frames", "--update-notice-preview", "0.2.0"]
+config = "seeds/updates/check-on.toml"
+steps = [["wait-id", "AppWindow::toast"], ["pause", "500"]]
+out   = "assets/manual/notifications/update-notice.png"
+crop  = "AppWindow::toast"
 pad   = 8

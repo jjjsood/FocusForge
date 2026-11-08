@@ -149,6 +149,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: true,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "weight-exponent".to_string(),
@@ -167,6 +168,7 @@ static PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
     ]
 });

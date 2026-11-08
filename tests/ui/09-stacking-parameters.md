@@ -27,13 +27,13 @@ Start: --open fixtures/mantis-64/frames --open fixtures/mantis-512/frames --dock
 11. Click the **Algorithm** menu under FUSE (`FFMenu::root` 0).
    Expect: a list opens under it with the entries "Details", "Soft transitions" and "Focus map" in that order, their ids "laplacian", "weighted-average" and "depth-map" in grey, and a check mark beside "Details"; the list has 3 entries.
 12. Click the entry **Soft transitions**, grey id "weighted-average" (`FFMenuList::option-area` 1).
-   Expect: the list is gone; the field reads "Soft transitions"; a row "Sharp-source preference" with a value field reading "4" appears under FUSE; the FUSE heading still shows its "DEFAULT" badge.
+   Expect: the list is gone; the field reads "Soft transitions"; a row "Sharp-source preference" with a readout reading "4.0" appears under FUSE; the FUSE heading still shows its "DEFAULT" badge.
 13. Click the **More...** bar under the FUSE heading, the second **More...** bar of the panel (`FFMoreToggle::header-area` 1).
-   Expect: a row "Radius" appears under "More..." with a value field reading "16".
+   Expect: a row "Radius" appears under "More..." with a readout reading "16".
 14. Click the middle of the track of the **Sharp-source preference** slider (`FFSlider::drag-area` 0).
-   Expect: the value field reads a number from 4.4 to 4.6 and the FUSE heading has no "DEFAULT" badge.
+   Expect: the readout reads 4.4, 4.5 or 4.6 and the FUSE heading has no "DEFAULT" badge.
 15. Click the middle of the track of the **Radius** slider (`FFSlider::drag-area` 1).
-   Expect: the Radius value field reads "8".
+   Expect: the Radius readout reads "8".
 16. Click the **Algorithm** menu under FUSE (`FFMenu::root` 0).
    Expect: the list opens with a check mark beside "Soft transitions" (grey id "weighted-average").
 17. Click the entry **Focus map**, grey id "depth-map", the last entry of the list (`FFMenuList::option-area` 2).

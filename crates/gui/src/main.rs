@@ -31,6 +31,10 @@ use slint::winit_030::{SlintEvent, WinitWindowAccessor, winit};
 #[derive(Parser)]
 #[command(name = "focusforge-gui", version)]
 struct Args {
+    /// Frames, a folder or a `*.ffp` to open together, as dropping them on the
+    /// window would. A file manager's "Open with" passes its selection here.
+    #[arg(value_name = "PATH")]
+    paths: Vec<PathBuf>,
     /// Exit this many milliseconds after the window is shown.
     #[arg(long)]
     exit_after: Option<u64>,
@@ -41,7 +45,7 @@ struct Args {
     /// Choose the main or detached window for `--screenshot`.
     #[arg(long, value_enum, default_value = "main", requires = "screenshot")]
     screenshot_window: ScreenshotWindow,
-    /// Undock a pane once a project loads, for window inspection.
+    /// Undock a pane once the `--open` project loads, for window inspection.
     #[arg(long, value_enum, requires = "open")]
     undock_pane: Option<UndockPane>,
     /// Dock the inspected pane this many milliseconds after undocking.
@@ -65,10 +69,24 @@ struct Args {
     /// order, one `open_paths` call per path.
     #[arg(long, action = clap::ArgAction::Append)]
     open: Vec<PathBuf>,
-    /// Read and write the input map at `<DIR>/focusforge/settings.toml`'s
-    /// `[input]` table instead of the platform config directory.
+    /// Read and write `<DIR>/focusforge/settings.toml` -- recent projects,
+    /// appearance, input map, export choice and performance -- instead of
+    /// the one in the platform config directory.
     #[arg(long)]
     config_dir: Option<PathBuf>,
+    /// Shows the notice for a newer release of this version without asking
+    /// the release server; nothing with the start-up check switched off.
+    #[arg(long, hide = true, value_name = "VERSION")]
+    update_notice_preview: Option<String>,
+    /// Shows one state of the About tab's update controls without asking the
+    /// release server; use with `--settings-section about`.
+    #[arg(
+        long,
+        hide = true,
+        value_name = "STATE",
+        value_parser = ["idle", "checking", "up-to-date", "newer", "skipped", "failed", "save-error"]
+    )]
+    about_preview: Option<String>,
     /// Opens the settings modal on the named section at startup:
     /// `performance`, `appearance`, `storage`, `input-map`, `diagnostics` or `about`.
     #[arg(long)]
@@ -116,12 +134,18 @@ struct Args {
     /// Opens the step calculator overlay at startup.
     #[arg(long)]
     calculator: bool,
-    /// Opens the Analytics overlay once the `--open` load has landed.
-    #[arg(long, requires = "open")]
+    /// Opens the Analytics overlay once the `--open` load, if any, has landed.
+    #[arg(long)]
     analytics: bool,
     /// With `--analytics`, holds the count's worker for MS milliseconds.
     #[arg(long, requires = "analytics", value_name = "MS")]
     analytics_hold_ms: Option<u64>,
+    /// With `--analytics`, counts in tiles of PX pixels.
+    #[arg(long, requires = "analytics", value_name = "PX")]
+    analytics_tile_size: Option<u32>,
+    /// With `--analytics`, pauses the count MS milliseconds after each tile.
+    #[arg(long, requires = "analytics", value_name = "MS")]
+    analytics_tile_pause_ms: Option<u64>,
     /// With `--calculator`, selects the objective optics.
     #[arg(long, requires = "calculator")]
     calculator_objective: bool,
@@ -154,9 +178,9 @@ struct Args {
     /// the editor surface with no click sequence.
     #[arg(long, requires = "fuse_tabs")]
     enter_editor: bool,
-    /// Requests removing the frame at this index right after `--open`, for
-    /// inspecting the frame-set warning it raises on a checkpointed project
-    /// with no click sequence.
+    /// Presses the remove control of the frame at this index once the opened
+    /// project has loaded, for inspecting the frame-set warning it raises on
+    /// a checkpointed project with no click sequence.
     #[arg(long)]
     frame_remove_warning: Option<usize>,
     /// Presses `Export image` on the active tab's current row once `--open`
@@ -265,7 +289,7 @@ fn apply_export_dialog_preview(app: &AppWindow, spec: &str) {
     let open = (variant == "menu").then_some("tiff-compression");
     focusforge_gui::bridge::push_export_view(app, &choice.view(open));
     app.set_export_open(true);
-    app.set_export_context("mantis-512.ffp · ORB · 2026-09-28 14:32".into());
+    app.set_export_context("mantis-512.ffp · Details · 2026-09-28 14:32".into());
     app.set_export_what("Exporting the saved checkpoint you selected.".into());
     app.set_export_stage(stage.into());
     app.set_export_writing_file_name(if stage == "writing" {
@@ -398,6 +422,50 @@ fn start_fuse_tabs_timer(
         }
     });
     *slot.borrow_mut() = Some(timer);
+}
+
+/// Presses the remove control of frame `index` once every `--open` load has
+/// settled (`open_timer` is the load timer starting them), so the press acts
+/// on the last-opened project and raises its frame-set warning. With nothing
+/// to open it fires on the first tick.
+fn start_frame_remove_timer(
+    app_weak: slint::Weak<AppWindow>,
+    controller: Arc<Mutex<AppController>>,
+    slot: &Rc<RefCell<Option<slint::Timer>>>,
+    index: usize,
+    open_timer: &Rc<RefCell<Option<slint::Timer>>>,
+) {
+    let timer_slot = slot.clone();
+    let open_timer = open_timer.clone();
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, job::POLL, move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if controller.lock().unwrap().load_in_flight()
+            || open_timer
+                .borrow()
+                .as_ref()
+                .is_some_and(slint::Timer::running)
+        {
+            return;
+        }
+        app.invoke_images_frame_remove_requested(index as i32);
+        if let Some(t) = timer_slot.borrow().as_ref() {
+            t.stop();
+        }
+    });
+    *slot.borrow_mut() = Some(timer);
+}
+
+/// The first load a launch starts and the `--open` paths queued behind it:
+/// the positional paths together, else the first `--open` path alone.
+fn startup_loads(args: &Args) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+    if !args.paths.is_empty() {
+        return Some((args.paths.clone(), args.open.clone()));
+    }
+    let (first, rest) = args.open.split_first()?;
+    Some((vec![first.clone()], rest.to_vec()))
 }
 
 /// Presses `Export image` and confirms with the proposed destination once
@@ -1092,17 +1160,8 @@ fn install_input_table(
 
     let mut controller = controller.lock().unwrap();
     controller.install_input_table(loaded.table);
-
-    let rows: Vec<focusforge_gui::InputRow> = controller
-        .input_rows()
-        .into_iter()
-        .map(|r| focusforge_gui::InputRow {
-            input: r.input.into(),
-            stacking: r.stacking.into(),
-            editor: r.editor.into(),
-        })
-        .collect();
-    app.set_input_rows(std::rc::Rc::new(slint::VecModel::from(rows)).into());
+    controller.install_input_source(&loaded.provenance, &loaded.problems);
+    focusforge_gui::bridge::push_input_map_view(app, &controller);
 
     if let Some(section) = &args.settings_section {
         controller.open_settings();
@@ -1761,10 +1820,10 @@ fn install_diagnostics(
     controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
     app: &AppWindow,
 ) {
-    controller.lock().unwrap().set_diagnostics_dirs(
-        focusforge_diagnostics::data_dir_from_env(),
-        focusforge_diagnostics::config_dir_from_env(),
-    );
+    controller
+        .lock()
+        .unwrap()
+        .set_diagnostics_dirs(focusforge_diagnostics::data_dir_from_env());
     let _ = controller.lock().unwrap().start_manifest_scan();
     focusforge_gui::bridge::push_diagnostics_view(app, controller);
 }
@@ -1780,25 +1839,52 @@ fn install_recent(
     args: &Args,
 ) {
     let Some(config_dir) = resolve_config_dir(args) else {
-        controller.lock().unwrap().install_performance(
+        let mut controller = controller.lock().unwrap();
+        controller.install_performance(
             focusforge_gui::performance_settings::PerformanceSettings::default(),
         );
+        controller.install_updates(focusforge_gui::update_settings::UpdateSettings::default());
         return;
     };
     let entries = focusforge_gui::recent::load(&config_dir);
     let choice = focusforge_gui::export_settings::load(&config_dir);
     let performance = focusforge_gui::performance_settings::load(&config_dir);
     let appearance = focusforge_gui::appearance_settings::load(&config_dir);
+    let updates = focusforge_gui::update_settings::load(&config_dir);
     let mut controller = controller.lock().unwrap();
     controller.install_export_choice(choice);
     controller.install_performance(performance);
     controller.install_appearance(appearance);
+    controller.install_updates(updates);
     app.set_appearance_presentation(controller.source_presentation().slug().into());
     app.set_appearance_sharpness_heatmap(controller.sharpness_heatmap());
     app.set_appearance_reduce_motion(controller.reduce_motion());
     app.global::<Theme>()
         .set_reduce_motion(controller.reduce_motion());
     controller.install_recent(entries, config_dir);
+}
+
+/// Installs the release source behind Check now and starts the
+/// once-per-start update check from the installed `[updates]` settings: the
+/// preview release when `--update-notice-preview` names a version, else the
+/// latest GitHub release.
+fn start_update_check(
+    controller: &std::sync::Arc<std::sync::Mutex<focusforge_gui::AppController>>,
+    args: &Args,
+) {
+    let preview = args.update_notice_preview.clone();
+    let factory: focusforge_gui::ReleaseSourceFactory =
+        std::sync::Arc::new(move || match &preview {
+            Some(version) => Box::new(focusforge_gui::update_settings::PreviewRelease::new(
+                version,
+            )) as Box<dyn focusforge_gui::job::ReleaseSource + Send>,
+            None => Box::new(focusforge_gui::job::HttpReleaseSource::new()),
+        });
+    let mut controller = controller.lock().unwrap();
+    let settings = controller.update_settings().clone();
+    controller.set_release_source(factory.clone());
+    // The thread reports through the sink and needs no join.
+    drop(controller.start_update_check(&settings, factory()));
 }
 
 /// Parses a whole number of at least 1; `None` for anything else, including
@@ -1980,7 +2066,8 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
     // Built before `select_backend`: the drop route (`bridge::DropHandler`)
     // installs on the `BackendSelector` chain before any window exists, and
     // needs the same renderer cell every other open path feeds.
-    let controller_state = AppController::new();
+    let mut controller_state = AppController::new();
+    controller_state.set_analytics_background(true);
     let controller = Arc::new(Mutex::new(controller_state));
     let canvas: Rc<RefCell<Canvas>> = Rc::new(RefCell::new(Canvas::default()));
     let app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>> = Rc::new(RefCell::new(None));
@@ -2018,14 +2105,20 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
 
         install_input_table(&controller, &app, args);
         apply_appearance_preview(&app, args.appearance_preview);
+        install_recent(&controller, &app, args);
         install_diagnostics(&controller, &app);
         bridge::install_crash_notice(&controller, &app, &toast_timer);
-        install_recent(&controller, &app, args);
+        match &args.about_preview {
+            // The check reports through the sink and needs no join.
+            Some(state) => drop(controller.lock().unwrap().set_about_preview(state)),
+            None => start_update_check(&controller, args),
+        }
         install_slow_down(&controller, args);
         install_save_folder(args);
         bridge::push_performance_view(&app, &controller);
         bridge::push_storage_view(&app, &controller);
         bridge::push_about_view(&app);
+        bridge::push_update_controls_view(&app, &controller);
 
         if let Some(state) = &args.toolbar_state {
             let mut controller = controller.lock().unwrap();
@@ -2037,21 +2130,18 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
         }
 
         // Each load runs on its own worker thread; a refusal reaches the
-        // window's own refusal dialog. Only the first `--open` path starts
-        // here -- the load timer starts each of the rest in turn once the
-        // one before it settles, and repaints once the last one has.
+        // window's own refusal dialog. Only the first load starts here -- the
+        // load timer starts each queued `--open` path in turn once the one
+        // before it settles, and repaints once the last one has.
         let open_wait_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
-        if let Some((first, rest)) = args.open.split_first() {
-            controller
-                .lock()
-                .unwrap()
-                .open_paths(std::slice::from_ref(first));
+        if let Some((first, queued)) = startup_loads(args) {
+            controller.lock().unwrap().open_paths(&first);
             bridge::start_load_timer(
                 app.as_weak(),
                 controller.clone(),
                 canvas.clone(),
                 &open_wait_timer,
-                rest.to_vec(),
+                queued,
             );
         }
 
@@ -2063,9 +2153,18 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
                     .unwrap()
                     .set_analytics_hold(Duration::from_millis(ms));
             }
+            if let Some(size) = args.analytics_tile_size {
+                controller.lock().unwrap().set_analytics_tile_size(size);
+            }
+            if let Some(ms) = args.analytics_tile_pause_ms {
+                controller
+                    .lock()
+                    .unwrap()
+                    .set_analytics_tile_pause(Duration::from_millis(ms));
+            }
             let controller = controller.clone();
             let timer = analytics_timer.clone();
-            let tabs = args.open.len();
+            let tabs = args.open.len() + usize::from(!args.paths.is_empty());
             analytics_timer.start(
                 slint::TimerMode::Repeated,
                 Duration::from_millis(50),
@@ -2073,10 +2172,7 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
                     let mut controller = controller.lock().unwrap();
                     // Every `--open` has produced a tab; a later load would
                     // switch tabs and close the overlay.
-                    if controller.load_in_flight()
-                        || !controller.analytics_enabled()
-                        || controller.project_tabs().len() < tabs
-                    {
+                    if controller.load_in_flight() || controller.project_tabs().len() < tabs {
                         return;
                     }
                     controller.toggle_analytics();
@@ -2177,8 +2273,15 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
             }
         }
 
+        let frame_remove_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
         if let Some(index) = args.frame_remove_warning {
-            controller.lock().unwrap().remove_frame(index);
+            start_frame_remove_timer(
+                app.as_weak(),
+                controller.clone(),
+                &frame_remove_timer,
+                index,
+                &open_wait_timer,
+            );
         }
 
         let export_active_row_timer: Rc<RefCell<Option<slint::Timer>>> =
@@ -2226,6 +2329,56 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
 mod tests {
     use super::*;
 
+    /// `count` of the mantis-64 frames copied into `<parent>/<name>`.
+    fn mantis_folder(parent: &Path, name: &str, count: usize) -> PathBuf {
+        let root = parent.join(name);
+        std::fs::create_dir(&root).unwrap();
+        for index in 0..count {
+            let frame = format!("{index:02}.tif");
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/mantis-64/frames")
+                    .join(&frame),
+                root.join(frame),
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    /// Advances the timers and the load worker's completion, which this
+    /// backend has no event loop to deliver, until no load or run is pending
+    /// and every timer in `slots` has stopped.
+    fn pump_until_settled(
+        app: &AppWindow,
+        controller: &Arc<Mutex<AppController>>,
+        slots: &[&Rc<RefCell<Option<slint::Timer>>>],
+    ) {
+        let started = std::time::Instant::now();
+        loop {
+            i_slint_backend_testing::mock_elapsed_time(job::POLL);
+            if controller.lock().unwrap().settle_open().is_some() {
+                bridge::push_projects(app, controller);
+            }
+            let idle = {
+                let controller = controller.lock().unwrap();
+                !controller.load_in_flight() && !controller.work_pending()
+            };
+            if idle
+                && !slots
+                    .iter()
+                    .any(|slot| slot.borrow().as_ref().is_some_and(slint::Timer::running))
+            {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(120),
+                "runs never settled"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn version_flag_prints_the_binary_name_and_workspace_version() {
         let error = Args::try_parse_from(["focusforge-gui", "--version"])
@@ -2236,6 +2389,41 @@ mod tests {
         let text = error.render().to_string();
         assert!(text.starts_with("focusforge-gui "), "{text}");
         assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+    }
+
+    #[test]
+    fn update_notice_preview_flag_parses_and_stays_out_of_the_help() {
+        use clap::CommandFactory;
+
+        let args =
+            Args::try_parse_from(["focusforge-gui", "--update-notice-preview", "999.0.0"]).unwrap();
+        assert_eq!(args.update_notice_preview.as_deref(), Some("999.0.0"));
+        let help = Args::command().render_long_help().to_string();
+        assert!(!help.contains("update-notice-preview"), "{help}");
+    }
+
+    #[test]
+    fn about_preview_flag_parses_and_stays_out_of_the_help() {
+        use clap::CommandFactory;
+
+        for state in [
+            "idle",
+            "checking",
+            "up-to-date",
+            "newer",
+            "skipped",
+            "failed",
+            "save-error",
+        ] {
+            let args = Args::try_parse_from(["focusforge-gui", "--about-preview", state]).unwrap();
+            assert_eq!(args.about_preview.as_deref(), Some(state));
+        }
+        let rejected = Args::try_parse_from(["focusforge-gui", "--about-preview", "bogus"])
+            .err()
+            .expect("an unknown state is refused at parse time");
+        assert_eq!(rejected.kind(), clap::error::ErrorKind::InvalidValue);
+        let help = Args::command().render_long_help().to_string();
+        assert!(!help.contains("about-preview"), "{help}");
     }
 
     #[test]
@@ -2258,22 +2446,10 @@ mod tests {
         let app = AppWindow::new().unwrap();
         app.window().set_size(slint::PhysicalSize::new(1440, 900));
         let dir = tempfile::tempdir().unwrap();
-        let folder = |name: &str| {
-            let root = dir.path().join(name);
-            std::fs::create_dir(&root).unwrap();
-            for index in 0..3 {
-                let frame = format!("{index:02}.tif");
-                std::fs::copy(
-                    Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join("../../fixtures/mantis-64/frames")
-                        .join(&frame),
-                    root.join(frame),
-                )
-                .unwrap();
-            }
-            root
-        };
-        let (first, second) = (folder("first"), folder("second"));
+        let (first, second) = (
+            mantis_folder(dir.path(), "first", 3),
+            mantis_folder(dir.path(), "second", 3),
+        );
         let mut state = AppController::new();
         state.set_scratch_root_for_test(dir.path().join("scratch"));
         let controller = Arc::new(Mutex::new(state));
@@ -2319,30 +2495,7 @@ mod tests {
             &open_slot,
         );
 
-        let running = |slot: &Rc<RefCell<Option<slint::Timer>>>| {
-            slot.borrow().as_ref().is_some_and(slint::Timer::running)
-        };
-        let started = std::time::Instant::now();
-        loop {
-            i_slint_backend_testing::mock_elapsed_time(job::POLL);
-            // The load worker's completion event, which this backend has no
-            // event loop to deliver.
-            if controller.lock().unwrap().settle_open().is_some() {
-                bridge::push_projects(&app, &controller);
-            }
-            let idle = {
-                let controller = controller.lock().unwrap();
-                !controller.load_in_flight() && !controller.work_pending()
-            };
-            if idle && !running(&open_slot) && !running(&press_slot) {
-                break;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(120),
-                "runs never settled"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        pump_until_settled(&app, &controller, &[&open_slot, &press_slot]);
 
         let mut controller = controller.lock().unwrap();
         assert_eq!(controller.project_tabs().len(), 2);
@@ -2353,6 +2506,126 @@ mod tests {
                 "tab {tab} fused and parked at its own question"
             );
         }
+    }
+
+    /// With two `--open` folders, a frame-remove press must wait until the
+    /// last one has loaded and then act on that tab, not on the first.
+    #[test]
+    fn frame_remove_press_waits_for_every_queued_open() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = AppWindow::new().unwrap();
+        app.window().set_size(slint::PhysicalSize::new(1440, 900));
+        let dir = tempfile::tempdir().unwrap();
+        let first = mantis_folder(dir.path(), "first", 3);
+        let second = mantis_folder(dir.path(), "second", 2);
+        let mut state = AppController::new();
+        state.set_scratch_root_for_test(dir.path().join("scratch"));
+        let controller = Arc::new(Mutex::new(state));
+        let canvas: Rc<RefCell<Canvas>> = Rc::new(RefCell::new(Canvas::default()));
+        let _installed = bridge::install(
+            &app,
+            controller.clone(),
+            canvas.clone(),
+            Rc::new(RefCell::new(None)),
+        );
+
+        let load = controller
+            .lock()
+            .unwrap()
+            .open_paths(std::slice::from_ref(&first))
+            .expect("the first load starts");
+        load.join().unwrap();
+        controller.lock().unwrap().settle_open().unwrap();
+        let open_slot: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+        bridge::start_load_timer(
+            app.as_weak(),
+            controller.clone(),
+            canvas,
+            &open_slot,
+            vec![second],
+        );
+        let press_slot: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+        start_frame_remove_timer(
+            app.as_weak(),
+            controller.clone(),
+            &press_slot,
+            1,
+            &open_slot,
+        );
+
+        pump_until_settled(&app, &controller, &[&open_slot, &press_slot]);
+
+        let mut controller = controller.lock().unwrap();
+        assert_eq!(controller.project_tabs().len(), 2);
+        let frames = |controller: &mut AppController, tab: usize| {
+            controller.select_project(tab);
+            controller.images_panel().rows.len()
+        };
+        assert_eq!(
+            frames(&mut controller, 1),
+            1,
+            "the last-opened tab lost frame 1"
+        );
+        assert_eq!(frames(&mut controller, 0), 3, "the first tab is untouched");
+    }
+
+    fn parse(args: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(std::iter::once("focusforge-gui").chain(args.iter().copied()))
+    }
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn positional_paths_open_as_one_drop() {
+        let args = parse(&["a.tif", "b.tif", "c.tif", "--exit-after", "5"]).unwrap();
+        assert_eq!(args.paths, paths(&["a.tif", "b.tif", "c.tif"]));
+        assert_eq!(
+            startup_loads(&args),
+            Some((paths(&["a.tif", "b.tif", "c.tif"]), Vec::new()))
+        );
+        let folder = parse(&["frames"]).unwrap();
+        assert_eq!(
+            startup_loads(&folder),
+            Some((paths(&["frames"]), Vec::new()))
+        );
+    }
+
+    #[test]
+    fn positional_paths_load_before_the_open_queue() {
+        let args = parse(&["a.tif", "b.tif", "--open", "x", "--open", "y"]).unwrap();
+        assert_eq!(
+            startup_loads(&args),
+            Some((paths(&["a.tif", "b.tif"]), paths(&["x", "y"])))
+        );
+        // `--open` takes one value, so the second word is a positional.
+        let args = parse(&["--open", "a", "b"]).unwrap();
+        assert_eq!(args.open, paths(&["a"]));
+        assert_eq!(args.paths, paths(&["b"]));
+        assert!(parse(&["--frame-remove-warning", "1", "x.ffp"]).is_ok());
+    }
+
+    #[test]
+    fn positional_paths_leave_open_alone_unchanged() {
+        let args = parse(&["--open", "x", "--open", "y", "--open", "z"]).unwrap();
+        assert!(args.paths.is_empty());
+        assert_eq!(
+            startup_loads(&args),
+            Some((paths(&["x"]), paths(&["y", "z"])))
+        );
+        assert_eq!(startup_loads(&parse(&[]).unwrap()), None);
+    }
+
+    #[test]
+    fn positional_paths_do_not_unlock_flags_that_need_open() {
+        let error = parse(&["x.ffp", "--undock-pane", "frame"])
+            .err()
+            .expect("--undock-pane still requires --open");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2486,5 +2759,28 @@ mod tests {
         let error =
             first_working_adapter::<(), ()>(Vec::new(), |_| Ok(())).expect_err("nothing to try");
         assert!(error.contains("no wgpu adapter"), "{error}");
+    }
+
+    #[test]
+    fn export_preview_names_a_fusion_method() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = AppWindow::new().unwrap();
+        let methods: Vec<&str> = focusforge_core::registry::stack_algorithms()
+            .iter()
+            .map(|a| a.display_name())
+            .collect();
+        for spec in ["ready", "writing", "refused", "refused-format"] {
+            apply_export_dialog_preview(&app, spec);
+            let context = app.get_export_context().to_string();
+            let method = context
+                .split(" · ")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{context:?} has no method field"));
+            assert!(
+                methods.contains(&method),
+                "{method:?} in {context:?} is not a registered display name ({methods:?})"
+            );
+            assert!(!context.contains("ORB"), "{context:?}");
+        }
     }
 }

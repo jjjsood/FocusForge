@@ -336,6 +336,17 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("appearance_tab.slint"), "next-requested")
             | (Some("appearance_tab.slint"), "accepted")
             | (Some("appearance_tab.slint"), "dismissed")
+            | (Some("performance_tab.slint"), "changed host-unit-open")
+            | (Some("performance_tab.slint"), "changed vram-unit-open")
+            | (Some("performance_tab.slint"), "unit-previous-requested")
+            | (Some("performance_tab.slint"), "unit-next-requested")
+            | (Some("performance_tab.slint"), "unit-accepted")
+            | (Some("performance_tab.slint"), "unit-dismissed")
+            | (Some("performance_tab.slint"), "option-selected(unit)")
+            | (Some("diagnostics_panel.slint"), "changed destination")
+            | (Some("ff_size_field.slint"), "option-selected(picked)")
+            | (Some("ff_text_field.slint"), "accepted")
+            | (Some("ff_text_field.slint"), "changed has-focus")
             | (Some("app.slint"), "bell-activated")
             | (Some("app.slint"), "changed dialog-open")
             | (Some("app.slint"), "changed notification-center-open")
@@ -2498,7 +2509,7 @@ fn diagnostics_bundle_manifest() {
         for include_minidumps in [false, true] {
             let mut controller = AppController::new();
             let events = install_recording_sink(&mut controller);
-            controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+            controller.set_diagnostics_dirs(Some(data_dir.clone()));
             // Joined so its own scan report has already landed before
             // `run_scan` takes its "since here" snapshot below -- otherwise
             // a straggling report can land in an unrelated later window.
@@ -2546,11 +2557,61 @@ fn diagnostics_bundle_manifest() {
 
 #[test]
 fn diagnostics_bundle_manifest_value_column_units() {
-    assert_eq!(size_text(0), "0 KB");
+    assert_eq!(size_text(0), "0 B");
+    assert_eq!(size_text(312), "312 B");
+    assert_eq!(size_text(1023), "1023 B");
     assert_eq!(size_text(1024), "1 KB");
     assert_eq!(size_text(1024 * 1024 - 1), "1024 KB");
     assert_eq!(size_text(1024 * 1024), "1.0 MB");
     assert_eq!(size_text(1024 * 1024 + 1024 * 512), "1.5 MB");
+}
+
+/// The `input_map` entry of the `configuration.json` a bundle written by
+/// `controller` holds, as `(path, exists)`.
+fn bundle_input_map(
+    controller: &mut AppController,
+    events: &Arc<Mutex<Vec<ShellEvent>>>,
+    out: &Path,
+) -> (serde_json::Value, serde_json::Value) {
+    controller.set_destination(out.to_str().unwrap());
+    assert_eq!(run_write(controller, events), DiagnosticsStatus::Written);
+    let mut archive = zip::ZipArchive::new(fs::File::open(out).unwrap()).unwrap();
+    let configuration: serde_json::Value =
+        serde_json::from_reader(archive.by_name("configuration.json").unwrap()).unwrap();
+    let input_map = &configuration["input_map"];
+    (input_map["path"].clone(), input_map["exists"].clone())
+}
+
+#[test]
+fn diagnostics_bundle_records_the_installed_settings_file() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = seed_diagnostics_dir(root.path());
+    let config_dir = root.path().join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+    let settings = config_dir.join("settings.toml");
+
+    let mut controller = AppController::new();
+    let events = install_recording_sink(&mut controller);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
+    let (path, _) = bundle_input_map(&mut controller, &events, &root.path().join("none.zip"));
+    assert!(path.is_null(), "no installed directory records no path");
+
+    controller.install_recent(vec![], config_dir.clone());
+    // A bundle replaces the user's home prefix with `[home]`, so the recorded
+    // path is compared by its tail.
+    let names_installed_file = |path: &serde_json::Value| {
+        Path::new(path.as_str().expect("a path string")).ends_with("config/settings.toml")
+    };
+    let (path, exists) =
+        bundle_input_map(&mut controller, &events, &root.path().join("absent.zip"));
+    assert!(names_installed_file(&path), "recorded path: {path}");
+    assert_eq!(exists, false, "the settings file is not there yet");
+
+    fs::write(&settings, "").unwrap();
+    let (path, exists) =
+        bundle_input_map(&mut controller, &events, &root.path().join("present.zip"));
+    assert!(names_installed_file(&path), "recorded path: {path}");
+    assert_eq!(exists, true);
 }
 
 #[test]
@@ -2561,7 +2622,7 @@ fn diagnostics_bundle_write() {
     for include_minidumps in [false, true] {
         let mut controller = AppController::new();
         let events = install_recording_sink(&mut controller);
-        controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+        controller.set_diagnostics_dirs(Some(data_dir.clone()));
         // Joined for the same reason as `diagnostics_bundle_manifest`: its
         // own scan must land before `run_scan`'s window, or `run_write`'s
         // later one can catch the straggler instead.
@@ -2602,7 +2663,7 @@ fn diagnostics_bundle_write_repeats_without_an_extra_click() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     // A destination outside `default_destination()`'s own
     // `<data_dir>/diagnostics/` tree, so the fresh path finish derives next
     // can never collide with it regardless of the clock's granularity.
@@ -2655,7 +2716,7 @@ fn diagnostics_bundle_destination() {
     fs::write(&existing, b"placeholder").unwrap();
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.set_destination(existing.to_str().unwrap());
     assert_eq!(
         controller.diagnostics_status(),
@@ -2677,7 +2738,7 @@ fn diagnostics_bundle_destination() {
     let unwritable = blocked_parent.join("bundle.zip");
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.set_destination(unwritable.to_str().unwrap());
     let status = run_write(&mut controller, &events);
     assert_eq!(status, DiagnosticsStatus::Failed);
@@ -2697,7 +2758,7 @@ fn diagnostics_bundle_marks_reported() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.set_destination(root.path().join("bundle.zip").to_str().unwrap());
     let status = run_write(&mut controller, &events);
     assert_eq!(status, DiagnosticsStatus::Written);
@@ -2735,7 +2796,7 @@ fn diagnostics_bundle_marks_reported() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir2.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir2.clone()));
     controller.set_destination(root2.path().join("bundle.zip").to_str().unwrap());
     let status = run_write(&mut controller, &events);
 
@@ -2774,7 +2835,7 @@ fn diagnostics_scan_off_the_main_thread() {
     for data_dir in [&seeded, &empty] {
         let mut controller = AppController::new();
         let start = std::time::Instant::now();
-        controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+        controller.set_diagnostics_dirs(Some(data_dir.clone()));
         let view = controller.diagnostics_view();
         let elapsed = start.elapsed();
         assert!(
@@ -2803,7 +2864,7 @@ fn diagnostics_scan_reports_through_the_sink() {
 
     for include_minidumps in [false, true] {
         let mut controller = AppController::new();
-        controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+        controller.set_diagnostics_dirs(Some(data_dir.clone()));
         // Sets the choice and lets its own scan finish unobserved, so the
         // sink installed below records only the scan this test starts.
         controller
@@ -2855,7 +2916,7 @@ fn diagnostics_rescan_on_minidump_choice() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     run_scan(&mut controller, &events);
     assert!(
         !controller.diagnostics_view().entries.is_empty(),
@@ -2905,7 +2966,7 @@ fn diagnostics_scan_unreadable_dir() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(unreadable), None);
+    controller.set_diagnostics_dirs(Some(unreadable));
     run_scan(&mut controller, &events);
     let view = controller.diagnostics_view();
 
@@ -2939,7 +3000,7 @@ fn diagnostics_scan_outlives_its_controller() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir), None);
+    controller.set_diagnostics_dirs(Some(data_dir));
     let handle = controller.start_manifest_scan();
     drop(controller);
 
@@ -3044,7 +3105,7 @@ fn crash_notice_counts_and_acknowledges() {
     let data_dir = seed_notice_crashes(root.path());
 
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.scan_crash_notice();
     let record = crash_record(&controller).expect("unreported evidence is announced");
     assert_eq!(record.title, "Previous session stopped");
@@ -3068,7 +3129,7 @@ fn crash_notice_counts_and_acknowledges() {
     assert_eq!(crash.reports, 2, "the count outlives the cleared ids");
 
     let mut after = AppController::new();
-    after.set_diagnostics_dirs(Some(data_dir), None);
+    after.set_diagnostics_dirs(Some(data_dir));
     after.scan_crash_notice();
     assert!(
         crash_record(&after).is_none(),
@@ -3078,7 +3139,7 @@ fn crash_notice_counts_and_acknowledges() {
     let empty_root = tempfile::tempdir().unwrap();
     fs::create_dir_all(empty_root.path().join("focusforge/crashes")).unwrap();
     let mut empty = AppController::new();
-    empty.set_diagnostics_dirs(Some(empty_root.path().join("focusforge")), None);
+    empty.set_diagnostics_dirs(Some(empty_root.path().join("focusforge")));
     empty.scan_crash_notice();
     assert!(empty.notifications().is_empty());
 }
@@ -3095,7 +3156,7 @@ fn crash_notice_unreadable_dir() {
     fs::set_permissions(&crashes, fs::Permissions::from_mode(0o000)).unwrap();
 
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(Some(data_dir), None);
+    controller.set_diagnostics_dirs(Some(data_dir));
     controller.scan_crash_notice();
 
     fs::set_permissions(&crashes, writable).unwrap();
@@ -3112,7 +3173,7 @@ fn crash_record_survives_expiry_and_reading() {
     let data_dir = seed_notice_crashes(root.path());
 
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.scan_crash_notice();
     assert!(controller.visible_toast().is_some(), "the crash is toasted");
 
@@ -3134,7 +3195,7 @@ fn crash_record_survives_expiry_and_reading() {
     );
 
     let mut after = AppController::new();
-    after.set_diagnostics_dirs(Some(data_dir), None);
+    after.set_diagnostics_dirs(Some(data_dir));
     after.scan_crash_notice();
     assert!(
         crash_record(&after).is_some(),
@@ -3153,7 +3214,7 @@ fn crash_failed_acknowledgement_keeps_evidence_and_its_error() {
     let writable = fs::metadata(&crashes).unwrap().permissions();
 
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(Some(data_dir), None);
+    controller.set_diagnostics_dirs(Some(data_dir));
     controller.scan_crash_notice();
     let id = crash_record(&controller).unwrap().id;
 
@@ -3186,7 +3247,7 @@ fn crash_failed_acknowledgement_keeps_evidence_and_its_error() {
 #[test]
 fn missing_crash_directory_keeps_the_center_usable() {
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(None, None);
+    controller.set_diagnostics_dirs(None);
     controller.scan_crash_notice();
     let record = crash_record(&controller).expect("the unavailable state is announced");
     assert!(record.crash.as_ref().unwrap().unavailable);
@@ -3245,7 +3306,7 @@ fn crash_notice_diagnostics_acknowledges_and_opens_settings() {
     let data_dir = seed_notice_crashes(root.path());
 
     let mut controller = AppController::new();
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.scan_crash_notice();
     let id = crash_record(&controller).unwrap().id;
 
@@ -3286,7 +3347,7 @@ fn crash_notice_cleared_by_a_bundle_write() {
 
     let mut controller = AppController::new();
     let events = install_recording_sink(&mut controller);
-    controller.set_diagnostics_dirs(Some(data_dir.clone()), None);
+    controller.set_diagnostics_dirs(Some(data_dir.clone()));
     controller.scan_crash_notice();
     assert_eq!(
         crash_record(&controller).unwrap().crash.unwrap().ids.len(),
@@ -3307,7 +3368,7 @@ fn crash_notice_cleared_by_a_bundle_write() {
     let data_dir2 = seed_two_crashes(root2.path());
     let mut controller2 = AppController::new();
     let events2 = install_recording_sink(&mut controller2);
-    controller2.set_diagnostics_dirs(Some(data_dir2.clone()), None);
+    controller2.set_diagnostics_dirs(Some(data_dir2.clone()));
     controller2.scan_crash_notice();
 
     let blocked_parent = data_dir2.parent().unwrap().join("blocked");
@@ -6145,9 +6206,8 @@ fn equalize_rows_reach_the_run() {
     assert_eq!(recorded.gains.len(), 3, "one gain per frame");
 }
 
-/// A frame the equalization bound clamps is reported on the window's info
-/// toast, naming the frame, the bound and the bound that would cover it; a
-/// bound wide enough for the stack raises nothing.
+/// A frame the equalization bound clamps is reported as a record naming its
+/// file in plain words; a bound wide enough for the stack raises nothing.
 #[test]
 fn settings_journey_equalization_reports_a_clamped_frame() {
     use focusforge_core::equalize::UNIT_GAIN;
@@ -6177,17 +6237,21 @@ fn settings_journey_equalization_reports_a_clamped_frame() {
     );
     let notices = controller.notifications();
     assert!(notices.len() > 1, "each clamped frame has its own record");
-    let notice = notices[0].message.as_str();
-    assert!(notice.contains("frame "), "{notice}");
-    assert!(notice.contains("1.01"), "{notice}");
-    assert!(notice.contains("would cover it"), "{notice}");
-    assert!(!notice.contains(" more)"), "no collapsed count: {notice}");
+    let notice = &notices[0];
+    let file = notice
+        .frame
+        .as_deref()
+        .expect("the record names its frame file");
+    assert_eq!(notice.title, "Brightness not fully matched");
+    assert_eq!(
+        notice.message,
+        format!("{file} could not be brought to the same brightness as the other frames.")
+    );
 
-    let named: usize = notice
-        .strip_prefix("frame ")
-        .and_then(|rest| rest.split(':').next())
+    let named: usize = file
+        .strip_suffix(".tif")
         .and_then(|index| index.parse().ok())
-        .unwrap_or_else(|| panic!("the notice starts with its frame: {notice}"));
+        .unwrap_or_else(|| panic!("the frame file is its index: {file}"));
     let recorded = controller
         .held_checkpoints()
         .last()
@@ -7906,7 +7970,7 @@ fn duplicated_tab_keeps_crop_and_remembered_values() {
     controller.set_fuse_algorithm("weighted-average");
     assert_eq!(
         active_fuse_value(&controller, "weight-exponent"),
-        "4",
+        "4.0",
         "the copy carries the values remembered for other methods"
     );
     controller.set_param_value("fuse", "weight-exponent", ParamValue::Float(6.0));
@@ -7917,7 +7981,7 @@ fn duplicated_tab_keeps_crop_and_remembered_values() {
     controller.set_fuse_algorithm("weighted-average");
     assert_eq!(
         active_fuse_value(&controller, "weight-exponent"),
-        "4",
+        "4.0",
         "editing the copy leaves the original's remembered values alone"
     );
 }
@@ -8561,11 +8625,27 @@ fn performance_readout_does_not_probe() {
         focusforge_gpu::harness::settled_backend().is_none(),
         "building the view must not bring a backend up"
     );
-    assert_eq!(view.vram_budget, performance_settings::NOT_PROBED);
+    assert_eq!(view.vram_cap.text, "");
+    assert_eq!(view.vram_cap.placeholder, performance_settings::NOT_PROBED);
     assert_eq!(view.backend, "");
-    assert!(view.host_budget.ends_with("iB"), "{}", view.host_budget);
+    assert_budget_default(&view.host_cap);
     assert!(view.vram_cap.enabled && view.gpu_enabled);
     assert_eq!(view.note, "");
+}
+
+/// The row shows a budget as a whole number of MiB or GiB and no failure mark.
+fn assert_budget_default(row: &performance_settings::CapField) {
+    assert!(
+        !row.text.is_empty() && row.text.bytes().all(|b| b.is_ascii_digit()),
+        "{:?}",
+        row.text
+    );
+    assert!(
+        matches!(row.unit.label(), "MiB" | "GiB"),
+        "{}",
+        row.unit.label()
+    );
+    assert!(row.enabled && !row.invalid);
 }
 
 #[test]
@@ -8616,6 +8696,308 @@ fn performance_vram_cap_pending_note() {
         performance_settings::load(config.path()).max_vram_bytes(),
         Some(2 << 30),
         "text that does not parse leaves the stored cap"
+    );
+}
+
+const SIBLING_TABLE: &str = "# my notes\n[recent]\nentries = [] # none yet\n\n";
+
+/// Points `controller` at a fresh config directory whose settings file holds
+/// only a hand-edited table beside the one the Performance tab writes.
+fn install_hand_edited_settings(controller: &mut AppController) -> tempfile::TempDir {
+    let config = tempfile::tempdir().unwrap();
+    fs::write(config.path().join("settings.toml"), SIBLING_TABLE).unwrap();
+    controller.install_recent(Vec::new(), config.path().to_path_buf());
+    config
+}
+
+fn settings_text(config: &tempfile::TempDir) -> String {
+    fs::read_to_string(config.path().join("settings.toml")).unwrap()
+}
+
+/// `settings.toml` lines of the form `<key> = ...`.
+fn settings_lines<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
+    text.lines().filter(|line| line.starts_with(key)).collect()
+}
+
+#[test]
+fn host_cap_row_shows_the_default_then_the_committed_cap() {
+    use performance_settings::CapUnit;
+
+    let mut controller = scratch_controller("host_cap_row");
+    open_mantis64_tab(&mut controller, "host_cap_row", 2);
+    let config = install_hand_edited_settings(&mut controller);
+    let before = settings_text(&config);
+
+    let row = controller.performance_view().host_cap;
+    assert_budget_default(&row);
+    assert!(row.limit.is_empty());
+    assert_eq!(
+        settings_text(&config),
+        before,
+        "showing the default saves nothing"
+    );
+    assert_eq!(controller.job_request_for(0).unwrap().max_host_memory, None);
+
+    controller.set_host_cap_unit("MiB");
+    controller.edit_host_memory_cap("512");
+    controller.commit_cap_drafts();
+    let row = controller.performance_view().host_cap;
+    assert_eq!((row.text.as_str(), row.unit), ("512", CapUnit::Mib));
+    assert!(row.limit.is_empty() && !row.invalid);
+    assert_eq!(
+        controller.job_request_for(0).unwrap().max_host_memory,
+        Some(512 << 20)
+    );
+    let saved = settings_text(&config);
+    assert!(saved.starts_with(SIBLING_TABLE), "{saved:?}");
+    assert_eq!(
+        settings_lines(&saved, "max-host-memory"),
+        ["max-host-memory = \"512MiB\""]
+    );
+
+    controller.edit_host_memory_cap("100");
+    let row = controller.performance_view().host_cap;
+    assert_eq!(row.text, "512", "an unconfirmed number changes nothing");
+    assert_eq!(settings_text(&config), saved);
+
+    assert_eq!(
+        performance_settings::load(config.path()).max_host_memory_bytes(),
+        Some(512 << 20)
+    );
+}
+
+#[test]
+fn host_cap_over_the_maximum_shows_the_limit_and_stores_no_cap() {
+    use focusforge_gui::SettingsSection;
+
+    let mut controller = scratch_controller("host_cap_limit");
+    let config = install_hand_edited_settings(&mut controller);
+    controller.set_host_memory_cap("200MiB");
+    assert_eq!(
+        performance_settings::load(config.path()).max_host_memory_bytes(),
+        Some(200 << 20)
+    );
+    let over_the_maximum = |controller: &mut AppController| {
+        controller.edit_host_memory_cap("1000000");
+        controller.set_host_cap_unit("GiB");
+        controller.performance_view().host_cap
+    };
+
+    let row = over_the_maximum(&mut controller);
+    assert_eq!(
+        performance_settings::load(config.path()).max_host_memory_bytes(),
+        None,
+        "a number above the maximum stores no cap"
+    );
+    assert!(settings_lines(&settings_text(&config), "max-host-memory").is_empty());
+    assert!(settings_text(&config).starts_with(SIBLING_TABLE));
+    assert_budget_default(&row);
+    assert_ne!(
+        row.text, "1000000",
+        "the field shows the default, not the typed digits"
+    );
+    let named = row
+        .limit
+        .strip_prefix("Max ")
+        .and_then(|rest| rest.strip_suffix(" possible."))
+        .unwrap_or_else(|| panic!("a line naming the maximum, got {:?}", row.limit));
+    assert!(
+        named.ends_with(" MiB") || named.ends_with(" GiB"),
+        "the maximum is in format_bytes form: {named:?}"
+    );
+
+    controller.edit_host_memory_cap("200");
+    controller.set_host_cap_unit("MiB");
+    let row = controller.performance_view().host_cap;
+    assert_eq!(row.limit, "", "the next commit clears the line");
+    assert_eq!(
+        performance_settings::load(config.path()).max_host_memory_bytes(),
+        Some(200 << 20)
+    );
+
+    assert!(!over_the_maximum(&mut controller).limit.is_empty());
+    controller.select_settings_section(SettingsSection::About);
+    assert_eq!(controller.performance_view().host_cap.limit, "");
+
+    assert!(!over_the_maximum(&mut controller).limit.is_empty());
+    controller.close_settings();
+    assert_eq!(controller.performance_view().host_cap.limit, "");
+}
+
+#[test]
+fn vram_cap_row_mirrors_the_host_row() {
+    use performance_settings::CapUnit;
+
+    let mut controller = scratch_controller("vram_cap_row");
+    let config = install_hand_edited_settings(&mut controller);
+    let vram = |controller: &AppController| {
+        let row = controller.performance_view().vram_cap;
+        (row.text, row.unit, row.limit)
+    };
+    assert!(focusforge_gpu::harness::settled_backend().is_none());
+    let row = controller.performance_view().vram_cap;
+    assert_eq!(row.text, "");
+    assert_eq!(row.placeholder, performance_settings::NOT_PROBED);
+    assert!(row.enabled && !row.invalid);
+
+    controller.edit_vram_cap("8");
+    controller.commit_cap_drafts();
+    assert_eq!(vram(&controller), ("8".into(), CapUnit::Gib, String::new()));
+    assert_eq!(
+        settings_lines(&settings_text(&config), "max-vram"),
+        ["max-vram = \"8GiB\""]
+    );
+
+    controller.set_vram_cap_unit("MiB");
+    assert_eq!(vram(&controller), ("8".into(), CapUnit::Mib, String::new()));
+    assert_eq!(
+        settings_lines(&settings_text(&config), "max-vram"),
+        ["max-vram = \"8MiB\""],
+        "a unit change commits at once with the number as shown"
+    );
+
+    controller.edit_vram_cap("1000000");
+    controller.set_vram_cap_unit("GiB");
+    assert_eq!(
+        vram(&controller),
+        ("1000000".into(), CapUnit::Gib, String::new()),
+        "no maximum is known before a probe, so nothing is clamped"
+    );
+    assert_eq!(
+        performance_settings::load(config.path()).max_vram_bytes(),
+        Some(1_000_000 << 30)
+    );
+
+    controller.edit_vram_cap("");
+    controller.commit_cap_drafts();
+    controller.set_vram_cap_unit("MiB");
+    assert_eq!(
+        vram(&controller),
+        (String::new(), CapUnit::Mib, String::new()),
+        "an empty number keeps the unit picked beside it"
+    );
+    assert_eq!(
+        performance_settings::load(config.path()).max_vram_bytes(),
+        None
+    );
+    assert!(settings_text(&config).starts_with(SIBLING_TABLE));
+}
+
+#[test]
+fn cap_row_commits_only_on_confirm() {
+    fn host_row(controller: &AppController) -> performance_settings::CapField {
+        controller.performance_view().host_cap
+    }
+    fn vram_row(controller: &AppController) -> performance_settings::CapField {
+        controller.performance_view().vram_cap
+    }
+    type Rows = (
+        &'static str,
+        fn(&mut AppController, &str),
+        fn(&mut AppController, &str),
+        fn(&AppController) -> performance_settings::CapField,
+    );
+    let rows: [Rows; 2] = [
+        (
+            "max-host-memory",
+            AppController::edit_host_memory_cap,
+            AppController::set_host_cap_unit,
+            host_row,
+        ),
+        (
+            "max-vram",
+            AppController::edit_vram_cap,
+            AppController::set_vram_cap_unit,
+            vram_row,
+        ),
+    ];
+
+    for (key, edit, pick_unit, row) in rows {
+        let mut controller = scratch_controller(&format!("cap_row_{key}"));
+        let config = install_hand_edited_settings(&mut controller);
+        pick_unit(&mut controller, "MiB");
+        let before = settings_text(&config);
+        let shown = row(&controller);
+        assert!(before.starts_with(SIBLING_TABLE), "{key}: {before:?}");
+
+        for draft in ["5", "51", "512"] {
+            edit(&mut controller, draft);
+            assert_eq!(
+                settings_text(&config),
+                before,
+                "{key}: draft {draft:?} saved"
+            );
+            assert_eq!(
+                row(&controller).text,
+                shown.text,
+                "{key}: draft {draft:?} shown"
+            );
+        }
+
+        controller.commit_cap_drafts();
+        let committed = settings_text(&config);
+        assert_eq!(
+            settings_lines(&committed, key),
+            [format!("{key} = \"512MiB\"")],
+            "{key}"
+        );
+        assert!(committed.starts_with(SIBLING_TABLE), "{key}: {committed:?}");
+        assert_eq!(row(&controller).text, "512", "{key}");
+
+        controller.commit_cap_drafts();
+        assert_eq!(
+            settings_text(&config),
+            committed,
+            "{key}: a second commit changes nothing"
+        );
+
+        edit(&mut controller, "0");
+        controller.commit_cap_drafts();
+        assert_eq!(settings_text(&config), committed, "{key}: zero is refused");
+        assert!(
+            row(&controller).invalid,
+            "{key}: zero marks the row invalid"
+        );
+
+        edit(&mut controller, "");
+        controller.commit_cap_drafts();
+        let cleared = settings_text(&config);
+        assert!(
+            settings_lines(&cleared, key).is_empty(),
+            "{key}: {cleared:?}"
+        );
+        assert!(cleared.starts_with(SIBLING_TABLE), "{key}: {cleared:?}");
+        assert!(!row(&controller).invalid, "{key}");
+    }
+}
+
+#[test]
+fn cap_drafts_commit_when_settings_close_or_the_section_changes() {
+    use focusforge_gui::SettingsSection;
+
+    let mut controller = scratch_controller("cap_drafts_leave");
+    let config = install_hand_edited_settings(&mut controller);
+    controller.set_host_cap_unit("MiB");
+    controller.set_vram_cap_unit("MiB");
+
+    controller.edit_host_memory_cap("200");
+    controller.close_settings();
+    assert_eq!(
+        performance_settings::load(config.path()).max_host_memory_bytes(),
+        Some(200 << 20),
+        "closing commits the host number"
+    );
+
+    controller.edit_vram_cap("512");
+    controller.select_settings_section(SettingsSection::About);
+    assert_eq!(
+        performance_settings::load(config.path()).max_vram_bytes(),
+        Some(512 << 20),
+        "a section change commits the VRAM number"
+    );
+    assert_eq!(
+        settings_lines(&settings_text(&config), "max-vram"),
+        ["max-vram = \"512MiB\""]
     );
 }
 
@@ -8711,7 +9093,7 @@ fn storage_view_takes_its_rows_from_the_installed_directories() {
     let (config, data) = storage_dirs(&root.path().join("installed-marker"));
     let mut controller = AppController::new();
     controller.install_recent(Vec::new(), config.clone());
-    controller.set_diagnostics_dirs(Some(data.clone()), None);
+    controller.set_diagnostics_dirs(Some(data.clone()));
     controller.set_scratch_root_for_test(data.join("scratch"));
 
     let view = controller.storage_view();
@@ -8992,12 +9374,13 @@ mod notification {
         let records = warnings(&controller);
         assert_eq!(records.len(), 3, "one record per clamped frame");
         for (i, record) in records.iter().enumerate() {
-            assert!(
-                record.message.starts_with(&format!("frame {i}:")),
-                "{}",
-                record.message
+            assert_eq!(record.title, "Brightness not fully matched");
+            assert_eq!(
+                record.message,
+                format!(
+                    "{i:02}.tif could not be brought to the same brightness as the other frames."
+                )
             );
-            assert!(record.message.contains("1.25"), "{}", record.message);
         }
     }
 
@@ -9012,9 +9395,10 @@ mod notification {
         );
         let files: Vec<_> = records.iter().map(|r| r.frame.as_deref()).collect();
         assert_eq!(files, [Some("01.tif"), Some("02.tif")]);
-        assert!(
-            records[0].message.starts_with("frame 0:"),
-            "the index is the run's own"
+        assert_eq!(
+            records[0].message,
+            "01.tif could not be brought to the same brightness as the other frames.",
+            "the message names the file, not the run's own index"
         );
     }
 
@@ -9055,7 +9439,7 @@ mod notification {
     fn bell_over_projects_closes_projects_and_opens_the_center() {
         let mut controller = AppController::new();
         controller.toggle_projects_overlay();
-        controller.set_diagnostics_dirs(None, None);
+        controller.set_diagnostics_dirs(None);
         controller.scan_crash_notice();
         assert_eq!(controller.unread_notifications(), 1);
         assert!(
@@ -9074,7 +9458,7 @@ mod notification {
         let mut controller = AppController::new();
         controller.open_center();
         controller.set_window_focused(1, false);
-        controller.set_diagnostics_dirs(None, None);
+        controller.set_diagnostics_dirs(None);
         controller.scan_crash_notice();
         assert_eq!(
             controller.unread_notifications(),
@@ -9091,7 +9475,7 @@ mod notification {
     fn closing_projects_shows_unread_without_toast_replay() {
         let mut controller = AppController::new();
         controller.toggle_projects_overlay();
-        controller.set_diagnostics_dirs(None, None);
+        controller.set_diagnostics_dirs(None);
         controller.scan_crash_notice();
         controller.toggle_projects_overlay();
         assert!(
@@ -9111,7 +9495,7 @@ mod native_delivery {
     use std::cell::Cell;
 
     fn crash_notice(controller: &mut AppController) {
-        controller.set_diagnostics_dirs(None, None);
+        controller.set_diagnostics_dirs(None);
         controller.scan_crash_notice();
     }
 
@@ -9279,7 +9663,7 @@ fn fixture_two_stacks_ask_the_grouping_question() {
     let mut controller = AppController::new();
     match common::open_and_settle(&mut controller, &[root]) {
         OpenOutcome::Question(question, _) => {
-            assert_eq!(question.frame_count, 6);
+            assert_eq!(question.stack_sizes, vec![3, 3]);
             assert_eq!(question.project_count, 2);
         }
         _ => panic!("two stacks in one folder must raise the grouping question"),
@@ -9320,6 +9704,72 @@ fn fixture_root_and_subfolder_reports_the_skipped_subfolder() {
         .find(|card| card.kind == "not-a-project")
         .expect("the skipped subfolder keeps a card");
     assert_eq!(skipped.project_name, "notes");
+}
+
+/// What the open tab's folder shows through the GUI: each row's source
+/// preview state once the previews settle, whether each frame opens in the
+/// frame pane, and whether a fuse completes.
+fn exercise_open_folder(controller: &mut AppController) -> (Vec<&'static str>, Vec<bool>, bool) {
+    controller.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
+    });
+    controller.set_images_viewport_height(600.0);
+    let rows = controller.images_panel().rows;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let previews = loop {
+        controller.poll_source_previews();
+        let states: Vec<_> = rows
+            .iter()
+            .map(|row| controller.source_preview_state(&row.path, row.unresolved))
+            .collect();
+        if !states.contains(&"loading") {
+            break states;
+        }
+        assert!(Instant::now() < deadline, "previews never settled");
+        std::thread::yield_now();
+    };
+    let pane = rows
+        .iter()
+        .map(|row| {
+            focusforge_gui::canvas::FrameSource::default()
+                .set(&row.path, None, job::host_budget())
+                .is_ok()
+        })
+        .collect();
+    assert!(controller.start_fuse(), "the fuse must start");
+    common::wait_for_settle(controller, Duration::from_secs(60));
+    let fused = matches!(controller.job_view().state, job::RunState::Fused { .. });
+    (previews, pane, fused)
+}
+
+#[test]
+fn eight_bit_tiff_folder_previews_and_fuses() {
+    for set in ["mantis8-64", "mantis8-64-lzw-p1-tile-mm"] {
+        let mut controller = AppController::new();
+        controller.set_scratch_root_for_test(tree(&format!("eight_bit_{set}_scratch")));
+        common::open_fixture_tab(&mut controller, "eight_bit", set, 3);
+        let (previews, pane, fused) = exercise_open_folder(&mut controller);
+        assert_eq!(previews, ["ready"; 3], "{set}: source previews");
+        assert_eq!(pane, [true; 3], "{set}: frame pane opens every frame");
+        assert!(fused, "{set}: the fuse completes");
+    }
+
+    let root = tree("eight_bit_rgba_frames");
+    for i in 0..3 {
+        common::write_rgba8_frame(&root.join(format!("{i:02}.tif")), 16, 16);
+    }
+    let mut controller = AppController::new();
+    controller.set_scratch_root_for_test(tree("eight_bit_rgba_scratch"));
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[root]),
+        OpenOutcome::Opened(_)
+    ));
+    controller.set_align_algorithm("dummy-align");
+    let (previews, pane, fused) = exercise_open_folder(&mut controller);
+    assert_eq!(previews, ["ready"; 3], "RGBA: source previews");
+    assert_eq!(pane, [true; 3], "RGBA: frame pane opens every frame");
+    assert!(fused, "RGBA: the fuse completes");
 }
 
 #[test]
@@ -9401,7 +9851,7 @@ fn fixture_project_without_its_frames_opens_as_sources_missing() {
         .sources_notice()
         .expect("the missing frames raise the notice");
     assert_eq!(title, "The frames are no longer there");
-    assert_eq!(file_name, "missing");
+    assert_eq!(file_name, "missing.ffp");
 }
 
 #[test]

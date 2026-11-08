@@ -492,6 +492,69 @@ fn dry_run_writes_nothing_and_succeeds() {
     let records = read_records(&status);
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0]["outcome"], "dry-run");
+    assert!(
+        !dir.join("manifest.json").exists(),
+        "a dry run writes no run manifest"
+    );
+}
+
+/// `stack` over a small synthetic folder, no alignment or crop, working in
+/// `cwd`; `extra` is appended.
+fn run_synthetic_stack(cwd: &Path, frames: &Path, extra: &[&str]) -> CliOutput {
+    let mut args = vec![
+        "stack",
+        frames.to_str().unwrap(),
+        "--algorithm",
+        "dummy-stack",
+        "--no-align",
+        "--no-crop",
+    ];
+    args.extend_from_slice(extra);
+    run_cli_in(cwd, &args)
+}
+
+#[test]
+fn dry_run_writes_no_run_manifest() {
+    let frames = common::synthetic_frames("preset_cli_dry_run_no_manifest_frames");
+    let cwd = tmp_dir("preset_cli_dry_run_no_manifest_cwd");
+    let status = cwd.join("status.ndjson");
+    let out = run_synthetic_stack(
+        &cwd,
+        &frames,
+        &["--dry-run", "--status", status.to_str().unwrap()],
+    );
+    assert_eq!(out.code, Some(0), "stderr: {}", out.stderr);
+    assert!(out.stdout.contains("tile_size="), "stdout: {}", out.stdout);
+
+    let manifest = frames.join(format!(
+        "{}-run.json",
+        frames.file_name().unwrap().to_string_lossy()
+    ));
+    assert!(!manifest.exists(), "a dry run writes no run manifest");
+    let records = read_records(&status);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["outcome"], "dry-run");
+}
+
+#[test]
+fn dry_run_leaves_an_existing_manifest_untouched() {
+    let frames = common::synthetic_frames("preset_cli_dry_run_keeps_manifest_frames");
+    let cwd = tmp_dir("preset_cli_dry_run_keeps_manifest_cwd");
+    let real = run_synthetic_stack(&cwd, &frames, &[]);
+    assert_eq!(real.code, Some(0), "stderr: {}", real.stderr);
+    let manifest = frames.join(format!(
+        "{}-run.json",
+        frames.file_name().unwrap().to_string_lossy()
+    ));
+    let before = std::fs::read_to_string(&manifest).unwrap();
+
+    let dry = run_synthetic_stack(&cwd, &frames, &["--dry-run"]);
+    assert_eq!(dry.code, Some(0), "stderr: {}", dry.stderr);
+    assert_eq!(
+        std::fs::read_to_string(&manifest).unwrap(),
+        before,
+        "a dry run leaves the earlier run's manifest byte-identical"
+    );
 }
 
 #[test]

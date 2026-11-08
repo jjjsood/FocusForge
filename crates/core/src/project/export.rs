@@ -159,6 +159,7 @@ pub static TIFF_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "tiff-compression".to_string(),
@@ -186,6 +187,7 @@ pub static TIFF_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
     ]
 });
@@ -214,6 +216,7 @@ pub static PNG_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "png-compression".to_string(),
@@ -239,6 +242,7 @@ pub static PNG_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
     ]
 });
@@ -254,6 +258,7 @@ pub static JPEG_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "jpeg-subsampling".to_string(),
@@ -277,6 +282,7 @@ pub static JPEG_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
     ]
 });
@@ -306,6 +312,7 @@ pub static METADATA_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "icc".to_string(),
@@ -319,6 +326,7 @@ pub static METADATA_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "xmp".to_string(),
@@ -333,6 +341,7 @@ pub static METADATA_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
         ParamDesc {
             id: "iptc".to_string(),
@@ -345,6 +354,7 @@ pub static METADATA_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             advanced: false,
             auto: None,
             host_default: None,
+            stack_max: None,
         },
     ]
 });

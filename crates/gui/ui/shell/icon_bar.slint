@@ -15,10 +15,8 @@ export component FFIconBar inherits Rectangle {
     in property <bool> center-open: false;
     // The calculator button is drawn selected while its overlay is open.
     in property <bool> calculator-open: false;
-    // The Analytics button is drawn selected while its overlay is open, and
-    // disabled with no stack to count.
+    // The Analytics button is drawn selected while its overlay is open.
     in property <bool> analytics-open: false;
-    in property <bool> analytics-enabled: false;
     callback calculator-activated();
     callback analytics-activated();
     callback bell-activated();
@@ -65,7 +63,6 @@ export component FFIconBar inherits Rectangle {
         icon: @image-url("../../../../assets/icons/chart-bar.svg");
         focusable: true;
         current: root.analytics-open;
-        enabled: root.analytics-enabled;
         accessible-label: "Analytics";
         triggered => { root.analytics-activated(); }
     }

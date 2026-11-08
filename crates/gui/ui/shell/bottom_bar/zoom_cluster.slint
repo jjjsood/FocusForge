@@ -9,9 +9,9 @@ import { FFIconButton } from "../../components/ff_icon_button.slint";
 // The zoom button box is 32px square (`Theme.icon-md` plus a full
 // `Theme.space-2` pad on every side), so the cluster's own height follows
 // that token rather than a pinned value, and everything else in the cluster
-// matches it for one shared baseline. At the bar's right end, mirroring the
-// gear's `Theme.space-3` inset at the left: `zoom-group 120 (32+56+32, one
-// shared surface) | 16 | Fit 80` -- 120+16+80 = 216. Zoom-out, the readout
+// matches it for one shared baseline. At the bar's right end, `Theme.space-3`
+// in from the edge: `zoom-group 120 (32+56+32, one shared surface) | 16 |
+// Fit 80` -- 120+16+80 = 216. Zoom-out, the readout
 // and zoom-in share one rounded surface -- the same track-plus-segments
 // idiom `FFModeSwitch` uses -- so they read as one control rather than
 // three floating pieces, with `Fit` kept visually separate by a full

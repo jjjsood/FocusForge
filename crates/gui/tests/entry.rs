@@ -17,7 +17,7 @@ use focusforge_gui::viewport::PaneRect;
 use focusforge_gui::{AppController, EntryError, OpenAs, OpenOutcome, ShellMode};
 use slint::ComponentHandle;
 
-use common::{copy_frame_from, tree};
+use common::{copy_frame, copy_frame_from, tree};
 
 fn base_pane() -> (PaneRect, PaneRect) {
     (
@@ -69,7 +69,7 @@ fn ambiguous_folder_asks_once() {
     match common::open_and_settle(&mut controller, &[root]) {
         OpenOutcome::Question(question, _proposal) => {
             assert_eq!(question.project_count, 2);
-            assert_eq!(question.frame_count, 2);
+            assert_eq!(question.stack_sizes, vec![1, 1]);
         }
         OpenOutcome::Opened(_) => panic!("two directories must ask, not open straight through"),
         OpenOutcome::Mismatch(_) => panic!("opening a folder must never raise a mismatch"),
@@ -87,6 +87,47 @@ fn ambiguous_folder_asks_once() {
         "cancel clears the question's own vocabulary"
     );
     assert!(controller.project_tabs().is_empty());
+}
+
+#[test]
+fn grouping_question_counts_frames_per_stack() {
+    for (label, sizes, body) in [
+        (
+            "equal",
+            [3, 3],
+            "This folder holds 2 stacks of 3 frames each.",
+        ),
+        (
+            "unequal",
+            [3, 4],
+            "This folder holds 2 stacks (3 and 4 frames).",
+        ),
+    ] {
+        let root = tree(&format!("entry_per_stack_{label}"));
+        for (stack, count) in ["subject-a", "subject-b"].into_iter().zip(sizes) {
+            for i in 0..count {
+                // mantis-64 holds three frames; a stack longer than that reuses them.
+                copy_frame_from(
+                    "mantis-64",
+                    &root.join(stack),
+                    &format!("{i:02}.tif"),
+                    i % 3,
+                );
+            }
+        }
+        let mut controller = AppController::new();
+        match common::open_and_settle(&mut controller, &[root]) {
+            OpenOutcome::Question(question, _) => {
+                assert_eq!(question.stack_sizes, sizes, "{label}");
+                assert_eq!(
+                    focusforge_gui::overlay::grouping_body(&question.stack_sizes),
+                    body,
+                    "{label}"
+                );
+            }
+            _ => panic!("{label}: two stacks must raise the question"),
+        }
+    }
 }
 
 #[test]
@@ -457,15 +498,16 @@ fn picked_images_refusals_change_nothing() {
     let tabs = controller.project_tabs();
 
     let not_one_stack = Some("These images are not one stack");
+    let no_frames = Some("No frames here");
     let mut refusals = Vec::new();
     for (set, title) in [
-        (vec![root.join("00.tif"), note.clone()], None),
+        (vec![root.join("00.tif"), note.clone()], no_frames),
         (
             vec![root.join("00.tif"), other.join("00.tif")],
             not_one_stack,
         ),
         (vec![root.join("00.tif"), raw.clone()], not_one_stack),
-        (vec![jpeg_a.clone(), png], None),
+        (vec![jpeg_a.clone(), png], no_frames),
         (vec![jpeg_a, jpeg_b], not_one_stack),
     ] {
         assert!(
@@ -476,7 +518,7 @@ fn picked_images_refusals_change_nothing() {
         assert_eq!(
             controller.refusal_title(),
             title,
-            "{set:?}: a set that is not one stack says so; an unreadable file keeps the dialog's own title"
+            "{set:?}: a set that is not one stack says so; an unreadable file says no frames are here"
         );
         refusals.push(
             controller
@@ -611,6 +653,251 @@ fn unreadable_folder_is_refused_with_its_read_error() {
     assert_eq!(refusal, expected);
 }
 
+// ---------------------------------------------------------------------
+// TIFF frames no reader here can open are refused when the folder or the
+// file set is opened, not when the fuse starts.
+// ---------------------------------------------------------------------
+
+/// Eight bytes: a TIFF byte-order mark and magic 43, which is BigTIFF.
+fn write_bigtiff(path: &Path, big_endian: bool) {
+    let bytes: &[u8; 8] = if big_endian {
+        b"MM\0+\0\x08\0\0"
+    } else {
+        b"II+\0\x08\0\0\0"
+    };
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Sets every SHORT of `tag` in the first IFD of the little-endian TIFF at
+/// `path` to `value`.
+fn patch_short_tag(path: &Path, tag: u16, value: u16) {
+    let mut bytes = std::fs::read(path).unwrap();
+    assert_eq!(&bytes[..2], b"II", "the fixture frames are little-endian");
+    let u16_at = |bytes: &[u8], at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+    let u32_at =
+        |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let ifd = u32_at(&bytes, 4) as usize;
+    for index in 0..usize::from(u16_at(&bytes, ifd)) {
+        let entry = ifd + 2 + index * 12;
+        if u16_at(&bytes, entry) != tag {
+            continue;
+        }
+        let count = u32_at(&bytes, entry + 4) as usize;
+        let values = if count * 2 <= 4 {
+            entry + 8
+        } else {
+            u32_at(&bytes, entry + 8) as usize
+        };
+        for slot in 0..count {
+            bytes[values + slot * 2..values + slot * 2 + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(path, bytes).unwrap();
+        return;
+    }
+    panic!("no tag {tag} in {}", path.display());
+}
+
+/// The refusal an unreadable TIFF frame raises: no tab, the dialog titled
+/// and offering Close, a "Not a project" card for `card`, and a body that
+/// names `file` and says `cause` without the open root's path or any
+/// format jargon. Returns the body.
+fn assert_unreadable_frame(
+    label: &str,
+    controller: &AppController,
+    outcome: OpenOutcome,
+    root: &Path,
+    card: &Path,
+    file: &str,
+    cause: &str,
+) -> String {
+    match outcome {
+        OpenOutcome::Refused(EntryError::UnreadableFrame { path, .. }) => {
+            assert_eq!(path, card, "{label}: the path the card is made for");
+        }
+        OpenOutcome::Refused(other) => panic!("{label}: expected UnreadableFrame, got {other}"),
+        _ => panic!("{label}: the frames must be refused before any tab opens"),
+    }
+    assert!(controller.project_tabs().is_empty(), "{label}: no tab");
+    assert_eq!(
+        controller.refusal_title(),
+        Some("These frames cannot be read"),
+        "{label}"
+    );
+    let cards = controller.project_cards();
+    let card_view = cards
+        .iter()
+        .find(|view| view.kind == "not-a-project")
+        .unwrap_or_else(|| panic!("{label}: a Not a project card must be recorded"));
+    assert_eq!(
+        card_view.project_name,
+        card.file_name().unwrap().to_string_lossy(),
+        "{label}: the card's name"
+    );
+    let body = controller
+        .last_refusal()
+        .unwrap_or_else(|| panic!("{label}: a refusal message must be recorded"))
+        .to_string();
+    assert!(
+        body.contains(file),
+        "{label}: the body names {file}: {body}"
+    );
+    assert!(
+        body.contains(cause),
+        "{label}: the body says {cause}: {body}"
+    );
+    assert!(
+        !body.contains(&*root.to_string_lossy()),
+        "{label}: the body leaves out the path: {body}"
+    );
+    for jargon in [
+        "magic",
+        "43",
+        "Compression",
+        "BitsPerSample",
+        "PhotometricInterpretation",
+    ] {
+        assert!(!body.contains(jargon), "{label}: no {jargon:?}: {body}");
+    }
+    body
+}
+
+#[test]
+fn open_refuses_bigtiff_folder() {
+    for (label, big_endian) in [("II first", false), ("MM first", true)] {
+        let root = tree(&format!("entry_bigtiff_{}", label.replace(' ', "_")));
+        copy_frame(&root, "00.tif", 0);
+        write_bigtiff(&root.join("01.tif"), big_endian);
+        write_bigtiff(&root.join("02.tif"), !big_endian);
+        let mut controller = AppController::new();
+        let outcome = common::open_and_settle(&mut controller, std::slice::from_ref(&root));
+        let body = assert_unreadable_frame(
+            label,
+            &controller,
+            outcome,
+            &root,
+            &root,
+            "01.tif",
+            "BigTIFF",
+        );
+        assert!(
+            body.contains("standard TIFF"),
+            "{label}: the way out: {body}"
+        );
+        assert!(
+            !body.contains("02.tif"),
+            "{label}: the first file only: {body}"
+        );
+    }
+
+    let root = tree("entry_bigtiff_two_stacks");
+    copy_frame(&root.join("subject-a"), "00.tif", 0);
+    std::fs::create_dir_all(root.join("subject-b")).unwrap();
+    write_bigtiff(&root.join("subject-b").join("00.tif"), false);
+    let mut controller = AppController::new();
+    let outcome = common::open_and_settle(&mut controller, std::slice::from_ref(&root));
+    assert_unreadable_frame(
+        "two stacks",
+        &controller,
+        outcome,
+        &root,
+        &root,
+        "00.tif",
+        "BigTIFF",
+    );
+    assert!(
+        controller.pending_question().is_none(),
+        "two stacks: the grouping question is not raised"
+    );
+
+    for set in ["mantis-64", "mantis8-64", "mantis-64-deflate-p1-strip-ii"] {
+        let root = tree(&format!("entry_readable_{set}"));
+        copy_frame_from(set, &root, "00.tif", 0);
+        copy_frame_from(set, &root, "01.tif", 1);
+        let mut controller = AppController::new();
+        let outcome = common::open_and_settle(&mut controller, &[root]);
+        assert!(
+            matches!(outcome, OpenOutcome::Opened(_)),
+            "{set}: a readable folder opens"
+        );
+        assert_eq!(controller.last_refusal(), None, "{set}");
+        assert_eq!(controller.project_tabs().len(), 1, "{set}");
+    }
+}
+
+#[test]
+fn open_refuses_unreadable_tiff_layout() {
+    // A file set: two classic frames and one BigTIFF.
+    let root = tree("entry_layout_file_set");
+    copy_frame(&root, "00.tif", 0);
+    copy_frame(&root, "01.tif", 1);
+    write_bigtiff(&root.join("02.tif"), false);
+    let picked: Vec<PathBuf> = ["00.tif", "01.tif", "02.tif"]
+        .iter()
+        .map(|name| root.join(name))
+        .collect();
+    let mut controller = AppController::new();
+    let outcome = common::open_and_settle(&mut controller, &picked);
+    assert_unreadable_frame(
+        "file set",
+        &controller,
+        outcome,
+        &root,
+        &root.join("02.tif"),
+        "02.tif",
+        "BigTIFF",
+    );
+
+    // A folder whose second frame the decoded reader refuses by header; the
+    // palette case is compressed, because an uncompressed 16-bit frame is
+    // read by the memory-mapped reader, which does not look at the photometric.
+    for (label, set, tag, value) in [
+        ("palette photometric", "mantis-64-lzw-p1-strip-ii", 262, 3),
+        ("32-bit samples", "mantis-64", 258, 32),
+    ] {
+        let root = tree(&format!("entry_layout_{}", label.replace([' ', '-'], "_")));
+        copy_frame_from(set, &root, "00.tif", 0);
+        copy_frame_from(set, &root, "01.tif", 1);
+        patch_short_tag(&root.join("01.tif"), tag, value);
+        let mut controller = AppController::new();
+        let outcome = common::open_and_settle(&mut controller, std::slice::from_ref(&root));
+        let body = assert_unreadable_frame(
+            label,
+            &controller,
+            outcome,
+            &root,
+            &root,
+            "01.tif",
+            "TIFF layout",
+        );
+        assert!(
+            body.contains("standard 8- or 16-bit TIFF"),
+            "{label}: the way out: {body}"
+        );
+    }
+
+    // A frame deleted after the picked set classified, while the load waits.
+    let root = tree("entry_layout_deleted_in_hold");
+    copy_frame(&root, "00.tif", 0);
+    copy_frame(&root, "01.tif", 1);
+    let mut controller = AppController::new();
+    controller.set_open_hold(Duration::from_millis(300));
+    let load = controller
+        .open_paths(&[root.join("00.tif"), root.join("01.tif")])
+        .expect("the pick classifies and starts a load");
+    std::fs::remove_file(root.join("01.tif")).unwrap();
+    load.join().unwrap();
+    let outcome = controller.settle_open().expect("the load settles");
+    assert_unreadable_frame(
+        "deleted during the open",
+        &controller,
+        outcome,
+        &root,
+        &root.join("01.tif"),
+        "01.tif",
+        "could not be read",
+    );
+}
+
 #[test]
 fn a_path_that_is_neither_a_folder_nor_a_project_is_refused_by_name() {
     let dir = tree("entry_unreadable_path");
@@ -732,8 +1019,9 @@ fn no_grouping_vocabulary_after_the_answer() {
     match common::open_and_settle(&mut controller, &[ambiguous_root]) {
         OpenOutcome::Question(question, _) => {
             let rendered = format!(
-                "This folder reads as {} stacks of {} frames. Open as one project. Open as {} projects. Cancel",
-                question.project_count, question.frame_count, question.project_count,
+                "{} Open as one project. Open as {} projects. Cancel",
+                focusforge_gui::overlay::grouping_body(&question.stack_sizes),
+                question.project_count,
             );
             assert!(!rendered.to_lowercase().contains("group"));
         }
@@ -1048,6 +1336,23 @@ fn a_saved_project_reopens_through_the_same_picker() {
     assert!(
         !tabs[0].unsaved,
         "a reopened project carries no unsaved chip"
+    );
+}
+
+#[test]
+fn a_reopened_project_plans_for_its_frames_not_its_cropped_composite() {
+    use focusforge_gui::entry::tab_stack_context;
+
+    let dir = tree("entry_reopen_context");
+    copy_frame_from("mantis-64", &dir, "00.tif", 0);
+    let project_path = seal_test_project(&dir, &[dir.join("00.tif")]);
+    let project = focusforge_core::project::Project::open(&project_path).expect("project opens");
+
+    let context = tab_stack_context(&GuiProject::Opened(Box::new(project))).expect("a context");
+    assert_eq!(
+        (context.width, context.height, context.samples_per_pixel),
+        (64, 64, 3),
+        "the 4x4 composite is smaller than the 64x64 frame the run read"
     );
 }
 

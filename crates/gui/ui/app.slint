@@ -26,8 +26,8 @@ export { SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
 import { FFIconBar } from "shell/icon_bar.slint";
 import { FFNotificationCenter, NotificationRowView } from "shell/notification_center.slint";
-import { AboutState, FFSettingsModal, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState } from "shell/settings_modal.slint";
-export { AboutState, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
+import { AboutState, FFSettingsModal, UpdateControlsState, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState } from "shell/settings_modal.slint";
+export { AboutState, UpdateControlsState, InputRow, FFManifestRow, PerformanceCap, PerformanceState, StoragePathState, StorageState }
 import { FFCheckpointDelete, FFCloseGuard, FFDivergenceWarning, ExportRowView, FFExportDialog, FFFingerprintMismatch, FFFrameSetWarning, FFGroupingQuestion, FFRefusalDialog, FFSourcesMissing } from "shell/dialogs.slint";
 import { FFToast } from "components/ff_toast.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
@@ -574,6 +574,8 @@ export component AppWindow inherits Window {
     // `AppController::open_settings`/`close_settings`.
     in property <bool> settings-open: false;
     in property <[InputRow]> input-rows: [];
+    in property <string> input-source: "";
+    in property <[string]> input-problems: [];
     in property <string> settings-section: "performance";
     callback settings-open-requested();
     // The unread count on the bell, and whether the notification center is
@@ -596,8 +598,14 @@ export component AppWindow inherits Window {
     callback performance-gpu-toggled(bool);
     callback performance-host-cap-edited(string);
     callback performance-vram-cap-edited(string);
+    callback performance-cap-committed();
     callback performance-host-cap-cursor-moved(length, length);
     callback performance-vram-cap-cursor-moved(length, length);
+    callback performance-host-unit-toggled();
+    callback performance-vram-unit-toggled();
+    callback performance-host-unit-selected(string);
+    callback performance-vram-unit-selected(string);
+    callback performance-unit-dismissed();
 
     in property <string> appearance-presentation: "image-list";
     in property <bool> appearance-menu-open: false;
@@ -615,6 +623,11 @@ export component AppWindow inherits Window {
     callback storage-clear-requested();
 
     in property <AboutState> about;
+    in property <UpdateControlsState> update-controls;
+    callback update-check-on-start-toggled(bool);
+    callback update-check-now-requested();
+    callback update-skip-requested();
+    callback update-page-requested();
 
     in property <[FFManifestRow]> diagnostics-rows: [];
     in property <string> diagnostics-note: "";
@@ -679,7 +692,6 @@ export component AppWindow inherits Window {
         center-open: root.notification-center-open;
         calculator-open: root.calculator-open;
         analytics-open: root.analytics-open;
-        analytics-enabled: root.analytics-enabled;
 
         bell-activated => {
             root.bell-activated();
@@ -782,6 +794,7 @@ export component AppWindow inherits Window {
     in property <string> calculator-duration: "";
     in property <int> calculator-planes: 13;
     in property <float> calculator-overlap: 0.25;
+    out property <float> calculator-drawing-scale: calculator-overlay.drawing-scale;
     callback calculator-toggled();
     callback calculator-optics-chosen(string);
     callback calculator-field-edited(int, string);
@@ -812,8 +825,7 @@ export component AppWindow inherits Window {
     }
 
     in property <bool> analytics-open: false;
-    in property <bool> analytics-enabled: false;
-    in property <string> analytics-state: "computing";
+    in property <string> analytics-state: "waiting";
     in property <[AnalyticsRowView]> analytics-rows: [];
     in property <string> analytics-error: "";
     callback analytics-toggled();
@@ -855,6 +867,8 @@ export component AppWindow inherits Window {
         height: root.height;
         settings-open: root.settings-open;
         input-rows: root.input-rows;
+        input-source: root.input-source;
+        input-problems: root.input-problems;
         settings-section: root.settings-section;
         performance: root.performance;
         appearance-presentation: root.appearance-presentation;
@@ -870,6 +884,11 @@ export component AppWindow inherits Window {
         appearance-menu-toggled => { root.appearance-menu-toggled(); }
         storage: root.storage;
         about: root.about;
+        update-controls: root.update-controls;
+        update-check-on-start-toggled(on) => { root.update-check-on-start-toggled(on); }
+        update-check-now-requested => { root.update-check-now-requested(); }
+        update-skip-requested => { root.update-skip-requested(); }
+        update-page-requested => { root.update-page-requested(); }
         diagnostics-rows: root.diagnostics-rows;
         diagnostics-note: root.diagnostics-note;
         diagnostics-include-minidumps: root.diagnostics-include-minidumps;
@@ -891,8 +910,14 @@ export component AppWindow inherits Window {
         performance-gpu-toggled(on) => { root.performance-gpu-toggled(on); }
         performance-host-cap-edited(t) => { root.performance-host-cap-edited(t); }
         performance-vram-cap-edited(t) => { root.performance-vram-cap-edited(t); }
+        performance-cap-committed => { root.performance-cap-committed(); }
         performance-host-cap-cursor-moved(x, w) => { root.performance-host-cap-cursor-moved(x, w); }
         performance-vram-cap-cursor-moved(x, w) => { root.performance-vram-cap-cursor-moved(x, w); }
+        performance-host-unit-toggled => { root.performance-host-unit-toggled(); }
+        performance-vram-unit-toggled => { root.performance-vram-unit-toggled(); }
+        performance-host-unit-selected(u) => { root.performance-host-unit-selected(u); }
+        performance-vram-unit-selected(u) => { root.performance-vram-unit-selected(u); }
+        performance-unit-dismissed => { root.performance-unit-dismissed(); }
         storage-clear-requested => { root.storage-clear-requested(); }
         diagnostics-minidumps-toggled(v) => { root.diagnostics-minidumps-toggled(v); }
         diagnostics-destination-edited(t) => { root.diagnostics-destination-edited(t); }
@@ -907,16 +932,19 @@ export component AppWindow inherits Window {
     // The one grouping question and the two refusals the entry path can
     // produce.
     in property <bool> question-open: false;
-    in property <int> question-frame-count: 0;
+    in property <string> question-body;
     in property <int> question-project-count: 0;
     callback question-open-as-one();
     callback question-open-as-many();
     callback question-cancelled();
     in property <bool> refusal-open: false;
-    in property <string> refusal-title: "No frames here";
+    in property <string> refusal-title: "";
     in property <string> refusal-body: "";
-    in property <string> refusal-button-label: "Pick another folder…";
-    callback refusal-pick-another-folder();
+    in property <string> refusal-dismiss-label: "Close";
+    // Empty for a refusal that offers nothing beyond closing.
+    in property <string> refusal-confirm-label: "";
+    callback refusal-dismissed();
+    callback refusal-confirmed();
 
     // A saved project's source content disagrees with its recorded
     // fingerprint; the project stays unopened until a choice is made.
@@ -966,6 +994,7 @@ export component AppWindow inherits Window {
     // "info" | "warning" | "failure" | "crash".
     in property <string> toast-kind: "info";
     in property <string> toast-title: "";
+    in property <string> toast-link-label: "Open notification";
     callback toast-dismissed();
     callback toast-activated(int);
     // The pointer or the keyboard is on the toast.
@@ -979,8 +1008,10 @@ export component AppWindow inherits Window {
     in property <string> frame-warning-info: "";
     in property <string> frame-warning-confirm-label: "Confirm";
     in property <string> frame-warning-secondary-label: "";
+    in property <string> frame-warning-tertiary-label: "";
     callback frame-warning-cancelled();
     callback frame-warning-secondary-pressed();
+    callback frame-warning-tertiary-pressed();
     callback frame-warning-confirmed();
 
     // Keep or discard a run whose alignment left some frames unregistered.
@@ -1119,7 +1150,7 @@ export component AppWindow inherits Window {
         width: root.width;
         height: root.height;
         question-open: root.question-open;
-        frame-count: root.question-frame-count;
+        body: root.question-body;
         project-count: root.question-project-count;
         open-as-one => { root.question-open-as-one(); }
         open-as-many => { root.question-open-as-many(); }
@@ -1189,11 +1220,13 @@ export component AppWindow inherits Window {
         y: 0px;
         width: root.width;
         height: root.height;
-        refusal-open: root.refusal-open;
+        open: root.refusal-open;
         title: root.refusal-title;
         body: root.refusal-body;
-        button-label: root.refusal-button-label;
-        pick-another-folder => { root.refusal-pick-another-folder(); }
+        cancel-label: root.refusal-dismiss-label;
+        confirm-label: root.refusal-confirm-label;
+        cancelled => { root.refusal-dismissed(); }
+        confirmed => { root.refusal-confirmed(); }
     }
 
     toast := FFToast {
@@ -1202,6 +1235,7 @@ export component AppWindow inherits Window {
         toast-open: root.toast-open;
         title: root.toast-title;
         kind: root.toast-kind;
+        link-label: root.toast-link-label;
         dismissed => { root.toast-dismissed(); }
         link-activated => {
             root.toast-activated(root.toast-id);
@@ -1223,8 +1257,10 @@ export component AppWindow inherits Window {
         info: root.frame-warning-info;
         confirm-label: root.frame-warning-confirm-label;
         secondary-label: root.frame-warning-secondary-label;
+        tertiary-label: root.frame-warning-tertiary-label;
         cancelled => { root.frame-warning-cancelled(); }
         secondary-pressed => { root.frame-warning-secondary-pressed(); }
+        tertiary-pressed => { root.frame-warning-tertiary-pressed(); }
         confirmed => { root.frame-warning-confirmed(); }
     }
 

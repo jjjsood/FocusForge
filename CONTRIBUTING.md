@@ -9,7 +9,9 @@ crates/core/   TIFF and RAW I/O, tiles, stacking and alignment algorithms, the
                over tile-sized work units), the stage cache, grouping
                proposals, the `.ffp` project container and its
                checkpoint history (op log, render from the stored
-               composite, image export in TIFF, PNG and JPEG)
+               composite, image export in TIFF, PNG and JPEG), the update check
+               (`update`: version comparison and one HTTPS GET through `ureq`;
+               tests and `FOCUSFORGE_RELEASE_URL` point it at a local server)
 crates/gpu/    the shared wgpu device, WGSL fusion/warp/blend kernels and the
                tile-scheduler pipeline that runs them, behind the `gpu`
                feature (on by default). An allocate-and-back-off probe at
@@ -259,6 +261,8 @@ should come with the matching page edit and regenerated screenshots.
 
 ## Before you send a change
 
+Branch from `develop` and open the pull request against `develop`. `main` holds released versions only; a pull request from `develop` to `main` is a release.
+
 `tools/check-all.sh` runs every gate (formatting, licenses, SPDX headers, NOTICE, fixtures, build,
 clippy, tests, rustdoc, advisories, and the synthetic-ground-truth alignment
 check) in one command; `--static` is the fast subset a pre-commit hook runs,
@@ -288,7 +292,7 @@ memory, so tiling is the default path everywhere, not a fallback.
 
 ## Releases
 
-A human starts a release by pushing a version tag such as `v0.1.0`;
+A release is a pull request from `develop` to `main`. Candidate tags go on the `develop` snapshot and the final tag on the promoted `main`. A human starts a build by pushing a version tag such as `v0.1.0`;
 `.github/workflows/release.yml` builds the Linux, macOS and Windows packages and
 creates the release only after its same-commit checks pass. The release holds
 the installers (AppImage, `.deb`, DMG, MSI), one command-line archive per

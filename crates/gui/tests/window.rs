@@ -58,6 +58,73 @@ fn comparison_window_geometry() {
     assert_eq!(rect("ComparisonWindow::pane"), (1.0, 29.0, 818.0, 570.0));
 }
 
+/// Rests the pointer on `control` for the tooltip delay and returns the
+/// shown tooltip's text and its `(x, y, width, height)`.
+fn hover_tooltip(
+    window: &slint::Window,
+    root: &impl i_slint_backend_testing::ElementRoot,
+    control: &i_slint_backend_testing::ElementHandle,
+) -> (String, (f32, f32, f32, f32)) {
+    use i_slint_backend_testing::ElementQuery;
+    use slint::platform::WindowEvent;
+
+    window.dispatch_event(WindowEvent::PointerMoved {
+        position: common::element_center(control),
+    });
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(600));
+    let tooltip = ElementQuery::from_root(root)
+        .match_predicate(|element| element.type_name().as_deref() == Some("FFTooltip"))
+        .find_first()
+        .expect("hovering the control shows its tooltip through the control's own touch area");
+    let text = tooltip
+        .query_descendants()
+        .match_type_name("Text")
+        .find_first()
+        .and_then(|text| text.accessible_label())
+        .expect("the tooltip holds its text");
+    let position = tooltip.absolute_position();
+    let size = tooltip.size();
+    (
+        text.to_string(),
+        (position.x, position.y, size.width, size.height),
+    )
+}
+
+// tier: synthetic; layer: GUI view
+#[test]
+fn undock_control_shows_its_label_as_a_tooltip() {
+    use focusforge_gui::{AppWindow, ComparisonWindow};
+    use i_slint_backend_testing::ElementQuery;
+    use slint::ComponentHandle;
+
+    common::init_window_backend();
+    for index in 0..2 {
+        let app = AppWindow::new().unwrap();
+        app.window().set_size(slint::PhysicalSize::new(1440, 900));
+        app.set_project_loaded(true);
+        let controls = ElementQuery::from_root(&app)
+            .match_id("FFPane::pane-undock")
+            .find_all();
+        assert_eq!(controls.len(), 2, "both docked panes carry the control");
+        let (text, (x, y, width, height)) = hover_tooltip(app.window(), &app, &controls[index]);
+        assert_eq!(text, "Undock pane", "pane {index}");
+        assert!(
+            x >= 0.0 && y >= 0.0 && x + width <= 1440.0 && y + height <= 900.0,
+            "pane {index}: the tooltip ({x}, {y}, {width}, {height}) lies inside the window"
+        );
+    }
+
+    let window = ComparisonWindow::new().unwrap();
+    window.window().set_size(slint::PhysicalSize::new(820, 600));
+    window.set_project_loaded(true);
+    let control = ElementQuery::from_root(&window)
+        .match_id("FFPane::pane-undock")
+        .find_first()
+        .expect("the comparison window's pane carries the dock control");
+    let (text, _) = hover_tooltip(window.window(), &window, &control);
+    assert_eq!(text, "Dock pane");
+}
+
 #[test]
 fn comparison_current_crop_matches_the_visible_draw() {
     use focusforge_gui::ComparisonWindow;
