@@ -180,6 +180,7 @@ fn seal_staged(
         blobs,
         metrics: request.metrics,
         checkpoint: checkpoint_id.clone(),
+        format_version: None,
     };
 
     let checkpoint = Checkpoint {

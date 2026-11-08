@@ -4,6 +4,7 @@
 
 pub mod blend;
 
+use crate::project::BrushMode;
 use crate::tile::Rect;
 use crate::zmap::ZMapError;
 
@@ -25,6 +26,14 @@ pub enum RetouchError {
     /// `softness` is outside `0.0..=1.0` (also true for `NaN`).
     #[error("softness {softness} is not in 0.0..=1.0")]
     InvalidSoftness { softness: f32 },
+
+    /// `opacity` is outside `0 < x <= 1` (also true for `NaN`).
+    #[error("opacity {opacity} is not in 0 < x ≤ 1")]
+    InvalidOpacity { opacity: f32 },
+
+    /// The blend renders only [`BrushMode::Normal`] strokes.
+    #[error("blend mode {mode:?} is not rendered")]
+    ModeNotRendered { mode: BrushMode },
 
     /// A stroke's path holds no points.
     #[error("path is empty")]

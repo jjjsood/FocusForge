@@ -11,7 +11,7 @@
 use std::num::NonZeroU32;
 
 use crate::algorithm::TileReader;
-use crate::project::{Op, Point};
+use crate::project::{BrushMode, Op, Point};
 use crate::tile::{Rect, Sample};
 use crate::zmap::ZMapInfo;
 
@@ -24,24 +24,27 @@ const OPAQUE: u32 = 1 << 16;
 /// Caps the radius so the ramp's products stay far inside `u64`.
 const MAX_RADIUS_16: u64 = 1 << 40;
 
-/// A validated brush stroke: [`Op::BrushStroke`]'s path, radius and
-/// softness, checked against the map they will be applied to.
+/// A validated brush stroke: [`Op::BrushStroke`]'s path, radius, softness,
+/// mode and opacity, checked against the map they will be applied to.
 pub(super) struct Stroke<'a> {
     pub(super) path: &'a [Point],
     pub(super) radius: f32,
     pub(super) softness: f32,
+    pub(super) mode: BrushMode,
+    pub(super) opacity: f32,
 }
 
 /// Refuses, in order: an empty path; `source_id >= info.frame_count()`; a
-/// non-finite or non-positive radius; a softness outside `0.0..=1.0`.
+/// non-finite or non-positive radius; a softness outside `0.0..=1.0`; an
+/// opacity outside `0 < x <= 1`.
 pub(super) fn validate<'a>(op: &'a Op, info: ZMapInfo) -> Result<Stroke<'a>, RetouchError> {
     let Op::BrushStroke {
         source_id,
         path,
         radius,
         softness,
-        mode: _,
-        opacity: _,
+        mode,
+        opacity,
     } = op;
     if path.is_empty() {
         return Err(RetouchError::EmptyPath);
@@ -60,10 +63,15 @@ pub(super) fn validate<'a>(op: &'a Op, info: ZMapInfo) -> Result<Stroke<'a>, Ret
             softness: *softness,
         });
     }
+    if !(*opacity > 0.0 && *opacity <= 1.0) {
+        return Err(RetouchError::InvalidOpacity { opacity: *opacity });
+    }
     Ok(Stroke {
         path: path.as_slice(),
         radius: *radius,
         softness: *softness,
+        mode: *mode,
+        opacity: *opacity,
     })
 }
 
@@ -277,6 +285,15 @@ pub fn mask_ramp(op: &Op, info: ZMapInfo) -> Result<(u64, u64), RetouchError> {
     Ok((ramp.radius, ramp.core))
 }
 
+/// A stroke's `opacity` as a Q16 factor (`0..=65536`): `opacity * 65536`
+/// rounded to nearest, ties away from zero. `1.0` gives `65536`; anything
+/// below `0.5 / 65536` (about `7.6e-6`) gives `0`. [`apply`] scales each mask
+/// alpha `a` by it as `(a * q + 32768) >> 16`, and a blend that reproduces
+/// [`apply`] must convert and scale the same way.
+pub fn opacity_q16(opacity: f32) -> u32 {
+    (f64::from(opacity) * f64::from(OPAQUE)).round() as u32
+}
+
 /// The Q16 alpha (`0..=65536`) the stroke `op` gives the pixel `(x, y)`,
 /// testing every segment: the definition [`apply`] reproduces with segment
 /// culling.
@@ -412,6 +429,9 @@ pub fn apply<S: Blend>(
     spp: usize,
 ) -> Result<(), RetouchError> {
     let stroke = validate(op, info)?;
+    if stroke.mode != BrushMode::Normal {
+        return Err(RetouchError::ModeNotRendered { mode: stroke.mode });
+    }
     if !info.contains(out_rect) || out_rect.intersect(region) != Some(region) {
         return Err(RetouchError::TileOutsideMap { tile: region });
     }
@@ -428,6 +448,7 @@ pub fn apply<S: Blend>(
         return Ok(());
     };
     let ramp = Ramp::new(&stroke);
+    let opacity = u64::from(opacity_q16(stroke.opacity));
     SegmentGrid::new(&stroke, active).walk(|x, y, segments| {
         let a = ramp.alpha(distance_16(
             &stroke,
@@ -435,6 +456,7 @@ pub fn apply<S: Blend>(
             y,
             segments.iter().map(|&i| i as usize),
         ));
+        let a = ((u64::from(a) * opacity + 32768) >> 16) as u32;
         if a == 0 {
             return;
         }
@@ -521,6 +543,194 @@ mod tests {
 
     fn info(width: u32, height: u32) -> ZMapInfo {
         ZMapInfo::new(width, height, 4).unwrap()
+    }
+
+    #[test]
+    fn opacity_q16() {
+        assert_eq!(super::opacity_q16(1.0), 65536);
+        assert_eq!(super::opacity_q16(0.5), 32768);
+        assert_eq!(super::opacity_q16(1.0 - f32::EPSILON / 2.0), 65536);
+        assert_eq!(super::opacity_q16(1e-9), 0);
+        assert_eq!(super::opacity_q16(7.6e-6), 0, "just below 0.5 / 65536");
+        assert_eq!(super::opacity_q16(7.7e-6), 1, "just above 0.5 / 65536");
+        let mut last = 0;
+        for i in 1..=4096u32 {
+            let opacity = i as f32 / 4096.0;
+            let q = super::opacity_q16(opacity);
+            assert!(q >= last, "monotone at {opacity}");
+            let exact = f64::from(opacity) * 65536.0;
+            assert!((f64::from(q) - exact).abs() <= 0.5, "{opacity}: {q}");
+            last = q;
+        }
+    }
+
+    #[test]
+    fn opacity_scales_mask() {
+        let info = info(40, 30);
+        let out_rect = rect(0, 0, 40, 30);
+        let region = rect(8, 6, 20, 16);
+        for spp in [1usize, 3] {
+            let base: Vec<u16> = (0..40 * 30 * spp)
+                .map(|i| (i * 37 % 65536) as u16)
+                .collect();
+            let src: Vec<u16> = (0..20 * 16 * spp)
+                .map(|i| (i * 91 % 65536) as u16)
+                .collect();
+            let base_f: Vec<f32> = base.iter().map(|&v| f32::from(v) + 0.25).collect();
+            let src_f: Vec<f32> = src.iter().map(|&v| f32::from(v) - 0.5).collect();
+            for opacity in [0.01f32, 0.5, 1.0] {
+                let op = Op::BrushStroke {
+                    source_id: 2,
+                    path: vec![pt(10, 10), pt(25, 15)],
+                    radius: 8.0,
+                    softness: 0.5,
+                    mode: BrushMode::Normal,
+                    opacity,
+                };
+                let q = u64::from(super::opacity_q16(opacity));
+                let mut out = base.clone();
+                apply(&op, info, out_rect, &mut out, region, &src, spp).unwrap();
+                let mut out_f = base_f.clone();
+                apply(&op, info, out_rect, &mut out_f, region, &src_f, spp).unwrap();
+                let mut changed = 0;
+                for y in 0..30u32 {
+                    for x in 0..40u32 {
+                        let in_region = (8..28).contains(&x) && (6..22).contains(&y);
+                        let a = alpha(&op, info, x, y).unwrap();
+                        let a = ((u64::from(a) * q + 32768) >> 16) as u32;
+                        for c in 0..spp {
+                            let i = (y as usize * 40 + x as usize) * spp + c;
+                            let (want, want_f) = if in_region {
+                                let at = ((y - 6) as usize * 20 + (x - 8) as usize) * spp + c;
+                                (
+                                    blend_sample(base[i], src[at], a),
+                                    <f32 as Blend>::blend(base_f[i], src_f[at], a),
+                                )
+                            } else {
+                                (base[i], base_f[i])
+                            };
+                            let label = format!("spp {spp} opacity {opacity} ({x}, {y}, {c})");
+                            assert_eq!(out[i], want, "u16 {label}");
+                            assert_eq!(out_f[i], want_f, "f32 {label}");
+                            changed += usize::from(out[i] != base[i]);
+                        }
+                    }
+                }
+                assert!(changed > 0, "spp {spp} opacity {opacity} changes something");
+                if opacity == 1.0 {
+                    let plain = stroke_op(2, vec![pt(10, 10), pt(25, 15)], 8.0, 0.5);
+                    let mut again = base.clone();
+                    apply(&plain, info, out_rect, &mut again, region, &src, spp).unwrap();
+                    assert_eq!(out, again, "opacity 1.0 is the stroke without the fields");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unimplemented_modes_are_refused_at_blend() {
+        let info = info(32, 32);
+        let whole = rect(0, 0, 32, 32);
+        for mode in [BrushMode::Lighten, BrushMode::Darken, BrushMode::Detail] {
+            // The refusal does not depend on the stroke reaching the map.
+            for at in [pt(1, 1), pt(500, 500)] {
+                let op = Op::BrushStroke {
+                    source_id: 0,
+                    path: vec![at],
+                    radius: 3.0,
+                    softness: 0.0,
+                    mode,
+                    opacity: 0.5,
+                };
+                assert!(validate(&op, info).is_ok());
+                assert!(footprint(&op, info).is_ok());
+                let mut out = vec![7u16; 32 * 32];
+                let result = apply(&op, info, whole, &mut out, whole, &[9u16; 32 * 32], 1);
+                assert!(
+                    matches!(result, Err(RetouchError::ModeNotRendered { mode: m }) if m == mode),
+                    "{mode:?}: {result:?}"
+                );
+                assert!(out.iter().all(|&s| s == 7), "{mode:?} writes nothing");
+            }
+        }
+    }
+
+    fn stroke_with(mode: BrushMode, opacity: f32) -> Op {
+        Op::BrushStroke {
+            source_id: 0,
+            path: vec![pt(1, 1)],
+            radius: 3.0,
+            softness: 0.0,
+            mode,
+            opacity,
+        }
+    }
+
+    const MODES: [BrushMode; 4] = [
+        BrushMode::Normal,
+        BrushMode::Lighten,
+        BrushMode::Darken,
+        BrushMode::Detail,
+    ];
+
+    #[test]
+    fn opacity_bounds() {
+        let info = info(32, 32);
+        for opacity in [
+            0.0,
+            -0.5,
+            1.0001,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            for mode in MODES {
+                let op = stroke_with(mode, opacity);
+                assert!(
+                    matches!(
+                        validate(&op, info),
+                        Err(RetouchError::InvalidOpacity { .. })
+                    ),
+                    "{mode:?} {opacity}"
+                );
+                assert!(matches!(
+                    footprint(&op, info),
+                    Err(RetouchError::InvalidOpacity { .. })
+                ));
+            }
+        }
+        for opacity in [1e-9, 1e-6, 0.5, 1.0] {
+            for mode in MODES {
+                let op = stroke_with(mode, opacity);
+                assert!(validate(&op, info).is_ok(), "{mode:?} {opacity}");
+                assert!(footprint(&op, info).is_ok(), "{mode:?} {opacity}");
+            }
+        }
+        // The earlier checks keep their place in the order.
+        let bad = |path: Vec<Point>, source_id, radius, softness| Op::BrushStroke {
+            source_id,
+            path,
+            radius,
+            softness,
+            mode: BrushMode::Normal,
+            opacity: 0.0,
+        };
+        assert!(matches!(
+            validate(&bad(vec![], 0, 3.0, 0.0), info),
+            Err(RetouchError::EmptyPath)
+        ));
+        assert!(matches!(
+            validate(&bad(vec![pt(1, 1)], 9, 3.0, 0.0), info),
+            Err(RetouchError::SourceOutOfRange { .. })
+        ));
+        assert!(matches!(
+            validate(&bad(vec![pt(1, 1)], 0, 0.0, 0.0), info),
+            Err(RetouchError::InvalidRadius { .. })
+        ));
+        assert!(matches!(
+            validate(&bad(vec![pt(1, 1)], 0, 3.0, 2.0), info),
+            Err(RetouchError::InvalidSoftness { .. })
+        ));
     }
 
     #[test]
@@ -876,6 +1086,8 @@ mod tests {
                 path,
                 radius: 16.0,
                 softness: 0.3,
+                mode: BrushMode::Normal,
+                opacity: 1.0,
             };
             let mut total = 0;
             SegmentGrid::new(&stroke, map).walk(|_, _, segments| total += segments.len() as u64);

@@ -139,6 +139,23 @@ fn flags_old_processing_names_are_rejected() {
 }
 
 #[test]
+fn retouch_help_names_mode_and_opacity() {
+    let output = common::cli_bin("cli_contract")
+        .args(["retouch", "--help"])
+        .output()
+        .expect("retouch help must run");
+    let help = String::from_utf8_lossy(&output.stdout);
+    let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "`mode` (`normal`, `lighten`, `darken` or `detail`; default `normal`)",
+        "`opacity` (0 < x \u{2264} 1; default 1.0)",
+        "An opacity too small to register still records a state but changes no sample",
+    ] {
+        assert!(help.contains(needle), "{needle} missing from {help}");
+    }
+}
+
+#[test]
 fn flags_cpu_is_feature_gated() {
     let output = common::cli_bin("cli_contract")
         .args(["stack", "--help"])
@@ -648,7 +665,7 @@ fn no_progress_is_local_to_processing_commands() {
     }
 }
 
-/// Copies `src` to `dst` with `manifest.json`'s `format_version` raised to 2:
+/// Copies `src` to `dst` with `manifest.json`'s `format_version` raised to 3:
 /// a project saved by a newer FocusForge.
 fn write_newer_format_copy(src: &std::path::Path, dst: &std::path::Path) {
     use focusforge_core::project::container::{ContainerWriter, Index};
@@ -659,7 +676,7 @@ fn write_newer_format_copy(src: &std::path::Path, dst: &std::path::Path) {
         let mut bytes = index.read_entry(src, name).unwrap();
         if name == "manifest.json" {
             let mut manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            manifest["format_version"] = serde_json::json!(2);
+            manifest["format_version"] = serde_json::json!(3);
             bytes = serde_json::to_vec_pretty(&manifest).unwrap();
         }
         writer.put_bytes(name, &bytes).unwrap();

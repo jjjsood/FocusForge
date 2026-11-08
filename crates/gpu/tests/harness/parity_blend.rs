@@ -301,3 +301,49 @@ fn blend_refuses_oversized_region() {
     }
     assert_eq!(out, base, "a refused region is not truncated or blended");
 }
+
+#[test]
+fn blend_refuses_modes_and_opacity_below_q16_full() {
+    let Some(shared) = shared_device_or_skip() else {
+        return;
+    };
+    let blender = blender(shared);
+    let region = rect(0, 0, 64, 64);
+    let info = ZMapInfo::new(64, 64, 8).unwrap();
+    let base: Vec<u16> = (0..64 * 64).map(|i| (i * 37 % 65_536) as u16).collect();
+    let src: Vec<u16> = (0..64 * 64).map(|i| (i * 91 % 65_536) as u16).collect();
+    let styled = |mode, opacity| Op::BrushStroke {
+        source_id: 0,
+        path: vec![pt(20, 20), pt(40, 30)],
+        radius: 12.0,
+        softness: 0.5,
+        mode,
+        opacity,
+    };
+
+    let refused = [
+        (styled(BrushMode::Lighten, 1.0), "mode"),
+        (styled(BrushMode::Darken, 1.0), "mode"),
+        (styled(BrushMode::Detail, 1.0), "mode"),
+        (styled(BrushMode::Normal, 0.5), "opacity"),
+        (styled(BrushMode::Normal, 1e-9), "opacity"),
+    ];
+    for (op, want) in refused {
+        let mut out = base.clone();
+        match blender.apply(&op, info, region, &mut out, region, &src, 1) {
+            Err(BlendError::Refused { limit, .. }) => assert_eq!(limit, want, "{op:?}"),
+            other => panic!("expected a {want} refusal for {op:?}, got {other:?}"),
+        }
+        assert_eq!(out, base, "a refused stroke changes no sample");
+    }
+
+    // The largest f32 below 1.0 is Q16 full: the kernel takes it, as the CPU blend does.
+    let op = styled(BrushMode::Normal, 1.0 - f32::EPSILON / 2.0);
+    let mut device = base.clone();
+    blender
+        .apply(&op, info, region, &mut device, region, &src, 1)
+        .expect("an opacity that rounds to Q16 full is not refused");
+    let mut cpu = base.clone();
+    blend::apply(&op, info, region, &mut cpu, region, &src, 1).unwrap();
+    assert_eq!(device, cpu);
+}

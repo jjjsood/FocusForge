@@ -720,6 +720,26 @@ fn append_refuses_bad_ops_and_writes_nothing() {
 }
 
 #[test]
+fn q16_zero_opacity_changes_nothing() {
+    let (_, project_path, root, _) = gained_pair("retouch_ops_q16_zero");
+    let faint = Op::BrushStroke {
+        source_id: 1,
+        path: vec![Point { x: 10, y: 10 }, Point { x: 30, y: 20 }],
+        radius: 9.0,
+        softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1e-9,
+    };
+    let ids = project::append_op_chain(&project_path, Some(&root), vec![faint], None, 1)
+        .expect("an opacity that rounds to zero is accepted");
+    assert_eq!(ids.len(), 1, "one state is recorded");
+    assert!(
+        render_state(&project_path, &ids[0]) == render_state(&project_path, &root),
+        "the state renders sample-identical to its parent"
+    );
+}
+
+#[test]
 fn op_chain_appends_one_state_per_op() {
     let (_, project_path, root, _) = gained_pair("retouch_ops_chain");
     let twin = project_path.with_file_name("twin.ffp");

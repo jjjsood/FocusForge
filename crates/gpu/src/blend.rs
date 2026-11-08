@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use focusforge_core::project::{Op, Point};
+use focusforge_core::project::{BrushMode, Op, Point};
 use focusforge_core::retouch::{RetouchError, blend};
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::ZMapInfo;
@@ -35,8 +35,8 @@ pub enum BlendError {
     Retouch(#[from] RetouchError),
 
     /// The stroke lies outside what the kernel computes exactly; the CPU
-    /// blend handles it. `limit` names the bound: `coordinate`, `radius` or
-    /// `buffer`.
+    /// blend handles it. `limit` names the bound: `coordinate`, `radius`,
+    /// `buffer`, `mode` or `opacity`.
     #[error("the blend kernel refuses this stroke: {limit} {detail}")]
     Refused { limit: &'static str, detail: String },
 
@@ -76,6 +76,19 @@ fn plan(
     max_binding: u64,
 ) -> Result<Option<Plan>, BlendError> {
     let footprint = blend::footprint(op, info)?;
+    let Op::BrushStroke { mode, opacity, .. } = op else {
+        return Err(RetouchError::Unsupported.into());
+    };
+    if *mode != BrushMode::Normal {
+        return Err(refused("mode", format!("{mode:?} is not rendered")));
+    }
+    let q16 = blend::opacity_q16(*opacity);
+    if q16 != 1 << 16 {
+        return Err(refused(
+            "opacity",
+            format!("of {opacity} is {q16} in Q16, not full"),
+        ));
+    }
     if !info.contains(out_rect) || out_rect.intersect(region) != Some(region) {
         return Err(RetouchError::TileOutsideMap { tile: region }.into());
     }
@@ -247,8 +260,10 @@ impl Blender {
     /// `region`) over `out` (of `out_rect`), exactly as the CPU blend does.
     /// [`BlendError::Refused`] covers coordinates of 2^14 or more in absolute
     /// value, a mask radius of 2^16 sixteenths of a pixel or more, and a region
-    /// past one storage-buffer binding at one `u32` a sample. On any `Err`,
-    /// `out` is as it was.
+    /// past one storage-buffer binding at one `u32` a sample. It also refuses
+    /// a stroke whose mode is not `normal` or whose Q16 opacity
+    /// ([`blend::opacity_q16`]) is not full, which the kernel does not render.
+    /// On any `Err`, `out` is as it was.
     #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &self,
@@ -365,6 +380,41 @@ mod tests {
             Err(BlendError::Refused { limit, .. }) => limit,
             other => panic!("expected a refusal, got {:?}", other.map(|p| p.is_some())),
         }
+    }
+
+    fn styled(path: Vec<Point>, mode: BrushMode, opacity: f32) -> Op {
+        Op::BrushStroke {
+            source_id: 0,
+            path,
+            radius: 4.0,
+            softness: 0.5,
+            mode,
+            opacity,
+        }
+    }
+
+    #[test]
+    fn a_mode_or_an_opacity_below_full_is_refused_whatever_the_region() {
+        let region = rect(0, 0, 16, 16);
+        let clear = rect(100, 100, 16, 16);
+        for mode in [BrushMode::Lighten, BrushMode::Darken, BrushMode::Detail] {
+            let op = styled(vec![pt(8, 8)], mode, 1.0);
+            assert_eq!(refused(plan_over(&op, region, 1, BIG)), "mode");
+            assert_eq!(
+                refused(plan_over(&op, clear, 1, BIG)),
+                "mode",
+                "a stroke with no active region is refused too"
+            );
+        }
+        for opacity in [0.5, 1e-9, 0.99] {
+            let op = styled(vec![pt(8, 8)], BrushMode::Normal, opacity);
+            assert_eq!(refused(plan_over(&op, region, 1, BIG)), "opacity");
+            assert_eq!(refused(plan_over(&op, clear, 1, BIG)), "opacity");
+        }
+        // An opacity whose Q16 value is 65536 is the kernel's own.
+        let just_under = styled(vec![pt(8, 8)], BrushMode::Normal, 1.0 - f32::EPSILON / 2.0);
+        assert!(plan_over(&just_under, region, 1, BIG).unwrap().is_some());
+        assert!(plan_over(&just_under, clear, 1, BIG).unwrap().is_none());
     }
 
     #[test]

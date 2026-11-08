@@ -143,7 +143,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (retouch)
 _arguments "${_arguments_options[@]}" : \
-'--ops=[The op list\: a JSON array of ops in the persisted \`Op\` shape. A brush stroke blends frame \`source_id\` over the image along its path\: fully within \`radius * (1 - softness)\`, fading linearly to nothing at \`radius\`. Every op is checked before anything is written; positions in error messages count from 0 in list order]:FILE:_files' \
+'--ops=[The op list\: a JSON array of ops in the persisted \`Op\` shape. A brush stroke blends frame \`source_id\` over the image along its path\: fully within \`radius * (1 - softness)\`, fading linearly to nothing at \`radius\`. A stroke may also carry \`mode\` (\`normal\`, \`lighten\`, \`darken\` or \`detail\`; default \`normal\`) and \`opacity\` (0 < x ≤ 1; default 1.0). An opacity too small to register still records a state but changes no sample. Every op is checked before anything is written; positions in error messages count from 0 in list order]:FILE:_files' \
 '--from=[The state to append under -- any unique prefix of its id. Defaults to the project'\''s current head]:FROM:_default' \
 '--name=[Name the last appended state]:NAME:_default' \
 '--json[Emit the JSON report instead of human-readable text]' \

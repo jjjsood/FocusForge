@@ -376,7 +376,10 @@ enum Command {
         /// The op list: a JSON array of ops in the persisted `Op` shape.
         /// A brush stroke blends frame `source_id` over the image along
         /// its path: fully within `radius * (1 - softness)`, fading
-        /// linearly to nothing at `radius`. Every op is checked before
+        /// linearly to nothing at `radius`. A stroke may also carry `mode`
+        /// (`normal`, `lighten`, `darken` or `detail`; default `normal`) and
+        /// `opacity` (0 < x ≤ 1; default 1.0). An opacity too small to
+        /// register still records a state but changes no sample. Every op is checked before
         /// anything is written; positions in error messages count from 0 in
         /// list order.
         #[arg(long, value_name = "FILE")]

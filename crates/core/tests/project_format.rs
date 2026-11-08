@@ -227,6 +227,10 @@ fn manifest_value(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+fn stored_format_version(path: &Path) -> Option<serde_json::Value> {
+    manifest_value(path).get("format_version").cloned()
+}
+
 #[test]
 fn manifest_carries_no_format_version() {
     let (_dir, project_path) = sealed("project_format_no_version");
@@ -371,6 +375,119 @@ fn stroke(mode: BrushMode, opacity: f32) -> Op {
         softness: 0.0,
         mode,
         opacity,
+    }
+}
+
+/// Every stroke shape that needs format 2.
+fn non_default_strokes() -> [Op; 5] {
+    [
+        stroke(BrushMode::Lighten, 1.0),
+        stroke(BrushMode::Darken, 1.0),
+        stroke(BrushMode::Detail, 1.0),
+        stroke(BrushMode::Normal, 0.5),
+        stroke(BrushMode::Normal, 1.0 - f32::EPSILON / 2.0),
+    ]
+}
+
+fn required_version(path: &Path) -> u32 {
+    project::required_format_version(Project::open(path).unwrap().history())
+}
+
+#[test]
+fn required_format_version_is_two_for_a_listed_non_default_stroke() {
+    let (_dir, path) = sealed("project_format_required_fold");
+    assert_eq!(required_version(&path), 1, "a sealed project");
+    project::append_ops(&path, vec![stroke(BrushMode::Normal, 1.0)], None).unwrap();
+    assert_eq!(required_version(&path), 1, "a default stroke");
+    for (i, op) in non_default_strokes().into_iter().enumerate() {
+        let (_dir, other) = sealed(&format!("project_format_required_fold_{i}"));
+        project::append_ops(&other, vec![op.clone()], None).unwrap();
+        assert_eq!(required_version(&other), 2, "{op:?}");
+        // A default stroke after it leaves the earlier checkpoint listed.
+        project::append_ops(&other, vec![stroke(BrushMode::Normal, 1.0)], None).unwrap();
+        assert_eq!(required_version(&other), 2, "{op:?} then a default stroke");
+    }
+}
+
+#[test]
+fn required_format_version_never_lowers_a_stored_version() {
+    let (_dir, path) = sealed("project_format_required_monotone");
+    let default = || vec![stroke(BrushMode::Normal, 1.0)];
+
+    let at_two = with_manifest(&path, "stored-two", |m| {
+        m.insert("format_version".into(), serde_json::json!(2));
+    });
+    project::append_ops(&at_two, default(), None).unwrap();
+    assert_eq!(stored_format_version(&at_two), Some(serde_json::json!(2)));
+
+    for (name, stored) in [("stored-zero", 0), ("stored-one", 1)] {
+        let copy = with_manifest(&path, name, |m| {
+            m.insert("format_version".into(), serde_json::json!(stored));
+        });
+        project::append_ops(&copy, default(), None).unwrap();
+        assert_eq!(
+            stored_format_version(&copy),
+            Some(serde_json::json!(stored)),
+            "{name}: a default-only save rewrites nothing"
+        );
+        project::append_ops(&copy, vec![stroke(BrushMode::Detail, 1.0)], None).unwrap();
+        assert_eq!(
+            stored_format_version(&copy),
+            Some(serde_json::json!(2)),
+            "{name}: a non-default stroke raises it"
+        );
+    }
+}
+
+#[test]
+fn required_format_version_two_opens_and_three_is_refused() {
+    let (_dir, path) = sealed("project_format_required_supported");
+    project::append_ops(&path, vec![stroke(BrushMode::Lighten, 0.5)], None).unwrap();
+    let head = Project::open(&path).unwrap().manifest().checkpoint.clone();
+    assert_eq!(stored_format_version(&path), Some(serde_json::json!(2)));
+    assert_eq!(Project::open(&path).unwrap().manifest().checkpoint, head);
+
+    let newer = with_manifest(&path, "v3", |m| {
+        m.insert("format_version".into(), serde_json::json!(3));
+    });
+    assert!(matches!(
+        open_err(&newer),
+        project::ProjectError::NewerFormat {
+            found: 3,
+            supported: 2,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn format_version_stamp_marks_only_non_default_strokes() {
+    let (_dir, path) = sealed("project_format_stamp_default");
+    let keys = |p: &Path| -> Vec<String> {
+        manifest_value(p)
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    };
+    let before = keys(&path);
+    project::append_ops(&path, vec![stroke(BrushMode::Normal, 1.0)], None).unwrap();
+    assert_eq!(
+        stored_format_version(&path),
+        None,
+        "default strokes: no field"
+    );
+    assert_eq!(keys(&path), before, "the default manifest keeps its keys");
+
+    for (i, op) in non_default_strokes().into_iter().enumerate() {
+        let (_dir, other) = sealed(&format!("project_format_stamp_{i}"));
+        project::append_ops(&other, vec![op.clone()], None).unwrap();
+        assert_eq!(
+            stored_format_version(&other),
+            Some(serde_json::json!(2)),
+            "{op:?}"
+        );
     }
 }
 
@@ -834,7 +951,7 @@ fn open_err(path: &Path) -> project::ProjectError {
 #[test]
 fn newer_format_version_is_refused() {
     let (_dir, project_path) = sealed("project_format_newer");
-    for found in [2u32, 7] {
+    for found in [3u32, 7] {
         let newer = with_manifest(&project_path, &format!("v{found}"), |m| {
             m.insert("format_version".into(), serde_json::json!(found));
         });
@@ -842,14 +959,14 @@ fn newer_format_version_is_refused() {
         assert!(
             matches!(
                 &err,
-                project::ProjectError::NewerFormat { found: f, supported: 1, .. } if *f == found
+                project::ProjectError::NewerFormat { found: f, supported: 2, .. } if *f == found
             ),
             "expected NewerFormat for version {found}: {err:?}"
         );
         assert_eq!(
             err.to_string(),
             format!(
-                "{}: saved by a newer FocusForge (project format {found}; this build reads up to 1). Update FocusForge to open it.",
+                "{}: saved by a newer FocusForge (project format {found}; this build reads up to 2). Update FocusForge to open it.",
                 newer.display()
             )
         );
@@ -859,14 +976,14 @@ fn newer_format_version_is_refused() {
 #[test]
 fn newer_format_version_is_refused_before_the_manifest_is_decoded() {
     let (_dir, project_path) = sealed("project_format_newer_undecodable");
-    let newer = with_manifest(&project_path, "v2-no-registration", |m| {
-        m.insert("format_version".into(), serde_json::json!(2));
+    let newer = with_manifest(&project_path, "v3-no-registration", |m| {
+        m.insert("format_version".into(), serde_json::json!(3));
         m.remove("registration")
             .expect("the sealed manifest must carry a registration key to remove");
     });
     let err = open_err(&newer);
     assert!(
-        matches!(&err, project::ProjectError::NewerFormat { found: 2, .. }),
+        matches!(&err, project::ProjectError::NewerFormat { found: 3, .. }),
         "expected NewerFormat, not a parse error: {err:?}"
     );
 }
@@ -882,6 +999,7 @@ fn format_version_absent_or_current_opens() {
     let cases = [
         ("absent", None),
         ("one", Some(serde_json::json!(1))),
+        ("two", Some(serde_json::json!(2))),
         ("zero", Some(serde_json::json!(0))),
         ("null", Some(serde_json::Value::Null)),
     ];

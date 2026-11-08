@@ -125,7 +125,8 @@ pub enum Op {
     /// `mode` and `opacity` read as [`BrushMode::Normal`] and `1.0` when
     /// absent, and each is left out of the serialized stroke while it holds
     /// that default, so a default stroke keeps its bytes (and the id hashed
-    /// from them). Rendering ignores them.
+    /// from them). `opacity` scales the stroke's coverage; only
+    /// [`BrushMode::Normal`] strokes render.
     BrushStroke {
         source_id: u16,
         path: Vec<Point>,
@@ -138,7 +139,8 @@ pub enum Op {
     },
 }
 
-/// The blend mode a stroke records. Rendering ignores it.
+/// The blend mode a stroke records. Only `Normal` renders; the blend refuses
+/// the others.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BrushMode {

@@ -77,7 +77,7 @@ pub use error::ProjectError;
 pub use export::{export_checkpoint, export_held, export_pending};
 pub use manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
-    SourceResolution,
+    SourceResolution, required_format_version,
 };
 use manifest::{FORMAT_VERSION, FormatProbe};
 pub use render::{CheckpointImage, PendingState, render_checkpoint};
@@ -780,9 +780,15 @@ impl Project {
     }
 
     /// Writes the manifest if it changed, then the footer: every record put
-    /// since the project was opened becomes the committed state at once. After
-    /// an error the project is stale; reopen it.
+    /// since the project was opened becomes the committed state at once. The
+    /// manifest's `format_version` is raised to what the history needs and
+    /// never lowered. After an error the project is stale; reopen it.
     pub(super) fn commit(&mut self) -> Result<(), ProjectError> {
+        let required = required_format_version(&self.history);
+        if required > self.manifest.format_version.unwrap_or(1).max(1) {
+            self.manifest.format_version = Some(required);
+            self.manifest_changed = true;
+        }
         if self.manifest_changed {
             let bytes = serde_json::to_vec(&self.manifest)
                 .map_err(|err| ProjectError::container(&self.path, err))?;

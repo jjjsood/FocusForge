@@ -226,6 +226,7 @@ fn write_fused(
         blobs,
         metrics,
         checkpoint: checkpoint_id.clone(),
+        format_version: project.manifest().format_version,
     };
 
     let checkpoint = Checkpoint {
@@ -408,6 +409,7 @@ pub(super) fn append_ops_on(
         metrics: fuse.metrics,
         checkpoint: checkpoint_id.clone(),
         registration: fuse.registration.clone(),
+        format_version: manifest.format_version,
     };
 
     let checkpoint = Checkpoint {
