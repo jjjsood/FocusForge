@@ -806,3 +806,484 @@ fn op_chain_appends_one_state_per_op() {
         Some(ids[0].as_str())
     );
 }
+
+fn stroke_in(
+    mode: BrushMode,
+    (source_id, path, radius): (u16, &[(i32, i32)], f32),
+    opacity: f32,
+) -> Op {
+    Op::BrushStroke {
+        source_id,
+        path: path.iter().map(|&(x, y)| Point { x, y }).collect(),
+        radius,
+        softness: 0.3,
+        mode,
+        opacity,
+    }
+}
+
+/// `ops` blended over the whole of `composite` in one `apply_strokes` call:
+/// no tile and no band, so every blur window sees the map.
+fn reference_whole<S: Blend>(
+    composite: &[S],
+    (width, height, spp): (u32, u32, u32),
+    frame_count: u32,
+    ops: &[Op],
+    frames: &dyn TileReader,
+    origin: (u32, u32),
+) -> Vec<S> {
+    let info = ZMapInfo::new(width, height, frame_count).unwrap();
+    let placed: Vec<blend::PlacedStroke> = ops
+        .iter()
+        .filter_map(|op| {
+            let Op::BrushStroke { source_id, .. } = op else {
+                panic!("only strokes are blended");
+            };
+            blend::footprint(op, info)
+                .unwrap()
+                .map(|footprint| blend::PlacedStroke {
+                    op,
+                    frame: usize::from(*source_id),
+                    footprint,
+                })
+        })
+        .collect();
+    let mut out = composite.to_vec();
+    blend::apply_strokes(
+        info,
+        full(width, height),
+        &mut out,
+        &placed,
+        frames,
+        origin,
+        spp as usize,
+        blend::apply::<S>,
+    )
+    .unwrap();
+    out
+}
+
+/// `rect`'s rows and columns of a `width`-wide plane of `spp` samples.
+fn cut<S: Copy>(plane: &[S], width: u32, spp: u32, rect: Rect) -> Vec<S> {
+    let (width, spp) = (width as usize, spp as usize);
+    (rect.y..rect.y + rect.height)
+        .flat_map(|y| {
+            let at = (y as usize * width + rect.x as usize) * spp;
+            plane[at..at + rect.width as usize * spp].iter().copied()
+        })
+        .collect()
+}
+
+/// The samples `render` hands its sink for `tile`, as the tile's own rows;
+/// every band must lie inside the tile, in row order.
+fn collect<S: Copy + Default>(
+    spp: u32,
+    tile: Rect,
+    render: impl FnOnce(
+        &mut dyn FnMut(&[S], Rect) -> Result<(), ProjectError>,
+    ) -> Result<(), ProjectError>,
+) -> Vec<S> {
+    let spp = spp as usize;
+    let row = tile.width as usize * spp;
+    let mut out = vec![S::default(); row * tile.height as usize];
+    let mut next_row = tile.y;
+    render(&mut |band, rect| {
+        assert_eq!(
+            tile.intersect(rect),
+            Some(rect),
+            "a band lies inside the tile"
+        );
+        assert_eq!(rect.y, next_row, "bands arrive in row order");
+        next_row += rect.height;
+        let len = rect.width as usize * spp;
+        for r in 0..rect.height as usize {
+            let dst = (rect.y - tile.y) as usize * row + r * row + (rect.x - tile.x) as usize * spp;
+            out[dst..dst + len].copy_from_slice(&band[r * len..(r + 1) * len]);
+        }
+        Ok(())
+    })
+    .expect("the tile must render");
+    assert_eq!(next_row, tile.y + tile.height, "the bands cover the tile");
+    out
+}
+
+fn differing<S: PartialEq>(a: &[S], b: &[S]) -> usize {
+    assert_eq!(a.len(), b.len());
+    a.iter().zip(b).filter(|(a, b)| a != b).count()
+}
+
+/// Two Detail strokes with a Normal one between them, overlapping, around
+/// `(cx, cy)`; each Detail margin is `3 * ((16 * radius + 24) / 48)`.
+fn detail_pile(cx: i32, cy: i32, radius: f32) -> Vec<Op> {
+    let near = radius as i32 / 2;
+    vec![
+        stroke_in(
+            BrushMode::Detail,
+            (1, &[(cx - near, cy), (cx + near, cy + 10)], radius),
+            1.0,
+        ),
+        stroke_in(BrushMode::Normal, (0, &[(cx, cy + 5)], radius * 0.6), 1.0),
+        stroke_in(
+            BrushMode::Detail,
+            (1, &[(cx, cy - 10), (cx + 2 * near, cy)], radius),
+            0.7,
+        ),
+    ]
+}
+
+#[test]
+fn detail_tiled_equals_untiled_on_mantis() {
+    let dir = tmp_dir("retouch_ops_detail_mantis");
+    let frames = frame_paths(&common::mantis_512_dir().join("frames")).unwrap();
+    let held = common::fuse_held(&frames, "weighted-average", true, &dir);
+    let project_path = dir.join(format!("mantis.{}", project::PROJECT_EXTENSION));
+    let root = seal_held(&project_path, &held);
+    let ops = detail_pile(256, 256, 40.0);
+    let edited = append(&project_path, &root, ops.clone());
+
+    let (width, height, spp, composite) = read_tiff(&held.composite);
+    let set = open_frame_set(&held.sources, HostBudget::explicit(1 << 30)).unwrap();
+    let gained = GainReader::new(&*set.reader, held.registration.gains());
+    let warping = WarpingReader::new(
+        &gained,
+        set.reader.dimensions(),
+        spp,
+        held.registration.transforms(held.sources.len()),
+    );
+    let expected = reference_whole(
+        &composite,
+        (width, height, spp),
+        held.sources.len() as u32,
+        &ops,
+        &warping,
+        held.registration.origin(),
+    );
+    assert_ne!(expected, composite, "the strokes must change the image");
+
+    let mut project = Project::open(&project_path).unwrap();
+    let image = CheckpointImage::prepare(&project, &edited).unwrap();
+    for size in [16, 64, 100, 512] {
+        let rendered = render_tiled(&image, &mut project, size);
+        assert_eq!(
+            differing(&rendered, &expected),
+            0,
+            "tile size {size}: samples differ from the untiled render"
+        );
+    }
+}
+
+/// A 2-frame source set of `width` x `height` x 3 `u16` TIFFs sealed under a
+/// pattern composite.
+fn wide_u16_project(
+    name: &str,
+    width: u32,
+    height: u32,
+) -> (PathBuf, PathBuf, String, Vec<PathBuf>) {
+    let dir = tmp_dir(name);
+    let len = (width * height * SPP) as usize;
+    let sources: Vec<PathBuf> = (0..2usize)
+        .map(|i| {
+            let path = dir.join(format!("frame-{i}.tif"));
+            let samples: Vec<u16> = (0..len)
+                .map(|s| ((s * (5 + 2 * i) + i * 4001) % 60_001) as u16)
+                .collect();
+            write_tiff(&path, width, height, SPP, &samples);
+            path
+        })
+        .collect();
+    let (project_path, root) = seal_synthetic(
+        &dir,
+        &sources,
+        (width, height, SPP),
+        Registration::default(),
+    );
+    (dir, project_path, root, sources)
+}
+
+fn pending(dir: &Path, sources: &[PathBuf], ops: &[Op]) -> project::PendingState {
+    project::PendingState {
+        composite: dir.join("composite.tif"),
+        ops: ops.to_vec(),
+        sources: sources.to_vec(),
+        registration: Registration::default(),
+        reference: 0,
+        description: "staged composite".to_string(),
+    }
+}
+
+#[test]
+fn detail_bands_below_the_margin_equal_untiled_u16() {
+    let (width, height) = (8192, 400);
+    let (dir, project_path, root, sources) =
+        wide_u16_project("retouch_ops_detail_wide", width, height);
+    let ops = detail_pile(3200, 200, 120.0);
+    let info = ZMapInfo::new(width, height, 2).unwrap();
+    let margin = blend::read_margin(&ops[0], info).unwrap();
+    assert!(
+        margin > 100,
+        "the margin {margin} exceeds the rows of a band"
+    );
+    let edited = append(&project_path, &root, ops.clone());
+
+    let set = open_frame_set(&sources, HostBudget::explicit(1 << 30)).unwrap();
+    let composite = composite_pattern((width * height * SPP) as usize);
+    let expected = reference_whole(
+        &composite,
+        (width, height, SPP),
+        2,
+        &ops,
+        &*set.reader,
+        (0, 0),
+    );
+    assert_ne!(expected, composite, "the strokes must change the image");
+
+    let inner = Rect {
+        x: 2900,
+        y: 120,
+        width: 700,
+        height: 140,
+    };
+    let mut project = Project::open(&project_path).unwrap();
+    let saved = CheckpointImage::prepare(&project, &edited).unwrap();
+    let state = pending(&dir, &sources, &ops);
+    let live = CheckpointImage::prepare_pending(&state).unwrap();
+    for tile in [full(width, height), inner] {
+        let want = cut(&expected, width, SPP, tile);
+        let from_saved = collect(SPP, tile, |sink| {
+            saved.render(Some(&mut project), tile, sink)
+        });
+        assert_eq!(differing(&from_saved, &want), 0, "saved render of {tile:?}");
+        let from_pending = collect(SPP, tile, |sink| live.render(None, tile, sink));
+        assert_eq!(
+            differing(&from_pending, &want),
+            0,
+            "pending render of {tile:?}"
+        );
+    }
+}
+
+#[test]
+fn detail_bands_below_the_margin_equal_untiled_f32() {
+    let dngs: Vec<_> = (0..2u32)
+        .map(|i| {
+            let mut spec = DngSpec::new(
+                12,
+                64,
+                4095,
+                [0, 1, 1, 2],
+                (0..8192 * 400u32)
+                    .map(|j| 64 + ((j * (7 + 2 * i) + i * 997) % 3900) as u16)
+                    .collect(),
+            );
+            spec.width = 8192;
+            spec.height = 400;
+            write_dng(&spec, false)
+        })
+        .collect();
+    let sources: Vec<PathBuf> = dngs.iter().map(|f| f.path().to_path_buf()).collect();
+    let set = open_frame_set(&sources, HostBudget::explicit(1 << 30)).unwrap();
+    let (width, height) = set.reader.dimensions();
+    let spp = set.reader.stack_context().samples_per_pixel;
+    assert_eq!(spp, 3, "a developed RAW frame is RGB");
+    assert!(width >= 4096 && height >= 300, "{width}x{height}");
+
+    let dir = tmp_dir("retouch_ops_detail_raw_wide");
+    let (project_path, root) = seal_synthetic(
+        &dir,
+        &sources,
+        (width, height, spp),
+        Registration::default(),
+    );
+    let ops = detail_pile(width as i32 / 2, height as i32 / 2, 120.0);
+    let info = ZMapInfo::new(width, height, 2).unwrap();
+    assert!(blend::read_margin(&ops[0], info).unwrap() > 100);
+    let edited = append(&project_path, &root, ops.clone());
+
+    let composite = composite_pattern_f32((width * height * spp) as usize);
+    let expected = reference_whole(
+        &composite,
+        (width, height, spp),
+        2,
+        &ops,
+        &*set.reader,
+        (0, 0),
+    );
+    assert_ne!(expected, composite, "the strokes must change the image");
+
+    let inner = Rect {
+        x: width / 2 - 300,
+        y: height / 2 - 70,
+        width: 600,
+        height: 140,
+    };
+    let mut project = Project::open(&project_path).unwrap();
+    let saved = CheckpointImage::prepare(&project, &edited).unwrap();
+    let state = pending(&dir, &sources, &ops);
+    let live = CheckpointImage::prepare_pending(&state).unwrap();
+    let bits = |plane: &[f32]| plane.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    for tile in [full(width, height), inner] {
+        let want = bits(&cut(&expected, width, spp, tile));
+        let from_saved = collect(spp, tile, |sink| {
+            saved.render_f32(Some(&mut project), tile, sink)
+        });
+        assert_eq!(
+            differing(&bits(&from_saved), &want),
+            0,
+            "saved render of {tile:?}"
+        );
+        let from_pending = collect(spp, tile, |sink| live.render_f32(None, tile, sink));
+        assert_eq!(
+            differing(&bits(&from_pending), &want),
+            0,
+            "pending render of {tile:?}"
+        );
+    }
+}
+
+#[test]
+fn untouched_tile_reads_no_source_inside_a_detail_margin() {
+    let (dir, project_path, root, _) = gained_pair("retouch_ops_untouched_detail");
+    let ops = vec![
+        stroke(1, &[(10, 24)], 8.0, 0.3),
+        stroke_in(BrushMode::Detail, (1, &[(50, 24)], 8.0), 1.0),
+    ];
+    let edited = append(&project_path, &root, ops);
+    let (_, _, _, stored) = read_tiff(&dir.join("composite.tif"));
+    let mut project = Project::open(&project_path).unwrap();
+    let image = CheckpointImage::prepare(&project, &edited).unwrap();
+    std::fs::rename(dir.join("frames"), dir.join("frames-gone")).unwrap();
+
+    // The Detail stroke has pass radius 3, margin 9: x 33..41 lies within the
+    // margin of its footprint (x 42..58) and is not written.
+    let margin_only = Rect {
+        x: 33,
+        y: 10,
+        width: 8,
+        height: 28,
+    };
+    let rendered = try_render(&image, &mut project, margin_only)
+        .expect("a tile no footprint meets reads no frame, margin or not");
+    assert_eq!(rendered, cut(&stored, WIDTH, SPP, margin_only));
+
+    let on_detail = Rect {
+        x: 40,
+        y: 10,
+        width: 8,
+        height: 28,
+    };
+    assert!(matches!(
+        try_render(&image, &mut project, on_detail),
+        Err(ProjectError::RenderSourcesUnavailable { .. })
+    ));
+}
+
+/// Tiled equals untiled for a Detail stroke whose radius exceeds the tile
+/// size, on windows cut from two frames of the reference stack; then the
+/// window bytes a 10-stroke Detail pile reads at full stack size.
+#[test]
+#[ignore = "reads the 16 GB reference stack"]
+fn detail_margin_reference_stack() {
+    let Some(stack_dir) = common::reference_stack_dir() else {
+        return;
+    };
+    let frames: Vec<PathBuf> = frame_paths(&stack_dir)
+        .unwrap()
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().contains("IMG_"))
+        })
+        .collect();
+    assert!(frames.len() >= 2, "the reference stack holds its frames");
+    let stack = TiffStack::open_files(&frames).unwrap();
+    let (stack_width, stack_height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+
+    let (window, tile_size) = (640u32, 128u32);
+    let at = Rect {
+        x: stack_width / 2 - window / 2,
+        y: stack_height / 2 - window / 2,
+        width: window,
+        height: window,
+    };
+    let dir = tmp_dir("retouch_ops_detail_reference");
+    let sources: Vec<PathBuf> = (0..2)
+        .map(|i| {
+            let mut samples = vec![0u16; (window * window * spp) as usize];
+            stack.read_tile_into(i, at, &mut samples).unwrap();
+            let path = dir.join(format!("window-{i}.tif"));
+            write_tiff(&path, window, window, spp, &samples);
+            path
+        })
+        .collect();
+    let (project_path, root) = seal_synthetic(
+        &dir,
+        &sources,
+        (window, window, spp),
+        Registration::default(),
+    );
+    let c = window as i32 / 2;
+    let ops = vec![
+        stroke_in(
+            BrushMode::Detail,
+            (1, &[(c - 60, c), (c + 40, c + 20)], 200.0),
+            1.0,
+        ),
+        stroke_in(
+            BrushMode::Detail,
+            (1, &[(c, c - 30), (c + 80, c)], 200.0),
+            0.8,
+        ),
+    ];
+    let info = ZMapInfo::new(window, window, 2).unwrap();
+    let margin = blend::read_margin(&ops[0], info).unwrap();
+    assert!(margin > tile_size, "the margin {margin} exceeds the tile");
+    let edited = append(&project_path, &root, ops.clone());
+
+    let set = open_frame_set(&sources, HostBudget::explicit(1 << 30)).unwrap();
+    let composite = composite_pattern((window * window * spp) as usize);
+    let expected = reference_whole(
+        &composite,
+        (window, window, spp),
+        2,
+        &ops,
+        &*set.reader,
+        (0, 0),
+    );
+    assert_ne!(expected, composite, "the strokes must change the image");
+    let mut project = Project::open(&project_path).unwrap();
+    let image = CheckpointImage::prepare(&project, &edited).unwrap();
+    let rendered = render_tiled(&image, &mut project, tile_size);
+    assert_eq!(
+        differing(&rendered, &expected),
+        0,
+        "tiled differs from untiled"
+    );
+
+    // Ten overlapping strokes of radius 200 stepping 40 px along a line, at
+    // the full stack's size: the area one write rect at the pile's end reads.
+    let full_info = ZMapInfo::new(stack_width, stack_height, frames.len() as u32).unwrap();
+    let (cx, cy) = (stack_width as i32 / 2, stack_height as i32 / 2);
+    let pile: Vec<Op> = (0..10)
+        .map(|i| stroke_in(BrushMode::Detail, (1, &[(cx + 40 * i, cy)], 200.0), 1.0))
+        .collect();
+    let placed: Vec<blend::PlacedStroke> = pile
+        .iter()
+        .map(|op| blend::PlacedStroke {
+            op,
+            frame: 1,
+            footprint: blend::footprint(op, full_info).unwrap().unwrap(),
+        })
+        .collect();
+    let write = Rect {
+        x: cx as u32,
+        y: cy as u32,
+        width: tile_size,
+        height: tile_size,
+    };
+    let extent = blend::read_extent(full_info, &placed, write);
+    let bytes = u64::from(extent.width) * u64::from(extent.height) * u64::from(spp) * 2;
+    eprintln!(
+        "10-stroke Detail pile on {stack_width}x{stack_height}: write {write:?} reads {extent:?}, window {bytes} bytes"
+    );
+}

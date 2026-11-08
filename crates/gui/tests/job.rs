@@ -8202,6 +8202,75 @@ fn raw_project_live_retouch_matches_saved_and_export() {
     assert_eq!(got, narrowed, "16-bit export");
 }
 
+fn raw_stroke_in(mode: BrushMode, source_id: u16, (x, y): (i32, i32), radius: f32) -> Op {
+    Op::BrushStroke {
+        source_id,
+        path: vec![Point { x, y }, Point { x: x + 3, y: y + 2 }],
+        radius,
+        softness: 0.3,
+        mode,
+        opacity: 0.8,
+    }
+}
+
+#[test]
+fn raw_detail_region_reads_its_margin_and_installs_only_the_region() {
+    // Pass radius 2, margin 6: the region's edge samples blur past the region.
+    let earlier = raw_stroke_in(BrushMode::Normal, 2, (16, 10), 9.0);
+    let detail = raw_stroke_in(BrushMode::Detail, 1, (18, 10), 6.0);
+    let both = vec![earlier.clone(), detail.clone()];
+    let region = Rect {
+        x: 14,
+        y: 6,
+        width: 9,
+        height: 8,
+    };
+    let files = raw_files("raw_detail_region");
+    let expected = cut(&pending_f32(&raw_pending(&files, both.clone())), region);
+    let alone = cut(
+        &pending_f32(&raw_pending(&files, vec![detail.clone()])),
+        region,
+    );
+    assert_ne!(bits(&expected), bits(&alone), "the earlier stroke matters");
+
+    for pre in [
+        job::PreImage::Base,
+        job::PreImage::Current,
+        job::PreImage::Snapshot,
+    ] {
+        let mut session = open_session(&files, &files.composite, &files.sources).unwrap();
+        let ops = if matches!(pre, job::PreImage::Base) {
+            both.clone()
+        } else {
+            live_region(&mut session, raw_whole(), vec![earlier.clone()]);
+            vec![detail.clone()]
+        };
+        session.tiles.take_rendered_regions();
+        session
+            .render_region_now(&job::RegionRender {
+                region,
+                pre,
+                ops,
+                ends_drag: false,
+            })
+            .expect("the region renders");
+        assert_eq!(
+            session.tiles.take_rendered_regions(),
+            vec![region],
+            "{pre:?} installs only the region"
+        );
+        let mut got = vec![f32::NAN; (region.width * region.height * 3) as usize];
+        session.tiles.overlay_into(region, &mut got);
+        assert_eq!(bits(&got), bits(&expected), "{pre:?}: region samples");
+        if matches!(pre, job::PreImage::Base) {
+            let mut around = vec![f32::NAN; (RAW_W * RAW_H * 3) as usize];
+            session.tiles.overlay_into(raw_whole(), &mut around);
+            let filled = around.iter().filter(|s| !s.is_nan()).count();
+            assert_eq!(filled, got.len(), "no texel outside the region is filled");
+        }
+    }
+}
+
 #[test]
 fn raw_staging_composite_mismatch_refused() {
     let files = raw_files("raw_session_mismatch");

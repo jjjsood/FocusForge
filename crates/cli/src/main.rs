@@ -383,6 +383,8 @@ enum Command {
         /// changes a pixel only where the source's sum over all its samples
         /// is greater than the image's there, `darken` only where it is
         /// smaller; either then blends every sample by the same amount.
+        /// `detail` keeps the image's own brightness and takes only the
+        /// source's fine detail, over a reach about the brush radius.
         /// Every op is checked before anything is written; positions in error
         /// messages count from 0 in list order.
         #[arg(long, value_name = "FILE")]

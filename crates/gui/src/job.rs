@@ -2021,16 +2021,6 @@ fn blend_region<S: Blend>(
 ) -> Result<Vec<S>, String> {
     let region = job.region;
     let spp = input.samples_per_pixel;
-    let mut out = vec![S::default(); region.width as usize * region.height as usize * spp];
-    S::read_tile(&*input.base, 0, region, &mut out).map_err(|error| error.to_string())?;
-    match job.pre {
-        PreImage::Base => {}
-        PreImage::Current => local.overlay_into(region, &mut out),
-        PreImage::Snapshot => {
-            snapshot.capture(local, region);
-            snapshot.overlay_into(region, &mut out);
-        }
-    }
     let mut placed = Vec::new();
     for op in &job.ops {
         let Op::BrushStroke { source_id, .. } = op else {
@@ -2045,10 +2035,23 @@ fn blend_region<S: Blend>(
             });
         }
     }
+    // A Detail stroke blurs samples past the region, so the ops run over the
+    // extent that covers them and only `region` is kept.
+    let extent = blend::read_extent(input.info, &placed, region);
+    let mut out = vec![S::default(); extent.width as usize * extent.height as usize * spp];
+    S::read_tile(&*input.base, 0, extent, &mut out).map_err(|error| error.to_string())?;
+    match job.pre {
+        PreImage::Base => {}
+        PreImage::Current => local.overlay_into(extent, &mut out),
+        PreImage::Snapshot => {
+            snapshot.capture(local, extent);
+            snapshot.overlay_into(extent, &mut out);
+        }
+    }
     with_registered_sources(&*input.sources, &input.registration, |reader, origin| {
         blend::apply_strokes(
             input.info,
-            region,
+            extent,
             &mut out,
             &placed,
             reader,
@@ -2058,8 +2061,16 @@ fn blend_region<S: Blend>(
         )
     })
     .map_err(|error| error.to_string())?;
-    local.install(region, &out);
-    Ok(out)
+    let row = region.width as usize * spp;
+    let mut kept = Vec::with_capacity(row * region.height as usize);
+    for y in region.y..region.y + region.height {
+        let start = ((y - extent.y) as usize * extent.width as usize
+            + (region.x - extent.x) as usize)
+            * spp;
+        kept.extend_from_slice(&out[start..start + row]);
+    }
+    local.install(region, &kept);
+    Ok(kept)
 }
 
 impl EditState {

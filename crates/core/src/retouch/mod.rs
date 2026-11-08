@@ -4,7 +4,6 @@
 
 pub mod blend;
 
-use crate::project::BrushMode;
 use crate::tile::Rect;
 use crate::zmap::ZMapError;
 
@@ -30,10 +29,6 @@ pub enum RetouchError {
     /// `opacity` is outside `0 < x <= 1` (also true for `NaN`).
     #[error("opacity {opacity} is not in 0 < x ≤ 1")]
     InvalidOpacity { opacity: f32 },
-
-    /// The blend refuses [`BrushMode::Detail`] strokes.
-    #[error("blend mode {mode:?} is not rendered")]
-    ModeNotRendered { mode: BrushMode },
 
     /// A stroke's path holds no points.
     #[error("path is empty")]

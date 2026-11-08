@@ -85,6 +85,54 @@ pub fn footprint(op: &Op, info: ZMapInfo) -> Result<Option<Rect>, RetouchError> 
     Ok(stroke_footprint(&stroke, info))
 }
 
+/// `rect` widened by `margin` on every side, clamped to the map.
+fn grow(rect: Rect, margin: u32, info: ZMapInfo) -> Rect {
+    let x0 = rect.x.saturating_sub(margin);
+    let y0 = rect.y.saturating_sub(margin);
+    let x1 = rect.x.saturating_add(rect.width).saturating_add(margin);
+    let y1 = rect.y.saturating_add(rect.height).saturating_add(margin);
+    let (x1, y1) = (x1.min(info.width()), y1.min(info.height()));
+    Rect {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    }
+}
+
+/// The part of the map a render of `write` must read, given the `strokes`
+/// placed on it in order: walking backward, each Detail stroke whose footprint
+/// meets the extent so far grows it by [`read_margin`] around that overlap, so
+/// overlapping chains add up. Without one the result is `write`. Every stroke
+/// must be valid for `info`, as [`footprint`] checked.
+pub fn read_extent(info: ZMapInfo, strokes: &[PlacedStroke<'_>], write: Rect) -> Rect {
+    // ponytail: no cap. N overlapping Detail strokes of margin m reach about
+    // N * m past `write`, up to one plane (about 540 MB at 44.8 MP x 3 x f32);
+    // a render in several passes would bound it.
+    let mut extent = write;
+    for stroke in strokes.iter().rev() {
+        let Some(overlap) = stroke.footprint.intersect(extent) else {
+            continue;
+        };
+        let margin = read_margin(stroke.op, info).expect("a placed stroke is valid");
+        if margin == 0 {
+            continue;
+        }
+        let grown = grow(overlap, margin, info);
+        let x0 = extent.x.min(grown.x);
+        let y0 = extent.y.min(grown.y);
+        let x1 = (extent.x + extent.width).max(grown.x + grown.width);
+        let y1 = (extent.y + extent.height).max(grown.y + grown.height);
+        extent = Rect {
+            x: x0,
+            y: y0,
+            width: x1 - x0,
+            height: y1 - y0,
+        };
+    }
+    extent
+}
+
 pub(super) fn stroke_footprint(stroke: &Stroke, info: ZMapInfo) -> Option<Rect> {
     let r = f64::from(stroke.radius);
     let mut min_x = i64::MAX;
@@ -286,6 +334,196 @@ pub fn mask_ramp(op: &Op, info: ZMapInfo) -> Result<(u64, u64), RetouchError> {
     Ok((ramp.radius, ramp.core))
 }
 
+/// Largest Detail pass radius: beyond it a window sum would not fit `i64`.
+const MAX_PASS_RADIUS: u64 = 1 << 20;
+
+/// The radius `p` of each of Detail's three box passes:
+/// `max(1, (radius16 + 24) / 48)`, `radius16` being the stroke's radius in
+/// sixteenths of a pixel as [`mask_ramp`] rounds it, so three passes reach
+/// about the brush radius. Capped at 2^20.
+pub fn pass_radius(op: &Op, info: ZMapInfo) -> Result<u32, RetouchError> {
+    let radius16 = Ramp::new(&validate(op, info)?).radius;
+    Ok(((radius16 + 24) / 48).clamp(1, MAX_PASS_RADIUS) as u32)
+}
+
+/// How far outside its footprint a stroke reads the result and its source
+/// frame: `3 * p` pixels for [`BrushMode::Detail`] (`p` from [`pass_radius`]),
+/// zero for every other mode.
+pub fn read_margin(op: &Op, info: ZMapInfo) -> Result<u32, RetouchError> {
+    match validate(op, info)?.mode {
+        BrushMode::Detail => Ok(3 * pass_radius(op, info)?),
+        _ => Ok(0),
+    }
+}
+
+/// `r` grown by `p` along one axis, kept inside `within`.
+fn grow_axis(r: Rect, horizontal: bool, p: u32, within: Rect) -> Rect {
+    let (start, len, lo, hi) = if horizontal {
+        (
+            r.x,
+            r.width,
+            within.x,
+            within.x.saturating_add(within.width),
+        )
+    } else {
+        (
+            r.y,
+            r.height,
+            within.y,
+            within.y.saturating_add(within.height),
+        )
+    };
+    let from = start.saturating_sub(p).max(lo);
+    let to = start.saturating_add(len).saturating_add(p).min(hi);
+    if horizontal {
+        Rect {
+            x: from,
+            width: to - from,
+            ..r
+        }
+    } else {
+        Rect {
+            y: from,
+            height: to - from,
+            ..r
+        }
+    }
+}
+
+/// One 1-D box pass of radius `p` over `dst_rect`, along x or y. `src` holds
+/// `src_rect`, which covers every window except where it ends on the buffer's
+/// edge; a window reaching past that edge repeats the edge sample. Each output
+/// is `(sum + p).div_euclid(2p + 1)` of an exact `i64` window sum, slid along
+/// the line, so it does not depend on where the line starts.
+fn box_pass(
+    p: u32,
+    horizontal: bool,
+    src: &[i64],
+    src_rect: Rect,
+    dst_rect: Rect,
+    spp: usize,
+) -> Vec<i64> {
+    let (lo, hi, first, along, lines_from, lines) = if horizontal {
+        (
+            src_rect.x,
+            src_rect.x + src_rect.width - 1,
+            dst_rect.x,
+            dst_rect.width,
+            dst_rect.y,
+            dst_rect.height,
+        )
+    } else {
+        (
+            src_rect.y,
+            src_rect.y + src_rect.height - 1,
+            dst_rect.y,
+            dst_rect.height,
+            dst_rect.x,
+            dst_rect.width,
+        )
+    };
+    let (lo, hi, p) = (i64::from(lo), i64::from(hi), i64::from(p));
+    let at = |a: i64, line: u32, c: usize| {
+        let a = a.clamp(lo, hi) as u32;
+        let (x, y) = if horizontal { (a, line) } else { (line, a) };
+        let row = (y - src_rect.y) as usize * src_rect.width as usize;
+        src[(row + (x - src_rect.x) as usize) * spp + c]
+    };
+    let width = dst_rect.width as usize;
+    let mut dst = vec![0i64; width * dst_rect.height as usize * spp];
+    for line in 0..lines {
+        for c in 0..spp {
+            let l = lines_from + line;
+            let start = i64::from(first);
+            let (a, b) = (start - p, start + p);
+            // The part of the first window past an edge repeats that edge's sample.
+            let mut sum = (lo - a).max(0) * at(lo, l, c) + (b - hi).max(0) * at(hi, l, c);
+            for j in a.max(lo)..=b.min(hi) {
+                sum += at(j, l, c);
+            }
+            for k in 0..along {
+                let pos = start + i64::from(k);
+                let (x, y) = if horizontal { (k, line) } else { (line, k) };
+                dst[(y as usize * width + x as usize) * spp + c] = (sum + p).div_euclid(2 * p + 1);
+                sum += at(pos + p + 1, l, c) - at(pos - p, l, c);
+            }
+        }
+    }
+    dst
+}
+
+/// The fixed-point blur of `buf` (the samples of `rect`) over `at`: three
+/// passes, each a horizontal then a vertical box pass.
+fn blur_fixed<S: Blend>(p: u32, (rect, buf): (Rect, &[S]), at: Rect, spp: usize) -> Vec<i64> {
+    // `rects[i]` is what stage `i` (H, V, H, V, H, V) reads; `rects[6]` is `at`.
+    let mut rects = [at; 7];
+    for i in (0..6).rev() {
+        rects[i] = grow_axis(rects[i + 1], i % 2 == 0, p, rect);
+    }
+    let first = rects[0];
+    let mut cur = Vec::with_capacity(first.width as usize * first.height as usize * spp);
+    for y in first.y..first.y + first.height {
+        let from =
+            ((y - rect.y) as usize * rect.width as usize + (first.x - rect.x) as usize) * spp;
+        cur.extend(
+            buf[from..from + first.width as usize * spp]
+                .iter()
+                .map(|s| s.to_fixed()),
+        );
+    }
+    for i in 0..6 {
+        cur = box_pass(p, i % 2 == 0, &cur, rects[i], rects[i + 1], spp);
+    }
+    cur
+}
+
+/// Detail's target over `at` into `out` (row-major): `r + (B(r) - Q(r)) + (Q(s) - B(s))` for result
+/// `r` and source `s`. `B` is three passes, each a horizontal then a vertical box of radius `p`
+/// ([`pass_radius`]) giving `(sum + p).div_euclid(2p + 1)` of an exact `i64` sum; edges replicate,
+/// so the buffers must reach `3p` past `at` wherever the map does. `Q` is a `u16` as is or
+/// `round(f32 * 65536)`. A `u16` target clamps to `0..=65535`; an `f32` one is
+/// `r + correction * 2^-16` in `f64`, unclamped. Constant `r` and `s` give back `r`.
+pub fn detail_output<S: Blend>(
+    p: u32,
+    (result_rect, result): (Rect, &[S]),
+    (source_rect, source): (Rect, &[S]),
+    at: Rect,
+    spp: usize,
+    out: &mut [S],
+) {
+    let samples = |rect: Rect| rect.width as usize * rect.height as usize * spp;
+    assert!(
+        result_rect.intersect(at) == Some(at) && source_rect.intersect(at) == Some(at),
+        "detail_output: `at` lies inside both buffers"
+    );
+    assert!(
+        result.len() == samples(result_rect)
+            && source.len() == samples(source_rect)
+            && out.len() == samples(at),
+        "detail_output: each slice holds its rect's samples"
+    );
+    let blurred_result = blur_fixed(p, (result_rect, result), at, spp);
+    let blurred_source = blur_fixed(p, (source_rect, source), at, spp);
+    let mut i = 0;
+    for y in at.y..at.y + at.height {
+        for x in at.x..at.x + at.width {
+            let r_at = ((y - result_rect.y) as usize * result_rect.width as usize
+                + (x - result_rect.x) as usize)
+                * spp;
+            let s_at = ((y - source_rect.y) as usize * source_rect.width as usize
+                + (x - source_rect.x) as usize)
+                * spp;
+            for c in 0..spp {
+                let r = result[r_at + c];
+                let correction = (blurred_result[i] - r.to_fixed())
+                    + (source[s_at + c].to_fixed() - blurred_source[i]);
+                out[i] = r.corrected(correction);
+                i += 1;
+            }
+        }
+    }
+}
+
 /// A stroke's `opacity` as a Q16 factor (`0..=65536`): `opacity * 65536`
 /// rounded to nearest, ties away from zero. `1.0` gives `65536`; anything
 /// below `0.5 / 65536` (about `7.6e-6`) gives `0`. [`apply`] scales each mask
@@ -324,6 +562,13 @@ pub trait Blend: Sample {
     /// (the two slices are one pixel each); `None` when either sum is NaN.
     /// Lighten and Darken decide on this order.
     fn sum_order(src: &[Self], out: &[Self]) -> Option<Ordering>;
+
+    /// The sample in the fixed point Detail's blur sums in.
+    fn to_fixed(self) -> i64;
+
+    /// `self` plus a Detail `correction` in that fixed point, clamped to the
+    /// sample type's range where it has one.
+    fn corrected(self, correction: i64) -> Self;
 }
 
 impl Blend for u16 {
@@ -334,6 +579,14 @@ impl Blend for u16 {
     fn sum_order(src: &[Self], out: &[Self]) -> Option<Ordering> {
         let sum = |pixel: &[Self]| pixel.iter().map(|&s| u64::from(s)).sum::<u64>();
         Some(sum(src).cmp(&sum(out)))
+    }
+
+    fn to_fixed(self) -> i64 {
+        i64::from(self)
+    }
+
+    fn corrected(self, correction: i64) -> Self {
+        (i64::from(self) + correction).clamp(0, i64::from(u16::MAX)) as u16
     }
 }
 
@@ -350,31 +603,35 @@ impl Blend for f32 {
         let alpha = alpha as f32 / OPAQUE as f32;
         out * (1.0 - alpha) + src * alpha
     }
+
+    /// `round(v * 65536)`, kept within `+-2^40` so window sums cannot
+    /// overflow; NaN is 0.
+    fn to_fixed(self) -> i64 {
+        const LIMIT: f64 = (1u64 << 40) as f64;
+        (f64::from(self) * 65536.0).round().clamp(-LIMIT, LIMIT) as i64
+    }
+
+    fn corrected(self, correction: i64) -> Self {
+        (f64::from(self) + correction as f64 / 65536.0) as f32
+    }
 }
 
 /// `out` (the pre-stroke pixel) mixed toward `src` by the Q16 `alpha`, every
 /// sample by the same `alpha`. Normal always mixes; Lighten only where
 /// [`Blend::sum_order`] puts `src` strictly above `out`, Darken strictly
-/// below (a tie or NaN sum leaves `out`). Detail is refused with
-/// [`RetouchError::ModeNotRendered`] and writes nothing.
-pub fn blend_pixel<S: Blend>(
-    mode: BrushMode,
-    out: &mut [S],
-    src: &[S],
-    alpha: u32,
-) -> Result<(), RetouchError> {
+/// below (a tie or NaN sum leaves `out`). Detail mixes like Normal: its `src`
+/// is the target [`detail_output`] computes, not the source frame.
+pub fn blend_pixel<S: Blend>(mode: BrushMode, out: &mut [S], src: &[S], alpha: u32) {
     let acts = match mode {
-        BrushMode::Normal => true,
+        BrushMode::Normal | BrushMode::Detail => true,
         BrushMode::Lighten => S::sum_order(src, out) == Some(Ordering::Greater),
         BrushMode::Darken => S::sum_order(src, out) == Some(Ordering::Less),
-        BrushMode::Detail => return Err(RetouchError::ModeNotRendered { mode }),
     };
     if acts {
         for (o, &s) in out.iter_mut().zip(src) {
             *o = S::blend(*o, s, alpha);
         }
     }
-    Ok(())
 }
 
 /// Whether a stroke with Q16 `alpha` shows its own source at a pixel: more
@@ -461,6 +718,11 @@ pub fn overlay_colors(
 /// `region`, the part of `out_rect` the caller read the source frame for;
 /// only pixels inside `region` and the stroke's footprint change.
 ///
+/// A [`BrushMode::Detail`] stroke mixes toward [`detail_output`] of `out` and
+/// `src`, whose blur reads [`read_margin`] pixels past the footprint: `region`
+/// should reach that far wherever `out_rect` does, and `out_rect` further by
+/// the margins of the strokes before it.
+///
 /// Cost follows the area near the path, not the path's bounding box.
 pub fn apply<S: Blend>(
     op: &Op,
@@ -472,9 +734,6 @@ pub fn apply<S: Blend>(
     spp: usize,
 ) -> Result<(), RetouchError> {
     let stroke = validate(op, info)?;
-    if stroke.mode == BrushMode::Detail {
-        return Err(RetouchError::ModeNotRendered { mode: stroke.mode });
-    }
     if !info.contains(out_rect) || out_rect.intersect(region) != Some(region) {
         return Err(RetouchError::TileOutsideMap { tile: region });
     }
@@ -492,6 +751,16 @@ pub fn apply<S: Blend>(
     };
     let ramp = Ramp::new(&stroke);
     let opacity = u64::from(opacity_q16(stroke.opacity));
+    // Detail mixes toward its own target, one pixel per sample of `active`.
+    let mut target = Vec::new();
+    let (src, src_rect) = if stroke.mode == BrushMode::Detail {
+        target.resize(samples(active), S::default());
+        let p = pass_radius(op, info)?;
+        detail_output(p, (out_rect, out), (region, src), active, spp, &mut target);
+        (&target[..], active)
+    } else {
+        (src, region)
+    };
     SegmentGrid::new(&stroke, active).walk(|x, y, segments| {
         let a = ramp.alpha(distance_16(
             &stroke,
@@ -506,14 +775,13 @@ pub fn apply<S: Blend>(
         let out_at =
             ((y - out_rect.y) as usize * out_rect.width as usize + (x - out_rect.x) as usize) * spp;
         let src_at =
-            ((y - region.y) as usize * region.width as usize + (x - region.x) as usize) * spp;
+            ((y - src_rect.y) as usize * src_rect.width as usize + (x - src_rect.x) as usize) * spp;
         blend_pixel(
             stroke.mode,
             &mut out[out_at..out_at + spp],
             &src[src_at..src_at + spp],
             a,
-        )
-        .expect("a Detail stroke was refused before the walk");
+        );
     });
     Ok(())
 }
@@ -529,8 +797,9 @@ pub struct PlacedStroke<'a> {
 
 /// Blends each of `strokes`, in order, over `out`, the samples of `out_rect`
 /// (row-major, `spp` samples a pixel). A stroke reads its frame from `frames`
-/// over the part of `out_rect` its footprint meets, shifted by `origin` (the
-/// crop offset between map and frame coordinates); a stroke clear of
+/// over the part of `out_rect` its footprint meets, widened by
+/// [`read_margin`] for a Detail stroke, shifted by `origin` (the crop offset
+/// between map and frame coordinates); a stroke whose footprint is clear of
 /// `out_rect` reads nothing. A failed frame read is [`RetouchError::Source`]
 /// and leaves `out` as the strokes before it made it. Each stroke is blended
 /// by `blend`, called as [`apply`] is: [`apply`] itself, or a blend with the
@@ -548,9 +817,13 @@ pub fn apply_strokes<S: Sample>(
 ) -> Result<(), RetouchError> {
     let mut frame: Vec<S> = Vec::new();
     for stroke in strokes {
-        let Some(region) = stroke.footprint.intersect(out_rect) else {
+        if stroke.footprint.intersect(out_rect).is_none() {
             continue;
-        };
+        }
+        let margin = read_margin(stroke.op, info)?;
+        let region = grow(stroke.footprint, margin, info)
+            .intersect(out_rect)
+            .expect("the footprint meets out_rect");
         frame.resize(
             region.width as usize * region.height as usize * spp,
             S::default(),
@@ -831,7 +1104,7 @@ mod tests {
                         let at = ((y - 6) as usize * 20 + (x - 8) as usize) * spp;
                         let mut want = base[i..i + spp].to_vec();
                         if a > 0 {
-                            blend_pixel(mode, &mut want, &src[at..at + spp], a).unwrap();
+                            blend_pixel(mode, &mut want, &src[at..at + spp], a);
                         }
                         let label = format!("{mode:?} opacity {opacity} ({x}, {y})");
                         assert_eq!(out[i..i + spp], want[..], "{label}");
@@ -841,18 +1114,6 @@ mod tests {
                 assert!(changed > 0, "{mode:?} opacity {opacity} changes something");
             }
         }
-        let mut pixel = [7u16; 3];
-        let result = blend_pixel(BrushMode::Detail, &mut pixel, &[9; 3], OPAQUE);
-        assert!(
-            matches!(
-                result,
-                Err(RetouchError::ModeNotRendered {
-                    mode: BrushMode::Detail
-                })
-            ),
-            "{result:?}"
-        );
-        assert_eq!(pixel, [7; 3], "Detail writes nothing");
     }
 
     #[test]
@@ -861,21 +1122,21 @@ mod tests {
         let (out, src) = ([100u16, 50000, 100], [40000u16, 10, 40000]);
         let a = 20000;
         let mut lightened = out;
-        blend_pixel(BrushMode::Lighten, &mut lightened, &src, a).unwrap();
+        blend_pixel(BrushMode::Lighten, &mut lightened, &src, a);
         for c in 0..3 {
             assert_eq!(lightened[c], blend_sample(out[c], src[c], a), "channel {c}");
         }
         assert!(lightened[1] < out[1], "the darker channel moves down too");
         let mut darkened = out;
-        blend_pixel(BrushMode::Darken, &mut darkened, &src, a).unwrap();
+        blend_pixel(BrushMode::Darken, &mut darkened, &src, a);
         assert_eq!(darkened, out, "Darken leaves a brighter-by-sum pixel");
         // Swapped roles: the source is darker by sum.
         let mut darkened = src;
-        blend_pixel(BrushMode::Darken, &mut darkened, &out, a).unwrap();
+        blend_pixel(BrushMode::Darken, &mut darkened, &out, a);
         let want = [0, 1, 2].map(|c| blend_sample(src[c], out[c], a));
         assert_eq!(darkened, want, "Darken blends a darker-by-sum source");
         let mut lightened = src;
-        blend_pixel(BrushMode::Lighten, &mut lightened, &out, a).unwrap();
+        blend_pixel(BrushMode::Lighten, &mut lightened, &out, a);
         assert_eq!(lightened, src, "Lighten leaves a darker-by-sum pixel");
     }
 
@@ -1016,30 +1277,469 @@ mod tests {
         assert_ne!(stacked, wrong, "the pre-stroke result changes the outcome");
     }
 
+    /// A pixel's samples, `Normal`-blended toward `target` by `alpha`.
+    fn mixed<S: Blend>(before: &[S], target: &[S], alpha: u32) -> Vec<S> {
+        let mut pixel = before.to_vec();
+        blend_pixel(BrushMode::Normal, &mut pixel, target, alpha);
+        pixel
+    }
+
     #[test]
-    fn detail_mode_is_refused_at_blend() {
-        let info = info(32, 32);
-        let whole = rect(0, 0, 32, 32);
-        let mode = BrushMode::Detail;
-        // The refusal does not depend on the stroke reaching the map.
-        for at in [pt(1, 1), pt(500, 500)] {
+    fn detail_of_constant_input_keeps_the_result() {
+        let info = info(40, 30);
+        let whole = rect(0, 0, 40, 30);
+        let op = Op::BrushStroke {
+            source_id: 0,
+            path: vec![pt(20, 15)],
+            radius: 8.0,
+            softness: 0.0,
+            mode: BrushMode::Detail,
+            opacity: 1.0,
+        };
+        let normal = Op::BrushStroke {
+            source_id: 0,
+            path: vec![pt(20, 15)],
+            radius: 8.0,
+            softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
+        };
+        let covered = (0..30u32)
+            .flat_map(|y| (0..40u32).map(move |x| (x, y)))
+            .filter(|&(x, y)| alpha(&op, info, x, y).unwrap() == OPAQUE)
+            .count();
+        assert!(covered > 0);
+        for spp in [1usize, 3] {
+            let channels = |base: f32, step: f32| -> Vec<f32> {
+                (0..40 * 30 * spp)
+                    .map(|i| base + step * (i % spp) as f32)
+                    .collect()
+            };
+            let (result, source) = (channels(12345.0, 1000.0), channels(54321.0, -500.0));
+            let to_u16 = |v: &[f32]| v.iter().map(|&s| s as u16).collect::<Vec<_>>();
+            let (result_u, source_u) = (to_u16(&result), to_u16(&source));
+            let mut out = result_u.clone();
+            apply(&op, info, whole, &mut out, whole, &source_u, spp).unwrap();
+            assert_eq!(out, result_u, "u16 spp {spp}");
+            let mut control = result_u.clone();
+            apply(&normal, info, whole, &mut control, whole, &source_u, spp).unwrap();
+            assert_ne!(control, result_u, "Normal changes the same pixels");
+
+            let fractional =
+                |v: &[f32], shift: f32| v.iter().map(|&s| s + shift).collect::<Vec<_>>();
+            let (result_f, source_f) = (fractional(&result, 0.3), fractional(&source, -70_000.7));
+            let mut out_f = result_f.clone();
+            apply(&op, info, whole, &mut out_f, whole, &source_f, spp).unwrap();
+            let bits = |v: &[f32]| v.iter().map(|s| s.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&out_f), bits(&result_f), "f32 spp {spp}");
+        }
+    }
+
+    #[test]
+    fn detail_apply_blends_toward_the_naive_target() {
+        let info = info(40, 30);
+        let (out_rect, region) = (rect(0, 0, 40, 30), rect(8, 6, 20, 16));
+        for spp in [1usize, 3] {
+            let (base, mut src) = varied_maps(spp);
+            // Saturated source samples push the target past both ends.
+            for (i, s) in src.iter_mut().enumerate() {
+                match i % 7 {
+                    0 => *s = 0,
+                    3 => *s = 65535,
+                    _ => {}
+                }
+            }
+            let (base_f, src_f) = f32_maps(spp);
+            for opacity in [0.5f32, 1.0] {
+                let op = mode_stroke(BrushMode::Detail, opacity);
+                let p = pass_radius(&op, info).unwrap();
+                let active = footprint(&op, info)
+                    .unwrap()
+                    .unwrap()
+                    .intersect(region)
+                    .unwrap();
+                let mut out = base.clone();
+                apply(&op, info, out_rect, &mut out, region, &src, spp).unwrap();
+                let mut out_f = base_f.clone();
+                apply(&op, info, out_rect, &mut out_f, region, &src_f, spp).unwrap();
+                let target = naive_detail(p, (out_rect, &base), (region, &src), active, spp);
+                let target_f = naive_detail(p, (out_rect, &base_f), (region, &src_f), active, spp);
+                let (mut clamped_low, mut clamped_high, mut beyond) = (0, 0, 0);
+                for y in 0..30u32 {
+                    for x in 0..40u32 {
+                        let i = (y as usize * 40 + x as usize) * spp;
+                        let (mut want, mut want_f) =
+                            (base[i..i + spp].to_vec(), base_f[i..i + spp].to_vec());
+                        if active.intersect(rect(x, y, 1, 1)).is_some() {
+                            let a = scaled_alpha(&op, info, x, y);
+                            let t = ((y - active.y) * active.width + (x - active.x)) as usize * spp;
+                            if a > 0 {
+                                want = mixed(&want, &target[t..t + spp], a);
+                                want_f = mixed(&want_f, &target_f[t..t + spp], a);
+                            }
+                            clamped_low += target[t..t + spp].iter().filter(|&&v| v == 0).count();
+                            clamped_high +=
+                                target[t..t + spp].iter().filter(|&&v| v == 65535).count();
+                            beyond += target_f[t..t + spp]
+                                .iter()
+                                .filter(|&&v| !(0.0..=65535.0).contains(&v))
+                                .count();
+                        }
+                        let label = format!("spp {spp} opacity {opacity} ({x}, {y})");
+                        assert_eq!(out[i..i + spp], want[..], "u16 {label}");
+                        assert_eq!(out_f[i..i + spp], want_f[..], "f32 {label}");
+                    }
+                }
+                assert!(
+                    clamped_low > 0 && clamped_high > 0,
+                    "u16 targets hit both clamps"
+                );
+                assert!(beyond > 0, "f32 targets leave 0..=65535");
+                assert_ne!(out, base);
+            }
+        }
+    }
+
+    /// The documented blur by direct window sums, one pass at a time over the
+    /// whole buffer, edges clamped to the buffer.
+    fn naive_blur(p: u32, rect: Rect, fixed: &[i64], spp: usize) -> Vec<i64> {
+        let (w, h) = (rect.width as i64, rect.height as i64);
+        let p = i64::from(p);
+        let mut cur = fixed.to_vec();
+        for _pass in 0..3 {
+            for horizontal in [true, false] {
+                let prev = cur.clone();
+                for y in 0..h {
+                    for x in 0..w {
+                        for c in 0..spp {
+                            let sum: i64 = (-p..=p)
+                                .map(|d| {
+                                    let (xx, yy) = if horizontal {
+                                        ((x + d).clamp(0, w - 1), y)
+                                    } else {
+                                        (x, (y + d).clamp(0, h - 1))
+                                    };
+                                    prev[(yy * w + xx) as usize * spp + c]
+                                })
+                                .sum();
+                            cur[(y * w + x) as usize * spp + c] = (sum + p).div_euclid(2 * p + 1);
+                        }
+                    }
+                }
+            }
+        }
+        cur
+    }
+
+    /// `r + (B(r) - Q(r)) + (Q(s) - B(s))` for every sample of `at`, by
+    /// [`naive_blur`] over each whole buffer.
+    fn naive_detail<S: Blend>(
+        p: u32,
+        (r_rect, r): (Rect, &[S]),
+        (s_rect, s): (Rect, &[S]),
+        at: Rect,
+        spp: usize,
+    ) -> Vec<S> {
+        let fixed = |v: &[S]| v.iter().map(|&x| x.to_fixed()).collect::<Vec<_>>();
+        let (qr, qs) = (fixed(r), fixed(s));
+        let (br, bs) = (
+            naive_blur(p, r_rect, &qr, spp),
+            naive_blur(p, s_rect, &qs, spp),
+        );
+        let mut out = Vec::new();
+        for y in at.y..at.y + at.height {
+            for x in at.x..at.x + at.width {
+                for c in 0..spp {
+                    let ri = ((y - r_rect.y) * r_rect.width + (x - r_rect.x)) as usize * spp + c;
+                    let si = ((y - s_rect.y) * s_rect.width + (x - s_rect.x)) as usize * spp + c;
+                    out.push(r[ri].corrected((br[ri] - qr[ri]) + (qs[si] - bs[si])));
+                }
+            }
+        }
+        out
+    }
+
+    fn f32_maps(spp: usize) -> (Vec<f32>, Vec<f32>) {
+        let (base, src) = varied_maps(spp);
+        (
+            base.iter().map(|&v| f32::from(v) * 1.1 - 3000.25).collect(),
+            src.iter().map(|&v| f32::from(v) * 0.9 + 0.5).collect(),
+        )
+    }
+
+    #[test]
+    fn detail_blur_is_three_h_then_v_box_passes() {
+        // One row: the vertical passes see a constant column. Hand-computed
+        // for p = 1: each pass is `(a + b + c + 1) / 3`, edges replicated.
+        let line = rect(0, 0, 7, 1);
+        let result = [0u16, 0, 0, 3000, 0, 0, 0];
+        let source = [0u16; 7];
+        let mut out = [0u16; 7];
+        detail_output(1, (line, &result), (line, &source), line, 1, &mut out);
+        assert_eq!(out, [111, 333, 667, 778, 667, 333, 111]);
+    }
+
+    #[test]
+    fn detail_output_matches_the_naive_definition() {
+        let (out_rect, region) = (rect(0, 0, 40, 30), rect(8, 6, 20, 16));
+        for spp in [1usize, 3] {
+            let (base, src) = varied_maps(spp);
+            let (base_f, src_f) = f32_maps(spp);
+            for p in [1u32, 2, 4, 9] {
+                for at in [rect(10, 8, 10, 8), region, rect(8, 6, 7, 16)] {
+                    let label = format!("spp {spp} p {p} at {at:?}");
+                    let want = naive_detail(p, (out_rect, &base), (region, &src), at, spp);
+                    let mut got = vec![0u16; want.len()];
+                    detail_output(p, (out_rect, &base), (region, &src), at, spp, &mut got);
+                    assert_eq!(got, want, "u16 {label}");
+                    let want = naive_detail(p, (out_rect, &base_f), (region, &src_f), at, spp);
+                    let mut got = vec![0f32; want.len()];
+                    detail_output(p, (out_rect, &base_f), (region, &src_f), at, spp, &mut got);
+                    assert_eq!(got, want, "f32 {label}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn detail_u16_clamps_and_f32_does_not() {
+        // A bright result under a source spike: the high-pass pushes past both ends.
+        let line = rect(0, 0, 9, 1);
+        let result = [65535u16, 65535, 65535, 65535, 65535, 0, 0, 0, 0];
+        let source = [0u16, 0, 0, 65535, 0, 0, 0, 0, 65535];
+        let mut out = [0u16; 9];
+        detail_output(1, (line, &result), (line, &source), line, 1, &mut out);
+        assert_eq!(
+            out,
+            naive_detail(1, (line, &result), (line, &source), line, 1)[..]
+        );
+        assert!(out.contains(&65535) && out.contains(&0), "{out:?}");
+        let to_f = |v: &[u16]| v.iter().map(|&s| f32::from(s)).collect::<Vec<_>>();
+        let (rf, sf) = (to_f(&result), to_f(&source));
+        let mut out_f = [0f32; 9];
+        detail_output(1, (line, &rf), (line, &sf), line, 1, &mut out_f);
+        assert!(out_f.iter().any(|&v| v > 65535.0), "{out_f:?}");
+        assert!(out_f.iter().any(|&v| v < 0.0), "{out_f:?}");
+    }
+
+    #[test]
+    fn detail_pass_radius_and_margin_follow_the_radius() {
+        let map = info(64, 64);
+        let detail = |radius| Op::BrushStroke {
+            source_id: 0,
+            path: vec![pt(5, 5)],
+            radius,
+            softness: 0.5,
+            mode: BrushMode::Detail,
+            opacity: 1.0,
+        };
+        for (radius, p) in [
+            (0.5f32, 1u32),
+            (1.0, 1),
+            (3.0, 1),
+            (7.5, 3),
+            (100.0, 33),
+            (5000.0, 1667),
+        ] {
+            assert_eq!(pass_radius(&detail(radius), map).unwrap(), p, "{radius}");
+            assert_eq!(
+                read_margin(&detail(radius), map).unwrap(),
+                3 * p,
+                "{radius}"
+            );
+        }
+        for mode in [BrushMode::Normal, BrushMode::Lighten, BrushMode::Darken] {
             let op = Op::BrushStroke {
                 source_id: 0,
-                path: vec![at],
-                radius: 3.0,
-                softness: 0.0,
+                path: vec![pt(5, 5)],
+                radius: 100.0,
+                softness: 0.5,
                 mode,
-                opacity: 0.5,
+                opacity: 1.0,
             };
-            assert!(validate(&op, info).is_ok());
-            assert!(footprint(&op, info).is_ok());
-            let mut out = vec![7u16; 32 * 32];
-            let result = apply(&op, info, whole, &mut out, whole, &[9u16; 32 * 32], 1);
-            assert!(
-                matches!(result, Err(RetouchError::ModeNotRendered { mode: m }) if m == mode),
-                "{mode:?}: {result:?}"
-            );
-            assert!(out.iter().all(|&s| s == 7), "{mode:?} writes nothing");
+            assert_eq!(read_margin(&op, map).unwrap(), 0, "{mode:?}");
+        }
+        let bad = stroke_op(9, vec![pt(5, 5)], 3.0, 0.5);
+        assert!(matches!(
+            read_margin(&bad, map),
+            Err(RetouchError::SourceOutOfRange { .. })
+        ));
+    }
+
+    fn place<'a>(info: ZMapInfo, ops: &'a [Op]) -> Vec<PlacedStroke<'a>> {
+        ops.iter()
+            .map(|op| {
+                let Op::BrushStroke { source_id, .. } = op;
+                PlacedStroke {
+                    op,
+                    frame: usize::from(*source_id),
+                    footprint: footprint(op, info).unwrap().unwrap(),
+                }
+            })
+            .collect()
+    }
+
+    fn mode_at(mode: BrushMode, x: i32, y: i32) -> Op {
+        Op::BrushStroke {
+            source_id: 0,
+            path: vec![pt(x, y)],
+            radius: 7.5,
+            softness: 0.5,
+            mode,
+            opacity: 1.0,
+        }
+    }
+
+    #[test]
+    fn read_extent_without_a_detail_stroke_is_the_write_rect() {
+        let map = info(400, 300);
+        let write = rect(100, 100, 10, 10);
+        let ops = [
+            mode_at(BrushMode::Normal, 105, 105),
+            mode_at(BrushMode::Lighten, 105, 105),
+            mode_at(BrushMode::Darken, 108, 102),
+            mode_at(BrushMode::Detail, 300, 250),
+        ];
+        let placed = place(map, &ops);
+        assert_eq!(read_extent(map, &placed, write), write);
+        assert_eq!(read_extent(map, &[], write), write);
+        assert_eq!(read_extent(map, &placed[..3], write), write);
+    }
+
+    #[test]
+    fn read_extent_grows_by_each_detail_margin_along_the_chain() {
+        let map = info(400, 300);
+        let write = rect(100, 100, 10, 10);
+        // Radius 7.5 gives p = 3, so every Detail stroke adds 9. The first
+        // stroke is clear of `write` and of the extent after the last one.
+        let ops = [
+            mode_at(BrushMode::Detail, 135, 105),
+            mode_at(BrushMode::Detail, 125, 105),
+            mode_at(BrushMode::Detail, 105, 105),
+        ];
+        let placed = place(map, &ops);
+        assert_eq!(placed[0].footprint.intersect(write), None);
+        assert_eq!(read_extent(map, &placed[2..], write), rect(91, 91, 28, 28));
+        assert_eq!(read_extent(map, &placed[1..], write), rect(91, 88, 37, 34));
+        assert_eq!(read_extent(map, &placed, write), rect(91, 88, 46, 34));
+        // A Normal stroke between them widens nothing and does not break the chain.
+        let with_normal = [
+            ops[0].clone(),
+            mode_at(BrushMode::Normal, 120, 105),
+            ops[1].clone(),
+            ops[2].clone(),
+        ];
+        let between = place(map, &with_normal);
+        assert_eq!(read_extent(map, &between, write), rect(91, 88, 46, 34));
+    }
+
+    #[test]
+    fn read_extent_is_clamped_to_the_map() {
+        let map = info(400, 300);
+        let ops = [mode_at(BrushMode::Detail, 2, 2)];
+        assert_eq!(
+            read_extent(map, &place(map, &ops), rect(0, 0, 5, 5)),
+            rect(0, 0, 14, 14)
+        );
+        let ops = [mode_at(BrushMode::Detail, 397, 297)];
+        assert_eq!(
+            read_extent(map, &place(map, &ops), rect(395, 295, 5, 5)),
+            rect(386, 286, 14, 14)
+        );
+    }
+
+    /// A frame source that refuses a read outside its `width` x `height`.
+    struct Framed {
+        width: u32,
+        height: u32,
+    }
+
+    impl crate::algorithm::TileReader for Framed {
+        fn read_tile_into(
+            &self,
+            frame: usize,
+            r: Rect,
+            out: &mut [u16],
+        ) -> Result<(), crate::algorithm::AlgorithmError> {
+            if r.x + r.width > self.width || r.y + r.height > self.height {
+                return Err(crate::algorithm::AlgorithmError::Failed {
+                    algorithm: "test frame".into(),
+                    detail: format!(
+                        "read {r:?} outside the {}x{} frame",
+                        self.width, self.height
+                    ),
+                });
+            }
+            for (i, o) in out.iter_mut().enumerate() {
+                let x = u64::from(r.x + i as u32 % r.width);
+                let y = u64::from(r.y + i as u32 / r.width);
+                *o = (((x * 7919 + y * 104_729 + frame as u64 * 31) * 2_654_435_761) >> 9) as u16;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn detail_reads_its_margin_at_every_map_edge() {
+        let map = info(40, 30);
+        let whole = rect(0, 0, 40, 30);
+        let origin = (7, 3);
+        let frames = Framed {
+            width: 47,
+            height: 33,
+        };
+        let base: Vec<u16> = (0..40 * 30).map(|i| (i * 37 % 65536) as u16).collect();
+        let mut full = vec![0u16; 40 * 30];
+        crate::algorithm::TileReader::read_tile_into(&frames, 1, rect(7, 3, 40, 30), &mut full)
+            .unwrap();
+        let edges = [
+            (-2, 15),
+            (0, 0),
+            (20, -3),
+            (39, 29),
+            (42, 15),
+            (20, 32),
+            (0, 15),
+            (39, 15),
+            (20, 0),
+            (20, 29),
+        ];
+        for (x, y) in edges {
+            let op = Op::BrushStroke {
+                source_id: 1,
+                path: vec![pt(x, y)],
+                radius: 7.5,
+                softness: 0.5,
+                mode: BrushMode::Detail,
+                opacity: 0.75,
+            };
+            let at = footprint(&op, map).unwrap().unwrap();
+            let p = pass_radius(&op, map).unwrap();
+            let target = naive_detail(p, (whole, &base), (whole, &full), at, 1);
+            let mut want = base.clone();
+            for py in at.y..at.y + at.height {
+                for px in at.x..at.x + at.width {
+                    let i = (py * 40 + px) as usize;
+                    let t = ((py - at.y) * at.width + (px - at.x)) as usize;
+                    let a = scaled_alpha(&op, map, px, py);
+                    want[i] = mixed(&want[i..i + 1], &target[t..t + 1], a)[0];
+                }
+            }
+            assert_ne!(want, base, "stroke at ({x}, {y}) changes something");
+            let ops = [op];
+            let mut out = base.clone();
+            apply_strokes(
+                map,
+                whole,
+                &mut out,
+                &place(map, &ops),
+                &frames,
+                origin,
+                1,
+                apply,
+            )
+            .unwrap_or_else(|e| panic!("stroke at ({x}, {y}): {e}"));
+            assert!(out == want, "stroke at ({x}, {y})");
         }
     }
 
