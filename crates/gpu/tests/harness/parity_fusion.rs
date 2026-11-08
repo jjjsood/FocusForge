@@ -236,7 +236,7 @@ fn score_plane_matches_cpu() {
     let pyr = pyramid::build(&tile.samples, rect.width, rect.height, spp, levels).expect("build");
     let level0 = &pyr.levels()[0];
     let radius = score_radius(levels, 0);
-    assert_eq!(radius, 8, "score_radius(5, 0) must be 8");
+    assert_eq!(radius, 6, "score_radius(5, 0) must be 6");
 
     let cpu_scores = score_plane(level0, radius);
 

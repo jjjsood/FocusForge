@@ -33,7 +33,7 @@
 //! (`tests::score_reaches_exactly_the_window_radius`).
 //!
 //! ```text
-//! SCORE_RADIUS   = 8                                   (pinned constant)
+//! SCORE_RADIUS   = 6                                   (pinned constant)
 //! headroom(N)    = margin_for_levels(N) - 2 * (2^N - 1)
 //! W(N)           = max(1, min(SCORE_RADIUS, headroom(N)))
 //! r_k            = max(1, W(N) >> k)
@@ -49,9 +49,8 @@
 //!
 //! The `headroom` clamp is what makes the tiling exactness derivation below
 //! hold at **every** level count, not only the shipped `levels = 5`: at
-//! `levels = 1` and `levels = 2` a flat radius 8 would not fit inside the
-//! margin those depths are planned with (`2 + 8 > 4`, `6 + 8 > 12`), and the
-//! clamp drops `W` to 2 and 6 there instead. Use
+//! `levels = 1` a flat radius 6 would not fit inside the margin that depth is
+//! planned with (`2 + 6 > 4`), and the clamp drops `W` to 2 there instead. Use
 //! [`crate::tile::plan::margin_for_levels`], **never**
 //! `crate::fuse::pyramid::MEASURED_MARGIN[levels]` directly: the planner
 //! rounds the raw table up to the `2^levels` decimation grid, and that
@@ -112,23 +111,24 @@
 //! dependency cone of a composite pixel:
 //!
 //! - A level-`k` selection at `p` reads coefficients within `build`'s reach,
-//!   `2*(2^N - 1)`, plus that level's score window `2^k * r_k`: 70 px at every
-//!   level but level 4 at `N = 5`, where the `max(1, ...)` clamp makes it 78.
+//!   `2*(2^N - 1)`, plus that level's score window `2^k * r_k`: at `N = 5` 68 px
+//!   at levels 0 and 1, 66 at level 2, 70 at level 3 and 78 at level 4, where
+//!   the `max(1, ...)` clamp keeps a 1 px window.
 //! - `collapse` adds its own `2*(2^N - 1)` on top: the composite cone is
-//!   `78 + 62 = 140` px at `N = 5`, 68 at 4, 36 at 3. Coverage depends on the
+//!   `78 + 62 = 140` px at `N = 5`, 68 at 4, 32 at 3. Coverage depends on the
 //!   global pixel position and adds nothing beyond it.
 //!
 //! [`Laplacian::tile_support`] reports that cone as the reach and the planner
 //! rounds it up to the `2^N` decimation grid: a 160 px margin at `N = 5`, 80
-//! at 4, 40 at 3. A selection flip at an interior edge is discrete, so no
+//! at 4, 32 at 3. A selection flip at an interior edge is discrete, so no
 //! smaller margin is exact. [`score_radius`] keeps reading the pyramid-only
 //! [`crate::tile::plan::margin_for_levels`].
 //!
-//! | level `k` | cone at fixed radius 1, `62 + 2^k` | cone with `W = 8`, `62 + 2^k * r_k` |
+//! | level `k` | cone at fixed radius 1, `62 + 2^k` | cone with `W = 6`, `62 + 2^k * r_k` |
 //! |---|---|---|
-//! | 0 | 63 | 70 |
-//! | 1 | 64 | 70 |
-//! | 2 | 66 | 70 |
+//! | 0 | 63 | 68 |
+//! | 1 | 64 | 68 |
+//! | 2 | 66 | 66 |
 //! | 3 | 70 | 70 |
 //! | 4 | **78** | **78** |
 
@@ -189,7 +189,7 @@ fn clamp_edge(v: i64, dim: u32) -> u32 {
 /// before the per-level-count headroom clamp in [`score_radius`] is
 /// applied. See the module docs' "Selection rule" section for the full
 /// `W(N)`/`r_k` derivation.
-pub const SCORE_RADIUS: u32 = 8;
+pub const SCORE_RADIUS: u32 = 6;
 
 /// The windowed sharpness score's radius at pyramid `level` of a `levels`-
 /// deep pyramid: `W(N) = max(1, min(SCORE_RADIUS, headroom(N)))`,
@@ -927,7 +927,7 @@ mod tests {
 
     #[test]
     fn tile_support_covers_the_composite_cone() {
-        for (levels, reach, margin) in [(3i64, 36, 40), (4, 68, 80), (5, 140, 160)] {
+        for (levels, reach, margin) in [(3i64, 32, 32), (4, 68, 80), (5, 140, 160)] {
             let support = Laplacian.tile_support(&cfg_with_levels(levels));
             assert_eq!(support.reach_px, reach, "levels {levels}");
             assert_eq!(support.decimation_levels, levels as u32);
@@ -949,10 +949,10 @@ mod tests {
     #[test]
     fn level_reaches_follow_the_cone_derivation() {
         let reaches: Vec<u32> = (0..5).map(|k| level_reach(5, k)).collect();
-        assert_eq!(reaches, vec![10, 14, 22, 38, 78]);
+        assert_eq!(reaches, vec![8, 12, 18, 38, 78]);
         assert_eq!(residual_reach(5), 62);
         let reaches: Vec<u32> = (0..3).map(|k| level_reach(3, k)).collect();
-        assert_eq!(reaches, vec![10, 14, 22]);
+        assert_eq!(reaches, vec![8, 12, 18]);
     }
 
     #[test]
@@ -1118,17 +1118,17 @@ mod tests {
 
     #[test]
     fn score_radius_halves_with_level() {
-        // levels = 5: headroom = 96 - 62 = 34, so W = min(8, 34) = 8
+        // levels = 5: headroom = 96 - 62 = 34, so W = min(6, 34) = 6
         // (unclamped), and r_k = max(1, W >> k) halves each level.
         assert_eq!(
             (0..5u32).map(|k| score_radius(5, k)).collect::<Vec<_>>(),
-            vec![8, 4, 2, 1, 1]
+            vec![6, 3, 1, 1, 1]
         );
         // levels = 1: headroom = margin_for_levels(1) - 2*(2^1 - 1) = 4 - 2
-        // = 2, so the clamp binds: W = min(8, 2) = 2.
+        // = 2, so the clamp binds: W = min(6, 2) = 2.
         assert_eq!(score_radius(1, 0), 2);
         // levels = 2: headroom = margin_for_levels(2) - 2*(2^2 - 1) = 12 - 6
-        // = 6, so the clamp binds: W = min(8, 6) = 6, and r_1 = max(1, 3).
+        // = 6, which equals SCORE_RADIUS: W = 6, and r_1 = 3.
         assert_eq!(score_radius(2, 0), 6);
         assert_eq!(score_radius(2, 1), 3);
     }
