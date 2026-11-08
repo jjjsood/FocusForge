@@ -616,29 +616,209 @@ impl Blend for f32 {
     }
 }
 
+/// Whether a stroke of `mode` changes the pre-stroke pixel `out` given its
+/// source pixel `src` (one pixel each): always for Normal and Detail, for
+/// Lighten only where [`Blend::sum_order`] puts `src` strictly above `out`,
+/// for Darken strictly below; a tie or NaN sum acts for neither.
+pub fn mode_acts<S: Blend>(mode: BrushMode, src: &[S], out: &[S]) -> bool {
+    match mode {
+        BrushMode::Normal | BrushMode::Detail => true,
+        BrushMode::Lighten => S::sum_order(src, out) == Some(Ordering::Greater),
+        BrushMode::Darken => S::sum_order(src, out) == Some(Ordering::Less),
+    }
+}
+
+/// A mask alpha `mask` (Q16) scaled by a stroke's [`opacity_q16`] factor,
+/// rounded to nearest: `(mask * opacity_q16 + 32768) >> 16`.
+pub fn scaled_alpha(mask: u32, opacity_q16: u32) -> u32 {
+    ((u64::from(mask) * u64::from(opacity_q16) + 32768) >> 16) as u32
+}
+
 /// `out` (the pre-stroke pixel) mixed toward `src` by the Q16 `alpha`, every
 /// sample by the same `alpha`. Normal always mixes; Lighten only where
 /// [`Blend::sum_order`] puts `src` strictly above `out`, Darken strictly
 /// below (a tie or NaN sum leaves `out`). Detail mixes like Normal: its `src`
 /// is the target [`detail_output`] computes, not the source frame.
 pub fn blend_pixel<S: Blend>(mode: BrushMode, out: &mut [S], src: &[S], alpha: u32) {
-    let acts = match mode {
-        BrushMode::Normal | BrushMode::Detail => true,
-        BrushMode::Lighten => S::sum_order(src, out) == Some(Ordering::Greater),
-        BrushMode::Darken => S::sum_order(src, out) == Some(Ordering::Less),
-    };
-    if acts {
+    if mode_acts(mode, src, out) {
         for (o, &s) in out.iter_mut().zip(src) {
             *o = S::blend(*o, s, alpha);
         }
     }
 }
 
-/// Whether a stroke with Q16 `alpha` shows its own source at a pixel: more
-/// than half of full coverage. The one rule [`top_source`] and
-/// [`overlay_colors`] share.
-fn shows_source(alpha: u32) -> bool {
-    alpha > OPAQUE / 2
+/// Where a Lighten or Darken stroke acts, sampled on the `step` lattice of a
+/// rect: per stroke (by its index in the op list), whether the stroke's
+/// source sample passes [`mode_acts`] against the result before the stroke.
+/// [`Default`] holds nothing, so no Lighten or Darken stroke acts anywhere.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ModeConditions {
+    held: Vec<Held>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Held {
+    op_index: usize,
+    x0: u32,
+    y0: u32,
+    step: u32,
+    columns: u32,
+    rows: u32,
+    acts: Vec<bool>,
+}
+
+impl ModeConditions {
+    /// Whether the stroke `op_index` acts at `(x, y)`: `false` for a pixel off
+    /// the replayed lattice and for a stroke that was not replayed.
+    pub fn holds(&self, op_index: usize, x: u32, y: u32) -> bool {
+        let Ok(at) = self.held.binary_search_by_key(&op_index, |h| h.op_index) else {
+            return false;
+        };
+        let h = &self.held[at];
+        let (Some(dx), Some(dy)) = (x.checked_sub(h.x0), y.checked_sub(h.y0)) else {
+            return false;
+        };
+        if dx % h.step != 0 || dy % h.step != 0 {
+            return false;
+        }
+        let (i, j) = (dx / h.step, dy / h.step);
+        i < h.columns && j < h.rows && h.acts[(j * h.columns + i) as usize]
+    }
+}
+
+/// The part of `rect` a valid Lighten or Darken stroke can reach.
+fn light_dark_reach(op: &Op, info: ZMapInfo, rect: Rect) -> Option<Rect> {
+    let stroke = validate(op, info).ok()?;
+    if !matches!(stroke.mode, BrushMode::Lighten | BrushMode::Darken) {
+        return None;
+    }
+    stroke_footprint(&stroke, info).and_then(|fp| rect.intersect(fp))
+}
+
+/// Whether any valid Lighten or Darken stroke of `ops` meets `rect`, i.e.
+/// whether [`top_source`] and [`overlay_colors`] over `rect` need
+/// [`replay_mode_conditions`]. Without one, nothing needs to be read.
+pub fn needs_mode_conditions(ops: &[Op], info: ZMapInfo, rect: Rect) -> bool {
+    ops.iter()
+        .any(|op| light_dark_reach(op, info, rect).is_some())
+}
+
+/// The [`ModeConditions`] for the `step` lattice of `rect`. `base` is the
+/// composite the ops apply to (frame 0, map coordinates), `frames` the source
+/// frames and `origin` the offset to frame coordinates, as in
+/// [`apply_strokes`]. Each Lighten or Darken stroke is decided on the result
+/// of the strokes before it. A failed read is returned, never a partial result.
+#[allow(clippy::too_many_arguments)]
+pub fn replay_mode_conditions<S: Blend>(
+    ops: &[Op],
+    info: ZMapInfo,
+    rect: Rect,
+    step: NonZeroU32,
+    base: &dyn TileReader,
+    frames: &dyn TileReader,
+    origin: (u32, u32),
+    spp: usize,
+) -> Result<ModeConditions, RetouchError> {
+    let step = step.get();
+    let samples = |r: Rect| r.width as usize * r.height as usize * spp;
+    let mut held = Vec::new();
+    // ponytail: one replay per Lighten or Darken stroke, so overlapping ones
+    // re-replay their shared earlier strokes; one forward pass recording each
+    // inside the `apply_strokes` closure is the upgrade.
+    for (op_index, op) in ops.iter().enumerate() {
+        let Some(reach) = light_dark_reach(op, info, rect) else {
+            continue;
+        };
+        let Op::BrushStroke {
+            source_id, mode, ..
+        } = op;
+        // Lattice samples inside `reach`: sample `i` sits at `rect.x + i * step`.
+        let first = |at: u32, from: u32| (from - at).div_ceil(step);
+        let (i0, i1) = (first(rect.x, reach.x), first(rect.x, reach.x + reach.width));
+        let (j0, j1) = (
+            first(rect.y, reach.y),
+            first(rect.y, reach.y + reach.height),
+        );
+        if i0 >= i1 || j0 >= j1 {
+            continue;
+        }
+        let (columns, rows) = (i1 - i0, j1 - j0);
+        let lattice = Rect {
+            x: rect.x + i0 * step,
+            y: rect.y + j0 * step,
+            width: (columns - 1) * step + 1,
+            height: (rows - 1) * step + 1,
+        };
+        let placed: Vec<PlacedStroke> = ops[..op_index]
+            .iter()
+            .filter_map(|earlier| {
+                let Op::BrushStroke { source_id, .. } = earlier;
+                let footprint = footprint(earlier, info).ok().flatten()?;
+                Some(PlacedStroke {
+                    op: earlier,
+                    frame: usize::from(*source_id),
+                    footprint,
+                })
+            })
+            .collect();
+        let extent = read_extent(info, &placed, lattice);
+        let mut result = vec![S::default(); samples(extent)];
+        S::read_tile(base, 0, extent, &mut result)?;
+        apply_strokes(
+            info,
+            extent,
+            &mut result,
+            &placed,
+            frames,
+            origin,
+            spp,
+            apply::<S>,
+        )?;
+        let mut source = vec![S::default(); samples(lattice)];
+        let at_frame = Rect {
+            x: lattice.x + origin.0,
+            y: lattice.y + origin.1,
+            ..lattice
+        };
+        S::read_tile(frames, usize::from(*source_id), at_frame, &mut source)?;
+        let pixel = |r: Rect, x: u32, y: u32| {
+            ((y - r.y) as usize * r.width as usize + (x - r.x) as usize) * spp
+        };
+        let mut acts = Vec::with_capacity((columns * rows) as usize);
+        for j in 0..rows {
+            for i in 0..columns {
+                let (x, y) = (lattice.x + i * step, lattice.y + j * step);
+                let (s, r) = (pixel(lattice, x, y), pixel(extent, x, y));
+                acts.push(mode_acts(*mode, &source[s..s + spp], &result[r..r + spp]));
+            }
+        }
+        held.push(Held {
+            op_index,
+            x0: lattice.x,
+            y0: lattice.y,
+            step,
+            columns,
+            rows,
+            acts,
+        });
+    }
+    Ok(ModeConditions { held })
+}
+
+/// Whether the stroke `op_index` of `mode` is a pixel's origin where its mask
+/// has Q16 alpha `mask`: the opacity-scaled alpha is more than half of full
+/// coverage and, for Lighten and Darken, `conditions` holds there. The one
+/// rule [`top_source`] and [`overlay_colors`] share.
+fn shows_source(
+    mode: BrushMode,
+    mask: u32,
+    opacity_q16: u32,
+    conditions: &ModeConditions,
+    (op_index, x, y): (usize, u32, u32),
+) -> bool {
+    scaled_alpha(mask, opacity_q16) > OPAQUE / 2
+        && (!matches!(mode, BrushMode::Lighten | BrushMode::Darken)
+            || conditions.holds(op_index, x, y))
 }
 
 /// `table`'s colour for `index`, clamped to the last entry.
@@ -646,25 +826,42 @@ fn table_color(table: &[[u8; 3]], index: u16) -> [u8; 3] {
     table[usize::from(index).min(table.len() - 1)]
 }
 
-/// The source of the latest valid stroke in `ops` whose alpha at `(x, y)`
-/// exceeds half of full coverage, `None` when no stroke reaches that far.
-pub fn top_source(ops: &[Op], info: ZMapInfo, x: u32, y: u32) -> Option<u16> {
-    ops.iter().rev().find_map(|op| {
-        let Op::BrushStroke { source_id, .. } = op;
-        shows_source(alpha(op, info, x, y).ok()?).then_some(*source_id)
+/// The source of the latest valid stroke in `ops` that is the origin of
+/// `(x, y)`: its opacity-scaled alpha there exceeds half of full coverage and,
+/// for Lighten and Darken, `conditions` holds. `None` when no stroke is.
+pub fn top_source(
+    ops: &[Op],
+    info: ZMapInfo,
+    x: u32,
+    y: u32,
+    conditions: &ModeConditions,
+) -> Option<u16> {
+    ops.iter().enumerate().rev().find_map(|(k, op)| {
+        let Op::BrushStroke {
+            source_id,
+            mode,
+            opacity,
+            ..
+        } = op;
+        let mask = alpha(op, info, x, y).ok()?;
+        shows_source(*mode, mask, opacity_q16(*opacity), conditions, (k, x, y))
+            .then_some(*source_id)
     })
 }
 
 /// Fills `out` with each sample's overlay colour over the `step`-th rows and
 /// columns of `rect`: `table`'s colour for the stored index in `indices`
 /// (clamped to the last entry), then, per valid stroke of `ops` in order, the
-/// stroke source's colour wherever the stroke shows its source (the rule of
-/// [`top_source`]). Cost follows the samples near each path.
+/// stroke source's colour wherever the stroke is the origin (the rule of
+/// [`top_source`], with the same `conditions`). Cost follows the samples near
+/// each path.
+#[allow(clippy::too_many_arguments)]
 pub fn overlay_colors(
     ops: &[Op],
     info: ZMapInfo,
     rect: Rect,
     step: NonZeroU32,
+    conditions: &ModeConditions,
     table: &[[u8; 3]],
     indices: &[u16],
     out: &mut [[u8; 3]],
@@ -677,7 +874,7 @@ pub fn overlay_colors(
     for (color, &index) in out.iter_mut().zip(indices) {
         *color = table_color(table, index);
     }
-    for op in ops {
+    for (k, op) in ops.iter().enumerate() {
         let Op::BrushStroke { source_id, .. } = op;
         let Ok(stroke) = validate(op, info) else {
             continue;
@@ -686,6 +883,7 @@ pub fn overlay_colors(
             continue;
         };
         let over = table_color(table, *source_id);
+        let opacity = opacity_q16(stroke.opacity);
         let ramp = Ramp::new(&stroke);
         let grid = SegmentGrid::new(&stroke, active);
         // Lattice samples inside `active`: sample `i` sits at `rect.x + i * step`.
@@ -705,7 +903,7 @@ pub fn overlay_colors(
                     y,
                     segments.iter().map(|&s| s as usize),
                 ));
-                if shows_source(a) {
+                if shows_source(stroke.mode, a, opacity, conditions, (k, x, y)) {
                     out[j as usize * columns + i as usize] = over;
                 }
             }
@@ -750,7 +948,7 @@ pub fn apply<S: Blend>(
         return Ok(());
     };
     let ramp = Ramp::new(&stroke);
-    let opacity = u64::from(opacity_q16(stroke.opacity));
+    let opacity = opacity_q16(stroke.opacity);
     // Detail mixes toward its own target, one pixel per sample of `active`.
     let mut target = Vec::new();
     let (src, src_rect) = if stroke.mode == BrushMode::Detail {
@@ -768,7 +966,7 @@ pub fn apply<S: Blend>(
             y,
             segments.iter().map(|&i| i as usize),
         ));
-        let a = ((u64::from(a) * opacity + 32768) >> 16) as u32;
+        let a = scaled_alpha(a, opacity);
         if a == 0 {
             return;
         }
@@ -842,6 +1040,7 @@ pub fn apply_strokes<S: Sample>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::algorithm::AlgorithmError;
 
     fn pt(x: i32, y: i32) -> Point {
         Point { x, y }
@@ -2428,12 +2627,24 @@ mod tests {
         step: u32,
         indices: &[u16],
     ) -> Vec<[u8; 3]> {
+        colors_with(ops, map, rect, step, &ModeConditions::default(), indices)
+    }
+
+    fn colors_with(
+        ops: &[Op],
+        map: ZMapInfo,
+        rect: Rect,
+        step: u32,
+        conditions: &ModeConditions,
+        indices: &[u16],
+    ) -> Vec<[u8; 3]> {
         let mut out = vec![[0u8; 3]; indices.len()];
         overlay_colors(
             ops,
             map,
             rect,
             NonZeroU32::new(step).unwrap(),
+            conditions,
             &palette(),
             indices,
             &mut out,
@@ -2527,16 +2738,21 @@ mod tests {
     #[test]
     fn top_source_takes_the_latest_majority_cover() {
         let map = info(60, 30);
+        let none = ModeConditions::default();
         // Radius 10 with full softness: alpha falls from 65536 at the point.
         let one = [stroke_op(1, vec![pt(10, 15)], 10.0, 1.0)];
         let flip = (10..40)
             .find(|&x| alpha(&one[0], map, x, 15).unwrap() <= 32768)
             .expect("the edge falls to half");
         for x in 10..flip {
-            assert_eq!(top_source(&one, map, x, 15), Some(1), "inside at {x}");
+            assert_eq!(
+                top_source(&one, map, x, 15, &none),
+                Some(1),
+                "inside at {x}"
+            );
         }
         for x in flip..40 {
-            assert_eq!(top_source(&one, map, x, 15), None, "outside at {x}");
+            assert_eq!(top_source(&one, map, x, 15, &none), None, "outside at {x}");
         }
 
         let two = [
@@ -2545,17 +2761,29 @@ mod tests {
         ];
         // The later stroke wins where it covers more than half, the earlier
         // one where only it does.
-        assert_eq!(top_source(&two, map, 13, 15), Some(3), "both over half");
-        assert_eq!(top_source(&two, map, 11, 15), Some(1), "only the earlier");
-        assert_eq!(top_source(&two, map, 20, 15), Some(3), "only the later");
-        assert_eq!(top_source(&two, map, 21, 15), None);
+        assert_eq!(
+            top_source(&two, map, 13, 15, &none),
+            Some(3),
+            "both over half"
+        );
+        assert_eq!(
+            top_source(&two, map, 11, 15, &none),
+            Some(1),
+            "only the earlier"
+        );
+        assert_eq!(
+            top_source(&two, map, 20, 15, &none),
+            Some(3),
+            "only the later"
+        );
+        assert_eq!(top_source(&two, map, 21, 15, &none), None);
 
         let refused = [
             stroke_op(1, vec![pt(10, 15)], 10.0, 1.0),
             stroke_op(9, vec![pt(10, 15)], 10.0, 1.0),
         ];
         assert_eq!(
-            top_source(&refused, map, 10, 15),
+            top_source(&refused, map, 10, 15, &none),
             Some(1),
             "refused op skipped"
         );
@@ -2573,7 +2801,7 @@ mod tests {
             let out = colors_over(&ops, map, rect, step, &indices);
             let mut shown = 0;
             for (at, x, y) in lattice(rect, step) {
-                let expected = match top_source(&ops, map, x, y) {
+                let expected = match top_source(&ops, map, x, y, &ModeConditions::default()) {
                     Some(source) => {
                         shown += 1;
                         table[usize::from(source).min(last)]
@@ -2584,5 +2812,616 @@ mod tests {
             }
             assert!(shown > 20, "the strokes cover samples at step {step}");
         }
+        top_source_follows_replayed_overlay::<u16>(false);
+        top_source_follows_replayed_overlay::<f32>(true);
+    }
+
+    fn mode_op(
+        source_id: u16,
+        mode: BrushMode,
+        opacity: f32,
+        path: Vec<Point>,
+        radius: f32,
+        softness: f32,
+    ) -> Op {
+        Op::BrushStroke {
+            source_id,
+            path,
+            radius,
+            softness,
+            mode,
+            opacity,
+        }
+    }
+
+    /// A stack of `f32` planes, `width` pixels wide with `spp` samples each; a
+    /// `u16` read casts, so `u16` scenes hold whole numbers in range.
+    struct Planes {
+        width: u32,
+        spp: usize,
+        planes: Vec<Vec<f32>>,
+    }
+
+    impl Planes {
+        fn copy<T>(
+            &self,
+            frame: usize,
+            r: Rect,
+            out: &mut [T],
+            convert: impl Fn(f32) -> T,
+        ) -> Result<(), AlgorithmError> {
+            let plane = self
+                .planes
+                .get(frame)
+                .ok_or(AlgorithmError::FrameOutOfRange {
+                    frame,
+                    frame_count: self.planes.len(),
+                })?;
+            let row_len = r.width as usize * self.spp;
+            for (j, row) in out.chunks_exact_mut(row_len).enumerate() {
+                let from = ((r.y as usize + j) * self.width as usize + r.x as usize) * self.spp;
+                for (o, &v) in row.iter_mut().zip(&plane[from..from + row_len]) {
+                    *o = convert(v);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl TileReader for Planes {
+        fn read_tile_into(
+            &self,
+            frame: usize,
+            rect: Rect,
+            out: &mut [u16],
+        ) -> Result<(), AlgorithmError> {
+            self.copy(frame, rect, out, |v| v as u16)
+        }
+
+        fn read_tile_f32_into(
+            &self,
+            frame: usize,
+            rect: Rect,
+            out: &mut [f32],
+        ) -> Result<(), AlgorithmError> {
+            self.copy(frame, rect, out, |v| v)
+        }
+
+        fn sample_format(&self) -> crate::tile::SampleFormat {
+            crate::tile::SampleFormat::F32
+        }
+    }
+
+    /// A reader whose every read fails.
+    struct Failing;
+
+    impl TileReader for Failing {
+        fn read_tile_into(
+            &self,
+            frame: usize,
+            _: Rect,
+            _: &mut [u16],
+        ) -> Result<(), AlgorithmError> {
+            Err(AlgorithmError::FrameOutOfRange {
+                frame,
+                frame_count: 0,
+            })
+        }
+    }
+
+    /// The frame-0 base and the source frames the origin tests replay over.
+    struct Scene {
+        map: ZMapInfo,
+        spp: usize,
+        base: Planes,
+        frames: Planes,
+    }
+
+    /// The frames sit at this offset in their planes, as a cropped stack does.
+    const ORIGIN: (u32, u32) = (3, 2);
+
+    /// A hash of the pixel: whole numbers in `0..65536`, or, `wide`, `f32`
+    /// values from -20000 to 80000.
+    fn scene_value(frame: usize, x: u32, y: u32, c: usize, wide: bool) -> f32 {
+        let mut h = x.wrapping_mul(73_856_093)
+            ^ y.wrapping_mul(19_349_663)
+            ^ (c as u32).wrapping_mul(83_492_791)
+            ^ (frame as u32 + 1).wrapping_mul(2_654_435_761);
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x2c1b_3c6d);
+        h ^= h >> 12;
+        if wide {
+            (h % 100_000) as f32 - 20_000.0 + 0.25
+        } else {
+            (h % 65_536) as f32
+        }
+    }
+
+    fn scene(wide: bool) -> Scene {
+        let (w, h, spp) = (48u32, 36u32, 3usize);
+        let plane = |frame: usize, (cols, rows): (u32, u32), shift: (u32, u32)| -> Vec<f32> {
+            (0..rows)
+                .flat_map(|y| (0..cols).map(move |x| (x, y)))
+                .flat_map(|(x, y)| {
+                    (0..spp).map(move |c| {
+                        scene_value(
+                            frame,
+                            x.wrapping_sub(shift.0),
+                            y.wrapping_sub(shift.1),
+                            c,
+                            wide,
+                        )
+                    })
+                })
+                .collect()
+        };
+        Scene {
+            map: info(w, h),
+            spp,
+            base: Planes {
+                width: w,
+                spp,
+                planes: vec![plane(0, (w, h), (0, 0))],
+            },
+            frames: Planes {
+                width: w + ORIGIN.0,
+                spp,
+                planes: (0..4)
+                    .map(|f| plane(f, (w + ORIGIN.0, h + ORIGIN.1), ORIGIN))
+                    .collect(),
+            },
+        }
+    }
+
+    /// Every mode and several opacities over a 48 x 36 map: a Detail stroke
+    /// under a Lighten one, strokes that cannot reach half coverage, and one
+    /// the map refuses (its index still counts).
+    fn mixed_ops() -> Vec<Op> {
+        use BrushMode::{Darken, Detail, Lighten, Normal};
+        vec![
+            mode_op(1, Normal, 1.0, vec![pt(6, 6), pt(40, 24)], 9.0, 0.6),
+            mode_op(2, Detail, 0.6, vec![pt(10, 28), pt(36, 10)], 8.0, 0.5),
+            mode_op(3, Lighten, 0.6, vec![pt(12, 20), pt(34, 16)], 9.0, 0.7),
+            mode_op(1, Darken, 1.0, vec![pt(5, 18), pt(42, 30)], 7.0, 0.5),
+            mode_op(2, Normal, 0.5, vec![pt(20, 30)], 8.0, 0.5),
+            mode_op(0, Lighten, 0.3, vec![pt(30, 8), pt(18, 12)], 8.0, 0.5),
+            mode_op(2, Lighten, 1.0, vec![pt(24, 18), pt(26, 19)], 6.0, 0.5),
+            mode_op(3, Darken, 0.5, vec![pt(14, 10)], 8.0, 0.5),
+            mode_op(1, Detail, 1.0, vec![pt(40, 6), pt(44, 10)], 6.0, 0.5),
+            mode_op(9, Lighten, 1.0, vec![pt(24, 18)], 6.0, 0.5),
+        ]
+    }
+
+    /// Per op, the map pixels (row-major) where the stroke changed or would
+    /// change the result: scaled alpha above half, and for Lighten and Darken
+    /// the channel-sum comparison against the result of the ops before it,
+    /// each op rendered whole-map with `apply`.
+    fn acting_pixels<S: Blend>(ops: &[Op], scene: &Scene) -> Vec<Vec<bool>> {
+        let (w, h) = (scene.map.width(), scene.map.height());
+        let whole = rect(0, 0, w, h);
+        let spp = scene.spp;
+        let mut result = vec![S::default(); (w * h) as usize * spp];
+        S::read_tile(&scene.base, 0, whole, &mut result).unwrap();
+        let sum = |pixel: &[S]| pixel.iter().map(|s| f64::from(s.widen())).sum::<f64>();
+        let mut acts = Vec::new();
+        for op in ops {
+            let Op::BrushStroke {
+                source_id,
+                mode,
+                opacity,
+                ..
+            } = op;
+            let mut hit = vec![false; (w * h) as usize];
+            if validate(op, scene.map).is_ok() {
+                let mut src = vec![S::default(); result.len()];
+                let at_frame = rect(ORIGIN.0, ORIGIN.1, w, h);
+                S::read_tile(&scene.frames, usize::from(*source_id), at_frame, &mut src).unwrap();
+                let q = u64::from(super::opacity_q16(*opacity));
+                for y in 0..h {
+                    for x in 0..w {
+                        let a = u64::from(alpha(op, scene.map, x, y).unwrap());
+                        let strong = (a * q + 32768) >> 16 > 32768;
+                        let at = (y * w + x) as usize * spp;
+                        let (s, r) = (&src[at..at + spp], &result[at..at + spp]);
+                        let condition = match mode {
+                            BrushMode::Lighten => sum(s) > sum(r),
+                            BrushMode::Darken => sum(s) < sum(r),
+                            _ => true,
+                        };
+                        hit[(y * w + x) as usize] = strong && condition;
+                    }
+                }
+                apply(op, scene.map, whole, &mut result, whole, &src, spp).unwrap();
+            }
+            acts.push(hit);
+        }
+        acts
+    }
+
+    fn replay_for<S: Blend>(
+        ops: &[Op],
+        scene: &Scene,
+        area: Rect,
+        step: u32,
+    ) -> Result<ModeConditions, RetouchError> {
+        replay_mode_conditions::<S>(
+            ops,
+            scene.map,
+            area,
+            NonZeroU32::new(step).unwrap(),
+            &scene.base,
+            &scene.frames,
+            ORIGIN,
+            scene.spp,
+        )
+    }
+
+    fn colors_match_where_each_mode_acts<S: Blend>(wide: bool) {
+        let scene = scene(wide);
+        let ops = mixed_ops();
+        let acts = acting_pixels::<S>(&ops, &scene);
+        let table = palette();
+        let last = table.len() - 1;
+        let (mut acting, mut declined) = (0, 0);
+        // The second rect lies under a Detail stroke, whose read margin the replay widens by.
+        for (area, step) in [
+            (rect(3, 2, 40, 31), 1u32),
+            (rect(3, 2, 40, 31), 3),
+            (rect(22, 14, 10, 8), 1),
+        ] {
+            let conditions = replay_for::<S>(&ops, &scene, area, step).unwrap();
+            let indices = stored(samples(area, step));
+            let out = colors_with(&ops, scene.map, area, step, &conditions, &indices);
+            for (at, x, y) in lattice(area, step) {
+                let pixel = (y * 48 + x) as usize;
+                let mut expected = table[usize::from(indices[at]).min(last)];
+                for (op, hit) in ops.iter().zip(&acts) {
+                    let Op::BrushStroke {
+                        source_id, mode, ..
+                    } = op;
+                    if hit[pixel] {
+                        expected = table[usize::from(*source_id).min(last)];
+                    } else if step == 1
+                        && matches!(mode, BrushMode::Lighten | BrushMode::Darken)
+                        && alpha(op, scene.map, x, y).is_ok_and(|a| a == OPAQUE)
+                    {
+                        declined += 1;
+                    }
+                }
+                assert_eq!(out[at], expected, "step {step} at ({x}, {y})");
+            }
+        }
+        for k in [2, 3, 6] {
+            acting += acts[k].iter().filter(|&&hit| hit).count();
+        }
+        assert!(acting > 40, "Lighten and Darken strokes act somewhere");
+        assert!(declined > 20, "and decline at covered pixels: {declined}");
+    }
+
+    #[test]
+    fn overlay_colors_match_where_each_mode_acts() {
+        colors_match_where_each_mode_acts::<u16>(false);
+        colors_match_where_each_mode_acts::<f32>(true);
+    }
+
+    #[test]
+    fn origin_follows_mask_times_opacity() {
+        let map = info(60, 30);
+        let none = ModeConditions::default();
+        for mode in [BrushMode::Normal, BrushMode::Detail] {
+            for opacity in [0.3f32, 0.5, 0.6, 1.0] {
+                let op = mode_op(2, mode, opacity, vec![pt(10, 15)], 10.0, 1.0);
+                let ops = std::slice::from_ref(&op);
+                let mut origins = 0;
+                for x in 0..45 {
+                    let product = f64::from(alpha(&op, map, x, 15).unwrap()) * f64::from(opacity);
+                    let got = top_source(ops, map, x, 15, &none);
+                    if product >= 32769.0 {
+                        assert_eq!(got, Some(2), "{mode:?} {opacity} at {x}");
+                    } else if product <= 32767.0 {
+                        assert_eq!(got, None, "{mode:?} {opacity} at {x}");
+                    }
+                    origins += usize::from(got.is_some());
+                }
+                if opacity <= 0.5 {
+                    assert_eq!(origins, 0, "{mode:?} at {opacity} is never an origin");
+                } else {
+                    assert!(origins > 0, "{mode:?} at {opacity} is an origin somewhere");
+                }
+                if opacity == 0.6 {
+                    let full = top_source(ops, map, 10, 15, &none);
+                    assert_eq!(full, Some(2), "full mask times 0.6 is above half");
+                    assert!(origins < 20, "but only where the mask is above 5/6");
+                }
+            }
+        }
+    }
+
+    /// Per pixel: sample triples of the base, frame 1 and frame 2.
+    type Triples = ([u32; 3], [u32; 3], [u32; 3]);
+    const PIXELS: [Triples; 6] = [
+        ([10, 10, 10], [30, 30, 30], [20, 20, 20]),
+        ([30, 30, 30], [10, 10, 10], [20, 20, 20]),
+        ([15, 15, 15], [15, 15, 15], [15, 15, 15]),
+        ([10, 10, 10], [10, 10, 10], [30, 0, 0]),
+        ([5, 5, 5], [5, 5, 5], [30, 30, 30]),
+        ([30, 30, 30], [30, 30, 30], [5, 5, 5]),
+    ];
+
+    fn lighten_darken_cases<S: Blend>(level: fn(u32) -> f32) {
+        let map = info(6, 1);
+        let plane = |pick: fn(&Triples) -> [u32; 3]| -> Vec<f32> {
+            PIXELS.iter().flat_map(|p| pick(p).map(level)).collect()
+        };
+        let base = Planes {
+            width: 6,
+            spp: 3,
+            planes: vec![plane(|p| p.0)],
+        };
+        let frames = Planes {
+            width: 6,
+            spp: 3,
+            planes: vec![plane(|p| p.0), plane(|p| p.1), plane(|p| p.2)],
+        };
+        let cover = |source_id, mode| mode_op(source_id, mode, 1.0, vec![pt(3, 0)], 20.0, 0.0);
+        let normal = cover(1, BrushMode::Normal);
+        let lighten = cover(2, BrushMode::Lighten);
+        let darken = cover(2, BrushMode::Darken);
+        let whole = rect(0, 0, 6, 1);
+        let table = palette();
+        // Frame 2's stroke against the base, then against frame 1 laid by a Normal stroke.
+        let cases = [
+            (
+                vec![lighten.clone()],
+                [Some(2), None, None, None, Some(2), None],
+            ),
+            (
+                vec![normal.clone(), lighten],
+                [Some(1), Some(2), Some(1), Some(1), Some(2), Some(1)],
+            ),
+            (
+                vec![darken.clone()],
+                [None, Some(2), None, None, None, Some(2)],
+            ),
+            (
+                vec![normal, darken],
+                [Some(2), Some(1), Some(1), Some(1), Some(1), Some(2)],
+            ),
+        ];
+        for (ops, expected) in cases {
+            let conditions = replay_mode_conditions::<S>(
+                &ops,
+                map,
+                whole,
+                NonZeroU32::MIN,
+                &base,
+                &frames,
+                (0, 0),
+                3,
+            )
+            .unwrap();
+            let indices = [0u16; 6];
+            let out = colors_with(&ops, map, whole, 1, &conditions, &indices);
+            let unreplayed = colors_with(&ops, map, whole, 1, &ModeConditions::default(), &indices);
+            let underneath = if ops.len() == 2 { Some(1) } else { None };
+            for (x, want) in expected.iter().enumerate() {
+                let x = x as u32;
+                assert_eq!(top_source(&ops, map, x, 0, &conditions), *want, "x {x}");
+                assert_eq!(out[x as usize], table[usize::from(want.unwrap_or(0))]);
+                // With nothing replayed the Lighten or Darken stroke is never an origin.
+                let none = ModeConditions::default();
+                assert_eq!(top_source(&ops, map, x, 0, &none), underneath, "x {x}");
+                assert_eq!(
+                    unreplayed[x as usize],
+                    table[usize::from(underneath.unwrap_or(0))]
+                );
+            }
+        }
+        let mut tied = vec![level(10); 3];
+        let source = [level(30), level(0), level(0)];
+        blend_pixel(BrushMode::Lighten, &mut tied, &source, OPAQUE);
+        assert_eq!(
+            tied,
+            vec![level(10); 3],
+            "an equal-sum pixel is left as it is"
+        );
+    }
+
+    #[test]
+    fn lighten_darken_origin_uses_pre_stroke_result() {
+        lighten_darken_cases::<u16>(|c| (c * 1000) as f32);
+        // Sample values run from -20000 to 70000, outside 0..=65535 both ways.
+        lighten_darken_cases::<f32>(|c| (c * 3000) as f32 - 20_000.0);
+    }
+
+    #[test]
+    fn normal_full_opacity_origin_matches_geometry_rule() {
+        let map = info(40, 30);
+        let table = palette();
+        let last = table.len() - 1;
+        let mut ops = overlapping_strokes();
+        ops.push(stroke_op(2, vec![pt(-50, -50), pt(-40, -50)], 5.0, 0.5));
+        let area = rect(2, 1, 35, 27);
+        assert!(!needs_mode_conditions(&ops, map, area));
+        let none = ModeConditions::default();
+        let mut painted = 0;
+        for step in [1u32, 3] {
+            let step_nz = NonZeroU32::new(step).unwrap();
+            let u16s = replay_mode_conditions::<u16>(
+                &ops,
+                map,
+                area,
+                step_nz,
+                &Failing,
+                &Failing,
+                (0, 0),
+                1,
+            );
+            assert_eq!(u16s.unwrap(), none, "no frame or base read");
+            let f32s = replay_mode_conditions::<f32>(
+                &ops,
+                map,
+                area,
+                step_nz,
+                &Failing,
+                &Failing,
+                (0, 0),
+                3,
+            );
+            assert_eq!(f32s.unwrap(), none);
+            let indices = stored(samples(area, step));
+            let out = colors_over(&ops, map, area, step, &indices);
+            for (at, x, y) in lattice(area, step) {
+                let mut expected = table[usize::from(indices[at]).min(last)];
+                let mut top = None;
+                for op in &ops {
+                    if alpha(op, map, x, y).is_ok_and(|a| a > 32768) {
+                        let Op::BrushStroke { source_id, .. } = op;
+                        expected = table[usize::from(*source_id).min(last)];
+                        top = Some(*source_id);
+                        painted += 1;
+                    }
+                }
+                assert_eq!(out[at], expected, "step {step} at ({x}, {y})");
+                assert_eq!(top_source(&ops, map, x, y, &none), top, "({x}, {y})");
+            }
+        }
+        assert!(painted > 40);
+
+        let lighten = [mode_op(
+            1,
+            BrushMode::Lighten,
+            1.0,
+            vec![pt(10, 10)],
+            4.0,
+            0.5,
+        )];
+        assert!(needs_mode_conditions(&lighten, map, area));
+        assert!(!needs_mode_conditions(&lighten, map, rect(30, 20, 5, 5)));
+        let refused = [mode_op(
+            9,
+            BrushMode::Darken,
+            1.0,
+            vec![pt(10, 10)],
+            4.0,
+            0.5,
+        )];
+        assert!(!needs_mode_conditions(&refused, map, area));
+    }
+
+    fn replay_error<S: Blend>(base: &dyn TileReader, frames: &dyn TileReader) -> RetouchError {
+        let map = info(40, 30);
+        let ops = [
+            mode_op(1, BrushMode::Normal, 1.0, vec![pt(10, 10)], 6.0, 0.5),
+            mode_op(2, BrushMode::Lighten, 1.0, vec![pt(12, 10)], 6.0, 0.5),
+        ];
+        replay_mode_conditions::<S>(
+            &ops,
+            map,
+            rect(0, 0, 40, 30),
+            NonZeroU32::MIN,
+            base,
+            frames,
+            (0, 0),
+            1,
+        )
+        .unwrap_err()
+    }
+
+    #[test]
+    fn replay_mode_conditions_returns_read_errors() {
+        let good = Planes {
+            width: 40,
+            spp: 1,
+            planes: vec![vec![7.0; 40 * 30]; 4],
+        };
+        for (what, base, frames) in [
+            (
+                "base",
+                &Failing as &dyn TileReader,
+                &good as &dyn TileReader,
+            ),
+            ("frames", &good, &Failing),
+        ] {
+            for err in [
+                replay_error::<u16>(base, frames),
+                replay_error::<f32>(base, frames),
+            ] {
+                assert!(
+                    matches!(
+                        err,
+                        RetouchError::Source(AlgorithmError::FrameOutOfRange { .. })
+                    ),
+                    "a failing {what} read: {err:?}"
+                );
+            }
+        }
+    }
+
+    /// For mixed-mode ops, `top_source` with the one-pixel replay of each
+    /// lattice sample names the frame the lattice overlay paints there.
+    fn top_source_follows_replayed_overlay<S: Blend>(wide: bool) {
+        let scene = scene(wide);
+        let ops = mixed_ops();
+        let table = palette();
+        let last = table.len() - 1;
+        let area = rect(3, 2, 40, 31);
+        for step in [1u32, 4] {
+            let conditions = replay_for::<S>(&ops, &scene, area, step).unwrap();
+            let indices = stored(samples(area, step));
+            let out = colors_with(&ops, scene.map, area, step, &conditions, &indices);
+            let mut shown = 0;
+            for (at, x, y) in lattice(area, step) {
+                let one = replay_for::<S>(&ops, &scene, rect(x, y, 1, 1), 1).unwrap();
+                let expected = match top_source(&ops, scene.map, x, y, &one) {
+                    Some(source) => {
+                        shown += 1;
+                        table[usize::from(source).min(last)]
+                    }
+                    None => table[usize::from(indices[at]).min(last)],
+                };
+                assert_eq!(out[at], expected, "step {step} at ({x}, {y})");
+            }
+            assert!(shown > 20, "strokes act at step {step}");
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement: one Lighten replay over fixtures/mantis-512"]
+    fn lighten_replay_cost_on_mantis_512() {
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/mantis-512");
+        let frames = crate::io::TiffStack::open(root.join("frames")).expect("frames open");
+        let base = crate::io::TiffStack::open_files(&[root.join("reference.tif")])
+            .expect("reference opens");
+        let (w, h) = frames.dimensions();
+        let spp = frames.header(0).samples_per_pixel as usize;
+        let map = ZMapInfo::new(w, h, frames.len() as u32).unwrap();
+        let ops = [
+            mode_op(1, BrushMode::Normal, 1.0, vec![pt(200, 250)], 80.0, 0.5),
+            mode_op(2, BrushMode::Lighten, 1.0, vec![pt(220, 250)], 60.0, 0.5),
+        ];
+        let area = footprint(&ops[1], map).unwrap().unwrap();
+        let started = std::time::Instant::now();
+        let conditions = replay_mode_conditions::<u16>(
+            &ops,
+            map,
+            area,
+            NonZeroU32::MIN,
+            &base,
+            &frames,
+            (0, 0),
+            spp,
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        let acting = lattice(area, 1)
+            .filter(|&(_, x, y)| conditions.holds(1, x, y))
+            .count();
+        println!(
+            "replay of a radius-60 Lighten over a Normal stroke: {elapsed:?}, {acting} of {} pixels act",
+            area.width * area.height
+        );
+        assert!(acting > 0);
     }
 }

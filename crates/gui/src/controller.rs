@@ -3605,7 +3605,14 @@ impl AppController {
         if x >= info.width() || y >= info.height() {
             return None;
         }
-        job::top_source(&edit.drawn_ops(), info, x, y).or_else(|| edit.stored_source(x, y))
+        job::top_source(
+            &edit.drawn_ops(),
+            info,
+            x,
+            y,
+            &job::ModeConditions::default(),
+        )
+        .or_else(|| edit.stored_source(x, y))
     }
 
     /// `Alt + click`, or the armed pipette's `Start`: reads the frame the

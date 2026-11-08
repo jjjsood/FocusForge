@@ -53,7 +53,7 @@ pub use focusforge_core::project::{BrushMode, Op};
 pub use focusforge_core::project::{
     HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, kept_entries, now_unix,
 };
-pub use focusforge_core::retouch::{footprint, top_source};
+pub use focusforge_core::retouch::{ModeConditions, footprint, top_source};
 pub use focusforge_core::update::{
     CheckFailure, HttpReleaseSource, ReleaseSource, UpdateCheck, check as check_for_update,
     parse_version,

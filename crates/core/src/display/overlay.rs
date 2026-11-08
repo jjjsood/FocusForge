@@ -84,6 +84,7 @@ fn opacity_endpoints_are_exact() {
         info,
         rect,
         std::num::NonZeroU32::MIN,
+        &crate::retouch::ModeConditions::default(),
         &table,
         &indices,
         &mut colors,

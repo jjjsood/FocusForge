@@ -15,7 +15,7 @@ use focusforge_core::timing::measurement_scope;
 
 use focusforge_core::TiffError;
 use focusforge_core::io::{FrameError, TiffStack};
-use focusforge_core::retouch::overlay_colors;
+use focusforge_core::retouch::{ModeConditions, overlay_colors};
 use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::zmap::ZMapReader;
 use focusforge_gpu::display::{DisplayRenderer, DisplayTexture, render_overlay};
@@ -1043,6 +1043,7 @@ impl CanvasRenderer {
                             zmap.info(),
                             rect,
                             step,
+                            &ModeConditions::default(),
                             &overlay.table,
                             sealed_indices,
                             &mut colors,

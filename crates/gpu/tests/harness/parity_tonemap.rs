@@ -8,7 +8,7 @@
 use focusforge_core::display::{overlay_cpu, tonemap_cpu, zmap_index_scale};
 use focusforge_core::io::TiffStack;
 use focusforge_core::project::{BrushMode, Op, Point};
-use focusforge_core::retouch::overlay_colors;
+use focusforge_core::retouch::{ModeConditions, overlay_colors};
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{NO_SOURCE, ZMapReader, overlay_table};
 use focusforge_gpu::device::shared_device_or_skip;
@@ -332,6 +332,7 @@ fn overlay_parity_matches_cpu() {
                 zmap.info(),
                 crop,
                 std::num::NonZeroU32::MIN,
+                &ModeConditions::default(),
                 &table,
                 &indices,
                 &mut colors,

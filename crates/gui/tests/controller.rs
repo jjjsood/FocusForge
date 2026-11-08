@@ -5209,6 +5209,7 @@ fn overlay_pixels(c: &AppController, zmap: &Path) -> Vec<[u8; 3]> {
         info,
         whole,
         NonZeroU32::MIN,
+        &focusforge_core::retouch::ModeConditions::default(),
         &draw.table,
         &stored,
         &mut colors,

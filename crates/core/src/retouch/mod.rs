@@ -7,7 +7,10 @@ pub mod blend;
 use crate::tile::Rect;
 use crate::zmap::ZMapError;
 
-pub use blend::{footprint, overlay_colors, top_source};
+pub use blend::{
+    ModeConditions, footprint, needs_mode_conditions, overlay_colors, replay_mode_conditions,
+    top_source,
+};
 
 /// Failures validating a stroke against the fused map's extent and frame count.
 #[derive(Debug, thiserror::Error)]
