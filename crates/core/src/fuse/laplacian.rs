@@ -4,7 +4,9 @@
 //! level and per pixel by Laplacian magnitude across frames, and emitting
 //! both the fused composite and the Z-Map that names the winning source
 //! frame. Every rounding, ordering and tie-break choice below is binding: the
-//! GPU twin reproduces the selection and the composite within 1 LSB at 16-bit.
+//! GPU twin follows the selection and the composite within 1 LSB at 16-bit on
+//! the parity fixtures; a near-tie between two frames can resolve differently
+//! on a real stack.
 //!
 //! # Selection rule
 //!
@@ -1265,7 +1267,7 @@ mod tests {
         out
     }
 
-    /// The previous nested `f32` accumulation, the naive reference.
+    /// The nested `f32` window sum, the naive reference.
     fn naive_score(plane: &Plane, radius: u32) -> Vec<f32> {
         let (w, h, spp) = (plane.width(), plane.height(), plane.samples_per_pixel());
         let r = i64::from(radius);
