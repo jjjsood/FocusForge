@@ -27,6 +27,12 @@ $wix = Join-Path $wixDirectory 'tools/net6.0/any/wix.dll'
 if (-not (Test-Path $wix)) { throw 'WiX entry point is missing' }
 $wixVersion = @(& dotnet $wix --version)
 if ($LASTEXITCODE -ne 0 -or $wixVersion.Count -ne 1 -or ([string]$wixVersion[0]).Trim() -ne '4.0.5+b9b2f1b4') { throw 'WiX 4.0.5 cannot run on this runner' }
+# Both pinned symbol tools are fetched before the long build, into the directory the package check reuses.
+$symbolTools = Join-Path $root '.scratch/symbol-tools'
+$dumpSyms = @(& python $root/tools/package-symbols.py install dump_syms x86_64-pc-windows-msvc $symbolTools)
+if ($LASTEXITCODE -ne 0 -or $dumpSyms.Count -ne 1) { throw 'pinned dump_syms cannot run on this runner' }
+& python $root/tools/package-symbols.py install stackwalk x86_64-pc-windows-msvc $symbolTools | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'pinned stackwalker cannot run on this runner' }
 foreach ($packageName in 'focusforge-cli', 'focusforge-gui') {
   cargo build --locked --release --target x86_64-pc-windows-msvc -p $packageName
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -39,8 +45,6 @@ $gui = Join-Path $root 'target/x86_64-pc-windows-msvc/release/focusforge-gui.exe
 $cliPdb = Join-Path (Split-Path $cli) (@(& python $root/tools/package-symbols.py windows-pdb $cli))
 $guiPdb = Join-Path (Split-Path $gui) (@(& python $root/tools/package-symbols.py windows-pdb $gui))
 foreach ($path in $cliPdb, $guiPdb) { if (-not (Test-Path $path)) { throw "missing PDB: $path" } }
-$dumpSyms = @(& python $root/tools/package-symbols.py install dump_syms x86_64-pc-windows-msvc (Join-Path $root '.scratch/package-windows/symbol-tools'))
-if ($LASTEXITCODE -ne 0 -or $dumpSyms.Count -ne 1) { throw 'pinned dump_syms cannot run on this runner' }
 & python $root/tools/package-symbols.py verify-windows "--identity=focusforge-cli=$cli,$cliPdb" "--identity=focusforge-gui=$gui,$guiPdb"
 if ($LASTEXITCODE -ne 0) { throw 'PE/PDB native GUID+age mismatch' }
 foreach ($pair in @(@($cli, $cliPdb), @($gui, $guiPdb))) {

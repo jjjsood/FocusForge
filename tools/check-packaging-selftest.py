@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import copy
 import fnmatch
 import gzip
@@ -698,6 +699,111 @@ def native_boundaries() -> None:
             reject(lambda: receipt.unlink())
         finally:
             collector.NATIVE, collector.OUTPUT = old_native, old_output
+
+
+def symbol_download_cases() -> None:
+    """Tool downloads retry transient failures only, and pinning stays strict."""
+    spec = importlib.util.spec_from_file_location("symbol_packager_download", SYMBOL_PACKAGER)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    target = "x86_64-unknown-linux-gnu"
+    class Reply(io.BytesIO):
+        def __enter__(self) -> "Reply": return self
+        def __exit__(self, *args: object) -> None: self.close()
+    def fixture(directory: Path, archive_sha: str | None = None, wrong_manifest: bool = False) -> tuple[dict, dict[str, bytes]]:
+        payload = directory / "tool.tar.xz"
+        with tarfile.open(payload, "w:xz") as archive:
+            body = directory / "minidump-stackwalk"; body.write_bytes(b"tool"); archive.add(body, arcname="minidump-stackwalk")
+        data = payload.read_bytes()
+        listed = {"artifacts": {payload.name: {"checksums": {"sha256": archive_sha or module.digest(payload)}, "target_triples": [target]}}}
+        manifest = json.dumps(listed).encode()
+        pins = {"stackwalk": {"version": "0.0", "manifest_url": "https://example.invalid/manifest.json", "manifest_sha256": hashlib.sha256(manifest).hexdigest(), "artifact": [{"target": target, "url": f"https://example.invalid/{payload.name}", "sha256": hashlib.sha256(data).hexdigest(), "executable": "minidump-stackwalk"}]}}
+        payload.unlink(); body.unlink()
+        served = {"https://example.invalid/manifest.json": b"{}" if wrong_manifest else manifest, f"https://example.invalid/{payload.name}": data}
+        return pins, served
+    def run(outcomes: list[Exception], served: dict[str, bytes], pins: dict, directory: Path) -> tuple[object, list[str], list[float], str]:
+        script, calls, sleeps = list(outcomes), [], []
+        def urlopen(url: str, timeout: float) -> Reply:
+            calls.append(url)
+            if script:
+                raise script.pop(0)
+            return Reply(served[url])
+        saved = module.urllib.request.urlopen, module.time.sleep
+        module.urllib.request.urlopen, module.time.sleep = urlopen, sleeps.append
+        errors = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(errors):
+                try: result: object = module.install(pins, "stackwalk", target, directory)
+                except (ValueError, urllib.error.HTTPError) as error: result = error
+        finally:
+            module.urllib.request.urlopen, module.time.sleep = saved
+        return result, calls, sleeps, errors.getvalue()
+    def failure(code: int) -> urllib.error.HTTPError:
+        return urllib.error.HTTPError("https://example.invalid/x", code, "stub", {}, None)
+    with tempfile.TemporaryDirectory() as temporary:
+        pins, served = fixture(Path(temporary))
+        cache = Path(temporary) / "cache"
+        result, calls, sleeps, _ = run([failure(504), urllib.error.URLError("offline"), TimeoutError("slow")], served, pins, cache)
+        assert isinstance(result, Path) and result.is_file(), result
+        assert len(calls) == 5 and sleeps == [5.0, 10.0, 20.0], (calls, sleeps)
+        result, calls, sleeps, _ = run([ConnectionResetError("reset")], served, pins, Path(temporary) / "second")
+        assert isinstance(result, Path) and len(calls) == 3 and sleeps == [5.0], (result, calls, sleeps)
+        result, calls, sleeps, errors = run([failure(504)] * 9, served, pins, Path(temporary) / "down")
+        assert isinstance(result, urllib.error.HTTPError) and result.code == 504, result
+        assert len(calls) == 4 and sleeps == [5.0, 10.0, 20.0], (calls, sleeps)
+        lines = [line for line in errors.splitlines() if "https://example.invalid/manifest.json" in line]
+        assert len(lines) == 3, errors
+        result, calls, sleeps, _ = run([failure(404)], served, pins, Path(temporary) / "missing")
+        assert isinstance(result, urllib.error.HTTPError) and result.code == 404 and len(calls) == 1 and not sleeps, (result, calls)
+    with tempfile.TemporaryDirectory() as temporary:
+        pins, served = fixture(Path(temporary), wrong_manifest=True)
+        result, calls, sleeps, _ = run([], served, pins, Path(temporary) / "cache")
+        assert isinstance(result, ValueError) and "release manifest checksum mismatch" in str(result) and len(calls) == 1 and not sleeps, (result, calls)
+    with tempfile.TemporaryDirectory() as temporary:
+        pins, served = fixture(Path(temporary), archive_sha="0" * 64)
+        result, calls, sleeps, _ = run([], served, pins, Path(temporary) / "cache")
+        assert isinstance(result, ValueError) and "does not match pinned archive" in str(result) and len(calls) == 1 and not sleeps, (result, calls)
+    with tempfile.TemporaryDirectory() as temporary:
+        pins, served = fixture(Path(temporary))
+        served["https://example.invalid/tool.tar.xz"] = b"corrupt"
+        result, calls, sleeps, _ = run([], served, pins, Path(temporary) / "cache")
+        assert isinstance(result, ValueError) and "archive checksum mismatch" in str(result) and len(calls) == 2 and not sleeps, (result, calls)
+
+
+def symbol_tool_placement_cases() -> None:
+    """Every package script installs its pinned tools before building and shares one tool directory with its checker."""
+    scripts = {name: (ROOT / f"tools/{name}").read_text() for name in ("package-macos.sh", "package-linux.sh", "package-windows.ps1", "check-package-macos.sh", "check-package-linux.sh", "check-package-windows.ps1")}
+    for name in ("package-macos.sh", "package-linux.sh", "package-windows.ps1"):
+        lines = scripts[name].splitlines()
+        install = next((index for index, line in enumerate(lines) if "package-symbols.py" in line and "install dump_syms" in line), None)
+        build = next((index for index, line in enumerate(lines) if "cargo build" in line), None)
+        assert install is not None and build is not None and install < build, (name, install, build)
+    def install_directories(text: str, tool: str) -> list[str]:
+        return [match.group(1).rstrip(")") for match in re.finditer(rf"package-symbols\.py\S* install {tool} \S+ (\S+)", text)]
+    macos = scripts["package-macos.sh"]
+    assert install_directories(macos, "dump_syms") == ['"$tools"'] == install_directories(macos, "stackwalk") and 'tools="$root/.scratch/symbol-tools"\n' in macos
+    assert "FOCUSFORGE_SYMBOL_SCRATCH" not in scripts["check-package-macos.sh"]
+    symbolicate_spec = importlib.util.spec_from_file_location("symbolicate_paths", ROOT / "tools/symbolicate.py")
+    symbolicate = importlib.util.module_from_spec(symbolicate_spec)
+    assert symbolicate_spec and symbolicate_spec.loader
+    symbolicate_spec.loader.exec_module(symbolicate)
+    saved = os.environ.pop("FOCUSFORGE_SYMBOL_SCRATCH", None)
+    try: assert symbolicate.scratch_root() / "symbol-tools" == ROOT / ".scratch/symbol-tools"
+    finally:
+        if saved is not None: os.environ["FOCUSFORGE_SYMBOL_SCRATCH"] = saved
+    linux_package, linux_check = scripts["package-linux.sh"], scripts["check-package-linux.sh"]
+    assert install_directories(linux_package, "dump_syms") == ["/symbol-tools"] == install_directories(linux_package, "stackwalk"), install_directories(linux_package, "stackwalk")
+    assert any(line.lstrip().startswith("docker run") and '-v "$tools:/symbol-tools"' in line and "/src:ro" in line for line in linux_package.splitlines())
+    assert re.search(r'^tools="\$root/\.scratch/symbol-tools"$', linux_package, re.M) and re.search(r'^tools="\$root/\.scratch/symbol-tools"$', linux_check, re.M)
+    assert install_directories(linux_check, "stackwalk") == ['"$tools"']
+    runs = [line for line in linux_check.splitlines() if line.lstrip().startswith("docker run")]
+    assert runs and all("--network=none" in line and '-v "$tools:/symbol-scratch/symbol-tools"' in line for line in runs), runs
+    for name in ("package-windows.ps1", "check-package-windows.ps1"):
+        assert "$symbolTools = Join-Path $root '.scratch/symbol-tools'\n" in scripts[name], name
+        assert install_directories(scripts[name], "stackwalk") == ["$symbolTools"], name
+    assert install_directories(scripts["package-windows.ps1"], "dump_syms") == ["$symbolTools"]
+    assert "FOCUSFORGE_SYMBOL_SCRATCH" not in scripts["check-package-windows.ps1"]
 
 
 def symbol_tool_cases() -> None:
@@ -1944,7 +2050,7 @@ def main(argv: list[str]) -> int:
     pwsh_groups = (wix_version_cases, windows_checker_mock)
     groups = (
         producer, producer_cleanup_mock, checker, cli_asset_helper_cases, gate_checks, gate_retry_cases, graph,
-        native_boundaries, symbol_tool_cases, linux_known_main_cases, linux_crash_roundtrip_cases, source_privacy_cases,
+        native_boundaries, symbol_download_cases, symbol_tool_placement_cases, symbol_tool_cases, linux_known_main_cases, linux_crash_roundtrip_cases, source_privacy_cases,
         hosted_runner_path_cases, macos_source_cases, windows_identity_cases, wix_version_cases, macos_checker_mock,
         macos_producer_mock, linux_producer_fresh_root, windows_checker_mock, smoke_callers,
     )

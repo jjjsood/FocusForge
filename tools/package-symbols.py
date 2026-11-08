@@ -14,7 +14,10 @@ import shutil
 import stat
 import subprocess
 import tarfile
+import sys
 import tempfile
+import time
+import urllib.error
 import urllib.request
 import uuid
 import zipfile
@@ -115,13 +118,31 @@ def extract_tar(source: tarfile.TarFile, destination: Path) -> None:
         source.extract(member, destination)
 
 
+DOWNLOAD_ATTEMPTS = 4
+
+
+def download(url: str) -> bytes:
+    """Read `url`, retrying server errors, timeouts and connection failures with growing delays."""
+    for attempt in range(DOWNLOAD_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                return response.read()
+        except OSError as error:
+            transient = error.code >= 500 if isinstance(error, urllib.error.HTTPError) else True
+            if not transient or attempt == DOWNLOAD_ATTEMPTS - 1:
+                raise
+            delay = min(90.0, 5.0 * 2**attempt)
+            print(f"download of {url} failed ({error}); retrying in {delay:g}s", file=sys.stderr)
+            time.sleep(delay)
+    raise AssertionError("download attempts exhausted without an error")
+
+
 def verified_release_manifest(data: dict, tool: str, target: str, item: dict, directory: Path) -> None:
     """Authenticate the release index before accepting its selected archive."""
     pinned = data[tool]
     manifest = directory / f"{tool}-{pinned['version']}-manifest.json"
     if not manifest.exists():
-        with urllib.request.urlopen(pinned["manifest_url"], timeout=60) as response:
-            manifest.write_bytes(response.read())
+        manifest.write_bytes(download(pinned["manifest_url"]))
     if digest(manifest) != pinned["manifest_sha256"]:
         raise ValueError(f"{tool} release manifest checksum mismatch")
     try:
@@ -141,8 +162,7 @@ def install(data: dict, tool: str, target: str, directory: Path) -> Path:
     verified_release_manifest(data, tool, target, item, directory)
     archive = directory / Path(item["url"]).name
     if not archive.is_file() or digest(archive) != item["sha256"]:
-        with urllib.request.urlopen(item["url"], timeout=60) as response:
-            archive.write_bytes(response.read())
+        archive.write_bytes(download(item["url"]))
     if digest(archive) != item["sha256"]:
         raise ValueError(f"{tool} archive checksum mismatch")
     unpacked = directory / f"{tool}-{target}"
