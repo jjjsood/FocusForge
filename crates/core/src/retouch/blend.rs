@@ -1020,27 +1020,26 @@ mod tests {
     fn detail_mode_is_refused_at_blend() {
         let info = info(32, 32);
         let whole = rect(0, 0, 32, 32);
-        for mode in [BrushMode::Detail] {
-            // The refusal does not depend on the stroke reaching the map.
-            for at in [pt(1, 1), pt(500, 500)] {
-                let op = Op::BrushStroke {
-                    source_id: 0,
-                    path: vec![at],
-                    radius: 3.0,
-                    softness: 0.0,
-                    mode,
-                    opacity: 0.5,
-                };
-                assert!(validate(&op, info).is_ok());
-                assert!(footprint(&op, info).is_ok());
-                let mut out = vec![7u16; 32 * 32];
-                let result = apply(&op, info, whole, &mut out, whole, &[9u16; 32 * 32], 1);
-                assert!(
-                    matches!(result, Err(RetouchError::ModeNotRendered { mode: m }) if m == mode),
-                    "{mode:?}: {result:?}"
-                );
-                assert!(out.iter().all(|&s| s == 7), "{mode:?} writes nothing");
-            }
+        let mode = BrushMode::Detail;
+        // The refusal does not depend on the stroke reaching the map.
+        for at in [pt(1, 1), pt(500, 500)] {
+            let op = Op::BrushStroke {
+                source_id: 0,
+                path: vec![at],
+                radius: 3.0,
+                softness: 0.0,
+                mode,
+                opacity: 0.5,
+            };
+            assert!(validate(&op, info).is_ok());
+            assert!(footprint(&op, info).is_ok());
+            let mut out = vec![7u16; 32 * 32];
+            let result = apply(&op, info, whole, &mut out, whole, &[9u16; 32 * 32], 1);
+            assert!(
+                matches!(result, Err(RetouchError::ModeNotRendered { mode: m }) if m == mode),
+                "{mode:?}: {result:?}"
+            );
+            assert!(out.iter().all(|&s| s == 7), "{mode:?} writes nothing");
         }
     }
 

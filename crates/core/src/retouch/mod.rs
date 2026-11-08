@@ -31,8 +31,7 @@ pub enum RetouchError {
     #[error("opacity {opacity} is not in 0 < x ≤ 1")]
     InvalidOpacity { opacity: f32 },
 
-    /// The blend renders [`BrushMode::Normal`], [`BrushMode::Lighten`] and
-    /// [`BrushMode::Darken`] strokes and refuses the others.
+    /// The blend refuses [`BrushMode::Detail`] strokes.
     #[error("blend mode {mode:?} is not rendered")]
     ModeNotRendered { mode: BrushMode },
 
