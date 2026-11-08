@@ -554,15 +554,19 @@ mod tests {
         Point { x, y }
     }
 
-    fn stroke(path: Vec<Point>, radius: f32, softness: f32) -> Op {
+    fn brush(path: Vec<Point>, radius: f32, softness: f32, mode: BrushMode, opacity: f32) -> Op {
         Op::BrushStroke {
             source_id: 0,
             path,
             radius,
             softness,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
+            mode,
+            opacity,
         }
+    }
+
+    fn stroke(path: Vec<Point>, radius: f32, softness: f32) -> Op {
+        brush(path, radius, softness, BrushMode::Normal, 1.0)
     }
 
     fn rect(x: u32, y: u32, width: u32, height: u32) -> Rect {
@@ -581,8 +585,7 @@ mod tests {
     const BIG: u64 = u64::MAX;
 
     fn plan_over(op: &Op, region: Rect, spp: usize, max: u64) -> Result<Option<Plan>, BlendError> {
-        let len = region.width as usize * region.height as usize * spp;
-        plan(op, info(), region, len, region, len, spp, max)
+        plan_in(op, region, region, spp, max)
     }
 
     fn refused(result: Result<Option<Plan>, BlendError>) -> &'static str {
@@ -593,14 +596,7 @@ mod tests {
     }
 
     fn styled(path: Vec<Point>, mode: BrushMode, opacity: f32) -> Op {
-        Op::BrushStroke {
-            source_id: 0,
-            path,
-            radius: 4.0,
-            softness: 0.5,
-            mode,
-            opacity,
-        }
+        brush(path, 4.0, 0.5, mode, opacity)
     }
 
     #[test]
@@ -650,14 +646,7 @@ mod tests {
     }
 
     fn styled_radius(path: Vec<Point>, mode: BrushMode, radius: f32) -> Op {
-        Op::BrushStroke {
-            source_id: 0,
-            path,
-            radius,
-            softness: 0.5,
-            mode,
-            opacity: 1.0,
-        }
+        brush(path, radius, 0.5, mode, 1.0)
     }
 
     fn plan_in(
