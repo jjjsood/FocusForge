@@ -287,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn free_ram_shortfall_pins_the_reported_numbers_at_both_shares() {
+    fn free_ram_refusal_pins_the_reported_numbers_at_both_shares() {
         let quarter = render(BOUND, REQUIRED, free_ram(4), true);
         assert_eq!(
             quarter,
@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn free_ram_shortfall_rounds_a_one_byte_gap_up_and_reads_zero_bound() {
+    fn one_byte_gap_rounds_up_and_a_zero_bound_reads_zero_mb() {
         let one = render(REQUIRED - 1, REQUIRED, free_ram(1), false);
         assert!(one.contains("about 1 MB more free RAM"), "{one}");
         assert!(!one.contains("TIFF"), "{one}");
@@ -310,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn free_ram_shortfall_limit_raises_to_need_times_divisor() {
+    fn limit_refusal_raises_to_need_times_divisor() {
         let whole = render(
             25_000_000,
             30_000_000,
@@ -337,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn free_ram_shortfall_text_never_holds_a_byte_count() {
+    fn refusal_text_never_holds_a_byte_count() {
         for text in [
             render(BOUND, REQUIRED, free_ram(4), true),
             render(BOUND, REQUIRED, MemoryBound::Limit { divisor: 4 }, true),
