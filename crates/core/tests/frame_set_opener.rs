@@ -16,7 +16,7 @@ use focusforge_core::io::{
     TiffHeader, TiffStack, classify_header, frame_paths, open_frame_set,
 };
 use focusforge_core::params::Provenance;
-use focusforge_core::tile::{HostBudget, MemoryBound};
+use focusforge_core::tile::{HOST_FIXED_BYTES, HostBudget, MemoryBound};
 use raw_dng::{DngSpec, write_dng};
 
 #[test]
@@ -278,7 +278,13 @@ fn raw_partition_floors_the_cache_at_the_largest_reservation() {
         assert_eq!(opened.scheduler_budget.provenance(), Provenance::Explicit);
     }
 
-    let facts = HostFacts::new(100 * r, 100 * r, None, None, 1);
+    let facts = HostFacts::new(
+        HOST_FIXED_BYTES + 200 * r,
+        HOST_FIXED_BYTES + 200 * r,
+        None,
+        None,
+        1,
+    );
     let host = HostBudget::host_derived(&facts);
     let opened = open_frame_set(&paths, host).expect("a host budget above R opens");
     assert_eq!(opened.scheduler_budget.provenance(), Provenance::Host);

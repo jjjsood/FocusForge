@@ -46,13 +46,21 @@ use crate::params::Provenance;
 use crate::tile::control::{ADMISSION_RECHECK, TileControl};
 use crate::tile::scheduler::{DEFAULT_MAX_BYTES_IN_FLIGHT, in_flight_for_budget};
 
-/// The share of `HostFacts::usable_available()` a host-derived budget
-/// claims. Frame tiles are not the process's only live bytes -- at
-/// fixture scale a 2 MiB budget measures under a 5 MiB peak live heap once
-/// the fusion consumer's per-worker pyramids are counted, roughly 2.5x, so
-/// claiming 40% of what the host currently reports available keeps the
-/// modelled peak at or under it.
-pub const HOST_BUDGET_SHARE_PERCENT: u64 = 40;
+/// The share of the available memory beyond [`HOST_FIXED_BYTES`] that a
+/// host-derived budget claims: `share * (usable_available - fixed) / 100`.
+///
+/// Peak memory is the fixed part plus at most 0.39 B per budget byte (GPU,
+/// 0.04 on CPU). At the smallest RAW budget (586 MB, 2463 MB available) the
+/// CPU path peaks at 1587 MB (64 %), the GPU path at 1035 MB (42 %), under 85 %.
+pub const HOST_BUDGET_SHARE_PERCENT: u64 = 65;
+
+/// The non-reclaimable memory a run holds regardless of its budget (driver
+/// and host buffers, process base), taken from the worst measured path: the
+/// CPU path of a RAW stack peaked at 1563 MB with the budget at its
+/// smallest, against 807 MB (RAW, GPU), 921 MB (TIFF, GPU), 1465 MB (TIFF,
+/// CPU) and 24 MB (export). A host with no more than this available gets no
+/// host-derived budget.
+pub const HOST_FIXED_BYTES: u64 = 1_563_000_000;
 
 /// The decoded-frame cache receives `1 / DECODED_CACHE_SHARE_DIVISOR` of a
 /// capped host budget; the scheduler keeps the rest. A RAW cache takes at
@@ -64,8 +72,12 @@ pub const DECODED_CACHE_SHARE_DIVISOR: u64 = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryBound {
     /// The bound derives from the host's free RAM:
-    /// `free RAM * share_percent / (100 * divisor)`.
-    FreeRam { share_percent: u64, divisor: u64 },
+    /// `(free RAM - fixed_bytes) * share_percent / (100 * divisor)`.
+    FreeRam {
+        share_percent: u64,
+        fixed_bytes: u64,
+        divisor: u64,
+    },
     /// The bound derives from a fixed memory limit: `limit / divisor`.
     Limit { divisor: u64 },
 }
@@ -190,14 +202,16 @@ impl DecodedCacheBudget {
 
 impl HostBudget {
     /// Derives a budget from host facts: [`HOST_BUDGET_SHARE_PERCENT`] of
-    /// what the host currently reports available when the facts were
-    /// actually probed, or the stated [`DEFAULT_MAX_BYTES_IN_FLIGHT`]
-    /// constant -- never deleted, the degraded answer -- when the probe was
-    /// unavailable.
+    /// what the host currently reports available beyond [`HOST_FIXED_BYTES`]
+    /// (zero at or under it) when the facts were actually probed, or the
+    /// stated [`DEFAULT_MAX_BYTES_IN_FLIGHT`] constant -- never deleted, the
+    /// degraded answer -- when the probe was unavailable.
     pub fn host_derived(facts: &HostFacts) -> Self {
         match facts.origin() {
             FactsOrigin::Probed => HostBudget {
-                bytes: facts.usable_available() * HOST_BUDGET_SHARE_PERCENT / 100,
+                bytes: facts.usable_available().saturating_sub(HOST_FIXED_BYTES)
+                    * HOST_BUDGET_SHARE_PERCENT
+                    / 100,
                 provenance: Provenance::Host,
                 host_probed: true,
             },
@@ -265,6 +279,7 @@ impl HostBudget {
         match self.provenance {
             Provenance::Host => MemoryBound::FreeRam {
                 share_percent: HOST_BUDGET_SHARE_PERCENT,
+                fixed_bytes: HOST_FIXED_BYTES,
                 divisor,
             },
             _ => MemoryBound::Limit { divisor },
@@ -502,10 +517,47 @@ mod tests {
     }
 
     #[test]
+    fn host_budget_share_is_pinned_to_its_measured_value() {
+        assert_eq!(HOST_BUDGET_SHARE_PERCENT, 65);
+        assert_eq!(HOST_FIXED_BYTES, 1_563_000_000);
+    }
+
+    #[test]
+    fn host_derived_claims_the_share_of_available_beyond_the_fixed_part() {
+        const GIB: u64 = 1 << 30;
+        let budget = HostBudget::host_derived(&probed_facts(3 * GIB, Some(1_000)));
+        assert_eq!(budget.bytes(), 1_077_846_556);
+        let budget = HostBudget::host_derived(&probed_facts(8 * GIB, Some(1_000)));
+        assert_eq!(budget.bytes(), 4_567_507_484);
+    }
+
+    #[test]
+    fn host_derived_gives_no_budget_at_or_under_the_fixed_part() {
+        for available in [0, 1_000_000_000, 1_563_000_000] {
+            let budget = HostBudget::host_derived(&probed_facts(available, Some(1_000)));
+            assert_eq!(budget.bytes(), 0, "available {available}");
+            assert_eq!(budget.provenance(), Provenance::Host);
+            assert!(budget.refuses_below_one_tile());
+        }
+    }
+
+    #[test]
+    fn host_derived_claims_the_share_of_the_cgroup_clamped_available() {
+        let facts = HostFacts::new(
+            64_000_000_000,
+            20_000_000_000,
+            Some(8_000_000_000),
+            Some(5_000_000_000),
+            4,
+        );
+        assert_eq!(HostBudget::host_derived(&facts).bytes(), 2_234_050_000);
+    }
+
+    #[test]
     fn host_derived_claims_the_stated_share_of_usable_available() {
-        let facts = probed_facts(10_000_000, Some(1_000));
+        let facts = probed_facts(10_000_000_000, Some(1_000));
         let budget = HostBudget::host_derived(&facts);
-        assert_eq!(budget.bytes(), 10_000_000 * HOST_BUDGET_SHARE_PERCENT / 100);
+        assert_eq!(budget.bytes(), 5_484_050_000);
         assert_eq!(budget.provenance(), Provenance::Host);
         assert!(budget.refuses_below_one_tile());
         assert!(budget.arms_back_off());
@@ -532,7 +584,7 @@ mod tests {
 
     #[test]
     fn capped_to_lowers_when_the_ceiling_is_smaller() {
-        let facts = probed_facts(10_000_000, Some(1_000));
+        let facts = probed_facts(10_000_000_000, Some(1_000));
         let budget = HostBudget::host_derived(&facts).capped_to(Some(1_000));
         assert_eq!(budget.bytes(), 1_000);
         assert_eq!(budget.provenance(), Provenance::Explicit);
@@ -540,7 +592,7 @@ mod tests {
 
     #[test]
     fn capped_to_leaves_a_higher_ceiling_unchanged() {
-        let facts = probed_facts(10_000_000, Some(1_000));
+        let facts = probed_facts(10_000_000_000, Some(1_000));
         let original = HostBudget::host_derived(&facts);
         let capped = original.capped_to(Some(u64::MAX));
         assert_eq!(capped, original);
@@ -549,18 +601,19 @@ mod tests {
 
     #[test]
     fn capped_to_none_leaves_the_budget_unchanged() {
-        let facts = probed_facts(10_000_000, Some(1_000));
+        let facts = probed_facts(10_000_000_000, Some(1_000));
         let original = HostBudget::host_derived(&facts);
         assert_eq!(original.capped_to(None), original);
     }
 
     #[test]
     fn memory_bound_maps_provenance_to_free_ram_or_limit() {
-        let host = HostBudget::host_derived(&probed_facts(10_000_000, Some(1_000)));
+        let host = HostBudget::host_derived(&probed_facts(10_000_000_000, Some(1_000)));
         assert_eq!(
             host.memory_bound(),
             MemoryBound::FreeRam {
                 share_percent: HOST_BUDGET_SHARE_PERCENT,
+                fixed_bytes: HOST_FIXED_BYTES,
                 divisor: 1
             }
         );
@@ -575,11 +628,12 @@ mod tests {
 
     #[test]
     fn memory_bound_of_the_cache_share_carries_the_partition_divisor() {
-        let host = HostBudget::host_derived(&probed_facts(10_000_000, Some(1_000)));
+        let host = HostBudget::host_derived(&probed_facts(10_000_000_000, Some(1_000)));
         assert_eq!(
             host.partition_for_decoded_cache().cache_bound(),
             MemoryBound::FreeRam {
                 share_percent: HOST_BUDGET_SHARE_PERCENT,
+                fixed_bytes: HOST_FIXED_BYTES,
                 divisor: 4
             }
         );
@@ -593,7 +647,7 @@ mod tests {
 
     #[test]
     fn reduced_by_keeps_provenance_and_saturates_at_zero() {
-        let host = HostBudget::host_derived(&probed_facts(10_000_000, Some(1_000)));
+        let host = HostBudget::host_derived(&probed_facts(10_000_000_000, Some(1_000)));
         let reduced = host.reduced_by(1_000);
         assert_eq!(reduced.bytes(), host.bytes() - 1_000);
         assert_eq!(reduced.provenance(), Provenance::Host);
@@ -682,7 +736,7 @@ mod tests {
             clock: clock.clone(),
         };
 
-        let facts = probed_facts(1_000, Some(1_000));
+        let facts = probed_facts(HOST_FIXED_BYTES + 1_000, Some(1_000));
         let budget = HostBudget::host_derived(&facts);
         let gate = Arc::new(HostBudgetGate::new(budget, 1, 8, sources));
         assert_eq!(gate.initial_limit(), 8);
@@ -890,7 +944,7 @@ mod tests {
             probe: Arc::new(ScriptedProbe::new(script)),
             clock: clock.clone(),
         };
-        let budget = HostBudget::host_derived(&probed_facts(1_000, Some(1_000)));
+        let budget = HostBudget::host_derived(&probed_facts(HOST_FIXED_BYTES + 1_000, Some(1_000)));
         let gate = Arc::new(HostBudgetGate::new(budget, 1, 8, sources));
         assert_eq!(gate.initial_limit(), 8);
         let control = Arc::new(CapControl::new(4));

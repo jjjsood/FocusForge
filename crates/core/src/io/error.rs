@@ -245,16 +245,28 @@ pub(crate) fn cache_refusal_message(
     match bounded_by {
         MemoryBound::FreeRam {
             share_percent,
+            fixed_bytes,
             divisor,
         } => {
-            let gap = required.saturating_sub(bound);
-            let more = gap
-                .saturating_mul(100 * divisor)
-                .div_ceil(share_percent.max(1))
-                .div_ceil(BYTES_PER_MB);
+            let to_free_ram = |bytes: u64| {
+                bytes
+                    .saturating_mul(100 * divisor)
+                    .div_ceil(share_percent.max(1))
+            };
+            // No bound at all means the host is under the fixed part, whose
+            // free RAM is unknown here, so the total is named instead.
+            let ask = if bound == 0 {
+                let total = fixed_bytes
+                    .saturating_add(to_free_ram(required))
+                    .div_ceil(BYTES_PER_MB);
+                format!("{total} MB of free RAM in all")
+            } else {
+                let more = to_free_ram(required.saturating_sub(bound)).div_ceil(BYTES_PER_MB);
+                format!("{more} MB more free RAM")
+            };
             format!(
                 "{path}: not enough free RAM to read this file. It needs {need} MB of working \
-                 memory, which takes about {more} MB more free RAM. Close other programs{tiff}."
+                 memory, which takes about {ask}. Close other programs{tiff}."
             )
         }
         MemoryBound::Limit { divisor } => {
@@ -282,6 +294,7 @@ mod tests {
     fn free_ram(divisor: u64) -> MemoryBound {
         MemoryBound::FreeRam {
             share_percent: 40,
+            fixed_bytes: 1_000_000_000,
             divisor,
         }
     }
@@ -298,6 +311,22 @@ mod tests {
         let whole = render(BOUND, REQUIRED, free_ram(1), true);
         assert!(whole.contains("about 490 MB more free RAM"), "{whole}");
         assert!(whole.contains("needs 953 MB"), "{whole}");
+    }
+
+    #[test]
+    fn a_host_under_the_fixed_part_is_told_the_free_ram_needed_in_all() {
+        let quarter = render(0, REQUIRED, free_ram(4), true);
+        assert_eq!(
+            quarter,
+            "a/frame.ARW: not enough free RAM to read this file. It needs 953 MB of working \
+             memory, which takes about 10524 MB of free RAM in all. Close other programs, or \
+             convert the frames to TIFF."
+        );
+        let whole = render(0, REQUIRED, free_ram(1), false);
+        assert!(
+            whole.contains("about 3381 MB of free RAM in all"),
+            "{whole}"
+        );
     }
 
     #[test]

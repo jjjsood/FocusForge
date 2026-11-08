@@ -98,8 +98,9 @@ reads "Unavailable".
 ### Memory caps and budgets
 
 FocusForge works through a stack in pieces, holding only as many in memory
-as its [budget](../glossary.md#budget) allows. On its own it claims 40 % of
-the memory that is free when it starts a run (the **Host memory** budget),
+as its [budget](../glossary.md#budget) allows. On its own it claims 65 % of
+the memory that is free when it starts a run, after about 1.6 GB set aside
+for the run itself (the **Host memory** budget),
 and on the graphics card a budget it measures the first time a fuse uses the
 card (the **VRAM** budget).
 

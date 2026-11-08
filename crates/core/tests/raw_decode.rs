@@ -15,7 +15,7 @@ use focusforge_core::pipeline::{
     FreeSpaceProbe, FuseOutcome, FuseOutput, FuseProduct, FuseRequest, PipelineError, RunStage,
     StageObserver, VolumeShortfall, VolumeSpace,
 };
-use focusforge_core::tile::{HostBudget, MemoryBound};
+use focusforge_core::tile::{HOST_FIXED_BYTES, HostBudget, MemoryBound};
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
 use rawler::rawsource::RawSource;
 use sha2::{Digest, Sha256};
@@ -2340,7 +2340,7 @@ fn capped_budget_opens_at_the_largest_reservation_and_refuses_one_byte_below() {
         );
         assert!(!text.contains("bytes"), "{text}");
 
-        let facts = HostFacts::new(r, r, None, None, 1);
+        let facts = HostFacts::new(HOST_FIXED_BYTES + r, HOST_FIXED_BYTES + r, None, None, 1);
         let host = HostBudget::host_derived(&facts);
         assert!(host.bytes() < r);
         let text = refused(host).to_string();
