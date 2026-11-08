@@ -156,6 +156,7 @@ fi
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 out=$(cd -- "${1:-"$root/.scratch/package-linux"}" && pwd)
 work="$out/check"
+tools="$root/.scratch/symbol-tools"
 owner_uid=$(id -u)
 owner_gid=$(id -g)
 image=$(python3 -c 'import sys
@@ -173,7 +174,7 @@ deb_dependencies=$(dpkg-deb --field "$out/focusforge_${version}_amd64.deb" Depen
 checker_image=$(docker build -q --build-arg DEB_DEPENDENCIES="$deb_dependencies" - <<EOF
 FROM $image
 ARG DEB_DEPENDENCIES
-RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq binutils file python3 dpkg && apt-get satisfy -y "\$DEB_DEPENDENCIES"
+RUN apt-get -o Acquire::Retries=3 update -qq && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y -qq binutils file python3 dpkg && apt-get -o Acquire::Retries=3 satisfy -y "\$DEB_DEPENDENCIES"
 EOF
 )
 rm -rf "$work"
@@ -186,7 +187,7 @@ cp "$root/fixtures/mantis-64/frames/00.tif" "$root/fixtures/mantis-64/frames/01.
 (cd "$out" && cp "FocusForge-$version-x86_64.AppImage" "focusforge_${version}_amd64.deb" artifacts.sha256 inventory.txt "$work/artifacts/")
 cp -a "$out/symbols" "$work/artifacts/"
 mkdir -p "$work/symbolicate"
-python3 "$root/tools/package-symbols.py" install stackwalk x86_64-unknown-linux-gnu "$work/symbolicate/symbol-tools" >/dev/null
+python3 "$root/tools/package-symbols.py" install stackwalk x86_64-unknown-linux-gnu "$tools" >/dev/null
 (cd "$work/expected" && sha256sum LICENSE NOTICE frames/00.tif frames/01.tif frames/02.tif > expected.sha256)
 python3 - "$root/packaging/linux-tools.toml" "$work/expected/type2-legal.sha256" <<'PY'
 import sys
@@ -206,10 +207,10 @@ with open(sys.argv[2], "w") as output:
 PY
 
 set +e
-docker run --rm --network=none -e FOCUSFORGE_PRODUCT_ROOT=/product -i -v "$work/artifacts:/artifacts:ro" -v "$work/expected:/checks/expected:ro" -v "$work/result:/checks" -v "$work/symbolicate:/symbol-scratch" -v "$root:/product:ro" -v "$root/tools/check-package-linux.sh:/checks/checker.sh:ro" "$checker_image" bash -s -- "$owner_uid" "$owner_gid" <<'APPIMAGE'
+docker run --rm --network=none -e FOCUSFORGE_PRODUCT_ROOT=/product -i -v "$work/artifacts:/artifacts:ro" -v "$work/expected:/checks/expected:ro" -v "$work/result:/checks" -v "$work/symbolicate:/symbol-scratch" -v "$tools:/symbol-scratch/symbol-tools" -v "$root:/product:ro" -v "$root/tools/check-package-linux.sh:/checks/checker.sh:ro" "$checker_image" bash -s -- "$owner_uid" "$owner_gid" <<'APPIMAGE'
 set -euo pipefail
 owner_uid=$1; owner_gid=$2
-trap 'chown -R "$owner_uid:$owner_gid" /checks/appimage /checks/crashes /checks/symbolicate 2>/dev/null || true' EXIT
+trap 'chown -R "$owner_uid:$owner_gid" /symbol-scratch/symbol-tools /checks/appimage /checks/crashes /checks/symbolicate 2>/dev/null || true' EXIT
 cd /checks/expected
 sha256sum -c expected.sha256
 cd /checks
@@ -267,10 +268,10 @@ set -e
 [ "$status" = 0 ] || exit "$status"
 
 set +e
-docker run --rm --network=none -e FOCUSFORGE_PRODUCT_ROOT=/product -i -v "$work/artifacts:/artifacts:ro" -v "$work/expected:/checks/expected:ro" -v "$work/result:/checks" -v "$work/symbolicate:/symbol-scratch" -v "$root:/product:ro" -v "$root/tools/check-package-linux.sh:/checks/checker.sh:ro" "$checker_image" bash -s -- "$owner_uid" "$owner_gid" <<'DEB'
+docker run --rm --network=none -e FOCUSFORGE_PRODUCT_ROOT=/product -i -v "$work/artifacts:/artifacts:ro" -v "$work/expected:/checks/expected:ro" -v "$work/result:/checks" -v "$work/symbolicate:/symbol-scratch" -v "$tools:/symbol-scratch/symbol-tools" -v "$root:/product:ro" -v "$root/tools/check-package-linux.sh:/checks/checker.sh:ro" "$checker_image" bash -s -- "$owner_uid" "$owner_gid" <<'DEB'
 set -euo pipefail
 owner_uid=$1; owner_gid=$2
-trap 'chown -R "$owner_uid:$owner_gid" /checks/crashes /checks/symbolicate /checks/deb-info.txt /checks/deb-info.json /checks/deb-smoke 2>/dev/null || true' EXIT
+trap 'chown -R "$owner_uid:$owner_gid" /symbol-scratch/symbol-tools /checks/crashes /checks/symbolicate /checks/deb-info.txt /checks/deb-info.json /checks/deb-smoke 2>/dev/null || true' EXIT
 deb=$(find /artifacts -maxdepth 1 -name '*.deb' -type f -print -quit)
 test -n "$deb"
 version=$(sed -n 's/^focusforge-cli //p' /checks/expected/VERSION)
