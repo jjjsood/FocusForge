@@ -20,7 +20,6 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use common::{CliOutput, bin};
 
@@ -411,7 +410,7 @@ fn cancel_keeps_the_staged_planes_for_resume() {
 /// -- no `libc` dependency, and the workspace denies `unsafe_code` anyway.
 #[cfg(unix)]
 fn send_sigint(pid: u32) {
-    let status = Command::new("kill")
+    let status = std::process::Command::new("kill")
         .args(["-INT", &pid.to_string()])
         .status()
         .expect("failed to invoke kill(1)");
