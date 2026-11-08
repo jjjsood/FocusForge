@@ -462,9 +462,7 @@ impl PaneJob {
         };
         reader.read_step_into(rect, self.draw.step, out)
     }
-}
 
-impl PaneJob {
     /// The overlay's colour per texel over `indices`, read for this job's
     /// view; empty without an overlay or an index source.
     pub(crate) fn overlay_colors(&self, indices: &[u16]) -> Vec<[u8; 3]> {

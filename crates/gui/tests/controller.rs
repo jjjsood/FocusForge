@@ -5487,7 +5487,7 @@ fn saved_lighten_replays_from_the_fused_ancestor() {
             let lighten = dab(l, LIGHTEN.0, LIGHTEN.1, BrushMode::Lighten, 1.0);
             let below = pending_render(&composite, &root, &sealed, vec![normal.clone()]);
             let above = pending_render(&composite, &root, &sealed, vec![normal, lighten]);
-            let mut seen = [false; 3];
+            let (mut acts, mut rests) = (false, false);
             for p in map_pixels().filter(|&p| deep_inside(LIGHTEN.0, LIGHTEN.1, 2.0, p)) {
                 let i = map_index(p) * 3;
                 let acted = above[i..i + 3] != below[i..i + 3];
@@ -5497,11 +5497,11 @@ fn saved_lighten_replays_from_the_fused_ancestor() {
                 }
                 match (acted, in_normal) {
                     (_, false) => {}
-                    (true, true) => seen[1] = true,
-                    (false, true) => seen[2] = true,
+                    (true, true) => acts = true,
+                    (false, true) => rests = true,
                 }
             }
-            seen[1] && seen[2]
+            acts && rests
         })
         .expect("sources whose Lighten stroke acts over a Normal one in some pixels and rests in others");
     let path = save_to_proposed(&mut c);
