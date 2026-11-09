@@ -18,9 +18,9 @@ use super::frame_cache::{CacheFault, DecodedFrame, FrameCache, TileFault, check_
 use super::orientation::Orientation;
 use super::tiff::header::exif_orientation;
 use super::tiff::segment::widen_8bit;
-use super::{FrameDesc, FrameError, FrameReader};
+use super::{FrameDesc, FrameError, FrameReader, cache_refusal_message};
 use crate::algorithm::{AlgorithmError, TileReader};
-use crate::tile::Rect;
+use crate::tile::{MemoryBound, Rect};
 
 /// Default bound for decoded JPEG frames and one decode reservation.
 const DEFAULT_JPEG_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -107,7 +107,7 @@ pub enum JpegError {
         got: usize,
     },
     /// The cache cannot hold one decoded frame and its decode reservation.
-    #[error("{}: JPEG cache bound {bound} bytes is below required {required} bytes", path.display())]
+    #[error("{}", cache_refusal_message(path, *bound, *required, *bounded_by, true))]
     CacheTooSmall {
         /// Source file.
         path: PathBuf,
@@ -115,6 +115,8 @@ pub enum JpegError {
         bound: u64,
         /// Conservative required reservation.
         required: u64,
+        /// What limited `bound`.
+        bounded_by: MemoryBound,
     },
     /// JPEG geometry overflows a byte count.
     #[error("{}: JPEG geometry overflows cache accounting", path.display())]
@@ -140,6 +142,8 @@ struct JpegFrame {
 pub struct JpegStack {
     frames: Vec<JpegFrame>,
     cache: FrameCache,
+    /// What limited the cache capacity.
+    cache_bound: MemoryBound,
 }
 
 impl JpegStack {
@@ -148,8 +152,19 @@ impl JpegStack {
         Self::open_files_with_budget(paths, DEFAULT_JPEG_CACHE_BYTES)
     }
 
-    /// Opens one or more JPEG files with a bound on decoded-frame retention.
+    /// Opens one or more JPEG files with a fixed byte limit on decoded-frame
+    /// retention.
     pub fn open_files_with_budget(paths: &[PathBuf], cache_bytes: u64) -> Result<Self, JpegError> {
+        Self::open_files_bounded(paths, cache_bytes, MemoryBound::Limit { divisor: 1 })
+    }
+
+    /// Opens one or more JPEG files; `cache_bound` says what limited
+    /// `cache_bytes`, for the refusal text.
+    pub(crate) fn open_files_bounded(
+        paths: &[PathBuf],
+        cache_bytes: u64,
+        cache_bound: MemoryBound,
+    ) -> Result<Self, JpegError> {
         if paths.is_empty() {
             return Err(JpegError::NoFrames);
         }
@@ -186,6 +201,7 @@ impl JpegStack {
         Ok(Self {
             frames,
             cache: FrameCache::new(cache_bytes),
+            cache_bound,
         })
     }
 }
@@ -249,6 +265,7 @@ impl JpegStack {
                     path: path.clone(),
                     bound,
                     required,
+                    bounded_by: self.cache_bound,
                 },
                 CacheFault::Overflow => JpegError::BudgetOverflow { path: path.clone() },
             })?;

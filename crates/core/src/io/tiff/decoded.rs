@@ -16,7 +16,7 @@ use super::header::TiffHeader;
 use super::segment::{DecodedSegment, SegmentInfo, SegmentOrigin, decode_segment, segment_layout};
 use super::stack::{check_uniform, frame_paths, map_file};
 use crate::algorithm::{AlgorithmError, TileReader};
-use crate::tile::{HostBudget, Rect, Tile};
+use crate::tile::{HostBudget, MemoryBound, Rect, Tile};
 use crate::timing::{TimingCounter, measurement_scope, record_timing};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -558,8 +558,19 @@ impl DecodedTiffStack {
         Self::open_files(&paths, cache_bytes)
     }
 
-    /// Opens exactly `paths`, retaining their supplied order.
+    /// Opens exactly `paths`, retaining their supplied order. `cache_bytes`
+    /// is a fixed limit.
     pub fn open_files(paths: &[PathBuf], cache_bytes: u64) -> Result<Self, TiffError> {
+        Self::open_files_bounded(paths, cache_bytes, MemoryBound::Limit { divisor: 1 })
+    }
+
+    /// Opens exactly `paths`; `bounded_by` says what limited `cache_bytes`,
+    /// for the refusal text.
+    pub(crate) fn open_files_bounded(
+        paths: &[PathBuf],
+        cache_bytes: u64,
+        bounded_by: MemoryBound,
+    ) -> Result<Self, TiffError> {
         if paths.is_empty() {
             return Err(TiffError::NoFrames {
                 path: PathBuf::new(),
@@ -601,6 +612,7 @@ impl DecodedTiffStack {
                 path,
                 bound: cache_bytes,
                 required,
+                bounded_by,
             });
         }
         Ok(Self {
@@ -617,7 +629,8 @@ impl DecodedTiffStack {
         paths: &[PathBuf],
         budget: HostBudget,
     ) -> Result<Self, TiffError> {
-        Self::open_files(paths, budget.partition_for_decoded_cache().cache.bytes())
+        let shares = budget.partition_for_decoded_cache();
+        Self::open_files_bounded(paths, shares.cache.bytes(), shares.cache_bound())
     }
 
     /// Number of frames in the opened set.

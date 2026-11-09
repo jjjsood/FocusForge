@@ -265,11 +265,7 @@ fn worker_loop(
                         break;
                     }
                     // Parked outcomes still count against the allowance.
-                    let admitted = HostBudget::explicit(
-                        budget
-                            .bytes()
-                            .saturating_sub(outcome_bytes.load(Ordering::Acquire)),
-                    );
+                    let admitted = budget.reduced_by(outcome_bytes.load(Ordering::Acquire));
                     let rendered = renderer(&request.path, admitted, &cancel);
                     if let Ok((_, reservation)) = &rendered {
                         tracing::debug!(
@@ -412,7 +408,7 @@ fn render_with_max_step(
     max_step: u32,
 ) -> Result<(PreviewPixels, PreviewReservation), PreviewError> {
     let cap = host_budget.bytes();
-    let frame_set = open_frame_set(&[path.to_path_buf()], HostBudget::explicit(cap))
+    let frame_set = open_frame_set(&[path.to_path_buf()], host_budget)
         .map_err(|error| PreviewError::Read(error.to_string()))?;
     let kind = frame_set.kind;
     let reader = frame_set.reader;
@@ -576,6 +572,21 @@ mod tests {
             band_rows: 1,
             step: 1,
         }
+    }
+
+    #[test]
+    fn preview_refusal_names_free_ram() {
+        use focusforge_core::host::HostFacts;
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/mantis-64-deflate-p1-strip-ii/frames/00.tif");
+        let budget = HostBudget::host_derived(&HostFacts::new(1 << 30, 1, None, None, 1));
+        let error = super::render(&path, budget).expect_err("no free RAM refuses");
+        let PreviewError::Read(text) = &error else {
+            panic!("expected a read refusal, got {error:?}");
+        };
+        assert!(text.contains("free RAM"), "{text}");
+        assert!(!text.contains("memory limit"), "{text}");
     }
 
     #[test]

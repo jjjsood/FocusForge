@@ -20,10 +20,8 @@ $shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Fo
 $fixtureDirectory = Join-Path $logs 'fixtures'
 New-Item -ItemType Directory -Force -Path $fixtureDirectory | Out-Null
 Copy-Item (Join-Path $root 'fixtures/mantis-64/frames/*.tif') $fixtureDirectory
-$symbolScratch = Join-Path $logs 'symbols'
-New-Item -ItemType Directory -Force -Path $symbolScratch | Out-Null
-$env:FOCUSFORGE_SYMBOL_SCRATCH = $symbolScratch
-& python (Join-Path $root 'tools/package-symbols.py') install stackwalk x86_64-pc-windows-msvc (Join-Path $symbolScratch 'symbol-tools') | Out-Null
+$symbolTools = Join-Path $root '.scratch/symbol-tools'
+& python (Join-Path $root 'tools/package-symbols.py') install stackwalk x86_64-pc-windows-msvc $symbolTools | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'pinned stackwalker cannot run on this runner' }
 function Assert-CrashRoundtrip([string]$Name, [string]$Binary, [string[]]$Arguments = @()) {
   $crash = Join-Path $logs "crashes/$Name"

@@ -698,8 +698,8 @@ and [Using the GPU](guide/stacking.md#using-the-gpu).
 
 There is no practical limit on the number of frames. FocusForge works
 through a stack in pieces and holds only as many in memory as its
-[budget](glossary.md#budget) allows: by default 40 % of the memory free when
-a fuse starts. More frames take longer; the budget stays the same. To keep memory free
+[budget](glossary.md#budget) allows: by default 65 % of the memory free when
+a fuse starts, after about 1.6 GB set aside for the run itself. More frames take longer; the budget stays the same. To keep memory free
 for other programs, set a [cap](glossary.md#cap). How many frames a subject
 needs is worked out in [Count the frames](stacking/shooting-practice.md#count-the-frames).
 Plan disk space too: a 16-bit TIFF from a 45-megapixel camera is about
