@@ -6643,11 +6643,10 @@ impl AppController {
             .map(|pixels| pixels.rgba.len() as u64 * 2)
             .sum();
         let host_budget = job::host_budget().capped_to(self.performance.max_host_memory_bytes());
-        let remaining = host_budget
-            .bytes()
-            .saturating_sub(self.preview_cache_bytes)
-            .saturating_sub(self.published_preview_bytes.load(Ordering::Acquire));
-        let budget = job::HostBudget::explicit(remaining);
+        let budget = host_budget
+            .reduced_by(self.preview_cache_bytes)
+            .reduced_by(self.published_preview_bytes.load(Ordering::Acquire));
+        let remaining = budget.bytes();
         let pending: Vec<_> = if remaining == 0 {
             Vec::new()
         } else {

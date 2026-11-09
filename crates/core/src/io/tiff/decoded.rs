@@ -2,7 +2,7 @@
 
 //! A TIFF frame reader backed by a bounded decoded-segment cache.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -16,7 +16,7 @@ use super::header::TiffHeader;
 use super::segment::{DecodedSegment, SegmentInfo, SegmentOrigin, decode_segment, segment_layout};
 use super::stack::{check_uniform, frame_paths, map_file};
 use crate::algorithm::{AlgorithmError, TileReader};
-use crate::tile::{HostBudget, Rect, Tile};
+use crate::tile::{HostBudget, MemoryBound, Rect, Tile};
 use crate::timing::{TimingCounter, measurement_scope, record_timing};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -60,10 +60,16 @@ struct Entry {
 #[derive(Debug, Default)]
 struct CacheState {
     entries: HashMap<Key, Entry>,
+    /// Decoded entries keyed by `used_at`, oldest first. Loading entries are
+    /// absent, so eviction never reaches them.
+    lru: BTreeMap<u64, Key>,
     stats: CacheStats,
     clock: u64,
     #[cfg(test)]
     waiters: usize,
+    /// Entries examined while choosing eviction victims.
+    #[cfg(test)]
+    eviction_probes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -80,21 +86,33 @@ impl SegmentCache {
         state.clock
     }
 
+    /// Evicts the least recently used resident entry that no reader holds.
     fn evict_one(state: &mut CacheState) -> bool {
+        #[cfg(test)]
+        let mut probed = 0u64;
         let candidate = state
-            .entries
+            .lru
             .iter()
-            .filter(|(_, entry)| {
-                entry
-                    .segment
-                    .as_ref()
+            .find(|(_, key)| {
+                #[cfg(test)]
+                {
+                    probed += 1;
+                }
+                state
+                    .entries
+                    .get(key)
+                    .and_then(|entry| entry.segment.as_ref())
                     .is_some_and(|segment| Arc::strong_count(segment) == 1)
             })
-            .min_by_key(|(_, entry)| entry.used_at)
-            .map(|(key, _)| *key);
-        let Some(key) = candidate else {
+            .map(|(tick, key)| (*tick, *key));
+        #[cfg(test)]
+        {
+            state.eviction_probes += probed;
+        }
+        let Some((tick, key)) = candidate else {
             return false;
         };
+        state.lru.remove(&tick);
         let entry = state
             .entries
             .remove(&key)
@@ -104,6 +122,8 @@ impl SegmentCache {
         true
     }
 
+    /// Returns the segment pinned until the caller drops it.
+    #[cfg(test)]
     fn get_or_decode(
         &self,
         key: Key,
@@ -111,25 +131,41 @@ impl SegmentCache {
         capacity: u64,
         decode: impl FnOnce() -> Result<DecodedSegment, TiffError>,
     ) -> Result<Arc<DecodedSegment>, TiffError> {
+        self.get_or_decode_with(key, bytes, capacity, decode, Arc::clone)
+    }
+
+    /// Runs `use_segment` on the segment while the cache lock is held, so the
+    /// entry is not pinned past the call. A hit takes the lock once, a miss
+    /// twice; the decode runs outside it.
+    fn get_or_decode_with<R>(
+        &self,
+        key: Key,
+        bytes: u64,
+        capacity: u64,
+        decode: impl FnOnce() -> Result<DecodedSegment, TiffError>,
+        use_segment: impl FnOnce(&Arc<DecodedSegment>) -> R,
+    ) -> Result<R, TiffError> {
         let mut decode = Some(decode);
+        let mut use_segment = Some(use_segment);
         'retry: loop {
             let mut state = self.state.lock().expect("cache mutex is not poisoned");
-            if let Some(segment) = state
-                .entries
-                .get(&key)
-                .and_then(|entry| entry.segment.as_ref().map(Arc::clone))
-            {
+            let resident = state.entries.get(&key).map(|entry| entry.segment.is_some());
+            if resident == Some(true) {
                 let tick = Self::next_tick(&mut state);
-                state
+                let state = &mut *state;
+                let entry = state
                     .entries
                     .get_mut(&key)
-                    .expect("resident cache entry exists")
-                    .used_at = tick;
+                    .expect("resident cache entry exists");
+                state.lru.remove(&entry.used_at);
+                entry.used_at = tick;
+                state.lru.insert(tick, key);
                 state.stats.hits += 1;
                 record_timing(TimingCounter::CacheHits, 1);
-                return Ok(segment);
+                let segment = entry.segment.as_ref().expect("resident segment");
+                return Ok(use_segment.take().expect("one use per call")(segment));
             }
-            if state.entries.contains_key(&key) {
+            if resident == Some(false) {
                 #[cfg(test)]
                 {
                     state.waiters += 1;
@@ -206,11 +242,14 @@ impl SegmentCache {
                     );
                     let segment = Arc::new(decoded);
                     let tick = Self::next_tick(&mut state);
+                    let state = &mut *state;
                     let entry = state.entries.get_mut(&key).expect("loading entry exists");
                     entry.used_at = tick;
                     entry.segment = Some(Arc::clone(&segment));
+                    state.lru.insert(tick, key);
+                    let result = use_segment.take().expect("one use per call")(&segment);
                     self.changed.notify_all();
-                    return Ok(segment);
+                    return Ok(result);
                 }
                 Err(error) => {
                     let entry = state.entries.remove(&key).expect("loading entry exists");
@@ -229,6 +268,7 @@ impl SegmentCache {
             .stats
     }
 
+    #[cfg(test)]
     fn release(&self) {
         let _state = self.state.lock().expect("cache mutex is not poisoned");
         self.changed.notify_all();
@@ -240,6 +280,23 @@ impl SegmentCache {
             .lock()
             .expect("cache mutex is not poisoned")
             .waiters
+    }
+
+    #[cfg(test)]
+    fn eviction_probes(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("cache mutex is not poisoned")
+            .eviction_probes
+    }
+
+    #[cfg(test)]
+    fn is_present(&self, key: Key) -> bool {
+        self.state
+            .lock()
+            .expect("cache mutex is not poisoned")
+            .entries
+            .contains_key(&key)
     }
 
     #[cfg(test)]
@@ -267,6 +324,78 @@ mod tests {
             valid_height: 1,
             samples: vec![7],
         }
+    }
+
+    fn key(segment: usize) -> Key {
+        Key { frame: 0, segment }
+    }
+
+    #[test]
+    fn eviction_takes_the_least_recently_used_unpinned_entry() {
+        let cache = SegmentCache::default();
+        let pinned = cache.get_or_decode(key(0), 1, 3, || Ok(segment())).unwrap();
+        cache.get_or_decode(key(1), 1, 3, || Ok(segment())).unwrap();
+        cache.get_or_decode(key(2), 1, 3, || Ok(segment())).unwrap();
+        cache.get_or_decode(key(1), 1, 3, || Ok(segment())).unwrap();
+
+        cache.get_or_decode(key(3), 1, 3, || Ok(segment())).unwrap();
+
+        assert!(cache.is_present(key(0)), "a pinned entry is never evicted");
+        assert!(cache.is_present(key(1)), "the touched entry outlives key 2");
+        assert!(!cache.is_present(key(2)), "key 2 was least recently used");
+        assert!(cache.is_present(key(3)));
+        assert_eq!(cache.stats().evictions, 1);
+        drop(pinned);
+    }
+
+    #[test]
+    fn a_loading_entry_is_never_evicted() {
+        let cache = Arc::new(SegmentCache::default());
+        let (started_tx, started_rx) = mpsc::channel();
+        let finish = Arc::new(std::sync::Barrier::new(2));
+        let loading_cache = Arc::clone(&cache);
+        let loading_finish = Arc::clone(&finish);
+        let loader = std::thread::spawn(move || {
+            loading_cache.get_or_decode(key(0), 1, 2, || {
+                started_tx.send(()).unwrap();
+                loading_finish.wait();
+                Ok(segment())
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cache.get_or_decode(key(1), 1, 2, || Ok(segment())).unwrap();
+
+        cache.get_or_decode(key(2), 1, 2, || Ok(segment())).unwrap();
+
+        assert!(cache.is_present(key(0)), "the loading entry stays reserved");
+        assert!(!cache.is_present(key(1)), "the resident entry made room");
+        finish.wait();
+        loader.join().unwrap().unwrap();
+        assert_eq!(cache.stats().resident_bytes, 2);
+    }
+
+    #[test]
+    fn a_miss_does_not_examine_every_resident_entry() {
+        const ENTRIES: usize = 20_000;
+        let cache = SegmentCache::default();
+        for index in 0..ENTRIES {
+            cache
+                .get_or_decode(key(index), 1, ENTRIES as u64, || Ok(segment()))
+                .unwrap();
+        }
+        assert_eq!(cache.eviction_probes(), 0);
+
+        cache
+            .get_or_decode(key(ENTRIES), 1, ENTRIES as u64, || Ok(segment()))
+            .unwrap();
+
+        assert_eq!(cache.stats().evictions, 1);
+        assert_eq!(
+            cache.eviction_probes(),
+            1,
+            "the oldest unpinned entry is found without a scan"
+        );
+        assert!(!cache.is_present(key(0)));
     }
 
     #[test]
@@ -429,8 +558,19 @@ impl DecodedTiffStack {
         Self::open_files(&paths, cache_bytes)
     }
 
-    /// Opens exactly `paths`, retaining their supplied order.
+    /// Opens exactly `paths`, retaining their supplied order. `cache_bytes`
+    /// is a fixed limit.
     pub fn open_files(paths: &[PathBuf], cache_bytes: u64) -> Result<Self, TiffError> {
+        Self::open_files_bounded(paths, cache_bytes, MemoryBound::Limit { divisor: 1 })
+    }
+
+    /// Opens exactly `paths`; `bounded_by` says what limited `cache_bytes`,
+    /// for the refusal text.
+    pub(crate) fn open_files_bounded(
+        paths: &[PathBuf],
+        cache_bytes: u64,
+        bounded_by: MemoryBound,
+    ) -> Result<Self, TiffError> {
         if paths.is_empty() {
             return Err(TiffError::NoFrames {
                 path: PathBuf::new(),
@@ -472,6 +612,7 @@ impl DecodedTiffStack {
                 path,
                 bound: cache_bytes,
                 required,
+                bounded_by,
             });
         }
         Ok(Self {
@@ -488,7 +629,8 @@ impl DecodedTiffStack {
         paths: &[PathBuf],
         budget: HostBudget,
     ) -> Result<Self, TiffError> {
-        Self::open_files(paths, budget.partition_for_decoded_cache().cache.bytes())
+        let shares = budget.partition_for_decoded_cache();
+        Self::open_files_bounded(paths, shares.cache.bytes(), shares.cache_bound())
     }
 
     /// Number of frames in the opened set.
@@ -575,7 +717,7 @@ impl DecodedTiffStack {
                 continue;
             }
             let bytes = segment_bytes(&frame_data.header, info)?;
-            let segment = self.cache.get_or_decode(
+            self.cache.get_or_decode_with(
                 Key {
                     frame,
                     segment: index,
@@ -586,10 +728,8 @@ impl DecodedTiffStack {
                     let map = Self::mapping(frame_data)?;
                     decode_segment(&frame_data.header, map, info, index)
                 },
+                |segment| copy_intersection(rect, x, y, segment, spp, out),
             )?;
-            copy_intersection(rect, x, y, &segment, spp, out);
-            drop(segment);
-            self.cache.release();
         }
         Ok(())
     }

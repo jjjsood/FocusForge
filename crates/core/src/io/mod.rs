@@ -29,6 +29,7 @@ pub mod test_frames;
 pub(crate) mod tiff;
 
 pub use crate::tile::{Rect, Tile};
+pub(crate) use error::cache_refusal_message;
 pub use error::{Refusal, TiffError};
 pub use frame::{FrameDesc, FrameError, FrameReader, RawIdentity};
 pub use frame_set::{FrameSet, ReaderKind, classify_header, open_frame_set};

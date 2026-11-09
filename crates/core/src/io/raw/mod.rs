@@ -15,10 +15,13 @@ use rawler::rawsource::RawSource;
 
 use super::frame_cache::{CacheFault, CachedFrame, FrameCache, TileFault, check_tile};
 use super::grouping::parse_exif_datetime;
-use super::{FrameDesc, FrameError, FrameReader, RawIdentity, map_read_only};
+use super::{
+    FrameDesc, FrameError, FrameReader, RawIdentity, cache_refusal_message, map_read_only,
+};
 use crate::algorithm::{AlgorithmError, TileReader};
 use crate::equalize::UNIT_GAIN;
-use crate::tile::{Rect, Sample, SampleFormat, ScratchDir, TileError};
+use crate::tile::budget::DECODED_CACHE_SHARE_DIVISOR;
+use crate::tile::{HostBudget, MemoryBound, Rect, Sample, SampleFormat, ScratchDir, TileError};
 
 mod look;
 pub use look::LookTransform;
@@ -172,7 +175,7 @@ pub enum RawError {
         got: usize,
     },
     /// The cache cannot hold one developed frame and its decode reservation.
-    #[error("{}: RAW cache bound {bound} bytes is below required {required} bytes", path.display())]
+    #[error("{}", cache_refusal_message(path, *bound, *required, *bounded_by, true))]
     CacheTooSmall {
         /// Source file.
         path: PathBuf,
@@ -180,6 +183,8 @@ pub enum RawError {
         bound: u64,
         /// Conservative required reservation.
         required: u64,
+        /// What limited `bound`.
+        bounded_by: MemoryBound,
     },
     /// RAW geometry overflows a byte count.
     #[error("{}: RAW geometry overflows a byte count", path.display())]
@@ -306,6 +311,8 @@ impl Developed<'_> {
 pub struct RawStack {
     frames: Vec<RawFrame>,
     cache: FrameCache<LinearFrame>,
+    /// What limited the cache capacity.
+    cache_bound: MemoryBound,
     /// Develops started per frame, counting failed ones.
     develops: Vec<AtomicU64>,
     look: OnceLock<LookTransform>,
@@ -319,71 +326,50 @@ impl RawStack {
         Self::open_files_with_budget(paths, DEFAULT_RAW_CACHE_BYTES)
     }
 
-    /// Opens one or more RAW files with a bound on developed-frame retention.
+    /// Opens one or more RAW files with a fixed byte limit on developed-frame
+    /// retention.
     pub fn open_files_with_budget(paths: &[PathBuf], cache_bytes: u64) -> Result<Self, RawError> {
-        let Some(first_path) = paths.first() else {
-            return Err(RawError::NoFrames);
-        };
-        let first = open_frame(first_path)?;
-        let dimensions = (first.desc.width, first.desc.height);
-        let mut frames = Vec::with_capacity(paths.len());
-        frames.push(first);
-        for path in &paths[1..] {
-            let frame = open_frame(path)?;
-            let found = (frame.desc.width, frame.desc.height);
-            if found != dimensions {
-                return Err(RawError::FrameMismatch {
-                    path: path.clone(),
-                    first: dimensions,
-                    found,
-                });
-            }
-            let first_metadata = &frames[0].metadata;
-            if (frame.metadata.make.as_str(), frame.metadata.model.as_str())
-                != (first_metadata.make.as_str(), first_metadata.model.as_str())
-            {
-                return Err(RawError::MetadataMismatch {
-                    path: path.clone(),
-                    property: "camera",
-                    first: format!("{}/{}", first_metadata.make, first_metadata.model),
-                    found: format!("{}/{}", frame.metadata.make, frame.metadata.model),
-                });
-            }
-            if (
-                &frame.metadata.cfa,
-                frame.metadata.cfa_width,
-                frame.metadata.cfa_height,
-            ) != (
-                &first_metadata.cfa,
-                first_metadata.cfa_width,
-                first_metadata.cfa_height,
-            ) {
-                return Err(RawError::MetadataMismatch {
-                    path: path.clone(),
-                    property: "CFA",
-                    first: format!(
-                        "{:?}/{}x{}",
-                        first_metadata.cfa,
-                        first_metadata.cfa_width.unwrap_or(0),
-                        first_metadata.cfa_height.unwrap_or(0)
-                    ),
-                    found: format!(
-                        "{:?}/{}x{}",
-                        frame.metadata.cfa,
-                        frame.metadata.cfa_width.unwrap_or(0),
-                        frame.metadata.cfa_height.unwrap_or(0)
-                    ),
-                });
-            }
-            frames.push(frame);
+        Ok(Self::from_frames(
+            open_frames(paths)?,
+            cache_bytes,
+            MemoryBound::Limit { divisor: 1 },
+        ))
+    }
+
+    /// Opens one or more RAW files within `budget`. The developed-frame cache
+    /// takes a quarter of it, but never less than the largest frame's decode
+    /// reservation; the second value is the budget left for tile scheduling.
+    /// A budget below that reservation is refused.
+    pub(crate) fn open_files_for_budget(
+        paths: &[PathBuf],
+        budget: HostBudget,
+    ) -> Result<(Self, HostBudget), RawError> {
+        let frames = open_frames(paths)?;
+        let (largest, required) = largest_reservation(&frames)?;
+        if budget.bytes() < required {
+            return Err(RawError::CacheTooSmall {
+                path: largest.metadata.path.clone(),
+                bound: budget.bytes(),
+                required,
+                bounded_by: budget.memory_bound(),
+            });
         }
-        Ok(Self {
+        let cache_bytes = (budget.bytes() / DECODED_CACHE_SHARE_DIVISOR).max(required);
+        Ok((
+            Self::from_frames(frames, cache_bytes, budget.memory_bound()),
+            budget.reduced_by(cache_bytes),
+        ))
+    }
+
+    fn from_frames(frames: Vec<RawFrame>, cache_bytes: u64, cache_bound: MemoryBound) -> Self {
+        Self {
             develops: frames.iter().map(|_| AtomicU64::new(0)).collect(),
             frames,
             cache: FrameCache::new(cache_bytes),
+            cache_bound,
             look: OnceLock::new(),
             scratch: OnceLock::new(),
-        })
+        }
     }
 
     /// Frame 0's developed output dimensions after the decoder crop.
@@ -439,6 +425,7 @@ impl RawStack {
                     path: path.clone(),
                     bound,
                     required,
+                    bounded_by: self.cache_bound,
                 },
                 CacheFault::Overflow => RawError::BudgetOverflow { path: path.clone() },
             })
@@ -558,7 +545,7 @@ impl FrameReader for RawStack {
     fn develop_once(
         &self,
         scratch_root: &Path,
-        budget: u64,
+        budget: HostBudget,
         workers: usize,
         cancelled: &(dyn Fn() -> bool + Sync),
         developed: &AtomicUsize,
@@ -566,24 +553,19 @@ impl FrameReader for RawStack {
         if self.scratch.get().is_some() {
             return Ok(0);
         }
-        let mut largest = None;
-        for frame in &self.frames {
-            let required = reservation_bytes(frame).map_err(FrameError::from)?;
-            if largest.is_none_or(|(_, most)| required > most) {
-                largest = Some((frame, required));
-            }
-        }
-        let (frame, required) = largest.expect("a RAW stack holds at least one frame");
-        if budget < required {
+        let (frame, required) = largest_reservation(&self.frames).map_err(FrameError::from)?;
+        let budget_bytes = budget.bytes();
+        if budget_bytes < required {
             return Err(FrameError::from(RawError::CacheTooSmall {
                 path: frame.metadata.path.clone(),
-                bound: budget,
+                bound: budget_bytes,
                 required,
+                bounded_by: budget.memory_bound(),
             })
             .into());
         }
         let threads = workers
-            .min(usize::try_from(budget / required.max(1)).unwrap_or(usize::MAX))
+            .min(usize::try_from(budget_bytes / required.max(1)).unwrap_or(usize::MAX))
             .min(self.frames.len())
             .max(1);
 
@@ -782,6 +764,80 @@ fn scratch_bytes(frames: usize, width: u32, height: u32) -> Option<u64> {
 }
 
 const IDENTITY_MATRIX: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+/// Opens every file's metadata, refusing a set whose frames differ in
+/// dimensions, camera or CFA.
+fn open_frames(paths: &[PathBuf]) -> Result<Vec<RawFrame>, RawError> {
+    let Some(first_path) = paths.first() else {
+        return Err(RawError::NoFrames);
+    };
+    let first = open_frame(first_path)?;
+    let dimensions = (first.desc.width, first.desc.height);
+    let mut frames = Vec::with_capacity(paths.len());
+    frames.push(first);
+    for path in &paths[1..] {
+        let frame = open_frame(path)?;
+        let found = (frame.desc.width, frame.desc.height);
+        if found != dimensions {
+            return Err(RawError::FrameMismatch {
+                path: path.clone(),
+                first: dimensions,
+                found,
+            });
+        }
+        let first_metadata = &frames[0].metadata;
+        if (frame.metadata.make.as_str(), frame.metadata.model.as_str())
+            != (first_metadata.make.as_str(), first_metadata.model.as_str())
+        {
+            return Err(RawError::MetadataMismatch {
+                path: path.clone(),
+                property: "camera",
+                first: format!("{}/{}", first_metadata.make, first_metadata.model),
+                found: format!("{}/{}", frame.metadata.make, frame.metadata.model),
+            });
+        }
+        if (
+            &frame.metadata.cfa,
+            frame.metadata.cfa_width,
+            frame.metadata.cfa_height,
+        ) != (
+            &first_metadata.cfa,
+            first_metadata.cfa_width,
+            first_metadata.cfa_height,
+        ) {
+            return Err(RawError::MetadataMismatch {
+                path: path.clone(),
+                property: "CFA",
+                first: format!(
+                    "{:?}/{}x{}",
+                    first_metadata.cfa,
+                    first_metadata.cfa_width.unwrap_or(0),
+                    first_metadata.cfa_height.unwrap_or(0)
+                ),
+                found: format!(
+                    "{:?}/{}x{}",
+                    frame.metadata.cfa,
+                    frame.metadata.cfa_width.unwrap_or(0),
+                    frame.metadata.cfa_height.unwrap_or(0)
+                ),
+            });
+        }
+        frames.push(frame);
+    }
+    Ok(frames)
+}
+
+/// The frame with the largest decode reservation, and that reservation.
+fn largest_reservation(frames: &[RawFrame]) -> Result<(&RawFrame, u64), RawError> {
+    let mut largest = None;
+    for frame in frames {
+        let required = reservation_bytes(frame)?;
+        if largest.is_none_or(|(_, most)| required > most) {
+            largest = Some((frame, required));
+        }
+    }
+    Ok(largest.expect("a RAW stack holds at least one frame"))
+}
 
 fn reservation_bytes(frame: &RawFrame) -> Result<u64, RawError> {
     u64::from(frame.metadata.raw_width)
