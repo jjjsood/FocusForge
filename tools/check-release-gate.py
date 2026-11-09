@@ -15,6 +15,9 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import download  # noqa: E402
+
 EXPECTED_JOBS = {"ubuntu-24.04", "macos-15", "windows-2022"}
 WORKFLOW = ".github/workflows/check.yml"
 
@@ -108,23 +111,25 @@ def approved(runs: dict, jobs: dict, sha: str) -> bool:
 def retry_delay(error: OSError, attempt: int) -> float | None:
     """Seconds to wait before retrying after `error`, or None when it is permanent.
 
-    Rate limits (403 with an exhausted quota or a Retry-After, 429), server errors
-    and network failures are transient; every other HTTP status is not.
+    Rate limits (403 with an exhausted quota or a Retry-After) and everything
+    `download.transient` accepts are transient; every other failure is not.
     """
-    if isinstance(error, urllib.error.HTTPError):
-        headers = error.headers or {}
-        retry_after, reset = headers.get("Retry-After"), headers.get("X-RateLimit-Reset")
-        limited = error.code == 429 or (error.code == 403 and (headers.get("X-RateLimit-Remaining") == "0" or retry_after))
-        if not (limited or error.code >= 500):
-            return None
-        try:
-            if retry_after:
-                return max(1.0, float(retry_after))
-            if reset and limited:
-                return max(1.0, float(reset) - time.time() + 1)
-        except ValueError:
-            pass
-    return min(90.0, 5.0 * 2 ** attempt)
+    backoff = min(90.0, 5.0 * 2 ** attempt)
+    if not isinstance(error, urllib.error.HTTPError):
+        return backoff if download.transient(error) else None
+    headers = error.headers or {}
+    retry_after, reset = headers.get("Retry-After"), headers.get("X-RateLimit-Reset")
+    limited = error.code == 429 or (error.code == 403 and (headers.get("X-RateLimit-Remaining") == "0" or retry_after))
+    if not (limited or download.transient(error)):
+        return None
+    try:
+        if retry_after:
+            return max(1.0, float(retry_after))
+        if reset and limited:
+            return max(1.0, float(reset) - time.time() + 1)
+    except ValueError:
+        pass
+    return backoff
 
 
 def request_pages(url: str, deadline: float, use_token: bool) -> dict:

@@ -218,6 +218,7 @@ tool_selftest "lock directory selftest" tools/with-lock-selftest.sh
 tool_selftest "tiff-diff selftest" python3 tools/tiff-diff.py --selftest
 tool_selftest "image-metrics selftest" python3 tools/image-metrics.py --selftest
 tool_selftest "rawtiff selftest" python3 tools/lib/rawtiff.py --selftest
+tool_selftest "download selftest" python3 tools/lib/download.py --selftest
 tool_selftest "make-fixtures selftest" python3 tools/lib/make_fixtures.py --selftest
 run_gate "test bodies"      python3 tools/check-test-bodies.py
 tool_selftest "test bodies selftest" python3 tools/check-test-bodies.py --selftest

@@ -16,9 +16,6 @@ import subprocess
 import tarfile
 import sys
 import tempfile
-import time
-import urllib.error
-import urllib.request
 import uuid
 import zipfile
 import struct
@@ -28,6 +25,9 @@ try:
     import tomllib
 except ModuleNotFoundError:
     tomllib = None
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from download import download  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / "packaging/symbol-tools.toml"
@@ -116,25 +116,6 @@ def extract_tar(source: tarfile.TarFile, destination: Path) -> None:
         raise ValueError("unsafe tool archive")
     for member in members:
         source.extract(member, destination)
-
-
-DOWNLOAD_ATTEMPTS = 4
-
-
-def download(url: str) -> bytes:
-    """Read `url`, retrying server errors, timeouts and connection failures with growing delays."""
-    for attempt in range(DOWNLOAD_ATTEMPTS):
-        try:
-            with urllib.request.urlopen(url, timeout=60) as response:
-                return response.read()
-        except OSError as error:
-            transient = error.code >= 500 if isinstance(error, urllib.error.HTTPError) else True
-            if not transient or attempt == DOWNLOAD_ATTEMPTS - 1:
-                raise
-            delay = min(90.0, 5.0 * 2**attempt)
-            print(f"download of {url} failed ({error}); retrying in {delay:g}s", file=sys.stderr)
-            time.sleep(delay)
-    raise AssertionError("download attempts exhausted without an error")
 
 
 def verified_release_manifest(data: dict, tool: str, target: str, item: dict, directory: Path) -> None:
