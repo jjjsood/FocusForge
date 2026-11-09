@@ -139,6 +139,7 @@ run_gate "lock directory selftest" tools/with-lock-selftest.sh
 run_gate "tiff-diff selftest" python3 tools/tiff-diff.py --selftest
 run_gate "image-metrics selftest" python3 tools/image-metrics.py --selftest
 run_gate "rawtiff selftest" python3 tools/lib/rawtiff.py --selftest
+run_gate "download selftest" python3 tools/lib/download.py --selftest
 run_gate "make-fixtures selftest" python3 tools/lib/make_fixtures.py --selftest
 run_gate "test bodies"      python3 tools/check-test-bodies.py
 run_gate "test bodies selftest" python3 tools/check-test-bodies.py --selftest
