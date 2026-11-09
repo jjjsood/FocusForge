@@ -2007,6 +2007,34 @@ fn render_region(
     rendered
 }
 
+/// `job`'s strokes with their footprints, the strokes that miss the map left out.
+fn placed_strokes(
+    info: ZMapInfo,
+    job: &RegionRender,
+) -> Result<Vec<blend::PlacedStroke<'_>>, String> {
+    let mut placed = Vec::new();
+    for op in &job.ops {
+        let Op::BrushStroke { source_id, .. } = op else {
+            return Err(RetouchError::Unsupported.to_string());
+        };
+        if let Some(footprint) = blend::footprint(op, info).map_err(|error| error.to_string())? {
+            placed.push(blend::PlacedStroke {
+                op,
+                frame: usize::from(*source_id),
+                footprint,
+            });
+        }
+    }
+    Ok(placed)
+}
+
+/// The samples `job` reads: its region grown by the margin its Detail strokes need.
+fn read_extent_of(info: ZMapInfo, job: &RegionRender) -> Rect {
+    placed_strokes(info, job).map_or(job.region, |placed| {
+        blend::read_extent(info, &placed, job.region)
+    })
+}
+
 /// [`render_region`] in sample type `S`, each stroke blended by `blend_stroke`.
 fn blend_region<S: Blend>(
     input: &RenderInput,
@@ -2025,20 +2053,7 @@ fn blend_region<S: Blend>(
 ) -> Result<Vec<S>, String> {
     let region = job.region;
     let spp = input.samples_per_pixel;
-    let mut placed = Vec::new();
-    for op in &job.ops {
-        let Op::BrushStroke { source_id, .. } = op else {
-            return Err(RetouchError::Unsupported.to_string());
-        };
-        let footprint = blend::footprint(op, input.info).map_err(|error| error.to_string())?;
-        if let Some(footprint) = footprint {
-            placed.push(blend::PlacedStroke {
-                op,
-                frame: usize::from(*source_id),
-                footprint,
-            });
-        }
-    }
+    let placed = placed_strokes(input.info, job)?;
     // A Detail stroke blurs samples past the region, so the ops run over the
     // extent that covers them and only `region` is kept.
     let extent = blend::read_extent(input.info, &placed, region);
@@ -2287,10 +2302,13 @@ impl EditState {
             return;
         }
         let jobs: Vec<RegionRender> = self.region_renders.queued.drain(..).collect();
-        let regions: Vec<Rect> = jobs.iter().map(|job| job.region).collect();
-        let (mut local, mut snapshot) = (self.tiles.subset(&regions), self.snapshot.clone());
-        let ends_drag = jobs.iter().any(|job| job.ends_drag);
         let input = self.render_input();
+        let extents: Vec<Rect> = jobs
+            .iter()
+            .map(|job| read_extent_of(input.info, job))
+            .collect();
+        let (mut local, mut snapshot) = (self.tiles.subset(&extents), self.snapshot.clone());
+        let ends_drag = jobs.iter().any(|job| job.ends_drag);
         self.region_renders.in_flight = true;
         let parked = Arc::clone(&self.region_renders.parked);
         let wake = Arc::clone(wake);
