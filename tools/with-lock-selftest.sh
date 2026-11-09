@@ -10,8 +10,9 @@ TMP="$(cd -P "$(mktemp -d)" && pwd)"
 trap 'rm -rf "$TMP"' EXIT
 
 FAIL=0
-# The host's real RAM use must not queue these cases; exercise_build_slots fakes it.
+# The host's real RAM use and a caller's slot settings must not queue these cases; exercise_build_slots fakes them.
 export FF_BUILD_RAM_CAP_GB=0
+unset FF_BUILD_SLOTS FF_BUILD_PRIORITY
 
 lock_dir() {
   local checkout="$1"
@@ -409,6 +410,63 @@ exercise_build_slots() {
     expect_status "RAM cap queues build" 4 run_lock "$pool/b" flock 0 build -- true
   FF_LOCK_MEMINFO="$meminfo" FF_BUILD_RAM_CAP_GB=51 \
     expect_status "RAM below cap builds" 0 run_lock "$pool/b" flock 0 build -- true
+  exercise_build_queue "$pool"
+}
+
+# Slot waiters queue in arrival order; the build.conf priority target and its
+# sub-targets go first; build.conf sets the slot count; a dead waiter is skipped.
+queue_order() {  # queue_order <pool> <build.conf> <first> <second>
+  local pool="$1" ready="$TMP/queue-ready" holder w pids=()
+  printf '%s' "$2" >"$pool/.locks/build.conf"
+  rm -f "$ready" "$TMP/order"
+  mkdir -p "$pool/$3" "$pool/$4"
+  [ -L "$pool/$3/target" ] || make_link "$pool/$3" "$pool/cargo-target/$3"
+  [ -L "$pool/$4/target" ] || make_link "$pool/$4" "$pool/cargo-target/$4"
+  run_lock "$pool/a" flock 5 build -- sh -c 'printf held >"$1"; sleep 2' sh "$ready" >/dev/null 2>&1 &
+  holder=$!
+  wait_ready "queue holder" "$holder" "$ready" >&2 || { reap_holder "$holder"; return; }
+  for w in "$3" "$4"; do
+    run_lock "$pool/$w" flock 10 build -- sh -c 'echo "$1" >>"$2"' sh "$w" "$TMP/order" >/dev/null 2>&1 &
+    pids+=("$!")
+    sleep 0.3
+  done
+  wait "$holder" "${pids[@]}"
+  tr -d '\n' <"$TMP/order"
+}
+
+expect_order() {  # expect_order <name> <wanted> <queue_order args...>
+  local name="$1" wanted="$2" got
+  shift 2
+  got="$(queue_order "$@")"
+  if [ "$got" = "$wanted" ]; then
+    echo "ok   [$name]"
+  else
+    echo "FAIL [$name]: order $got, wanted $wanted" >&2
+    FAIL=1
+  fi
+}
+
+exercise_build_queue() {  # exercise_build_queue <pool>
+  local pool="$1" ready="$TMP/queue-ready" holder dead
+  rm -f "$pool/.locks/build.conf"
+  expect_status "no build.conf builds under set -euo pipefail" 0 \
+    bash -c 'set -euo pipefail; cd "$1"; . "$2"; with_lock build -- true' -- "$pool/b" "$LOCK_LIB"
+  expect_order "waiters get the slot in arrival order" bc "$pool" "" b c
+  expect_order "priority target jumps the queue" cb "$pool" $'priority=c\n' b c
+  expect_order "priority covers the target's sub-targets" c-xb "$pool" $'priority=c\n' b c-x
+  printf 'slots=2\n' >"$pool/.locks/build.conf"
+  rm -f "$ready"
+  run_lock "$pool/a" flock 5 build -- sh -c 'printf held >"$1"; sleep 1' sh "$ready" >/dev/null 2>&1 &
+  holder=$!
+  require_ready "conf slot holder" "$holder" "$ready" || { reap_holder "$holder"; return; }
+  expect_status "build.conf slots=2 builds separate targets alongside" 0 run_lock "$pool/b" flock 0 build -- true
+  wait "$holder"
+  : >"$pool/.locks/build.conf"
+  sh -c true &
+  dead=$!
+  wait "$dead"
+  : >"$pool/.locks/build-queue/1.$dead.x"
+  expect_status "a dead waiter's ticket does not block the queue" 0 run_lock "$pool/b" flock 0 build -- true
 }
 
 if command -v flock >/dev/null 2>&1; then
