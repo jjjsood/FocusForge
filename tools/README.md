@@ -12,7 +12,7 @@ prerequisites when run on Linux.
 
 | script | what it does |
 |---|---|
-| `check-all.sh [--static] [--verbose] [--tail N] [--log-dir DIR]` | Every gate, one command, bounded output, pass/fail summary. `--static` is the pre-commit set. Skips cleanly until `Cargo.toml` exists. |
+| `check-all.sh [--static\|--quick] [--verbose] [--tail N] [--log-dir DIR]` | Every gate, one command, bounded output, pass/fail summary. `--static` is the pre-commit set; `--quick` is a change's working check (nextest `quick` profile, clippy over changed crates, no builds, doctests or rustdoc). With `--static`/`--quick`, tooling selftests run only when `tools/`, `.githooks/`, `.github/` or `.config/` changed since the merge base with develop (`FF_GATE_BASE` overrides). A passing full or quick run on a clean tree is recorded; a later run on the same tree prints `CACHED:` and exits 0 (`FF_GATE_NO_CACHE=1` forces, CI never caches). Skips cleanly until `Cargo.toml` exists. |
 | `check-licenses.sh [--advisories]` | `cargo deny` over the GPLv3 compatibility allowlist; `--advisories` checks RUSTSEC instead. Skips until `deny.toml` is committed. |
 | `check-headers.sh` | Requires the opening GPL-3.0-or-later SPDX comment on authored Rust, Slint, WGSL, shell, Python, and hook files. `check-headers-selftest.sh` proves its covered classes and exclusions. |
 | `check-notice.sh [--write]` | Compares root `NOTICE` with the locked, offline default CLI+GUI runtime graphs for three release targets. `--write` explicitly regenerates it; the check never edits files. Cargo's cached metadata and package index must be available. `check-notice-selftest.sh` covers deterministic rendering and stale component records. |
