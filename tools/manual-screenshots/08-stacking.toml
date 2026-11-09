@@ -81,20 +81,20 @@ crop  = "FFDock::settings-panel"
 pad   = 8
 
 [[shot]]
-name  = "stacking-prepare-off"
+name  = "stacking-prepare-on"
 args  = ["--open", "fixtures/mantis-512/frames", "--dock-tab", "settings"]
 steps = [
   ["wait-text", "DEFAULT", "120"],
   ["click-id", "FFMoreToggle::header-area", "0"],
   ["wait-text", "Target brightness (stops)"],
+  ["click-id", "FFToggle::area", "0"],
   ["click-id", "FFSlider::drag-area", "1"],
   ["key", "Left"],
   ["key", "Left"],
   ["wait-text", "−" ],
-  ["click-id", "FFToggle::area", "0"],
   ["pause", "500"],
 ]
-out   = "assets/manual/stacking/stacking-prepare-off.png"
+out   = "assets/manual/stacking/stacking-prepare-on.png"
 crop  = "FFDock::settings-panel"
 pad   = 8
 
