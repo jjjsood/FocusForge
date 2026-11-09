@@ -41,6 +41,7 @@
 
 **Fixing what the stack got wrong**
 - Halos, ghosting or a misplaced bristle? Brush in the right frame by hand with a soft brush
+- Choose a brush mode (Normal, Lighten, Darken, Detail) and an opacity per stroke; keys 1-4 switch the mode
 - A colour overlay shows which shot every part of the image came from, so you know where to paint from
 - Unlimited undo, and every version of the edit kept: go back, try another direction, export any of them
 

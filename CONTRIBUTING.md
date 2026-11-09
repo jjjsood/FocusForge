@@ -106,7 +106,7 @@ the reader, the tile scheduler's memory budget, the Z-Map reader and
 writer, each stacking algorithm's fusion output, the pyramidal ECC solver
 and its warp and auto-crop stages, the job engine's pause/resume/cancel
 control loop, the stage cache, grouping proposals and the `.ffp` project
-container's read/write round trip, the retouch op log (brush strokes, the
+container's read/write round trip, the retouch op log (brush strokes with their blend mode and opacity, the
 rainbow overlay palette) and the render of a checkpoint's state, the
 checkpoint history (append-only saves,
 branching, delete and import validation, the export formats), and the

@@ -24,7 +24,9 @@ Every entry is stored, not deflated — the blobs are already zstd-compressed
 the system clock. Two seals of the same inputs therefore produce byte-
 identical archives.
 
-The container carries no format version. A project written by an older
+The manifest carries a `format_version` field only when a stroke has a
+mode other than `normal` or an opacity other than `1.0`: it then reads 2,
+and a build that predates it refuses the project. A project written by an older
 build that lacks a field the current reader needs is refused when opened
 (see [Refusals](#refusals)); re-stack the frames to get a current one. A RAW project holds its composite
 as unclipped 32-bit float samples, so a RAW project saved before that is

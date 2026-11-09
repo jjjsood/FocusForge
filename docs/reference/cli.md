@@ -1067,7 +1067,7 @@ JSON shape. Render a result with [`export --checkpoint`](#export).
 | flag | meaning |
 |---|---|
 | `<PROJECT>` | the project to append to |
-| `--ops <FILE>` | the op list: a JSON array of ops in the persisted `Op` shape. A brush stroke blends frame `source_id` over the image along its path, fully within `radius * (1 - softness)` and fading linearly to nothing at `radius` |
+| `--ops <FILE>` | the op list: a JSON array of ops in the persisted `Op` shape. A brush stroke blends frame `source_id` over the image along its path, fully within `radius * (1 - softness)` and fading linearly to nothing at `radius`. A stroke may carry `mode` and `opacity` (see [Stroke fields](#stroke-fields)) |
 | `--from <ID>` | the checkpoint to append under, an id or a unique id prefix; defaults to the head |
 | `--name <NAME>` | names the last appended checkpoint |
 | `--json` | emit a JSON report instead of human-readable text |
@@ -1084,6 +1084,20 @@ wall: 0.012s
 An op that fails to validate — an unsupported tag, or a value outside what
 the op accepts — refuses the whole run before anything is written, naming
 the op's 0-based position in the list.
+
+### Stroke fields
+
+| field | values | meaning |
+|---|---|---|
+| `mode` | `normal` (default), `lighten`, `darken`, `detail` | `normal` blends the frame over the image. `lighten` changes a pixel only where the frame's sum over all samples exceeds the image's there, `darken` only where it is smaller; both then blend every sample by the same amount. `detail` keeps the image's own brightness and takes only the frame's fine detail, over a reach of about the brush radius |
+| `opacity` | `0 < x <= 1`, default `1.0` | scales the stroke's coverage; the window shows it as 1-100 % |
+
+An opacity outside `0 < x <= 1` refuses the run like any invalid op. An
+opacity too small to register still records a checkpoint but changes no
+sample. The overlay and the pipette count a stroke as the origin of a pixel
+only where its blend acts. A project holding a stroke with a mode other
+than `normal` or an opacity other than `1.0` is written with
+`format_version` 2; older builds refuse it.
 
 ### `--json`
 
