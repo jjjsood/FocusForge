@@ -24,6 +24,7 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 ### Changed
 
+- Equalize brightness is now off by default, in the GUI and in `focusforge-cli stack`. Turn it on with the switch under PREPARE or with `--set equalize=true`; a project opened from an earlier run keeps the setting it was fused with.
 - A project saved by a newer FocusForge is refused on open with a message saying so, instead of being read wrongly.
 - Every `focusforge-cli` project command exits with one code per class of error, and the line about a GPU that falls back to the CPU is shorter.
 - Each memory cap in Settings is one row with a number and a unit that commits on confirm, and the aperture is called f-stop.
