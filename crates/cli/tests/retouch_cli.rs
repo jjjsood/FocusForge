@@ -123,7 +123,7 @@ fn exported(dir: &Path, project: &Path, id: &str) -> Vec<u16> {
 fn rendered(dir: &Path, project: &Path, id: &str) -> Vec<u16> {
     let out = dir.join(format!("render-{id}.tif"));
     let mut open = Project::open(project).unwrap();
-    project::render_checkpoint(&mut open, id, &out).unwrap();
+    project::render_checkpoint(&mut open, id, &out, None).unwrap();
     common::read_whole(&out).0
 }
 

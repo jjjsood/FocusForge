@@ -6484,7 +6484,7 @@ fn checkpoint_planes_survive_an_unreadable_zmap() {
     common::corrupt_blob(&project_path, &blob);
     let scratch = common::tree("zmapless_planes_cache");
 
-    let (composite, zmap) = job::render_checkpoint_planes(&project_path, &scratch, &id)
+    let (composite, zmap) = job::render_checkpoint_planes(&project_path, &scratch, &id, None)
         .expect("the composite renders without its Z-Map");
     assert!(composite.is_file());
     assert_eq!(zmap, None, "no Z-Map is offered");
@@ -6498,8 +6498,8 @@ fn checkpoint_planes_survive_an_unreadable_zmap() {
         job::CheckpointPlanes::Ready(_, None)
     ));
 
-    let (_, head_zmap) =
-        job::render_checkpoint_planes(&project_path, &scratch, &head).expect("the head renders");
+    let (_, head_zmap) = job::render_checkpoint_planes(&project_path, &scratch, &head, None)
+        .expect("the head renders");
     assert!(
         head_zmap.is_some_and(|zmap| zmap.is_file()),
         "the head keeps its Z-Map"
@@ -6519,7 +6519,7 @@ fn a_save_makes_the_previous_plane_files_stale() {
         job::cached_checkpoint_planes(&first, &scratch, &first_id).unwrap(),
         job::CheckpointPlanes::NeedsRender
     ));
-    job::render_checkpoint_planes(&project_path, &scratch, &first_id).unwrap();
+    job::render_checkpoint_planes(&project_path, &scratch, &first_id, None).unwrap();
     assert!(matches!(
         job::cached_checkpoint_planes(&first, &scratch, &first_id).unwrap(),
         job::CheckpointPlanes::Ready(..)
@@ -8066,16 +8066,45 @@ fn open_session(
     composite: &Path,
     sources: &[PathBuf],
 ) -> Result<job::EditState, job::EditSessionError> {
+    open_session_at(files, composite, sources, job::host_budget())
+}
+
+fn open_session_at(
+    files: &RawFiles,
+    composite: &Path,
+    sources: &[PathBuf],
+    budget: job::HostBudget,
+) -> Result<job::EditState, job::EditSessionError> {
     job::open_edit_session(
         Some(&files.zmap),
         composite,
-        sources,
+        job::FrameSource::Open {
+            frames: sources.to_vec(),
+            budget,
+        },
         Registration::default(),
         16,
-        job::host_budget(),
         Vec::new(),
         Vec::new(),
     )
+}
+
+#[test]
+fn raw_edit_session_below_the_cap_is_refused_naming_the_cap() {
+    let files = raw_files("job_raw_session_cap");
+    let frame = common::workspace_root().join("fixtures/blackmagic-micro-dng/frame.dng");
+    let capped = job::host_budget().capped_to(Some(1 << 20));
+    let Err(err) = open_session_at(&files, &files.composite, &[frame], capped) else {
+        panic!("a cap below one developed frame refuses the session");
+    };
+    assert!(
+        matches!(err, job::EditSessionError::Frames(_)),
+        "the refusal is a frame-set error: {err}"
+    );
+    assert!(
+        err.to_string().contains("memory limit allows"),
+        "the refusal names the cap: {err}"
+    );
 }
 
 fn raw_stroke() -> Op {

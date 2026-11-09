@@ -5503,7 +5503,7 @@ fn overlay_and_pipette_skip_a_lighten_stroke_where_it_does_not_act() {
 
 #[test]
 fn pipette_keeps_source_when_condition_read_fails() {
-    let (mut c, root) = open_editor("origin_read_fails");
+    let (mut c, _root) = open_editor("origin_read_fails");
     let zmap = c.held_checkpoints().last().unwrap().zmap.clone();
     let stored = read_whole_zmap(&zmap);
     let table = focusforge_core::zmap::overlay_table(c.frame_count().unwrap(), None);
@@ -5512,8 +5512,9 @@ fn pipette_keeps_source_when_condition_read_fails() {
     common::paint(&mut c, dab(2, normal_at, 5.0, BrushMode::Normal, 1.0));
     common::paint(&mut c, dab(1, lighten_at, 5.0, BrushMode::Lighten, 1.0));
     common::settle_region_renders(&mut c);
-    // The session's mapped frames outlive the file; the readers open it again.
-    fs::remove_file(root.join("01.tif")).unwrap();
+    // The session's mapped composite outlives the file; the readers open it again.
+    let composite = c.materialize_active_tab_planes().unwrap().0;
+    fs::remove_file(composite).unwrap();
 
     c.ensure_origin_readers();
     assert!(c.take_origin_started(), "the readers start opening");
@@ -5546,6 +5547,153 @@ fn pipette_keeps_source_when_condition_read_fails() {
         settle_origin_readers(&mut c);
         assert!(!c.take_origin_started(), "a failed open is not retried");
     }
+}
+
+/// Whether the active tab's origin readers read through `session`'s frames.
+fn readers_share_sources(c: &AppController) -> bool {
+    let origin = c
+        .overlay_draw()
+        .and_then(|draw| draw.origin)
+        .expect("the origin readers are open");
+    Arc::ptr_eq(
+        &c.edit_session().expect("a session is open").sources,
+        origin.0.sources(),
+    )
+}
+
+#[test]
+fn origin_readers_share_the_session_frame_reader() {
+    let (mut c, _case) = lighten_case("origin_shares_reader", 1.0);
+    c.set_overlay_on(true);
+    settle_origin_readers(&mut c);
+    assert!(c.take_origin_started(), "the readers opened once");
+    assert!(readers_share_sources(&c), "after the Lighten dab");
+
+    common::paint(&mut c, dab(0, (30, 30), 6.0, BrushMode::Darken, 0.6));
+    common::settle_region_renders(&mut c);
+    settle_origin_readers(&mut c);
+    assert!(!c.take_origin_started(), "no second open");
+    assert!(readers_share_sources(&c), "after the Darken dab");
+}
+
+/// A saved project over three `set` frames holding one Lighten dab over its
+/// fuse.
+fn saved_lighten_row(name: &str, set: &str) -> PathBuf {
+    let mut c = scratch_controller(name);
+    common::open_fixture_tab(&mut c, name, set, 3);
+    c.set_param_value(
+        "prepare",
+        "equalize",
+        focusforge_core::params::ParamValue::Bool(false),
+    );
+    assert!(c.start_fuse());
+    settle_all(&mut c);
+    common::enter_editor(&mut c);
+    let path = save_to_proposed(&mut c);
+    common::paint(&mut c, dab(1, (30, 30), 10.0, BrushMode::Lighten, 1.0));
+    assert!(c.save_active_project(|_| None));
+    path
+}
+
+/// [`saved_lighten_row`] reopened with its overlay on and its planes rendered.
+fn reopened_lighten_row(path: &Path, name: &str) -> AppController {
+    let mut r = reopen(path, name);
+    r.set_overlay_on(true);
+    assert_eq!(r.materialize_active_tab_planes(), None, "the row renders");
+    common::settle_render(&mut r);
+    r
+}
+
+#[test]
+fn session_adopts_the_origin_readers_frame_reader() {
+    let path = saved_lighten_row("origin_adopted", "mantis-64");
+
+    let mut early = reopened_lighten_row(&path, "origin_adopted_early");
+    settle_origin_readers(&mut early);
+    assert!(early.overlay_draw().unwrap().origin.is_some());
+    common::enter_editor(&mut early);
+    assert!(readers_share_sources(&early), "readers settled first");
+
+    let mut racing = reopened_lighten_row(&path, "origin_adopted_racing");
+    racing.ensure_origin_readers();
+    assert!(racing.take_origin_started(), "the readers start opening");
+    assert!(racing.set_mode(ShellMode::Editor));
+    assert!(
+        !racing.take_session_started(),
+        "the session waits for the readers instead of opening frames of its own"
+    );
+    settle_origin_readers(&mut racing);
+    common::settle_session(&mut racing);
+    assert!(racing.edit_session().is_some(), "the session opened");
+    assert!(
+        readers_share_sources(&racing),
+        "session opened while the readers were opening"
+    );
+}
+
+fn memory_cap(text: &str) -> performance_settings::PerformanceSettings {
+    performance_settings::PerformanceSettings {
+        max_host_memory: performance_settings::parse_cap(text).unwrap(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn edit_session_frame_set_budget_honours_the_memory_cap() {
+    let set = "mantis-64-deflate-p1-strip-ii";
+    let path = saved_lighten_row("origin_capped", set);
+
+    let mut tight = reopened_lighten_row(&path, "origin_capped_1b");
+    tight.install_performance(memory_cap("1"));
+    settle_origin_readers(&mut tight);
+    assert!(tight.take_origin_started(), "the open was tried once");
+    assert!(
+        tight.overlay_draw().unwrap().origin.is_none(),
+        "1 B holds no decoded segment"
+    );
+    for _ in 0..3 {
+        settle_origin_readers(&mut tight);
+        assert!(
+            !tight.take_origin_started(),
+            "a refused open is not retried"
+        );
+    }
+
+    let mut roomy = reopened_lighten_row(&path, "origin_capped_1mib");
+    roomy.install_performance(memory_cap("1048576"));
+    settle_origin_readers(&mut roomy);
+    assert!(
+        roomy.overlay_draw().unwrap().origin.is_some(),
+        "1 MiB opens the readers"
+    );
+}
+
+#[test]
+fn edit_session_below_the_memory_cap_drops_to_stacking() {
+    let path = saved_lighten_row("session_capped", "mantis-64-deflate-p1-strip-ii");
+    let mut c = reopened_lighten_row(&path, "session_capped_reopened");
+    assert!(
+        c.edit_session().is_none(),
+        "a reopened row holds no session"
+    );
+
+    c.install_performance(memory_cap("1"));
+    assert!(c.set_mode(ShellMode::Editor));
+    let start = Instant::now();
+    while c.mode() == ShellMode::Editor && c.edit_session().is_none() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the session open did not settle"
+        );
+        c.settle_checkpoint_render();
+        c.settle_edit_session();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(c.mode(), ShellMode::Stacking, "the open was refused");
+    assert!(c.edit_session().is_none());
+
+    c.install_performance(memory_cap("1048576"));
+    common::enter_editor(&mut c);
 }
 
 #[test]
@@ -7204,12 +7352,12 @@ fn background_region_render_matches_the_synchronous_one() {
     let mut fresh = job::open_edit_session(
         Some(&zmap),
         &composite,
-        &(0..3)
-            .map(|i| root.join(format!("{i:02}.tif")))
-            .collect::<Vec<_>>(),
+        job::FrameSource::Open {
+            frames: (0..3).map(|i| root.join(format!("{i:02}.tif"))).collect(),
+            budget: job::host_budget(),
+        },
         registration,
         16,
-        job::host_budget(),
         Vec::new(),
         ops(&c),
     )
@@ -9256,12 +9404,12 @@ fn a_session_renders_after_its_composite_file_is_removed() {
     let mut session = job::open_edit_session(
         Some(&zmap_copy),
         &composite_copy,
-        &(0..3)
-            .map(|i| root.join(format!("{i:02}.tif")))
-            .collect::<Vec<_>>(),
+        job::FrameSource::Open {
+            frames: (0..3).map(|i| root.join(format!("{i:02}.tif"))).collect(),
+            budget: job::host_budget(),
+        },
         sealed.registration.clone(),
         16,
-        job::host_budget(),
         Vec::new(),
         Vec::new(),
     )

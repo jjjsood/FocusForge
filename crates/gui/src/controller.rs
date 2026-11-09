@@ -2334,6 +2334,12 @@ impl AppController {
         true
     }
 
+    /// The memory budget a tab's frame sets are opened with: the host-derived
+    /// budget, lowered to the Performance memory limit when one is set.
+    fn frame_set_budget(&self) -> job::HostBudget {
+        job::host_budget().capped_to(self.performance.max_host_memory_bytes())
+    }
+
     /// Opens the active tab's edit session over its row's Z-Map and its own
     /// frames on a worker unless the tab already holds or is opening one,
     /// replaying an op-bearing row's stroke chain there. `Opening` also
@@ -2347,7 +2353,9 @@ impl AppController {
         if tab.edit.is_some() {
             return SessionOpen::Open;
         }
-        if self.state.edits.opening(tab.id, tab.session_generation) {
+        if self.state.edits.opening(tab.id, tab.session_generation)
+            || self.state.origin.opening(tab.id, tab.session_generation)
+        {
             return SessionOpen::Opening;
         }
         let (composite, zmap) = match self.active_tab_planes() {
@@ -2361,10 +2369,18 @@ impl AppController {
         // `can_edit` guarantees `tab.frames` equals the fused sources, in
         // the same order, by the time editor mode is entered -- so indexing
         // `registration`'s per-frame transforms by position here matches.
-        let Some((_, registration)) = tab.fused() else {
+        let Some((fused_frames, registration)) = tab.fused() else {
             return SessionOpen::Unavailable;
         };
-        let frames = tab.frames.clone();
+        let source = match &tab.origin {
+            Some(origin) if fused_frames == tab.frames => {
+                job::FrameSource::Reader(Arc::clone(origin.sources()))
+            }
+            _ => job::FrameSource::Open {
+                frames: tab.frames.clone(),
+                budget: self.frame_set_budget(),
+            },
+        };
         let base_ops = tab.base_ops();
         let chain = tab
             .selected_checkpoint
@@ -2381,18 +2397,17 @@ impl AppController {
         slot.started = true;
         let parked = Arc::clone(&slot.parked);
         std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(|| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 job::open_edit_session(
                     zmap.as_deref(),
                     &composite,
-                    &frames,
+                    source,
                     registration,
                     tile_size,
-                    job::host_budget(),
                     base_ops,
                     chain,
                 )
-            })
+            }))
             .map_err(|_| "the session worker panicked".to_string())
             .and_then(|opened| opened.map_err(|err| err.to_string()));
             parked
@@ -2475,6 +2490,7 @@ impl AppController {
             || tab.origin.is_some()
             || tab.origin_failed
             || self.state.origin.opening(tab.id, tab.session_generation)
+            || self.state.edits.opening(tab.id, tab.session_generation)
             || !tab.overlay_ops().iter().any(|op| {
                 matches!(
                     op,
@@ -2490,10 +2506,28 @@ impl AppController {
         let Some((frames, registration)) = tab.fused() else {
             return;
         };
+        let source = match &tab.edit {
+            Some(edit) if frames == tab.frames => {
+                job::FrameSource::Reader(Arc::clone(&edit.sources))
+            }
+            Some(_) => {
+                tracing::error!("the origin readers' frames differ from the edit session's");
+                self.state
+                    .active_mut()
+                    .expect("the active tab was just read")
+                    .origin_failed = true;
+                return;
+            }
+            None => job::FrameSource::Open {
+                frames,
+                budget: self.frame_set_budget(),
+            },
+        };
         let (tab_id, generation) = (tab.id, tab.session_generation);
         let Some(composite) = self.origin_composite() else {
             return;
         };
+        let memory_cap = self.performance.max_host_memory_bytes();
         let rendering = match &composite {
             OriginComposite::Render { id, .. } => Some(id.clone()),
             OriginComposite::Cached(_) => None,
@@ -2511,12 +2545,12 @@ impl AppController {
                         scratch_root,
                         id,
                     } => {
-                        job::render_checkpoint_planes(&project_path, &scratch_root, &id)
+                        job::render_checkpoint_planes(&project_path, &scratch_root, &id, memory_cap)
                             .map_err(|err| err.to_string())?
                             .0
                     }
                 };
-                job::OriginReaders::open(&composite, &frames, registration, job::host_budget())
+                job::OriginReaders::open(&composite, source, registration)
                     .map_err(|err| err.to_string())
             }))
             .map_err(|_| "the origin worker panicked".to_string())
@@ -2621,6 +2655,11 @@ impl AppController {
                     tab.origin_failed = true;
                 }
             }
+        }
+        let wants_session = self.state.mode == ShellMode::Editor
+            || self.state.active().is_some_and(ProjectTab::on_ops_row);
+        if wants_session && self.state.active().is_some_and(|tab| tab.edit.is_none()) {
+            self.ensure_edit_session();
         }
         self.state.origin.in_flight.is_empty()
     }
@@ -6642,8 +6681,8 @@ impl AppController {
             .values()
             .map(|pixels| pixels.rgba.len() as u64 * 2)
             .sum();
-        let host_budget = job::host_budget().capped_to(self.performance.max_host_memory_bytes());
-        let budget = host_budget
+        let budget = self
+            .frame_set_budget()
             .reduced_by(self.preview_cache_bytes)
             .reduced_by(self.published_preview_bytes.load(Ordering::Acquire));
         let remaining = budget.bytes();
@@ -9774,10 +9813,11 @@ impl AppController {
     ) {
         self.state.render.in_flight = Some((tab_id, key.clone()));
         self.state.render.started = true;
+        let memory_cap = self.performance.max_host_memory_bytes();
         let outcome = Arc::clone(&self.state.render.outcome);
         std::thread::spawn(move || {
             let result = job::render_outcome(std::panic::catch_unwind(|| {
-                job::render_checkpoint_planes(&project_path, &scratch_root, &key)
+                job::render_checkpoint_planes(&project_path, &scratch_root, &key, memory_cap)
             }));
             *outcome
                 .lock()

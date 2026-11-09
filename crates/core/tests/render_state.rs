@@ -315,7 +315,7 @@ fn view_and_export_are_pixel_identical() {
     for (label, id) in [("fused", &built.root), ("op-bearing", &built.edited)] {
         let view = dir.join(format!("{label}-view.tif"));
         let export = dir.join(format!("{label}-export.tif"));
-        project::render_checkpoint(&mut project, id, &view).unwrap();
+        project::render_checkpoint(&mut project, id, &view, None).unwrap();
         project::export_checkpoint(
             &mut project,
             id,
@@ -489,7 +489,7 @@ fn pending_state_export_equals_the_saved_export() {
     let mut project = Project::open(&project_path).unwrap();
     let record = project.fuse_state(&saved).unwrap();
     let base = dir.join("base.tif");
-    project::render_checkpoint(&mut project, &saved, &base).unwrap();
+    project::render_checkpoint(&mut project, &saved, &base, None).unwrap();
     let pending_ops = vec![
         pending_stroke(2, &[(1, 1), (4, 3)], 1.5, 0.5),
         pending_stroke(0, &[(3, 0), (3, 4)], 2.0, 0.0),

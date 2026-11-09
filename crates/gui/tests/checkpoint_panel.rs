@@ -371,7 +371,7 @@ fn build_edited(name: &str) -> Edited {
 /// `render_checkpoint`'s own output for `id`, as samples.
 fn rendered(project: &Path, id: &str, out: &Path) -> Vec<u16> {
     let mut project = Project::open(project).unwrap();
-    render_checkpoint(&mut project, id, out).unwrap();
+    render_checkpoint(&mut project, id, out, None).unwrap();
     samples(out)
 }
 

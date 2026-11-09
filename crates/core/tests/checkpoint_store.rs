@@ -982,7 +982,7 @@ fn hiding_a_parent_keeps_its_child_byte_identical() {
         let render = dir.join(format!("{tag}-render.tif"));
         let export = dir.join(format!("{tag}-export.tif"));
         project::materialize_zmap(&mut project, &checkpoint, &zmap).unwrap();
-        project::render_checkpoint(&mut project, &child.checkpoint, &render).unwrap();
+        project::render_checkpoint(&mut project, &child.checkpoint, &render, None).unwrap();
         project::export_checkpoint(
             &mut project,
             &child.checkpoint,

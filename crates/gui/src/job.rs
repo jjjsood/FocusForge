@@ -1550,16 +1550,18 @@ pub fn cached_checkpoint_planes(
 /// Renders checkpoint `id` of the project at `project_path` into its plane
 /// cache, over a project opened on the calling thread. An op-bearing
 /// checkpoint re-hashes its sources on every call and refuses on any
-/// missing or changed frame. A Z-Map that fails to materialize is logged and
+/// missing or changed frame, and its source frames open under `memory_cap`.
+/// A Z-Map that fails to materialize is logged and
 /// answered as `None`: the composite is the image, the map only analysis.
 pub fn render_checkpoint_planes(
     project_path: &Path,
     scratch_root: &Path,
     id: &str,
+    memory_cap: Option<u64>,
 ) -> Result<(PathBuf, Option<PathBuf>), PlaneCacheError> {
     let mut project = Project::open(project_path)?;
     let (composite, zmap) = checkpoint_plane_paths(scratch_root, project_path, id);
-    let zmap = write_checkpoint_planes(&mut project, id, &composite, zmap)?;
+    let zmap = write_checkpoint_planes(&mut project, id, &composite, zmap, memory_cap)?;
     Ok((composite, zmap))
 }
 
@@ -1568,11 +1570,12 @@ fn write_checkpoint_planes(
     id: &str,
     composite: &Path,
     zmap: PathBuf,
+    memory_cap: Option<u64>,
 ) -> Result<Option<PathBuf>, PlaneCacheError> {
     if let Some(dir) = composite.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    project::render_checkpoint(project, id, composite)?;
+    project::render_checkpoint(project, id, composite, memory_cap)?;
     let checkpoint = project.history().get(id)?.clone();
     match project::materialize_zmap(project, &checkpoint, &zmap) {
         Ok(()) => Ok(Some(zmap)),
@@ -2345,15 +2348,36 @@ impl EditState {
     }
 }
 
+/// Where an edit session or the origin readers get the stroke source frames.
+pub enum FrameSource {
+    /// A frame set that is already open and read once for the whole tab.
+    Reader(Arc<dyn FrameReader>),
+    /// `frames`, opened with `budget`.
+    Open {
+        frames: Vec<PathBuf>,
+        budget: HostBudget,
+    },
+}
+
+impl FrameSource {
+    fn into_reader(self) -> Result<Arc<dyn FrameReader>, EditSessionError> {
+        match self {
+            FrameSource::Reader(reader) => Ok(reader),
+            FrameSource::Open { frames, budget } => {
+                Ok(Arc::from(open_frame_set(&frames, budget)?.reader))
+            }
+        }
+    }
+}
+
 /// Opens `composite` and the frame set it is edited from, which must hold
 /// the same sample type.
 fn open_base_and_sources(
     composite: &Path,
-    frames: &[PathBuf],
-    budget: HostBudget,
+    source: FrameSource,
 ) -> Result<(Arc<TiffStack>, Arc<dyn FrameReader>), EditSessionError> {
     let base = Arc::new(TiffStack::open_staged(composite)?);
-    let sources: Arc<dyn FrameReader> = Arc::from(open_frame_set(frames, budget)?.reader);
+    let sources = source.into_reader()?;
     if base.sample_format() != sources.sample_format() {
         return Err(EditSessionError::SampleFormatMismatch {
             path: composite.to_path_buf(),
@@ -2374,20 +2398,24 @@ pub struct OriginReaders {
 }
 
 impl OriginReaders {
-    /// Opens `ancestor_composite` (the fused composite, before any stroke) and
-    /// `frames`; the composite and the frames must hold one sample type.
+    /// Opens `ancestor_composite` (the fused composite, before any stroke)
+    /// over `source`; the composite and the frames must hold one sample type.
     pub fn open(
         ancestor_composite: &Path,
-        frames: &[PathBuf],
+        source: FrameSource,
         registration: Registration,
-        budget: HostBudget,
     ) -> Result<Self, EditSessionError> {
-        let (ancestor, sources) = open_base_and_sources(ancestor_composite, frames, budget)?;
+        let (ancestor, sources) = open_base_and_sources(ancestor_composite, source)?;
         Ok(Self {
             ancestor,
             sources,
             registration,
         })
+    }
+
+    /// The stroke source frames the readers sample.
+    pub fn sources(&self) -> &Arc<dyn FrameReader> {
+        &self.sources
     }
 
     /// Replays `ops` over the ancestor composite and returns where each
@@ -2420,15 +2448,12 @@ impl OriginReaders {
 /// ops, oldest first) is replayed over it and kept as the state's chain. An
 /// op that cannot be applied ends the replay; a region that cannot be
 /// rendered is skipped.
-// The inputs are independent; none of them groups naturally with another.
-#[allow(clippy::too_many_arguments)]
 pub fn open_edit_session(
     zmap: Option<&Path>,
     composite: &Path,
-    frames: &[PathBuf],
+    source: FrameSource,
     registration: Registration,
     tile_size: u32,
-    budget: HostBudget,
     base_ops: Vec<Op>,
     chain: Vec<Op>,
 ) -> Result<EditState, EditSessionError> {
@@ -2438,14 +2463,14 @@ pub fn open_edit_session(
         width: 1,
         height: 1,
     };
-    let (base, sources) = open_base_and_sources(composite, frames, budget)?;
+    let (base, sources) = open_base_and_sources(composite, source)?;
     let header = base.header(0);
     let mut first = vec![0u16; header.samples_per_pixel as usize];
     base.read_tile_into(0, pixel, &mut first)?;
     let info = ZMapInfo::new(
         header.width,
         header.height,
-        u32::try_from(frames.len()).unwrap_or(u32::MAX),
+        u32::try_from(sources.len()).unwrap_or(u32::MAX),
     )?;
     // Each plane is mapped on its first read; the mapping outlives the file,
     // which a save removes together with the row's other held files. A map

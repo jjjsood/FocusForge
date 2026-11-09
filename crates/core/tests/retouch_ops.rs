@@ -505,7 +505,7 @@ fn stroke_over_raw_frames() {
     let mut project = Project::open(&project_path).unwrap();
     let view = dir.join("view.tif");
     let export = dir.join("export.tif");
-    project::render_checkpoint(&mut project, &edited, &view).unwrap();
+    project::render_checkpoint(&mut project, &edited, &view, None).unwrap();
     project::export_checkpoint(
         &mut project,
         &edited,

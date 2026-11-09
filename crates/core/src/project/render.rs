@@ -43,6 +43,9 @@ pub struct CheckpointImage {
     /// whose document keeps values outside the 16-bit range.
     pub sample_format: SampleFormat,
     body: Body,
+    /// Ceiling on the memory the source frame set may take when a stroke
+    /// opens it; `None` takes the host-derived budget.
+    memory_cap: Option<u64>,
 }
 
 enum Body {
@@ -116,6 +119,7 @@ impl CheckpointImage {
             description: composite.description.clone(),
             sample_format,
             body,
+            memory_cap: None,
         }
     }
 
@@ -183,6 +187,7 @@ impl CheckpointImage {
             description: held.composite_description.clone(),
             sample_format: stack.sample_format(),
             body: Body::Held(held.composite.clone()),
+            memory_cap: None,
         })
     }
 
@@ -216,6 +221,7 @@ impl CheckpointImage {
                 info,
                 strokes,
             },
+            memory_cap: None,
         })
     }
 
@@ -307,7 +313,14 @@ impl CheckpointImage {
                 strokes,
             } => {
                 let project = project.expect("a saved checkpoint renders against its project");
-                render_ops(project, checkpoint, ancestor, strokes, tile, sink)
+                render_ops(
+                    project,
+                    (checkpoint, ancestor),
+                    strokes,
+                    tile,
+                    self.memory_cap,
+                    sink,
+                )
             }
             Body::Held(composite) => render_held(composite, spp, tile, sink),
             Body::Pending {
@@ -399,9 +412,13 @@ fn check_pending_sources(paths: &[PathBuf], composite: &Path) -> Result<(), Proj
 /// TIFF or RAW). `context_path` names the error when opening fails -- the
 /// project's own path for a checkpoint's sources, the composite's for a
 /// pending state, which has no project of its own.
-fn open_sources(paths: &[PathBuf], context_path: &Path) -> Result<FrameSet, ProjectError> {
-    open_frame_set(paths, HostBudget::host_derived(&crate::host::snapshot()))
-        .map_err(|err| ProjectError::container(context_path, err))
+fn open_sources(
+    paths: &[PathBuf],
+    context_path: &Path,
+    memory_cap: Option<u64>,
+) -> Result<FrameSet, ProjectError> {
+    let budget = HostBudget::host_derived(&crate::host::snapshot()).capped_to(memory_cap);
+    open_frame_set(paths, budget).map_err(|err| ProjectError::container(context_path, err))
 }
 
 /// [`open_sources`] plus the shape check a checkpoint's own recorded fuse
@@ -413,8 +430,9 @@ fn open_checkpoint_sources(
     checkpoint: &Checkpoint,
     paths: &[PathBuf],
     record: &FuseRecord,
+    memory_cap: Option<u64>,
 ) -> Result<FrameSet, ProjectError> {
-    let set = open_sources(paths, project.path())?;
+    let set = open_sources(paths, project.path(), memory_cap)?;
     if set.reader.len() != record.sources.len()
         || set.reader.stack_context().samples_per_pixel != record.composite.samples_per_pixel
     {
@@ -436,7 +454,7 @@ fn open_pending_sources(
     composite: &Path,
     samples_per_pixel: u32,
 ) -> Result<FrameSet, ProjectError> {
-    let set = open_sources(paths, composite)?;
+    let set = open_sources(paths, composite, None)?;
     let found = set.reader.stack_context().samples_per_pixel;
     if found != samples_per_pixel {
         return Err(ProjectError::container(
@@ -704,10 +722,10 @@ fn render_pending<S: DocumentSample>(
 /// alignment the fusion used.
 fn render_ops<S: DocumentSample>(
     project: &mut Project,
-    checkpoint: &Checkpoint,
-    ancestor: &FuseRecord,
+    (checkpoint, ancestor): (&Checkpoint, &FuseRecord),
     strokes: &[PlacedStroke],
     tile: Rect,
+    memory_cap: Option<u64>,
     sink: &mut RenderSink<'_, S>,
 ) -> Result<(), ProjectError> {
     let spp = ancestor.composite.samples_per_pixel;
@@ -732,7 +750,7 @@ fn render_ops<S: DocumentSample>(
         .iter()
         .map(|s| project.source_path(s))
         .collect();
-    let set = open_checkpoint_sources(project, checkpoint, &paths, ancestor)?;
+    let set = open_checkpoint_sources(project, checkpoint, &paths, ancestor, memory_cap)?;
     let gained = GainReader::new(&*set.reader, ancestor.registration.gains());
     let warping = warp(&set, &gained, &ancestor.registration, paths.len(), spp);
     let project_path = project.path().to_path_buf();
@@ -758,9 +776,17 @@ fn render_ops<S: DocumentSample>(
 /// above white included. [`CheckpointImage::prepare`] then the render, into a
 /// `.partial` sibling of `path`, renamed onto it only once every band has
 /// been written; removed instead on any error, so a refused or interrupted
-/// render leaves nothing behind.
-pub fn render_checkpoint(project: &mut Project, id: &str, path: &Path) -> Result<(), ProjectError> {
-    let image = CheckpointImage::prepare(project, id)?;
+/// render leaves nothing behind. `memory_cap` lowers the budget of the source
+/// frame set an op-bearing checkpoint opens; a cap below the frames' decode
+/// reservation refuses the render.
+pub fn render_checkpoint(
+    project: &mut Project,
+    id: &str,
+    path: &Path,
+    memory_cap: Option<u64>,
+) -> Result<(), ProjectError> {
+    let mut image = CheckpointImage::prepare(project, id)?;
+    image.memory_cap = memory_cap;
     match image.sample_format {
         SampleFormat::U16 => write_tiff(
             &image,
