@@ -1499,13 +1499,21 @@ pub fn push_performance_view(app: &AppWindow, controller: &Arc<Mutex<AppControll
 fn performance_change(
     app_weak: &slint::Weak<AppWindow>,
     controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
     change: impl FnOnce(&mut AppController),
 ) {
     record_surface_input(InputSurface::Other);
-    change(&mut controller.lock().unwrap());
+    let session_started = {
+        let mut controller = controller.lock().unwrap();
+        change(&mut controller);
+        controller.take_session_started()
+    };
     if let Some(app) = app_weak.upgrade() {
         push_performance_view(&app, controller);
         direct_publication_scope(InputSurface::Other);
+        if session_started {
+            poll_edit_session(app.as_weak(), controller.clone(), canvas.clone());
+        }
     }
 }
 
@@ -3958,17 +3966,25 @@ pub fn install(
     app.on_settings_section_selected({
         let controller = controller.clone();
         let app_weak = app.as_weak();
+        let canvas = canvas.clone();
         move |section| {
             record_settings_input();
             let Some(parsed) = SettingsSection::from_slug(section.as_str()) else {
                 return;
             };
-            controller.lock().unwrap().select_settings_section(parsed);
+            let session_started = {
+                let mut controller = controller.lock().unwrap();
+                controller.select_settings_section(parsed);
+                controller.take_session_started()
+            };
             if let Some(app) = app_weak.upgrade() {
                 app.set_settings_section(parsed.slug().into());
                 push_performance_view(&app, &controller);
                 push_storage_view(&app, &controller);
                 direct_publication_scope(InputSurface::Settings);
+                if session_started {
+                    poll_edit_session(app.as_weak(), controller.clone(), canvas.clone());
+                }
             }
         }
     });
@@ -4130,32 +4146,54 @@ pub fn install(
     app.on_performance_cap_committed({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move || performance_change(&app_weak, &controller, |c| c.commit_cap_drafts())
+        let canvas = canvas.clone();
+        move || performance_change(&app_weak, &controller, &canvas, |c| c.commit_cap_drafts())
     });
     app.on_performance_host_unit_toggled({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move || performance_change(&app_weak, &controller, |c| c.toggle_host_unit_list())
+        let canvas = canvas.clone();
+        move || {
+            performance_change(&app_weak, &controller, &canvas, |c| {
+                c.toggle_host_unit_list()
+            })
+        }
     });
     app.on_performance_vram_unit_toggled({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move || performance_change(&app_weak, &controller, |c| c.toggle_vram_unit_list())
+        let canvas = canvas.clone();
+        move || {
+            performance_change(&app_weak, &controller, &canvas, |c| {
+                c.toggle_vram_unit_list()
+            })
+        }
     });
     app.on_performance_host_unit_selected({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move |unit| performance_change(&app_weak, &controller, |c| c.set_host_cap_unit(&unit))
+        let canvas = canvas.clone();
+        move |unit| {
+            performance_change(&app_weak, &controller, &canvas, |c| {
+                c.set_host_cap_unit(&unit)
+            })
+        }
     });
     app.on_performance_vram_unit_selected({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move |unit| performance_change(&app_weak, &controller, |c| c.set_vram_cap_unit(&unit))
+        let canvas = canvas.clone();
+        move |unit| {
+            performance_change(&app_weak, &controller, &canvas, |c| {
+                c.set_vram_cap_unit(&unit)
+            })
+        }
     });
     app.on_performance_unit_dismissed({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move || performance_change(&app_weak, &controller, |c| c.close_unit_lists())
+        let canvas = canvas.clone();
+        move || performance_change(&app_weak, &controller, &canvas, |c| c.close_unit_lists())
     });
     app.on_performance_host_cap_cursor_moved({
         let controller = controller.clone();

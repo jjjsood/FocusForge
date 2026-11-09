@@ -2348,6 +2348,9 @@ impl EditState {
     }
 }
 
+/// A frame set opened once and shared by the readers of a tab.
+pub type SharedFrames = Arc<dyn FrameReader>;
+
 /// Where an edit session or the origin readers get the stroke source frames.
 pub enum FrameSource {
     /// A frame set that is already open and read once for the whole tab.
@@ -2360,7 +2363,8 @@ pub enum FrameSource {
 }
 
 impl FrameSource {
-    fn into_reader(self) -> Result<Arc<dyn FrameReader>, EditSessionError> {
+    /// The frame set this source names, opened if it is not yet.
+    pub fn into_reader(self) -> Result<Arc<dyn FrameReader>, EditSessionError> {
         match self {
             FrameSource::Reader(reader) => Ok(reader),
             FrameSource::Open { frames, budget } => {
@@ -2416,6 +2420,15 @@ impl OriginReaders {
     /// The stroke source frames the readers sample.
     pub fn sources(&self) -> &Arc<dyn FrameReader> {
         &self.sources
+    }
+
+    /// These readers over `sources`, a re-opened set of the same frame files.
+    pub fn with_sources(&self, sources: Arc<dyn FrameReader>) -> Self {
+        Self {
+            ancestor: Arc::clone(&self.ancestor),
+            sources,
+            registration: self.registration.clone(),
+        }
     }
 
     /// Replays `ops` over the ancestor composite and returns where each

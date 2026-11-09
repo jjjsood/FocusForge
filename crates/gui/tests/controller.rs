@@ -5696,6 +5696,241 @@ fn edit_session_below_the_memory_cap_drops_to_stacking() {
     common::enter_editor(&mut c);
 }
 
+const DEFLATE_SET: &str = "mantis-64-deflate-p1-strip-ii";
+
+/// Fuses a new tab over three decoded-TIFF frames and opens its editor
+/// session; `cap` is the limit it opens under.
+fn open_capped_session(c: &mut AppController, name: &str, cap: &str) {
+    c.install_performance(memory_cap(cap));
+    common::open_fixture_tab(c, name, DEFLATE_SET, 3);
+    c.set_param_value(
+        "prepare",
+        "equalize",
+        focusforge_core::params::ParamValue::Bool(false),
+    );
+    assert!(c.start_fuse());
+    settle_all(c);
+    common::enter_editor(c);
+}
+
+/// The active tab's session reader.
+fn session_reader(c: &AppController) -> Arc<dyn focusforge_core::io::FrameReader> {
+    Arc::clone(&c.edit_session().expect("a session is open").sources)
+}
+
+/// Every resident display sample of the active tab's session.
+fn resident_samples(c: &AppController) -> Vec<u16> {
+    let map = map_rect(c);
+    let mut out = vec![0u16; (map.width * map.height * 3) as usize];
+    c.edit_session().unwrap().tiles.overlay_into(map, &mut out);
+    out
+}
+
+fn memory_warnings(c: &AppController) -> Vec<String> {
+    c.notifications()
+        .iter()
+        .filter(|n| n.kind == focusforge_gui::notifications::Kind::Warning)
+        .map(|n| n.message.clone())
+        .collect()
+}
+
+#[test]
+fn changed_memory_limit_reopens_the_session_frames() {
+    let mut c = scratch_controller("limit_reopens");
+    c.set_resident_tile_size_for_test(16);
+    open_capped_session(&mut c, "limit_reopens_a", "1048576");
+    common::paint(&mut c, dab(1, (20, 20), 8.0, BrushMode::Normal, 1.0));
+    common::paint(&mut c, dab(2, (40, 40), 8.0, BrushMode::Normal, 1.0));
+    c.undo();
+    common::settle_region_renders(&mut c);
+    let with_one = resident_samples(&c);
+    c.redo();
+    common::settle_region_renders(&mut c);
+    let with_both = resident_samples(&c);
+    assert_ne!(with_one, with_both, "the redone stroke is visible");
+    c.undo();
+    common::settle_region_renders(&mut c);
+    assert_eq!(resident_samples(&c), with_one);
+    let old_a = session_reader(&c);
+
+    c.set_mode(ShellMode::Stacking);
+    open_capped_session(&mut c, "limit_reopens_b", "1048576");
+    let old_b = session_reader(&c);
+
+    c.set_host_memory_cap("2MiB");
+    assert!(c.take_session_started(), "the re-opens started");
+    common::settle_session(&mut c);
+
+    assert!(!Arc::ptr_eq(&old_b, &session_reader(&c)), "tab B re-opened");
+    c.select_project(0);
+    let new_a = session_reader(&c);
+    assert!(!Arc::ptr_eq(&old_a, &new_a), "tab A re-opened");
+    let session = c.edit_session().unwrap();
+    assert_eq!(session.op_count(), 1);
+    assert!(session.can_undo() && session.can_redo());
+    assert_eq!(resident_samples(&c), with_one, "resident tiles kept");
+    c.redo();
+    common::settle_region_renders(&mut c);
+    assert_eq!(
+        resident_samples(&c),
+        with_both,
+        "the new reader renders the same samples"
+    );
+
+    c.set_host_memory_cap("2MiB");
+    assert!(!c.take_session_started(), "the same limit starts nothing");
+    assert!(Arc::ptr_eq(&new_a, &session_reader(&c)));
+}
+
+#[test]
+fn changed_memory_limit_keeps_origin_readers_shared() {
+    let path = saved_lighten_row("limit_origin", DEFLATE_SET);
+    let mut r = reopened_lighten_row(&path, "limit_origin_session");
+    r.install_performance(memory_cap("1048576"));
+    settle_origin_readers(&mut r);
+    common::enter_editor(&mut r);
+    assert!(readers_share_sources(&r));
+    let (_, zmap) = r.materialize_active_tab_planes().unwrap();
+    let before = overlay_pixels(&r, &zmap);
+    let old = session_reader(&r);
+
+    r.set_host_memory_cap("2MiB");
+    common::settle_session(&mut r);
+    assert!(
+        !Arc::ptr_eq(&old, &session_reader(&r)),
+        "the session re-opened"
+    );
+    assert!(readers_share_sources(&r), "the readers follow the swap");
+    assert_eq!(overlay_pixels(&r, &zmap), before);
+
+    let mut v = reopened_lighten_row(&path, "limit_origin_view");
+    v.install_performance(memory_cap("1048576"));
+    settle_origin_readers(&mut v);
+    let (_, zmap) = v.materialize_active_tab_planes().unwrap();
+    let before = overlay_pixels(&v, &zmap);
+    let old = Arc::clone(v.overlay_draw().unwrap().origin.unwrap().0.sources());
+    assert!(v.edit_session().is_none(), "readers without a session");
+    v.set_host_memory_cap("2MiB");
+    assert!(v.take_session_started());
+    common::settle_session(&mut v);
+    let new = Arc::clone(v.overlay_draw().unwrap().origin.unwrap().0.sources());
+    assert!(!Arc::ptr_eq(&old, &new), "the readers' frames re-opened");
+    assert_eq!(overlay_pixels(&v, &zmap), before);
+}
+
+/// Polls `settle_edit_session` to rest and returns how many different
+/// readers the active tab's session held on the way, counting the first.
+fn readers_installed(c: &mut AppController) -> usize {
+    let mut last = c.edit_session().map(|_| session_reader(c));
+    let mut changes = 0;
+    let start = Instant::now();
+    loop {
+        let done = c.settle_edit_session();
+        if c.edit_session().is_some() {
+            let now = session_reader(c);
+            if last.as_ref().is_none_or(|last| !Arc::ptr_eq(last, &now)) {
+                changes += 1;
+            }
+            last = Some(now);
+        }
+        if done {
+            return changes;
+        }
+        assert!(start.elapsed() < Duration::from_secs(60), "no settle");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn memory_limit_reopen_drops_stale_results() {
+    // Changed while the session is still opening: it lands, then re-opens.
+    let path = saved_lighten_row("limit_stale", DEFLATE_SET);
+    let mut c = reopened_lighten_row(&path, "limit_stale_reopened");
+    c.install_performance(memory_cap("1048576"));
+    assert!(c.set_mode(ShellMode::Editor));
+    assert!(c.take_session_started(), "the session is opening");
+    c.set_host_memory_cap("2MiB");
+    assert_eq!(readers_installed(&mut c), 2, "opened, then re-opened");
+    c.take_session_started();
+    c.set_host_memory_cap("2MiB");
+    assert!(
+        !c.take_session_started(),
+        "now opened at the limit in force"
+    );
+
+    // Changed twice while the first re-open runs: only the second installs.
+    c.set_host_memory_cap("3MiB");
+    c.set_host_memory_cap("4MiB");
+    assert_eq!(readers_installed(&mut c), 1);
+    c.take_session_started();
+    c.set_host_memory_cap("4MiB");
+    assert!(!c.take_session_started());
+
+    // A row change while a refused re-open runs: its result is dropped
+    // without a warning.
+    c.set_host_memory_cap("1");
+    c.select_checkpoint_row(0);
+    c.select_checkpoint_row(1);
+    common::settle_session(&mut c);
+    assert!(
+        memory_warnings(&c).is_empty(),
+        "a re-open from before the row change warned"
+    );
+}
+
+#[test]
+fn memory_limit_reopen_holds_back_the_session_open() {
+    let path = saved_lighten_row("limit_holds", DEFLATE_SET);
+    let mut r = reopened_lighten_row(&path, "limit_holds_reopened");
+    r.install_performance(memory_cap("1048576"));
+    settle_origin_readers(&mut r);
+    r.set_host_memory_cap("2MiB");
+    assert!(r.take_session_started());
+    assert!(r.set_mode(ShellMode::Editor));
+    assert!(
+        !r.take_session_started(),
+        "no session open beside the re-open"
+    );
+    common::enter_editor(&mut r);
+    assert!(
+        readers_share_sources(&r),
+        "the session adopted the new frames"
+    );
+}
+
+#[test]
+fn refused_memory_limit_reopen_keeps_the_session() {
+    let mut c = scratch_controller("limit_refused");
+    c.set_resident_tile_size_for_test(16);
+    open_capped_session(&mut c, "limit_refused", "1048576");
+    common::paint(&mut c, dab(1, (20, 20), 8.0, BrushMode::Normal, 1.0));
+    common::settle_region_renders(&mut c);
+    let old = session_reader(&c);
+
+    c.set_host_memory_cap("1");
+    assert!(c.take_session_started());
+    common::settle_session(&mut c);
+    assert!(
+        Arc::ptr_eq(&old, &session_reader(&c)),
+        "the old reader stays"
+    );
+    assert_eq!(c.edit_session().unwrap().op_count(), 1);
+    assert_eq!(c.mode(), ShellMode::Editor);
+    let warnings = memory_warnings(&c);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("limit of 1 "), "{}", warnings[0]);
+
+    c.set_host_memory_cap("1");
+    assert!(!c.take_session_started(), "the same limit starts nothing");
+    assert_eq!(memory_warnings(&c).len(), 1);
+
+    c.set_host_memory_cap("1048576");
+    assert!(c.take_session_started());
+    common::settle_session(&mut c);
+    assert!(!Arc::ptr_eq(&old, &session_reader(&c)), "raised: re-opened");
+    assert_eq!(memory_warnings(&c).len(), 1);
+}
+
 #[test]
 fn overlay_waits_for_lighten_darken_samples() {
     // Open session: stored colours until the readers settle.

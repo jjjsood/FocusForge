@@ -696,6 +696,9 @@ struct ProjectTab {
     /// Bumped whenever the session this tab holds, or is opening, is dropped:
     /// an opening session lands only while its generation is still this one.
     session_generation: u64,
+    /// The memory limit the frame set behind [`Self::edit`] and
+    /// [`Self::origin`] was last opened, or re-opened, under.
+    frames_cap: Option<u64>,
     /// This tab's own failed, cancelled or sources-missing run, if its most
     /// recent attempt did not succeed -- `None` once a later success clears
     /// it. Keyed by tab rather than by path so it survives an Unsaved ->
@@ -791,13 +794,26 @@ struct EditSlot {
     /// Set when a worker starts, until [`AppController::take_session_started`].
     started: bool,
     parked: Arc<Mutex<Vec<ParkedSession>>>,
+    /// Frame sets being re-opened under a changed memory limit: tab id,
+    /// session generation and the limit each was started for.
+    reopening: Vec<(u64, u64, Option<u64>)>,
+    parked_reopens: Arc<Mutex<Vec<ParkedReopen>>>,
 }
 
 type ParkedSession = (u64, u64, Result<job::EditState, String>);
 
+type ParkedReopen = (u64, u64, Option<u64>, Result<job::SharedFrames, String>);
+
 impl EditSlot {
     fn opening(&self, tab_id: u64, generation: u64) -> bool {
         self.in_flight.contains(&(tab_id, generation))
+    }
+
+    /// Whether the tab's frame set is being re-opened for `generation`.
+    fn reopening(&self, tab_id: u64, generation: u64) -> bool {
+        self.reopening
+            .iter()
+            .any(|&(tab, started, _)| (tab, started) == (tab_id, generation))
     }
 }
 
@@ -1015,6 +1031,7 @@ impl ProjectTab {
             origin: None,
             origin_failed: false,
             session_generation: 0,
+            frames_cap: None,
             failure: None,
         }
     }
@@ -2354,6 +2371,7 @@ impl AppController {
             return SessionOpen::Open;
         }
         if self.state.edits.opening(tab.id, tab.session_generation)
+            || self.state.edits.reopening(tab.id, tab.session_generation)
             || self.state.origin.opening(tab.id, tab.session_generation)
         {
             return SessionOpen::Opening;
@@ -2392,6 +2410,13 @@ impl AppController {
         let tile_size = self
             .resident_tile_size_for_test
             .unwrap_or(job::RESIDENT_TILE_SIZE);
+        if matches!(source, job::FrameSource::Open { .. }) {
+            let cap = self.performance.max_host_memory_bytes();
+            self.state
+                .active_mut()
+                .expect("the active tab was just read")
+                .frames_cap = cap;
+        }
         let slot = &mut self.state.edits;
         slot.in_flight.push((tab_id, generation));
         slot.started = true;
@@ -2424,6 +2449,7 @@ impl AppController {
     /// active tab in editor mode, drops the window to stacking. Returns
     /// `true` once no session is being opened -- the poll's cue to stop.
     pub fn settle_edit_session(&mut self) -> bool {
+        self.settle_reopened_frame_sets();
         let parked = std::mem::take(
             &mut *self
                 .state
@@ -2457,7 +2483,124 @@ impl AppController {
                 }
             }
         }
-        self.state.edits.in_flight.is_empty()
+        self.reopen_frame_sets();
+        self.state.edits.in_flight.is_empty() && self.state.edits.reopening.is_empty()
+    }
+
+    /// Re-opens the frame set of every tab holding a session or origin
+    /// readers that was opened under a memory limit other than the one in
+    /// force, on a worker each. A tab that is opening a session or readers,
+    /// or already re-opening, waits for the settle that follows.
+    fn reopen_frame_sets(&mut self) {
+        let cap = self.performance.max_host_memory_bytes();
+        let budget = self.frame_set_budget();
+        let slot = &mut self.state.edits;
+        for tab in &mut self.state.projects {
+            let (id, generation) = (tab.id, tab.session_generation);
+            if (tab.edit.is_none() && tab.origin.is_none())
+                || tab.frames_cap == cap
+                || slot.opening(id, generation)
+                || slot.reopening(id, generation)
+                || self.state.origin.opening(id, generation)
+            {
+                continue;
+            }
+            let frames = if tab.edit.is_some() {
+                tab.frames.clone()
+            } else if let Some((frames, _)) = tab.fused() {
+                frames
+            } else {
+                continue;
+            };
+            tab.frames_cap = cap;
+            slot.reopening.push((id, generation, cap));
+            slot.started = true;
+            let parked = Arc::clone(&slot.parked_reopens);
+            std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    job::FrameSource::Open { frames, budget }
+                        .into_reader()
+                        .map_err(|err| err.to_string())
+                }))
+                .map_err(|_| "the re-open worker panicked".to_string())
+                .and_then(|opened| opened);
+                parked
+                    .lock()
+                    .expect("no thread panicked while holding the parked re-opens")
+                    .push((id, generation, cap, result));
+            });
+        }
+    }
+
+    /// Installs the re-opened frame sets into the session and origin readers
+    /// of the tabs they were opened for. A result for a tab that is gone, at
+    /// another generation or opened under a limit no longer in force is
+    /// dropped; a refused one leaves the tab on its frames and warns.
+    fn settle_reopened_frame_sets(&mut self) {
+        let parked = std::mem::take(
+            &mut *self
+                .state
+                .edits
+                .parked_reopens
+                .lock()
+                .expect("no thread panicked while holding the parked re-opens"),
+        );
+        let landed = !parked.is_empty();
+        let cap = self.performance.max_host_memory_bytes();
+        for (tab_id, generation, opened_cap, result) in parked {
+            let reopening = &mut self.state.edits.reopening;
+            if let Some(at) = reopening
+                .iter()
+                .position(|&key| key == (tab_id, generation, opened_cap))
+            {
+                reopening.remove(at);
+            }
+            let Some(index) = self.tab_index(tab_id) else {
+                continue;
+            };
+            let tab = &mut self.state.projects[index];
+            if tab.session_generation != generation || opened_cap != cap {
+                continue;
+            }
+            match result {
+                Ok(reader) => {
+                    if let Some(origin) = &tab.origin {
+                        tab.origin = Some(Arc::new(origin.with_sources(Arc::clone(&reader))));
+                    }
+                    if let Some(edit) = &mut tab.edit {
+                        edit.sources = reader;
+                    }
+                }
+                Err(reason) => {
+                    tracing::warn!(error = %reason, "the frame set could not be re-opened");
+                    let (title, text) = match self.performance.max_host_memory.as_ref() {
+                        Some(cap) => (
+                            "Memory limit too small",
+                            format!(
+                                "The memory limit of {} is too small for this project's frames. \
+                                 This project keeps the frames it has open until the limit is raised.",
+                                cap.text
+                            ),
+                        ),
+                        None => (
+                            "Frames not re-opened",
+                            format!(
+                                "The frames could not be re-opened: {reason}. \
+                                 This project keeps the frames it has open."
+                            ),
+                        ),
+                    };
+                    let mut record = Notification::new(Kind::Warning, Source::Run, title, text);
+                    self.fill_project(&mut record, Some(index));
+                    self.publish_notification(record);
+                }
+            }
+        }
+        let wants_session = self.state.mode == ShellMode::Editor
+            || self.state.active().is_some_and(ProjectTab::on_ops_row);
+        if landed && wants_session && self.state.active().is_some_and(|tab| tab.edit.is_none()) {
+            self.ensure_edit_session();
+        }
     }
 
     /// Whether an editor session started opening since the last call -- the
@@ -2491,6 +2634,7 @@ impl AppController {
             || tab.origin_failed
             || self.state.origin.opening(tab.id, tab.session_generation)
             || self.state.edits.opening(tab.id, tab.session_generation)
+            || self.state.edits.reopening(tab.id, tab.session_generation)
             || !tab.overlay_ops().iter().any(|op| {
                 matches!(
                     op,
@@ -2532,6 +2676,12 @@ impl AppController {
             OriginComposite::Render { id, .. } => Some(id.clone()),
             OriginComposite::Cached(_) => None,
         };
+        if matches!(source, job::FrameSource::Open { .. }) {
+            self.state
+                .active_mut()
+                .expect("the active tab was just read")
+                .frames_cap = memory_cap;
+        }
         let slot = &mut self.state.origin;
         slot.in_flight.push((tab_id, generation, rendering));
         slot.started = true;
@@ -2661,6 +2811,7 @@ impl AppController {
         if wants_session && self.state.active().is_some_and(|tab| tab.edit.is_none()) {
             self.ensure_edit_session();
         }
+        self.reopen_frame_sets();
         self.state.origin.in_flight.is_empty()
     }
 
@@ -8454,6 +8605,7 @@ impl AppController {
                 self.host_notes.rejected = None;
                 self.save_performance();
                 self.refresh_source_previews();
+                self.reopen_frame_sets();
             }
             Err(_) => self.host_notes.rejected = Some(text.to_string()),
         }
