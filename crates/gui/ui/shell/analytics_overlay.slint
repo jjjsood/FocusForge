@@ -63,6 +63,7 @@ export component FFAnalyticsOverlay inherits Rectangle {
 
             VerticalLayout {
                 alignment: start;
+                padding-bottom: ShellGeometry.settings-content-inset-bottom;
 
                 for row in root.rows: FFAnalyticsRow {
                     chip: row.chip;
