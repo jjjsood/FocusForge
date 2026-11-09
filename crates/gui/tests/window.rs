@@ -500,7 +500,7 @@ fn both_sides_open_a_real_comparison_window() {
                 .arg("--open")
                 .arg(common::fixture_frame("mantis-64", 0))
                 .args(["--undock-pane", side, "--exit-after", "60000"])
-                .args(["--screenshot-when-ready"])
+                .arg("--screenshot-when-ready")
                 .args(["--screenshot-window", "comparison", "--screenshot"])
                 .arg(dir.join(format!("{side}.png")));
             command
