@@ -19,9 +19,10 @@ use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
 use crate::analytics::{AnalyticsView, RowValue};
+use crate::appearance_settings::SourcePresentation;
 use crate::canvas::{
     CanvasFeed, EditedView, OverlayDraw, Pane, PaneJob, PaneSource, Preparer, RepaintGate,
-    truncate_pane_label,
+    truncate_pane_label, truncate_tail,
 };
 use crate::controller::{
     AppController, ChromeKey, DockTab, GroupingQuestion, GuardSecondary, JobView, LocateTarget,
@@ -2337,6 +2338,18 @@ pub fn push_settings_scroll(app: &AppWindow, panel: &PanelModel) {
     });
 }
 
+/// Characters of a name the dock's name column holds: about 142 px in the
+/// list and large views, 88 px in the image list, at roughly 6 px a character.
+fn image_row_name_max_chars(presentation: SourcePresentation) -> usize {
+    match presentation {
+        SourcePresentation::List | SourcePresentation::Large => 21,
+        SourcePresentation::ImageList => 13,
+    }
+}
+
+/// Characters of a name the Analytics row's 112 px name column holds.
+const ANALYTICS_NAME_MAX_CHARS: usize = 16;
+
 /// Pushes the `Images` panel's whole state -- [`push_settings_panel`]'s
 /// twin.
 pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
@@ -2344,6 +2357,7 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
     prune_source_preview_images();
     app.set_editor_enabled(controller.editor_enabled());
     let panel = controller.images_panel();
+    let name_max = image_row_name_max_chars(controller.source_presentation());
     let mut native_previews = std::collections::HashSet::new();
     let mut native_preview_bytes = 0_u64;
     let rows: Vec<GeneratedImageRow> = panel
@@ -2363,7 +2377,8 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
             }
             GeneratedImageRow {
                 chip: slint::Color::from_rgb_u8(row.chip[0], row.chip[1], row.chip[2]),
-                name: row.name.clone().into(),
+                name: truncate_tail(&row.name, name_max).into(),
+                full_name: row.name.clone().into(),
                 time_text: row.trailing_text.clone().into(),
                 capture_stamp: row.capture_stamp.clone().into(),
                 excluded: row.excluded,
@@ -2708,7 +2723,7 @@ pub fn push_analytics(app: &AppWindow, controller: &AppController) {
         rows.iter()
             .map(|row| AnalyticsRowView {
                 chip: slint::Color::from_rgb_u8(row.chip[0], row.chip[1], row.chip[2]),
-                name: row.name.as_str().into(),
+                name: truncate_tail(&row.name, ANALYTICS_NAME_MAX_CHARS).into(),
                 mm_text: row.mm_text.as_str().into(),
                 fraction: row.fraction,
                 count: i32::try_from(row.count).unwrap_or(i32::MAX),

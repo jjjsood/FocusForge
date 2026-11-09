@@ -1200,6 +1200,7 @@ fn preview_row(chip: [u8; 3], name: &str, time: &str) -> focusforge_gui::ImageRo
         name: name.into(),
         time_text: time.into(),
         capture_stamp: "".into(),
+        full_name: "".into(),
         excluded: false,
         unresolved: false,
         selected: false,

@@ -479,6 +479,8 @@ def gate_retry_cases() -> None:
     assert isinstance(result, dict) and sleeps == [7.0]
     result, sleeps, _ = run(failure(429))
     assert isinstance(result, dict) and sleeps == [5.0]
+    result, sleeps, _ = run(failure(408))
+    assert isinstance(result, dict) and sleeps == [5.0], (result, sleeps)
     result, sleeps, _ = run(failure(502), urllib.error.URLError("offline"), TimeoutError("slow"))
     assert isinstance(result, dict) and sleeps == [5.0, 10.0, 20.0]
     for permanent in (failure(403), failure(403, **{"X-RateLimit-Remaining": "12"}), failure(404), failure(401)):
@@ -724,20 +726,22 @@ def symbol_download_cases() -> None:
         return pins, served
     def run(outcomes: list[Exception], served: dict[str, bytes], pins: dict, directory: Path) -> tuple[object, list[str], list[float], str]:
         script, calls, sleeps = list(outcomes), [], []
-        def urlopen(url: str, timeout: float) -> Reply:
+        def urlopen(request: object, timeout: float) -> Reply:
+            url = getattr(request, "full_url", request)
             calls.append(url)
             if script:
                 raise script.pop(0)
             return Reply(served[url])
-        saved = module.urllib.request.urlopen, module.time.sleep
-        module.urllib.request.urlopen, module.time.sleep = urlopen, sleeps.append
+        downloader = sys.modules["download"]
+        saved = downloader.urllib.request.urlopen, downloader.time.sleep
+        downloader.urllib.request.urlopen, downloader.time.sleep = urlopen, sleeps.append
         errors = io.StringIO()
         try:
             with contextlib.redirect_stderr(errors):
                 try: result: object = module.install(pins, "stackwalk", target, directory)
-                except (ValueError, urllib.error.HTTPError) as error: result = error
+                except (ValueError, OSError) as error: result = error
         finally:
-            module.urllib.request.urlopen, module.time.sleep = saved
+            downloader.urllib.request.urlopen, downloader.time.sleep = saved
         return result, calls, sleeps, errors.getvalue()
     def failure(code: int) -> urllib.error.HTTPError:
         return urllib.error.HTTPError("https://example.invalid/x", code, "stub", {}, None)
@@ -750,10 +754,11 @@ def symbol_download_cases() -> None:
         result, calls, sleeps, _ = run([ConnectionResetError("reset")], served, pins, Path(temporary) / "second")
         assert isinstance(result, Path) and len(calls) == 3 and sleeps == [5.0], (result, calls, sleeps)
         result, calls, sleeps, errors = run([failure(504)] * 9, served, pins, Path(temporary) / "down")
-        assert isinstance(result, urllib.error.HTTPError) and result.code == 504, result
-        assert len(calls) == 4 and sleeps == [5.0, 10.0, 20.0], (calls, sleeps)
+        assert isinstance(result, OSError) and "https://example.invalid/manifest.json" in str(result), result
+        assert "504" in str(result) and "8 attempts" in str(result), result
+        assert len(calls) == 8 and sleeps == [5.0, 10.0, 20.0, 40.0, 80.0, 90.0, 90.0], (calls, sleeps)
         lines = [line for line in errors.splitlines() if "https://example.invalid/manifest.json" in line]
-        assert len(lines) == 3, errors
+        assert len(lines) == 7, errors
         result, calls, sleeps, _ = run([failure(404)], served, pins, Path(temporary) / "missing")
         assert isinstance(result, urllib.error.HTTPError) and result.code == 404 and len(calls) == 1 and not sleeps, (result, calls)
     manifest_url = "https://example.invalid/manifest.json"
@@ -875,8 +880,8 @@ def symbol_tool_cases() -> None:
         manifest = {"artifacts": {payload.name: {"checksums": {"sha256": module.digest(payload)}, "target_triples": ["x86_64-unknown-linux-gnu"]}}}
         (cache / "stackwalk-0.0-manifest.json").write_text(json.dumps(manifest))
         pins = {"stackwalk": {"version": "0.0", "manifest_sha256": module.digest(cache / "stackwalk-0.0-manifest.json"), "artifact": [{"target": "x86_64-unknown-linux-gnu", "url": f"https://example.invalid/{payload.name}", "sha256": module.digest(payload), "executable": "minidump-stackwalk"}]}}
-        original = module.urllib.request.urlopen
-        module.urllib.request.urlopen = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("cached tool attempted network"))
+        original = sys.modules["download"].urllib.request.urlopen
+        sys.modules["download"].urllib.request.urlopen = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("cached tool attempted network"))
         try:
             assert module.install(pins, "stackwalk", "x86_64-unknown-linux-gnu", cache).is_file()
             payload.write_bytes(b"corrupt")
@@ -884,7 +889,7 @@ def symbol_tool_cases() -> None:
             except AssertionError: pass
             else: raise AssertionError("corrupt cached archive accepted without a verified replacement")
         finally:
-            module.urllib.request.urlopen = original
+            sys.modules["download"].urllib.request.urlopen = original
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         (root / "native").mkdir()
@@ -1699,6 +1704,7 @@ def macos_checker_mock() -> None:
         shutil.copytree(ROOT / "assets/completions", directory / "assets/completions")
         shutil.copytree(ROOT / "fixtures/mantis-64", directory / "fixtures/mantis-64")
         shutil.copy(ROOT / "tools/package-symbols.py", directory / "tools/package-symbols.py")
+        (directory / "tools/lib").mkdir(); shutil.copy(ROOT / "tools/lib/download.py", directory / "tools/lib/download.py")
         shutil.copy(ROOT / "tools/package-cli-assets.py", directory / "tools/package-cli-assets.py")
         shutil.copy(ROOT / "tools/symbolicate.py", directory / "tools/symbolicate.py")
         smoke = directory / "tools/smoke-release.sh"
@@ -1793,6 +1799,7 @@ def macos_producer_mock() -> None:
         shutil.copytree(ROOT / "assets/completions", root / "assets/completions")
         shutil.copytree(ROOT / "packaging", root / "packaging")
         shutil.copy(ROOT / "tools/package-symbols.py", tools / "package-symbols.py")
+        (tools / "lib").mkdir(); shutil.copy(ROOT / "tools/lib/download.py", tools / "lib/download.py")
         shutil.copy(ROOT / "tools/package-cli-assets.py", tools / "package-cli-assets.py")
         producer_copy = tools / "package-macos.sh"; producer_copy.write_text((ROOT / "tools/package-macos.sh").read_text())
         macho = root / "macho"; macho.write_bytes(thin_macho())
@@ -1940,6 +1947,7 @@ def windows_checker_mock() -> None:
         root = Path(temp) / "space root"; root.mkdir(); tools = root / "tools"; tools.mkdir()
         checker_copy = tools / "check-package-windows.ps1"; checker_copy.write_text((ROOT / "tools/check-package-windows.ps1").read_text())
         shutil.copy(ROOT / "tools/package-symbols.py", tools / "package-symbols.py")
+        (tools / "lib").mkdir(); shutil.copy(ROOT / "tools/lib/download.py", tools / "lib/download.py")
         shutil.copy(ROOT / "tools/symbolicate.py", tools / "symbolicate.py")
         shutil.copytree(ROOT / "packaging", root / "packaging")
         for name in ("Cargo.toml", "LICENSE", "NOTICE"): shutil.copy(ROOT / name, root / name)

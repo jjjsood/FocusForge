@@ -354,7 +354,10 @@ Release builds use line tables to create a same-build native debug archive and
 Breakpad store for both GUI and CLI. Preserve the platform symbol archive and
 its SHA-256 file with each installer; diagnose a retained minidump locally with
 `python3 tools/symbolicate.py MINIDUMP SYMBOL_ARCHIVE`. The command downloads
-only its pinned stackwalker and never contacts a symbol server.
+only its pinned stackwalker and never contacts a symbol server. Pinned-tool
+downloads in `package-symbols.py` and the check and book workflows go through
+`tools/lib/download.py`, which retries transient HTTP and network failures with
+backoff and fails at once on any other error.
 
 The symbol archives (`FocusForge-<version>-x86_64-unknown-linux-gnu-symbols.tar.gz`,
 `FocusForge-<version>-aarch64-apple-darwin-symbols.tar.gz` and
