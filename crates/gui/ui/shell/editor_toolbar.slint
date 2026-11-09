@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The editor-mode toolbar: brush size and softness, the pipette, undo/redo
+// The editor-mode toolbar: brush size, softness, blend mode and opacity, the pipette, undo/redo
 // and the checkpoint button.
 
 import { FFAppear } from "../components/ff_appear.slint";
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
+import { FFMenu } from "../components/ff_menu.slint";
 import { FFSlider } from "../components/ff_slider.slint";
 import { FFIconButton } from "../components/ff_icon_button.slint";
 import { FFButton } from "../components/ff_button.slint";
@@ -17,12 +18,18 @@ export component FFEditorToolbar inherits FFAppear {
     in property <int> size-ceiling: 1;
     in property <string> soft-text: "";
     in property <float> soft-fraction: 0.0;
+    in property <string> mode-label: "";
+    in property <bool> mode-menu-open: false;
+    in property <string> opacity-text: "";
+    in property <float> opacity-fraction: 0.0;
     in property <bool> picking: false;
     in property <bool> can-undo: false;
     in property <bool> can-redo: false;
     in property <bool> can-save-checkpoint: false;
     callback brush-size-fraction-changed(float);
     callback brush-softness-fraction-changed(float);
+    callback brush-opacity-fraction-changed(float);
+    callback brush-mode-menu-toggled();
     callback pipette-toggled();
     callback undo-requested();
     callback redo-requested();
@@ -30,6 +37,9 @@ export component FFEditorToolbar inherits FFAppear {
 
     height: ShellGeometry.toolbar-height;
     background: Theme.surface-raised;
+
+    property <length> track-width: ShellGeometry.editor-toolbar-narrow(root.width)
+        ? ShellGeometry.editor-toolbar-narrow-track-width : ShellGeometry.editor-toolbar-track-width;
 
     property <length> control-y: (root.height - ShellGeometry.toolbar-button-height) / 2;
 
@@ -43,27 +53,56 @@ export component FFEditorToolbar inherits FFAppear {
         x: ShellGeometry.editor-toolbar-size-track-x;
         y: (root.height - self.height) / 2;
         compact: true;
+        track-width: root.track-width;
         fraction: root.size-fraction;
         value-text: root.size-text;
         fraction-changed(f) => { root.brush-size-fraction-changed(f); }
     }
     FFRowText {
-        x: ShellGeometry.editor-toolbar-soft-caption-x;
+        x: ShellGeometry.editor-toolbar-soft-caption-x - ShellGeometry.editor-toolbar-shift(root.width, 1);
         height: parent.height;
         text: "Soft";
         muted: true;
     }
     FFSlider {
-        x: ShellGeometry.editor-toolbar-soft-track-x;
+        x: ShellGeometry.editor-toolbar-soft-track-x - ShellGeometry.editor-toolbar-shift(root.width, 1);
         y: (root.height - self.height) / 2;
         compact: true;
+        track-width: root.track-width;
         fraction: root.soft-fraction;
         value-text: root.soft-text;
         fraction-changed(f) => { root.brush-softness-fraction-changed(f); }
     }
+    FFMenu {
+        name: "Mode";
+        x: ShellGeometry.editor-toolbar-mode-menu-x - ShellGeometry.editor-toolbar-shift(root.width, 2);
+        y: root.control-y;
+        width: ShellGeometry.editor-toolbar-mode-menu-width;
+        field-height: ShellGeometry.toolbar-button-height;
+        chevron-inset: Theme.space-2;
+        external-list: true;
+        label: root.mode-label;
+        open: root.mode-menu-open;
+        toggled => { root.brush-mode-menu-toggled(); }
+    }
+    FFRowText {
+        x: ShellGeometry.editor-toolbar-opacity-caption-x - ShellGeometry.editor-toolbar-shift(root.width, 2);
+        height: parent.height;
+        text: "Opacity";
+        muted: true;
+    }
+    FFSlider {
+        x: ShellGeometry.editor-toolbar-opacity-track-x - ShellGeometry.editor-toolbar-shift(root.width, 2);
+        y: (root.height - self.height) / 2;
+        compact: true;
+        track-width: root.track-width;
+        fraction: root.opacity-fraction;
+        value-text: root.opacity-text;
+        fraction-changed(f) => { root.brush-opacity-fraction-changed(f); }
+    }
     pipette := FFIconButton {
         name: "Pipette";
-        x: ShellGeometry.editor-toolbar-pipette-x;
+        x: ShellGeometry.editor-toolbar-pipette-x - ShellGeometry.editor-toolbar-shift(root.width, 3);
         y: root.control-y;
         width: ShellGeometry.editor-toolbar-icon-width;
         height: ShellGeometry.toolbar-button-height;
@@ -74,7 +113,7 @@ export component FFEditorToolbar inherits FFAppear {
     }
     undo := FFIconButton {
         name: "Undo";
-        x: ShellGeometry.editor-toolbar-undo-x;
+        x: ShellGeometry.editor-toolbar-undo-x - ShellGeometry.editor-toolbar-shift(root.width, 3);
         y: root.control-y;
         width: ShellGeometry.editor-toolbar-icon-width;
         height: ShellGeometry.toolbar-button-height;
@@ -85,7 +124,7 @@ export component FFEditorToolbar inherits FFAppear {
     }
     redo := FFIconButton {
         name: "Redo";
-        x: ShellGeometry.editor-toolbar-redo-x;
+        x: ShellGeometry.editor-toolbar-redo-x - ShellGeometry.editor-toolbar-shift(root.width, 3);
         y: root.control-y;
         width: ShellGeometry.editor-toolbar-icon-width;
         height: ShellGeometry.toolbar-button-height;

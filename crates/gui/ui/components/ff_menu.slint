@@ -30,6 +30,8 @@ export component FFMenu inherits Rectangle {
     // The chevron's distance from the right edge; a narrow menu draws it
     // closer so the label keeps its room.
     in property <length> chevron-inset: Theme.space-4;
+    // The closed row's height; the open list starts below it.
+    in property <length> field-height: ShellGeometry.field-height;
     callback toggled();
     callback option-selected(string);
     callback previous-requested();
@@ -40,7 +42,7 @@ export component FFMenu inherits Rectangle {
     // The closed row is the whole component's own height -- the open list
     // draws over the content below rather than pushing it, so it is not
     // counted in this element's own layout height.
-    height: ShellGeometry.field-height;
+    height: root.field-height;
     accessible-role: combobox;
     accessible-label: root.name;
     accessible-value: root.label;
@@ -51,7 +53,7 @@ export component FFMenu inherits Rectangle {
 
     closed := FFField {
         width: 100%;
-        height: ShellGeometry.field-height;
+        height: root.field-height;
         text: root.label;
         focused: root.focused || root.open || focus.has-focus;
         disabled: root.disabled;
@@ -60,7 +62,7 @@ export component FFMenu inherits Rectangle {
 
     chevron := Text {
         x: parent.width - root.chevron-inset - self.width;
-        y: (ShellGeometry.field-height - self.height) / 2;
+        y: (root.field-height - self.height) / 2;
         text: "\u{2304}";
         color: Theme.text-secondary;
         font-size: Theme.text-value.size;
@@ -68,7 +70,7 @@ export component FFMenu inherits Rectangle {
 
     area := TouchArea {
         width: 100%;
-        height: ShellGeometry.field-height;
+        height: root.field-height;
         enabled: !root.disabled;
         clicked => { root.toggled(); }
     }
@@ -97,7 +99,7 @@ export component FFMenu inherits Rectangle {
 
     if root.open && !root.external-list: FFMenuList {
         x: 0px;
-        y: ShellGeometry.field-height;
+        y: root.field-height;
         width: parent.width;
         choices: root.choices;
         choice-ids: root.choice-ids;

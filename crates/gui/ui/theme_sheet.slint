@@ -1458,6 +1458,75 @@ export component ThemeSheet inherits Window {
             }
         }
 
+        GroupHeading { text: "Editor toolbar: mode menu (closed, focused, open), compact sliders (72 and 44 px tracks; 1 %, 100 %, keyboard focus)"; }
+        Rectangle {
+            width: 420px;
+            height: 140px;
+            background: Theme.surface-raised;
+
+            FFMenu {
+                x: 12px;
+                y: 7px;
+                width: 80px;
+                field-height: ShellGeometry.toolbar-button-height;
+                chevron-inset: Theme.space-2;
+                label: "Normal";
+                choices: ["Normal", "Lighten", "Darken", "Detail"];
+                choice-ids: ["normal", "lighten", "darken", "detail"];
+                show-choice-ids: false;
+                selected: "normal";
+            }
+            FFMenu {
+                x: 112px;
+                y: 7px;
+                width: 80px;
+                field-height: ShellGeometry.toolbar-button-height;
+                chevron-inset: Theme.space-2;
+                label: "Normal";
+                choices: ["Normal", "Lighten", "Darken", "Detail"];
+                choice-ids: ["normal", "lighten", "darken", "detail"];
+                show-choice-ids: false;
+                selected: "normal";
+                focused: true;
+            }
+            FFMenu {
+                x: 212px;
+                y: 7px;
+                width: 80px;
+                field-height: ShellGeometry.toolbar-button-height;
+                chevron-inset: Theme.space-2;
+                label: "Normal";
+                choices: ["Normal", "Lighten", "Darken", "Detail"];
+                choice-ids: ["normal", "lighten", "darken", "detail"];
+                show-choice-ids: false;
+                selected: "normal";
+                open: true;
+                external-list: true;
+            }
+            FFMenuList {
+                x: 212px;
+                y: 33px;
+                width: 80px;
+                choices: ["Normal", "Lighten", "Darken", "Detail"];
+                choice-ids: ["normal", "lighten", "darken", "detail"];
+                show-choice-ids: false;
+                chosen-accent: true;
+                selected: "normal";
+            }
+        }
+        Rectangle {
+            width: 420px;
+            height: 80px;
+            background: Theme.surface-raised;
+
+            FFSlider { x: 12px; y: 7px; width: 120px; compact: true; track-width: 72px; fraction: 0.0; value-text: "1%"; }
+            FFSlider { x: 148px; y: 7px; width: 120px; compact: true; track-width: 72px; fraction: 1.0; value-text: "100%"; }
+            FFSlider { x: 284px; y: 7px; width: 120px; compact: true; track-width: 72px; fraction: 0.5; value-text: "50%"; focused: true; }
+            FFSlider { x: 12px; y: 47px; width: 92px; compact: true; track-width: 44px; fraction: 0.0; value-text: "1%"; }
+            FFSlider { x: 148px; y: 47px; width: 92px; compact: true; track-width: 44px; fraction: 1.0; value-text: "100%"; }
+            FFSlider { x: 284px; y: 47px; width: 92px; compact: true; track-width: 44px; fraction: 0.5; value-text: "50%"; focused: true; }
+        }
+
         GroupHeading { text: "Editor toolbar: sliders, filled and selected icon buttons, inert button"; }
         Rectangle {
             height: ShellGeometry.toolbar-height;

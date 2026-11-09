@@ -424,6 +424,10 @@ struct InputState {
 struct BrushState {
     size: f32,
     soft: f32,
+    mode: job::BrushMode,
+    /// A whole percentage, `1.0..=100.0`.
+    opacity: f32,
+    mode_menu_open: bool,
     picking: bool,
 }
 
@@ -432,6 +436,9 @@ impl Default for BrushState {
         Self {
             size: 64.0,
             soft: 30.0,
+            mode: job::BrushMode::Normal,
+            opacity: 100.0,
+            mode_menu_open: false,
             picking: false,
         }
     }
@@ -490,6 +497,12 @@ pub struct BrushToolbarView {
     pub soft: f32,
     /// The linear slider's own thumb position, `0.0..=1.0`.
     pub soft_fraction: f32,
+    pub mode: job::BrushMode,
+    /// A whole percentage, `1.0..=100.0`.
+    pub opacity: f32,
+    /// The opacity slider's thumb position, `0.01..=1.0`.
+    pub opacity_fraction: f32,
+    pub mode_menu_open: bool,
     pub picking: bool,
     /// Whether the active tab's edit session has an op to undo/redo.
     pub can_undo: bool,
@@ -1236,8 +1249,8 @@ impl ProjectTab {
                 path: stroke.path_so_far(),
                 radius: stroke.radius(),
                 softness: stroke.softness(),
-                mode: job::BrushMode::Normal,
-                opacity: 1.0,
+                mode: stroke.mode(),
+                opacity: stroke.opacity(),
             });
         }
         ops
@@ -3682,6 +3695,10 @@ impl AppController {
             size_fraction: fraction_from_size(size, ceiling),
             soft: self.state.brush.soft,
             soft_fraction: self.state.brush.soft / 100.0,
+            mode: self.state.brush.mode,
+            opacity: self.state.brush.opacity,
+            opacity_fraction: self.state.brush.opacity / 100.0,
+            mode_menu_open: self.state.brush.mode_menu_open,
             picking: self.state.brush.picking,
             can_undo: self.edit_session().is_some_and(job::EditState::can_undo),
             can_redo: self.edit_session().is_some_and(job::EditState::can_redo),
@@ -3743,6 +3760,38 @@ impl AppController {
         self.emit(ShellEvent::EditorChanged);
     }
 
+    /// The opacity slider's own callback: `fraction` is `0.0..=1.0` along
+    /// the track and lands on a whole percentage of at least 1, so the
+    /// stroke it freezes is never fully transparent.
+    pub fn set_brush_opacity_fraction(&mut self, fraction: f32) {
+        self.state.brush.opacity = (fraction * 100.0).round().clamp(1.0, 100.0);
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// Picks the brush's blend mode and closes the mode list.
+    pub fn set_brush_mode(&mut self, mode: job::BrushMode) {
+        self.state.brush.mode = mode;
+        self.state.brush.mode_menu_open = false;
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// Opens or closes the mode list. A no-op outside the editor.
+    pub fn toggle_brush_mode_menu(&mut self) {
+        if self.mode() != ShellMode::Editor {
+            return;
+        }
+        self.state.brush.mode_menu_open = !self.state.brush.mode_menu_open;
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// Closes the mode list; nothing else changes.
+    pub fn close_brush_mode_menu(&mut self) {
+        if self.state.brush.mode_menu_open {
+            self.state.brush.mode_menu_open = false;
+            self.emit(ShellEvent::EditorChanged);
+        }
+    }
+
     /// Toggles the pipette's armed state.
     pub fn toggle_pipette(&mut self) {
         self.state.brush.picking = !self.state.brush.picking;
@@ -3756,6 +3805,12 @@ impl AppController {
         let ceiling = self.brush_size_ceiling();
         let size = self.state.brush.size.clamp(1.0, ceiling as f32);
         (size / 2.0, self.state.brush.soft / 100.0)
+    }
+
+    /// The brush's blend mode and opacity in the storage units core's
+    /// retouch ops take (`opacity` as a fraction of one).
+    fn brush_mode_opacity(&self) -> (job::BrushMode, f32) {
+        (self.state.brush.mode, self.state.brush.opacity / 100.0)
     }
 
     /// `Ctrl + Z`: steps the active tab's pending strokes back one op and
@@ -3905,6 +3960,10 @@ impl AppController {
     /// softness for the stroke. Both panes share one viewport, so the stroke
     /// is the same whichever pane the press lands in.
     fn paint_start(&mut self, x: f32, y: f32) {
+        if self.state.brush.mode_menu_open {
+            self.close_brush_mode_menu();
+            return;
+        }
         if self.state.brush.picking {
             let (pane, local) = self.anchor_pane();
             self.pick_source_at(pane, local);
@@ -3929,6 +3988,7 @@ impl AppController {
             return;
         };
         let (radius, softness) = self.brush_radius_softness();
+        let (mode, opacity) = self.brush_mode_opacity();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -3943,6 +4003,8 @@ impl AppController {
             source,
             radius,
             softness,
+            mode,
+            opacity,
             sx as f32 - 0.5,
             sy as f32 - 0.5,
         ));
@@ -3986,21 +4048,22 @@ impl AppController {
             return;
         };
         let (source_id, radius, softness) = (stroke.source(), stroke.radius(), stroke.softness());
+        let (mode, opacity) = (stroke.mode(), stroke.opacity());
         let op = job::Op::BrushStroke {
             source_id,
             path: segment,
             radius,
             softness,
-            mode: job::BrushMode::Normal,
-            opacity: 1.0,
+            mode,
+            opacity,
         };
         let so_far = job::Op::BrushStroke {
             source_id,
             path: stroke.path_so_far(),
             radius,
             softness,
-            mode: job::BrushMode::Normal,
-            opacity: 1.0,
+            mode,
+            opacity,
         };
         let region = job::footprint(&op, edit.info())
             .expect("a live stroke's own points are pre-clamped to what validate accepts");
@@ -4043,8 +4106,8 @@ impl AppController {
             path: stroke.finish(),
             radius: stroke.radius(),
             softness: stroke.softness(),
-            mode: job::BrushMode::Normal,
-            opacity: 1.0,
+            mode: stroke.mode(),
+            opacity: stroke.opacity(),
         };
         let has_footprint = job::footprint(&op, edit.info()).ok().flatten().is_some();
         let mut touched = stroke.tick_rects;
@@ -5692,6 +5755,10 @@ impl AppController {
             }
             if self.state.analytics.open {
                 self.close_analytics();
+                return ChromeKey::Consumed;
+            }
+            if self.state.brush.mode_menu_open {
+                self.close_brush_mode_menu();
                 return ChromeKey::Consumed;
             }
             return ChromeKey::None;

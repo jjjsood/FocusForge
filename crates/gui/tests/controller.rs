@@ -327,6 +327,7 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("ff_menu.slint"), "key-pressed(event)")
             | (Some("ff_slider.slint"), "pointer-event(event)")
             | (Some("ff_slider.slint"), "key-pressed(event)")
+            | (Some("ff_slider.slint"), "focus-changed-event(reason)")
             | (Some("ff_image_row.slint"), "pointer-event(event)")
             | (Some("ff_image_row.slint"), "moved")
             | (Some("images_panel.slint"), "clicked")
@@ -6429,7 +6430,15 @@ fn live_stroke_previews_each_new_segment() {
 
     release(&mut c, at(trace[44].0, trace[44].1));
     common::settle_region_renders(&mut c);
-    let mut live = LiveStroke::new(source, radius, softness, trace[0].0, trace[0].1);
+    let mut live = LiveStroke::new(
+        source,
+        radius,
+        softness,
+        BrushMode::Normal,
+        1.0,
+        trace[0].0,
+        trace[0].1,
+    );
     for w in trace.windows(2) {
         live.push(w[1].0 - w[0].0, w[1].1 - w[0].1);
     }
@@ -8362,15 +8371,48 @@ fn duplicated_tab_keeps_crop_and_remembered_values() {
 // never paints what the canvas shows.
 // ---------------------------------------------------------------------
 
+/// The blend mode and opacity percentage of each scripted stroke, in
+/// drawing order: every mode, every opacity below 100 %.
+const SCRIPTED_LOOKS: [(BrushMode, u32); 6] = [
+    (BrushMode::Lighten, 70),
+    (BrushMode::Darken, 40),
+    (BrushMode::Detail, 55),
+    (BrushMode::Normal, 85),
+    (BrushMode::Lighten, 25),
+    (BrushMode::Detail, 60),
+];
+
+/// Picks the brush's mode and an opacity of `percent` through the toolbar's
+/// own setters.
+fn set_look(c: &mut AppController, mode: BrushMode, percent: u32) {
+    c.set_brush_mode(mode);
+    c.set_brush_opacity_fraction(percent as f32 / 100.0);
+}
+
+/// The mode and opacity each op of `ops` carries.
+fn looks(ops: &[Op]) -> Vec<(BrushMode, f32)> {
+    ops.iter()
+        .map(|op| match op {
+            Op::BrushStroke { mode, opacity, .. } => (*mode, *opacity),
+            other => panic!("a brush stroke, got {other:?}"),
+        })
+        .collect()
+}
+
 /// The strokes the live-view tests paint: three softness classes, each a
-/// press-and-release dab then a ticked drag from another frame.
+/// press-and-release dab then a ticked drag from another frame, every
+/// stroke in its own mode and opacity.
 fn paint_scripted_strokes(c: &mut AppController) {
     set_size(c, 10.0);
     for (i, softness) in [0.0f32, 0.5, 1.0].into_iter().enumerate() {
         c.set_brush_softness_fraction(softness);
         c.select_frame((i + 1) % 3);
         let x = 8.0 + 16.0 * i as f32;
+        let (mode, percent) = SCRIPTED_LOOKS[2 * i];
+        set_look(c, mode, percent);
         drag(c, &[(x, 10.0)]);
+        let (mode, percent) = SCRIPTED_LOOKS[2 * i + 1];
+        set_look(c, mode, percent);
         drag_ticked(
             c,
             &[
@@ -8382,6 +8424,11 @@ fn paint_scripted_strokes(c: &mut AppController) {
         );
     }
     assert_eq!(ops(c).len(), 6);
+    let expected: Vec<(BrushMode, f32)> = SCRIPTED_LOOKS
+        .iter()
+        .map(|&(mode, percent)| (mode, percent as f32 / 100.0))
+        .collect();
+    assert_eq!(looks(&ops(c)), expected, "each stroke carries its own look");
 }
 
 /// Gives `c` the blend kernel on `device`, when there is one.
@@ -8697,6 +8744,15 @@ fn live_stroke_at_the_image_edge_matches_the_saved_render() {
 #[test]
 fn brush_stroke_appends_soft_op() {
     let (mut c, _) = open_editor("brush_soft_op");
+    let fresh = c.brush_toolbar_view();
+    assert_eq!(
+        fresh.mode,
+        BrushMode::Normal,
+        "a fresh window starts at Normal"
+    );
+    assert_eq!(fresh.opacity, 100.0);
+    assert_eq!(fresh.opacity_fraction, 1.0);
+    assert!(!fresh.mode_menu_open);
     set_size(&mut c, 14.0);
     c.select_frame(2);
     let view = c.brush_toolbar_view();
@@ -8728,6 +8784,167 @@ fn brush_stroke_appends_soft_op() {
             },
         ]
     );
+}
+
+#[test]
+fn brush_stroke_appends_mode_and_opacity() {
+    let (mut c, _) = open_editor("brush_mode_opacity");
+    set_size(&mut c, 6.0);
+    c.select_frame(1);
+    let mut expected = Vec::new();
+    for (m, mode) in [
+        BrushMode::Normal,
+        BrushMode::Lighten,
+        BrushMode::Darken,
+        BrushMode::Detail,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (p, percent) in [1u32, 37, 50, 99, 100].into_iter().enumerate() {
+            set_look(&mut c, mode, percent);
+            let view = c.brush_toolbar_view();
+            assert_eq!((view.mode, view.opacity), (mode, percent as f32));
+            let i = 5 * m + p;
+            let (x, y) = (4.0 + 5.0 * (i % 10) as f32, 8.0 + 24.0 * (i / 10) as f32);
+            drag(&mut c, &[(x, y), (x, y + 8.0)]);
+            expected.push((mode, percent as f32 / 100.0));
+        }
+    }
+    assert_eq!(looks(&ops(&c)), expected);
+}
+
+#[test]
+fn mode_and_opacity_freeze_at_stroke_start() {
+    let (mut c, _) = open_editor("brush_look_freeze");
+    set_size(&mut c, 6.0);
+    c.select_frame(1);
+    c.set_overlay_on(true);
+    set_look(&mut c, BrushMode::Darken, 40);
+    press(&mut c, at(10.0, 10.0));
+    let (x, y) = at(14.0, 16.0);
+    c.pointer_moved(x, y);
+
+    set_look(&mut c, BrushMode::Lighten, 90);
+    let (x, y) = at(20.0, 20.0);
+    c.pointer_moved(x, y);
+    c.flush_live_stroke();
+
+    let frozen = (BrushMode::Darken, 0.4);
+    let live = c
+        .edit_session()
+        .unwrap()
+        .stroke
+        .as_ref()
+        .expect("a live stroke");
+    assert_eq!(
+        (live.mode(), live.opacity()),
+        frozen,
+        "the tick ops' source"
+    );
+    let drawn = c.overlay_draw().expect("the overlay is on").ops;
+    assert_eq!(
+        looks(&drawn[drawn.len() - 1..]),
+        vec![frozen],
+        "the overlay op"
+    );
+
+    release(&mut c, at(20.0, 20.0));
+    common::settle_region_renders(&mut c);
+    assert_eq!(looks(&ops(&c)), vec![frozen], "the appended op");
+
+    drag(&mut c, &[(40.0, 10.0), (40.0, 20.0)]);
+    assert_eq!(
+        looks(&ops(&c)),
+        vec![frozen, (BrushMode::Lighten, 0.9)],
+        "the next stroke takes the new look"
+    );
+}
+
+#[test]
+fn opacity_slider_clamps_to_one_percent() {
+    let (mut c, _) = open_editor("opacity_slider_clamp");
+    for (fraction, percent) in [
+        (-0.3f32, 1.0f32),
+        (0.0, 1.0),
+        (0.004, 1.0),
+        (0.504, 50.0),
+        (1.0, 100.0),
+        (1.7, 100.0),
+    ] {
+        c.set_brush_opacity_fraction(fraction);
+        let view = c.brush_toolbar_view();
+        assert_eq!(view.opacity, percent, "fraction {fraction}");
+        assert_eq!(
+            view.opacity_fraction,
+            percent / 100.0,
+            "thumb at {fraction}"
+        );
+    }
+    for percent in 1..=100u32 {
+        c.set_brush_opacity_fraction(percent as f32 / 100.0);
+        assert_eq!(c.brush_toolbar_view().opacity, percent as f32);
+    }
+
+    let path = save_to_proposed(&mut c);
+    let known = saved_ids(&path);
+    set_size(&mut c, 6.0);
+    c.select_frame(1);
+    c.set_brush_opacity_fraction(0.0);
+    drag(&mut c, &[(10.0, 10.0), (20.0, 20.0)]);
+    assert_eq!(
+        looks(&ops(&c)),
+        vec![(BrushMode::Normal, 0.01)],
+        "accepted by append"
+    );
+    assert!(c.save_active_project(|_| None));
+    assert_eq!(
+        looks(&added_checkpoint(&path, &known).ops),
+        vec![(BrushMode::Normal, 0.01)],
+        "the 1 % stroke saved"
+    );
+}
+
+#[test]
+fn mode_list_closes_on_choice_field_escape_and_canvas_press() {
+    use focusforge_gui::ChromeKey;
+    let (mut c, _) = open_editor("brush_mode_list");
+    let open = |c: &AppController| c.brush_toolbar_view().mode_menu_open;
+    let escape = |c: &mut AppController| c.chrome_key("\u{1b}", NO_MODS);
+    set_size(&mut c, 6.0);
+    c.select_frame(1);
+
+    c.toggle_brush_mode_menu();
+    assert!(open(&c), "a press on the field opens the list");
+    c.toggle_brush_mode_menu();
+    assert!(!open(&c), "a second press on the field closes it");
+
+    c.toggle_brush_mode_menu();
+    c.set_brush_mode(BrushMode::Detail);
+    assert!(!open(&c), "a choice closes the list");
+    assert_eq!(c.brush_toolbar_view().mode, BrushMode::Detail);
+
+    c.toggle_brush_mode_menu();
+    assert!(matches!(escape(&mut c), ChromeKey::Consumed));
+    assert!(!open(&c), "Escape closes the list");
+    assert!(
+        matches!(escape(&mut c), ChromeKey::None),
+        "nothing left to close"
+    );
+
+    c.toggle_brush_mode_menu();
+    press(&mut c, at(20.0, 20.0));
+    release(&mut c, at(20.0, 20.0));
+    common::settle_region_renders(&mut c);
+    assert!(!open(&c), "a canvas press closes the list");
+    assert!(ops(&c).is_empty(), "and paints nothing");
+    assert!(!c.brush_toolbar_view().can_undo);
+    drag(&mut c, &[(20.0, 20.0), (30.0, 30.0)]);
+    assert_eq!(ops(&c).len(), 1, "the next press paints");
+
+    assert!(c.set_mode(ShellMode::Stacking));
+    c.toggle_brush_mode_menu();
+    assert!(!open(&c), "the list opens in the editor only");
 }
 
 /// `ops` over the sealed composite at `composite`, rendered whole by the
@@ -8837,11 +9054,17 @@ fn pending_strokes_append_on_save() {
     let known = saved_ids(&path);
 
     c.select_frame(1);
+    set_look(&mut c, BrushMode::Darken, 35);
     drag(&mut c, &[(10.0, 12.0), (30.0, 20.0)]);
     c.select_frame(2);
+    set_look(&mut c, BrushMode::Detail, 80);
     drag(&mut c, &[(20.0, 40.0), (44.0, 30.0)]);
     let pending = ops(&c);
     assert_eq!(pending.len(), 2);
+    assert_eq!(
+        looks(&pending),
+        vec![(BrushMode::Darken, 0.35), (BrushMode::Detail, 0.8)]
+    );
     assert!(
         fs::read(&path).unwrap() == before,
         "two strokes write nothing"
@@ -8857,6 +9080,11 @@ fn pending_strokes_append_on_save() {
     assert!(c.save_active_project(|_| None));
     let added = added_checkpoint(&path, &known);
     assert_eq!(added.ops, pending);
+    assert_eq!(
+        looks(&added.ops),
+        vec![(BrushMode::Darken, 0.35), (BrushMode::Detail, 0.8)],
+        "the saved checkpoint carries each stroke's mode and opacity"
+    );
     assert!(
         shown == saved_render(&path),
         "the newest checkpoint renders the live view"
