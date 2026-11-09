@@ -6,7 +6,7 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-11-08
+## [0.2.0] - 2026-11-09
 
 ### Added
 
