@@ -714,14 +714,14 @@ fn equalize_selected(controller: &AppController) -> String {
 }
 
 #[test]
-fn the_equalize_row_is_on_for_every_method() {
+fn the_equalize_row_is_off_for_every_method() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
     controller.toggle_section_more("prepare");
 
     for method in ["depth-map", "laplacian", "weighted-average", "depth-map"] {
         controller.set_fuse_algorithm(method);
-        assert_eq!(equalize_selected(&controller), "true", "{method}");
+        assert_eq!(equalize_selected(&controller), "false", "{method}");
     }
 }
 
@@ -734,20 +734,20 @@ fn an_explicit_equalize_choice_and_each_methods_values_survive_switching() {
 
     controller.set_fuse_algorithm("depth-map");
     controller.set_param_value("fuse", "score-radius", ParamValue::Int(7));
-    controller.set_param_value("prepare", "equalize", ParamValue::Bool(false));
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
     controller.set_fuse_algorithm("laplacian");
     controller.set_param_value("fuse", "levels", ParamValue::Int(3));
-    assert_eq!(equalize_selected(&controller), "false");
+    assert_eq!(equalize_selected(&controller), "true");
 
     controller.set_fuse_algorithm("depth-map");
-    assert_eq!(equalize_selected(&controller), "false", "the choice stays");
+    assert_eq!(equalize_selected(&controller), "true", "the choice stays");
     assert_eq!(fuse_value(&controller, "score-radius"), "7");
     controller.set_fuse_algorithm("laplacian");
     assert_eq!(fuse_value(&controller, "levels"), "3");
 
     controller.reset_all_sections();
     controller.set_fuse_algorithm("depth-map");
-    assert_eq!(equalize_selected(&controller), "true", "reset restores it");
+    assert_eq!(equalize_selected(&controller), "false", "reset restores it");
 }
 
 #[test]
@@ -1904,15 +1904,15 @@ fn more_reveals_that_sections_advanced_rows() {
     assert_eq!(field_ids(&rows, "finish"), ["auto-crop"]);
     assert_eq!(
         rows[row_index(&rows, "prepare", "equalize")].selected,
-        "true",
-        "Focus map equalizes by default"
+        "false",
+        "Focus map does not equalize by default"
     );
     controller.set_fuse_algorithm("laplacian");
     let rows = controller.settings_panel().rows;
     assert_eq!(
         rows[row_index(&rows, "prepare", "equalize")].selected,
-        "true",
-        "Details equalizes by default"
+        "false",
+        "Details does not equalize by default"
     );
 }
 
@@ -2139,7 +2139,7 @@ fn settings_journey_per_method() {
             .into_iter()
             .find(|r| r.section == "prepare" && r.id == "equalize")
             .expect("the prepare fold-out lists equalize");
-        assert_eq!(equalize.selected, "true", "{id}: equalize");
+        assert_eq!(equalize.selected, "false", "{id}: equalize");
         controller.toggle_section_more("prepare");
     }
 }
@@ -2237,8 +2237,8 @@ fn prepare_and_finish_sections_hold_the_project_settings() {
         );
         assert_eq!(
             rows[row_index(&rows, "prepare", "equalize")].selected,
-            "true",
-            "{method}: equalize starts on"
+            "false",
+            "{method}: equalize starts off"
         );
         assert_eq!(field_ids(&rows, "finish"), ["auto-crop"], "{method}");
         controller.toggle_section_more("prepare");
@@ -2720,6 +2720,13 @@ fn equalize_off_disables_target_and_max_gain_and_keeps_their_values() {
             .collect()
     };
 
+    assert_eq!(
+        disabled_prepare_rows(&controller),
+        ["equalize-max-gain", "equalize-target"],
+        "off by default: the two dependent rows are grey"
+    );
+
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
     assert!(disabled_prepare_rows(&controller).is_empty());
 
     controller.set_param_value("prepare", "equalize", ParamValue::Bool(false));
@@ -2832,6 +2839,12 @@ fn keyboard_step_moves_the_target_by_one_step_and_clamps() {
     // track's left end sets -0.5 and focuses the slider, Right then steps it.
     let panel = MountedPanel::open();
     panel.click_strip("prepare");
+    panel
+        .controller
+        .lock()
+        .unwrap()
+        .set_param_value("prepare", "equalize", ParamValue::Bool(true));
+    panel.perform();
     let rows = panel.rows();
     let target_at = row_index(&rows, "prepare", "equalize-target");
     let slider_position = rows[..target_at]

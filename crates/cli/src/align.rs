@@ -16,7 +16,7 @@ use focusforge_core::align::{
     align_stack_with, auto_crop,
 };
 use focusforge_core::gpu::TileBackend;
-use focusforge_core::io::{FrameReader, TiffSpec, TiffWriter, frame_paths, open_frame_set};
+use focusforge_core::io::{FrameReader, TiffSpec, TiffWriter, all_frame_paths, open_frame_set};
 use focusforge_core::params;
 use focusforge_core::registry;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
@@ -220,7 +220,7 @@ pub fn run(
         }
     }
 
-    let paths = match frame_paths(dir) {
+    let paths = match all_frame_paths(dir) {
         Ok(paths) => paths,
         Err(err) => return sink.fail(err),
     };

@@ -6146,9 +6146,9 @@ fn open_equalized_editor(name: &str, count: usize) -> AppController {
     controller
 }
 
-/// The prepare section lists the equalization switch (on), its bound and its
-/// target; a default run is equalized, switching it off records an unequalized
-/// run, and the bound and target the panel holds reach the run.
+/// The prepare section lists the equalization switch (off), its bound and its
+/// target; a default run is not equalized, and switching it on records an
+/// equalized run with the bound and target the panel holds.
 #[test]
 fn equalize_rows_reach_the_run() {
     use focusforge_core::params::ParamValue;
@@ -6166,32 +6166,15 @@ fn equalize_rows_reach_the_run() {
             .find(|r| r.id == id)
             .unwrap_or_else(|| panic!("no {id} row"))
     };
-    assert_eq!(row("equalize").selected, "true", "on by default");
+    assert_eq!(row("equalize").selected, "false", "off by default");
     assert_eq!(row("equalize-max-gain").value_text, "1.25");
 
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, SETTLE);
     let default_run = controller.held_checkpoints().last().cloned().unwrap();
-    let default_equalization = default_run
-        .registration
-        .equalization
-        .expect("a default run is equalized");
     assert_eq!(
-        (
-            default_equalization.max_gain,
-            default_equalization.target_stops
-        ),
-        (1.25, 0.0),
-        "a default run uses the default bound and the neutral target"
-    );
-
-    controller.set_param_value("prepare", "equalize", ParamValue::Bool(false));
-    assert!(controller.start_fuse());
-    common::wait_for_settle(&mut controller, SETTLE);
-    let off = controller.held_checkpoints().last().cloned().unwrap();
-    assert_eq!(
-        off.registration.equalization, None,
-        "switched off, the run is not equalized"
+        default_run.registration.equalization, None,
+        "a default run is not equalized"
     );
 
     controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
@@ -6312,27 +6295,30 @@ fn settings_journey_fuses_each_method_with_its_settings() {
     }
 }
 
-/// A `depth-map` run equalizes without the switch being touched; turning the
-/// switch off records an unequalized run.
+/// A `depth-map` run is not equalized while the switch is untouched; turning
+/// the switch on records an equalized run.
 #[test]
-fn focus_map_run_equalizes_by_default_and_an_explicit_off_wins() {
+fn focus_map_run_is_unequalized_by_default_and_an_explicit_on_wins() {
     use focusforge_core::params::ParamValue;
 
     let mut controller = common::controller_with_frames("focus_map_equalize_default", 3);
     controller.set_fuse_algorithm("depth-map");
     assert!(controller.start_fuse());
     common::wait_for_settle(&mut controller, SETTLE);
+    let off = controller.held_checkpoints().last().cloned().unwrap();
+    assert_eq!(
+        off.registration.equalization, None,
+        "not equalized by default"
+    );
+
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
+    assert!(controller.start_fuse());
+    common::wait_for_settle(&mut controller, SETTLE);
     let on = controller.held_checkpoints().last().cloned().unwrap();
     assert!(
         on.registration.equalization.is_some(),
-        "equalized by default"
+        "an explicit on wins"
     );
-
-    controller.set_param_value("prepare", "equalize", ParamValue::Bool(false));
-    assert!(controller.start_fuse());
-    common::wait_for_settle(&mut controller, SETTLE);
-    let off = controller.held_checkpoints().last().cloned().unwrap();
-    assert_eq!(off.registration.equalization, None, "an explicit off wins");
 }
 
 /// On an equalized `depth-map` tab a stroke's rendered pixel is the left

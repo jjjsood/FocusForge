@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use focusforge_core::io::Rect;
-use focusforge_core::params::ParamValues;
+use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use focusforge_gui::input_map::{Action, Binding, InputTable, Modifiers, Trigger};
@@ -563,6 +563,7 @@ fn a_failed_run_titles_match_the_card_stage() {
     let frame = dir.join("01.tif");
     let bytes = std::fs::read(&frame).unwrap();
     std::fs::write(&frame, &bytes[..bytes.len() / 2]).unwrap();
+    controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
     assert!(controller.start_fuse());
     settle_with_thumbnails(&mut controller, Duration::from_secs(60));
     let title = &controller

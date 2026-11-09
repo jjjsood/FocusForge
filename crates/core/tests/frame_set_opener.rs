@@ -6,14 +6,17 @@ mod raw_dng;
 
 use std::path::PathBuf;
 
+use focusforge_core::algorithm::{AlgorithmError, TileReader};
+use focusforge_core::host::HostFacts;
 use focusforge_core::io::test_frames::{
     ByteOrderSpec, FrameMetadata, shorts_bo, write_frame_with_metadata,
 };
 use focusforge_core::io::{
-    ByteOrder, FrameDesc, FrameError, ReaderKind, Refusal, TiffError, TiffHeader, TiffStack,
-    classify_header, frame_paths, open_frame_set,
+    ByteOrder, FrameDesc, FrameError, RawError, RawStack, ReaderKind, Rect, Refusal, TiffError,
+    TiffHeader, TiffStack, classify_header, frame_paths, open_frame_set,
 };
-use focusforge_core::tile::HostBudget;
+use focusforge_core::params::Provenance;
+use focusforge_core::tile::{HOST_FIXED_BYTES, HostBudget, MemoryBound};
 use raw_dng::{DngSpec, write_dng};
 
 #[test]
@@ -64,10 +67,29 @@ fn budget_partition_is_applied_once() {
             path,
             bound,
             required,
+            bounded_by,
         })) => {
             assert_eq!(bound, 0);
             assert!(required > bound);
             assert!(path.ends_with("00.tif"));
+            assert_eq!(bounded_by, MemoryBound::Limit { divisor: 4 });
+            let text = TiffError::DecodedCacheTooSmall {
+                path: path.clone(),
+                bound,
+                required,
+                bounded_by,
+            }
+            .to_string();
+            let need = required.div_ceil(1_000_000);
+            assert_eq!(
+                text,
+                format!(
+                    "{}: needs {need} MB of working memory, but the memory limit allows 0 MB \
+                     for it. Raise the memory limit to at least {} MB or close other programs.",
+                    path.display(),
+                    (required * 4).div_ceil(1_000_000)
+                )
+            );
         }
         Ok(_) => panic!("undersized decoded cache must refuse"),
         Err(error) => panic!("expected decoded-cache error, got {error}"),
@@ -216,6 +238,96 @@ fn raw_sets_open_lazily_and_mixed_formats_name_the_differing_frame() {
         FrameError::MixedFormats { path, found: "TIFF", .. } if path.ends_with("00.tif")
     ));
     assert!(error.to_string().contains("raw.dng"));
+}
+
+/// Frames `[plain, padded, plain]` of one 8x8 DNG, where only the padded
+/// second frame carries the largest reservation, and that reservation.
+fn padded_raw_set(root: &std::path::Path) -> (Vec<PathBuf>, u64) {
+    let source = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]),
+        true,
+    );
+    let paths: Vec<PathBuf> = (0..3)
+        .map(|index| root.join(format!("{index:02}.dng")))
+        .collect();
+    raw_dng::copy_padded(source.path(), &paths[0], 0);
+    raw_dng::copy_padded(source.path(), &paths[1], 4_000);
+    raw_dng::copy_padded(source.path(), &paths[2], 0);
+    let largest = std::fs::metadata(&paths[1]).expect("padded size").len();
+    (paths, 8 * 8 * 30 + largest)
+}
+
+#[test]
+fn raw_partition_floors_the_cache_at_the_largest_reservation() {
+    let root = tempfile::tempdir().expect("temporary directory");
+    let (paths, r) = padded_raw_set(root.path());
+    for (budget, cache) in [
+        (2 * r + 1, r),
+        (4 * r + 3, r),
+        (8 * r + 1, 2 * r),
+        (65_536, 16_384),
+    ] {
+        let opened = open_frame_set(&paths, HostBudget::explicit(budget))
+            .unwrap_or_else(|error| panic!("budget {budget}: {error}"));
+        assert_eq!(opened.kind, ReaderKind::Raw);
+        assert_eq!(
+            opened.scheduler_budget.bytes(),
+            budget - cache,
+            "budget {budget}, R {r}"
+        );
+        assert_eq!(opened.scheduler_budget.provenance(), Provenance::Explicit);
+    }
+
+    let facts = HostFacts::new(
+        HOST_FIXED_BYTES + 200 * r,
+        HOST_FIXED_BYTES + 200 * r,
+        None,
+        None,
+        1,
+    );
+    let host = HostBudget::host_derived(&facts);
+    let opened = open_frame_set(&paths, host).expect("a host budget above R opens");
+    assert_eq!(opened.scheduler_budget.provenance(), Provenance::Host);
+    assert!(opened.scheduler_budget.refuses_below_one_tile());
+    assert_eq!(
+        opened.scheduler_budget.bytes(),
+        host.bytes() - host.bytes() / 4
+    );
+}
+
+#[test]
+fn raw_capped_budget_reads_the_camera_frame_through_the_cache() {
+    let frame = common::fixtures_dir().join("blackmagic-micro-dng/frame.dng");
+    let paths = std::slice::from_ref(&frame);
+    let stack = RawStack::open_files(paths).expect("camera frame opens");
+    let metadata = stack.metadata(0).expect("frame 0 metadata");
+    let r = u64::from(metadata.raw_width) * u64::from(metadata.raw_height) * 30
+        + std::fs::metadata(&frame).expect("frame size").len();
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: 64,
+        height: 64,
+    };
+    let mut tile = vec![0u16; 64 * 64 * 3];
+
+    let opened = open_frame_set(paths, HostBudget::explicit(2 * r)).expect("2R budget opens");
+    // The checked-in frame is lossless-JPEG compressed, which the decoder
+    // rejects; reaching that error means the cache bound let the decode start.
+    match opened.reader.read_tile_into(0, rect, &mut tile) {
+        Err(AlgorithmError::Frame(FrameError::Raw(RawError::Decode { .. }))) => {}
+        other => panic!("the cache holds one frame at 2R and decode starts, got {other:?}"),
+    }
+
+    let quarter = RawStack::open_files_with_budget(paths, 2 * r / 4).expect("metadata opens");
+    match quarter.read_tile_into(0, rect, &mut tile) {
+        Err(AlgorithmError::Frame(FrameError::Raw(RawError::CacheTooSmall {
+            bound,
+            required,
+            ..
+        }))) => assert_eq!((bound, required), (2 * r / 4, r)),
+        other => panic!("the quarter cache must refuse the read, got {other:?}"),
+    }
 }
 
 fn write_jpeg(dir: &std::path::Path, name: &str, width: u16, height: u16, grey: bool) -> PathBuf {

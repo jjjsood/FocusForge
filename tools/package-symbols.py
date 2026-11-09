@@ -14,8 +14,8 @@ import shutil
 import stat
 import subprocess
 import tarfile
+import sys
 import tempfile
-import urllib.request
 import uuid
 import zipfile
 import struct
@@ -25,6 +25,9 @@ try:
     import tomllib
 except ModuleNotFoundError:
     tomllib = None
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from download import download  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / "packaging/symbol-tools.toml"
@@ -119,11 +122,11 @@ def verified_release_manifest(data: dict, tool: str, target: str, item: dict, di
     """Authenticate the release index before accepting its selected archive."""
     pinned = data[tool]
     manifest = directory / f"{tool}-{pinned['version']}-manifest.json"
-    if not manifest.exists():
-        with urllib.request.urlopen(pinned["manifest_url"], timeout=60) as response:
-            manifest.write_bytes(response.read())
-    if digest(manifest) != pinned["manifest_sha256"]:
-        raise ValueError(f"{tool} release manifest checksum mismatch")
+    if not manifest.is_file() or digest(manifest) != pinned["manifest_sha256"]:
+        manifest.write_bytes(download(pinned["manifest_url"]))
+        if digest(manifest) != pinned["manifest_sha256"]:
+            manifest.unlink()
+            raise ValueError(f"{tool} release manifest checksum mismatch")
     try:
         release = json.loads(manifest.read_text())
         published = release["artifacts"][Path(item["url"]).name]
@@ -141,10 +144,10 @@ def install(data: dict, tool: str, target: str, directory: Path) -> Path:
     verified_release_manifest(data, tool, target, item, directory)
     archive = directory / Path(item["url"]).name
     if not archive.is_file() or digest(archive) != item["sha256"]:
-        with urllib.request.urlopen(item["url"], timeout=60) as response:
-            archive.write_bytes(response.read())
-    if digest(archive) != item["sha256"]:
-        raise ValueError(f"{tool} archive checksum mismatch")
+        archive.write_bytes(download(item["url"]))
+        if digest(archive) != item["sha256"]:
+            archive.unlink()
+            raise ValueError(f"{tool} archive checksum mismatch")
     unpacked = directory / f"{tool}-{target}"
     shutil.rmtree(unpacked, ignore_errors=True)
     unpacked.mkdir()

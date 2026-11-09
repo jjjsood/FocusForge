@@ -447,8 +447,8 @@ fn project_defaults_json_follow_the_fusion_method() {
             .unwrap_or_else(|| panic!("no {id} entry"))["project_defaults"]["equalize"]
             .clone()
     };
-    assert_eq!(equalize("depth-map"), true);
-    assert_eq!(equalize("laplacian"), true);
+    assert_eq!(equalize("depth-map"), false);
+    assert_eq!(equalize("laplacian"), false);
 }
 
 #[test]

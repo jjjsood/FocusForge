@@ -30,7 +30,7 @@
 **From shoot to sharp image**
 - Drop in a focus bracket straight from the camera, camera RAW, TIFF or JPEG, and get one image sharp from front to back
 - Shot several subjects in one session? FocusForge sorts the card into separate stacks for you; check the split before it runs
-- Long brackets of high-resolution frames run on an ordinary computer, however much memory the stack would need
+- Long brackets of high-resolution frames run on an ordinary computer: the whole stack never has to fit in memory, only one frame's working memory does (see [Hardware](#hardware))
 - Shot handheld, or your lens breathes while focusing? Frames are lined up first and the edges trimmed to what every shot covers
 - Flickering light or exposure drift between shots is evened out
 - Three methods to choose from: Details as the all-rounder, Soft transitions for gentler blends between frames, Focus map for the most coherent source map to pick from
@@ -64,6 +64,14 @@ Details for each are in the [guides](docs/README.md).
 Linux: install the matching `.deb` or run its AppImage from [Releases](https://github.com/jjjsood/FocusForge/releases), or build from source.
 macOS: open the matching `.dmg` from [Releases](https://github.com/jjjsood/FocusForge/releases) and drag it to Applications, or build from source.
 Windows: run the matching `.msi` from [Releases](https://github.com/jjjsood/FocusForge/releases), or build from source; no Visual C++ redistributable is needed. See [getting started](docs/getting-started.md) for paths.
+
+## Hardware
+
+What a run needs depends on the kind of frames and their size, not on how many there are, and it is the **free** RAM that counts: FocusForge sets aside about 1.6 GB and plans with 65 % of the rest. With less than about 1.6 GB free nothing runs.
+
+Free RAM to run at all, decimal GB: camera RAW 3.1 GB (24–26 MP) to 5.0 GB (61 MP); 16-bit TIFF 1.7 GB (more for a compressed frame stored as one single strip); JPEG 3.0–5.2 GB. RAW frames also need scratch disk, 160–370 MB per frame. A graphics card is optional and the result is the same without one.
+
+The [manual's hardware page](docs/hardware.md) has the recommended figures, a rule of thumb for other cameras, measured runs and what to do when a run is short of memory.
 
 ## Quick start
 
@@ -144,12 +152,12 @@ demand.
 
 ## Documentation
 
-The user manual is an mdBook whose source is in [`docs/`](docs/README.md). It
-covers focus stacking and shooting practice, [getting started](docs/getting-started.md),
-the window, stacking, alignment, retouching, checkpoints, export and
-settings, troubleshooting and a glossary. The appendix is the reference for
-every `focusforge-cli` subcommand, the project format and the TIFF layouts it
-reads and writes.
+[Read the manual online](https://jjjsood.github.io/FocusForge/); its mdBook source
+is in [`docs/`](docs/README.md). It covers focus stacking and shooting practice,
+[getting started](docs/getting-started.md), the window, stacking, alignment,
+retouching, checkpoints, export and settings, troubleshooting and a glossary.
+The appendix is the reference for every `focusforge-cli` subcommand, the project
+format and the TIFF layouts it reads and writes.
 
 ## Contributing
 

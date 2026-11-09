@@ -16,6 +16,10 @@ for command in cargo lipo hdiutil plutil shasum dsymutil strip dwarfdump codesig
 # profile's "off" rustc deletes those after linking and the dSYM loses the binaries' own line tables.
 export CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=unpacked
 target=aarch64-apple-darwin
+# Both pinned symbol tools are fetched before the long build, into the directory the package check reuses.
+tools="$root/.scratch/symbol-tools"
+dump_syms=$(python3 "$root/tools/package-symbols.py" install dump_syms "$target" "$tools")
+python3 "$root/tools/package-symbols.py" install stackwalk "$target" "$tools" >/dev/null
 cargo build --locked --release --target "$target" -p focusforge-cli --bin focusforge-cli
 cargo build --locked --release --target "$target" -p focusforge-gui --bin focusforge-gui
 mkdir -p "$root/.scratch"
@@ -31,7 +35,6 @@ report_failure() {
 }
 trap 'report_failure $? "$BASH_COMMAND" $LINENO' ERR
 app="$staging/FocusForge.app"
-dump_syms=$(python3 "$root/tools/package-symbols.py" install dump_syms "$target" "$staging/tools")
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 mkdir -p "$staging/original" "$staging/native"
 for binary in focusforge-cli focusforge-gui; do
