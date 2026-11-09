@@ -18,6 +18,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
 use crate::algorithm::{AlgorithmError, AlignAlgorithm, StackAlgorithm, TileReader};
 use crate::align::{
     AlignDriverOptions, FailurePolicy, FrameAlignment, ReferencePolicy, Registration,
@@ -1276,7 +1278,7 @@ pub fn run(
 
     observer.stage(RunStage::Seal);
     let _ = source_hashes.join();
-    let metrics = measure_metrics(&staged_composite, frame_reader, &gain_reader);
+    let metrics = measure_metrics(&staged_composite, frame_reader, &gain_reader, workers);
     let align_record =
         alignment_result
             .as_ref()
@@ -1631,6 +1633,7 @@ fn measure_metrics(
     composite: &Path,
     sources: &dyn FrameReader,
     gained: &dyn TileReader,
+    workers: usize,
 ) -> Metrics {
     let Ok(stack) = TiffStack::open_staged(composite) else {
         return Metrics::default();
@@ -1642,18 +1645,17 @@ fn measure_metrics(
     let window = centered(width, height, side_w, side_h);
     let composite_lapvar = lapvar(&stack, 0, window, spp);
 
-    let mut max_input_lapvar: Option<f64> = None;
-    for index in 0..sources.len() {
-        let (fw, fh) = sources.dimensions();
-        if fw < side_w || fh < side_h {
-            continue;
-        }
-        let fspp = sources.frame(index).samples_per_pixel;
-        let rect = centered(fw, fh, side_w, side_h);
-        if let Some(value) = lapvar(gained, index, rect, fspp) {
-            max_input_lapvar = Some(max_input_lapvar.map_or(value, |m: f64| m.max(value)));
-        }
-    }
+    let spps: Vec<u32> = (0..sources.len())
+        .map(|index| sources.frame(index).samples_per_pixel)
+        .collect();
+    let max_input_lapvar = max_input_lapvar(
+        gained,
+        sources.len(),
+        sources.dimensions(),
+        &spps,
+        (side_w, side_h),
+        workers,
+    );
 
     Metrics {
         composite_lapvar,
@@ -1673,13 +1675,69 @@ fn centered(width: u32, height: u32, side_w: u32, side_h: u32) -> Rect {
 
 fn lapvar(reader: &dyn TileReader, frame: usize, rect: Rect, spp: u32) -> Option<f64> {
     let mut samples = vec![0u16; rect.width as usize * rect.height as usize * spp as usize];
-    reader.read_tile_into(frame, rect, &mut samples).ok()?;
+    lapvar_into(reader, frame, rect, spp, &mut samples)
+}
+
+/// [`lapvar`] reading into the front of a caller-owned buffer of at least
+/// `rect.width * rect.height * spp` samples.
+fn lapvar_into(
+    reader: &dyn TileReader,
+    frame: usize,
+    rect: Rect,
+    spp: u32,
+    buf: &mut [u16],
+) -> Option<f64> {
+    let samples = &mut buf[..rect.width as usize * rect.height as usize * spp as usize];
+    reader.read_tile_into(frame, rect, samples).ok()?;
     Some(crate::fuse::metrics::laplacian_variance(
-        &samples,
+        samples,
         rect.width,
         rect.height,
         spp,
     ))
+}
+
+/// The largest [`lapvar_into`] over the central `side` window of every frame
+/// of `frame_count` frames of size `frame_dims`, measured on `workers`
+/// threads. Frames smaller than the window are not read; frames that fail to
+/// read are skipped. `None` when no frame was measured.
+fn max_input_lapvar(
+    gained: &dyn TileReader,
+    frame_count: usize,
+    frame_dims: (u32, u32),
+    spps: &[u32],
+    side: (u32, u32),
+    workers: usize,
+) -> Option<f64> {
+    let (fw, fh) = frame_dims;
+    if fw < side.0 || fh < side.1 {
+        return None;
+    }
+    let rect = centered(fw, fh, side.0, side.1);
+    let max_spp = spps.iter().copied().max().unwrap_or(0) as usize;
+    let buffer_len = side.0 as usize * side.1 as usize * max_spp;
+    let measure =
+        |buf: &mut Vec<u16>, index: usize| lapvar_into(gained, index, rect, spps[index], buf);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers.max(1))
+        .thread_name(|i| format!("focusforge-metrics-{i}"))
+        .panic_handler(crate::pool::log_worker_panic)
+        .build();
+    match pool {
+        Ok(pool) => pool.install(|| {
+            (0..frame_count)
+                .into_par_iter()
+                .map_init(|| vec![0u16; buffer_len], measure)
+                .flatten()
+                .reduce_with(f64::max)
+        }),
+        Err(_) => {
+            let mut buf = vec![0u16; buffer_len];
+            (0..frame_count)
+                .filter_map(|index| measure(&mut buf, index))
+                .reduce(f64::max)
+        }
+    }
 }
 
 /// Compare reader-provided layout fragments and report the outlier against
@@ -1747,6 +1805,108 @@ pub fn uniform_check(frames: &[(&str, &FrameDesc)]) -> (bool, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// In-memory frames whose checkerboard contrast is `amps[frame]`; reads of
+    /// the frames in `failing` error out and every read is counted.
+    struct Frames {
+        amps: Vec<u16>,
+        spp: u32,
+        failing: Vec<usize>,
+        reads: AtomicUsize,
+    }
+
+    impl Frames {
+        /// Contrast rises to the middle frame.
+        fn graded(count: usize, spp: u32) -> Self {
+            let amps = (0..count)
+                .map(|i| 500 * (1 + i.min(count - 1 - i) as u16))
+                .collect();
+            Frames {
+                amps,
+                spp,
+                failing: Vec::new(),
+                reads: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl TileReader for Frames {
+        fn read_tile_into(
+            &self,
+            frame: usize,
+            rect: Rect,
+            out: &mut [u16],
+        ) -> Result<(), AlgorithmError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.failing.contains(&frame) {
+                return Err(AlgorithmError::Failed {
+                    algorithm: "test".to_string(),
+                    detail: format!("frame {frame} unreadable"),
+                });
+            }
+            let spp = self.spp as usize;
+            assert_eq!(out.len(), (rect.width * rect.height) as usize * spp);
+            let mut at = 0;
+            for y in rect.y..rect.y + rect.height {
+                for x in rect.x..rect.x + rect.width {
+                    out[at..at + spp].fill(20_000 + self.amps[frame] * ((x + y) % 2) as u16);
+                    at += spp;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    const FRAME: (u32, u32) = (40, 24);
+    const SIDE: (u32, u32) = (16, 12);
+
+    fn serial_max(reader: &Frames, count: usize) -> Option<f64> {
+        let rect = centered(FRAME.0, FRAME.1, SIDE.0, SIDE.1);
+        (0..count)
+            .filter_map(|i| lapvar(reader, i, rect, reader.spp))
+            .fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.max(v))))
+    }
+
+    #[test]
+    fn parallel_input_metrics_match_the_serial_loop() {
+        for count in [1usize, 5, 7] {
+            let reader = Frames::graded(count, 3);
+            let expected = serial_max(&reader, count).expect("frames measure");
+            for workers in [1usize, 4] {
+                let got = max_input_lapvar(&reader, count, FRAME, &vec![3; count], SIDE, workers)
+                    .expect("frames measure");
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "{count} frames, {workers} workers"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn input_metrics_skip_a_frame_that_fails_to_read() {
+        let mut reader = Frames::graded(5, 3);
+        let rect = centered(FRAME.0, FRAME.1, SIDE.0, SIDE.1);
+        let second_sharpest = lapvar(&reader, 1, rect, 3).expect("frame 1 measures");
+        reader.failing = vec![2];
+        for workers in [1usize, 4] {
+            let got = max_input_lapvar(&reader, 5, FRAME, &[3; 5], SIDE, workers);
+            assert_eq!(got.map(f64::to_bits), Some(second_sharpest.to_bits()));
+        }
+        reader.failing = (0..5).collect();
+        assert_eq!(max_input_lapvar(&reader, 5, FRAME, &[3; 5], SIDE, 4), None);
+    }
+
+    #[test]
+    fn input_metrics_skip_frames_smaller_than_the_window() {
+        for frame in [(SIDE.0 - 1, 24), (40, SIDE.1 - 1)] {
+            let reader = Frames::graded(3, 3);
+            assert_eq!(max_input_lapvar(&reader, 3, frame, &[3; 3], SIDE, 4), None);
+            assert_eq!(reader.reads.load(Ordering::SeqCst), 0, "{frame:?}");
+        }
+    }
 
     #[test]
     fn peek_resumable_alignment_skips_a_ledger_missing_raw_identity() {
