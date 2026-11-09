@@ -11,6 +11,7 @@
 # Part II — Using FocusForge
 
 - [Installing FocusForge](getting-started.md)
+- [Hardware](hardware.md)
 - [Your first stack](guide/first-stack.md)
 - [The window](guide/gui.md)
   - [The Images panel](guide/images-panel.md)
