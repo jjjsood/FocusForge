@@ -1295,6 +1295,15 @@ pub fn comparison_snapshot()
         .transpose()
 }
 
+/// The detached pane's physical size and scale factor, when it is open.
+pub fn comparison_window_size() -> Option<(slint::PhysicalSize, f32)> {
+    COMPARISON_WINDOW.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|window| (window.window().size(), window.window().scale_factor()))
+    })
+}
+
 /// Uses the detached pane's own dock control path for timed inspection.
 pub fn dock_comparison_for_inspection() {
     let window = COMPARISON_WINDOW.with(|slot| slot.borrow().as_ref().cloned());
