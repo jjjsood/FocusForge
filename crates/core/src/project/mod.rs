@@ -304,7 +304,7 @@ pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
                    shared by all frames, leaving the source files unchanged."
                 .to_string(),
             kind: ParamKind::Bool,
-            default: ParamValue::Bool(true),
+            default: ParamValue::Bool(false),
             advanced: true,
             auto: None,
             host_default: None,
@@ -1067,7 +1067,7 @@ mod tests {
         let on = desc("equalize");
         assert_eq!(on.label, "Equalize brightness");
         assert_eq!(on.kind, ParamKind::Bool);
-        assert_eq!(on.default, ParamValue::Bool(true));
+        assert_eq!(on.default, ParamValue::Bool(false));
 
         let bound = desc("equalize-max-gain");
         assert_eq!(bound.label, "Max brightness gain");
@@ -1163,11 +1163,11 @@ mod tests {
     }
 
     #[test]
-    fn equalize_defaults_on_for_every_method() {
+    fn equalize_defaults_off_for_every_method() {
         for algorithm in crate::registry::stack_algorithms() {
             assert_eq!(
                 default_of(&params_for(algorithm), "equalize"),
-                ParamValue::Bool(true),
+                ParamValue::Bool(false),
                 "{}",
                 algorithm.id()
             );
@@ -1216,7 +1216,7 @@ mod tests {
             ["equalize", "equalize-max-gain", "equalize-target"]
         );
         assert_eq!(ids(&finish), ["auto-crop"]);
-        assert_eq!(default_of(&prepare, "equalize"), ParamValue::Bool(true));
+        assert_eq!(default_of(&prepare, "equalize"), ParamValue::Bool(false));
         assert_eq!(default_of(&finish, "auto-crop"), ParamValue::Bool(true));
         assert_eq!(
             default_of(&prepare, "equalize-max-gain"),
@@ -1254,9 +1254,12 @@ mod tests {
             target_stops: 0.0,
         };
         let mut values = ParamValues::new();
+        assert_eq!(equalization_settings(&focus_map, &values), None);
+        assert_eq!(equalization_settings(&details, &values), None);
+
+        values.insert("equalize".into(), ParamValue::Bool(true));
         assert_eq!(equalization_settings(&focus_map, &values), Some(default));
         assert_eq!(equalization_settings(&details, &values), Some(default));
-
         values.insert("equalize".into(), ParamValue::Bool(false));
         assert_eq!(equalization_settings(&focus_map, &values), None);
         assert_eq!(equalization_settings(&details, &values), None);

@@ -1580,21 +1580,11 @@ fn equalize_preset_key_enables_it_and_write_preset_writes_it_back() {
     assert_eq!(report["equalization"]["max_gain"], 1.5);
 }
 
-/// The stack's report carries the default equalization. Every method's
+/// A stack without `--set equalize=…` reports no equalization. Every method's
 /// default is proven in the project schema, so one method is enough here.
 #[test]
-fn equalization_is_on_by_default() {
-    let on = equalization_run("stack_cli_equalize_default", "weighted-average", &[]);
-    assert_eq!(on["equalization"]["max_gain"], 1.25, "{on}");
-}
-
-#[test]
-fn an_explicit_equalize_false_wins_over_the_default() {
-    let report = equalization_run(
-        "stack_cli_equalize_false",
-        "weighted-average",
-        &["--set", "equalize=false"],
-    );
+fn equalization_is_off_by_default() {
+    let report = equalization_run("stack_cli_equalize_default", "weighted-average", &[]);
     assert!(report["equalization"].is_null(), "{report}");
 }
 
@@ -1607,8 +1597,8 @@ fn a_written_preset_reproduces_the_focus_map_equalization_choice() {
     let out_dir = cwd.join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
     for (name, extra, equalized) in [
-        ("default", vec![], true),
-        ("off", vec!["--set", "equalize=false"], false),
+        ("default", vec![], false),
+        ("on", vec!["--set", "equalize=true"], true),
     ] {
         let written = cwd.join(format!("{name}.toml"));
         let mut args = vec![
@@ -1627,8 +1617,8 @@ fn a_written_preset_reproduces_the_focus_map_equalization_choice() {
         assert!(dry.success, "{name}: stderr: {}", dry.stderr);
         let text = std::fs::read_to_string(&written).expect("the preset is written");
         assert_eq!(
-            text.contains("equalize = false"),
-            !equalized,
+            text.contains("equalize = true"),
+            equalized,
             "{name}: {text}"
         );
 

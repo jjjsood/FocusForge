@@ -1717,7 +1717,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "focusforge-cli"
-version = "0.2.0-rc.2"
+version = "0.2.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -1740,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "focusforge-core"
-version = "0.2.0-rc.2"
+version = "0.2.0"
 dependencies = [
  "akaze",
  "blake3",
@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "focusforge-diagnostics"
-version = "0.2.0-rc.2"
+version = "0.2.0"
 dependencies = [
  "crash-handler",
  "directories",
@@ -1796,7 +1796,7 @@ dependencies = [
 
 [[package]]
 name = "focusforge-gpu"
-version = "0.2.0-rc.2"
+version = "0.2.0"
 dependencies = [
  "focusforge-core",
  "tempfile",
@@ -1808,7 +1808,7 @@ dependencies = [
 
 [[package]]
 name = "focusforge-gui"
-version = "0.2.0-rc.2"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "clap",

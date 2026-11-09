@@ -169,6 +169,8 @@ fn prepare_progress_reaches_a_redirected_log() {
         "laplacian",
         "--no-align",
         "--no-crop",
+        "--set",
+        "equalize=true",
     ];
     if cfg!(feature = "gpu") {
         args.push("--cpu");
