@@ -22,9 +22,10 @@ use focusforge_core::display::alpha_from_opacity;
 use focusforge_core::equalize::GainReader;
 use focusforge_core::io::{FrameError, FrameReader, TiffStack, open_frame_set};
 use focusforge_core::project::Op;
+use focusforge_core::retouch::{needs_mode_conditions, overlay_colors};
 use focusforge_core::tile::{HostBudget, Rect, Sample};
 use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
-use focusforge_core::zmap::{ZMapError, ZMapReader, overlay_table};
+use focusforge_core::zmap::{ZMapError, ZMapInfo, ZMapReader, overlay_table};
 
 use crate::viewport::PaneDraw;
 
@@ -411,7 +412,7 @@ pub struct PaneJob {
     pub reader: Arc<dyn PaneReader>,
     /// The sealed Z-Map, read alongside a composite whose edit generation or
     /// overlay [`Self::state`] names; `None` when the sealed pixels draw as is.
-    pub indices: Option<Arc<dyn PaneReader>>,
+    pub indices: Option<Arc<ZMapReader>>,
     /// The edit generation and overlay this job's result is drawn under.
     pub state: EditState,
     /// Whether this is the low-detail whole-image read behind the pane's
@@ -461,6 +462,25 @@ impl PaneJob {
         };
         reader.read_step_into(rect, self.draw.step, out)
     }
+
+    /// The overlay's colour per texel over `indices`, read for this job's
+    /// view; empty without an overlay or an index source.
+    pub(crate) fn overlay_colors(&self, indices: &[u16]) -> Vec<[u8; 3]> {
+        let (Some(overlay), Some(zmap)) = (&self.state.overlay, &self.indices) else {
+            return Vec::new();
+        };
+        if indices.is_empty() {
+            return Vec::new();
+        }
+        let (x, y, width, height) = self.draw.src;
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        overlay.colors(zmap.info(), rect, self.draw.step, indices)
+    }
 }
 
 /// A [`PaneJob`] with its samples read.
@@ -469,6 +489,8 @@ pub struct Prepared {
     pub samples: Vec<u16>,
     /// The sealed Z-Map over the same texels; empty when the job has none.
     pub indices: Vec<u16>,
+    /// The overlay's colour per texel; empty when the job has no overlay.
+    pub colors: Vec<[u8; 3]>,
 }
 
 /// Accepts only stamps above the newest one it has seen or been reset to,
@@ -981,6 +1003,26 @@ pub struct OverlayDraw {
     pub table: Vec<[u8; 3]>,
     pub ops: Arc<[Op]>,
     pub alpha: u8,
+    /// The readers that tell where a Lighten or Darken stroke acts; `None`
+    /// until they are open.
+    pub origin: Option<SharedOrigin>,
+}
+
+/// The tab's open origin readers, compared by identity so that their arrival
+/// changes the draw.
+#[derive(Clone)]
+pub struct SharedOrigin(pub Arc<crate::job::OriginReaders>);
+
+impl PartialEq for SharedOrigin {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for SharedOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedOrigin")
+    }
 }
 
 impl OverlayDraw {
@@ -991,7 +1033,47 @@ impl OverlayDraw {
             table: overlay_table(sources, None),
             ops: Arc::from([]),
             alpha: alpha_from_opacity(opacity),
+            origin: None,
         }
+    }
+
+    /// The colour of each texel of the `step` lattice of `rect`, from its
+    /// stored Z-Map index in `indices`. A Lighten or Darken stroke shows its
+    /// source only where the readers say it acts; without them, or when a read
+    /// fails, the stored colour stays.
+    pub fn colors(
+        &self,
+        info: ZMapInfo,
+        rect: Rect,
+        step: NonZeroU32,
+        indices: &[u16],
+    ) -> Vec<[u8; 3]> {
+        let conditions = self
+            .origin
+            .as_ref()
+            .filter(|_| needs_mode_conditions(&self.ops, info, rect))
+            .and_then(|origin| {
+                origin
+                    .0
+                    .conditions(&self.ops, info, rect, step)
+                    .inspect_err(|error| {
+                        tracing::warn!(%error, "the overlay's stroke conditions could not be read");
+                    })
+                    .ok()
+            })
+            .unwrap_or_default();
+        let mut colors = vec![[0u8; 3]; indices.len()];
+        overlay_colors(
+            &self.ops,
+            info,
+            rect,
+            step,
+            &conditions,
+            &self.table,
+            indices,
+            &mut colors,
+        );
+        colors
     }
 }
 
@@ -1001,6 +1083,7 @@ fn read_job(job: PaneJob, mut samples: Vec<u16>, mut indices: Vec<u16>) -> Optio
         .and_then(|()| job.read_sealed_indices(&mut indices))
     {
         Ok(()) => Some(Prepared {
+            colors: job.overlay_colors(&indices),
             job,
             samples,
             indices,

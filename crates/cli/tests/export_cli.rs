@@ -24,7 +24,8 @@ use focusforge_core::io::{Rect, TiffHeader, TiffSpec, TiffStack, TiffWriter, ope
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
-    self, AlignRecord, AppendRequest, Metrics, Op, Plane, Point, Project, SealRequest, partial_path,
+    self, AlignRecord, AppendRequest, BrushMode, Metrics, Op, Plane, Point, Project, SealRequest,
+    partial_path,
 };
 use focusforge_core::tile::HostBudget;
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
@@ -463,6 +464,8 @@ fn build_branched(name: &str) -> Branched {
             path: vec![Point { x: 2, y: 2 }],
             radius: 1.5,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }],
         Some("branch-a".to_string()),
         1,
@@ -478,6 +481,8 @@ fn build_branched(name: &str) -> Branched {
             path: vec![Point { x: 3, y: 3 }],
             radius: 1.5,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }],
         Some("branch-b".to_string()),
         2,
@@ -1055,6 +1060,8 @@ fn build_unrecorded_alignment(name: &str) -> (common::TmpDir, PathBuf, String, S
             path: vec![Point { x: 1, y: 1 }],
             radius: 1.0,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }],
         None,
         1,

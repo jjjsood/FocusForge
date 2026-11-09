@@ -18,8 +18,8 @@ use focusforge_core::io::{
 };
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
-    self, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Op, ParentRef, PendingState, Point,
-    Project,
+    self, BrushMode, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Op, ParentRef, PendingState,
+    Point, Project,
 };
 use focusforge_core::retouch::blend;
 use focusforge_core::tile::Rect;
@@ -48,6 +48,8 @@ fn strokes(width: u32, height: u32) -> Vec<Op> {
             path: path.iter().map(|&(x, y)| Point { x, y }).collect(),
             radius,
             softness,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         };
     vec![
         stroke(

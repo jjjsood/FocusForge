@@ -17,8 +17,8 @@ use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
-    self, BlobKind, Checkpoint, HASH_ALGORITHM, Metrics, Op, Plane, Point, Project, SealRequest,
-    SourceResolution, blob,
+    self, BlobKind, BrushMode, Checkpoint, HASH_ALGORITHM, Metrics, Op, Plane, Point, Project,
+    SealRequest, SourceResolution, blob,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 
@@ -227,6 +227,10 @@ fn manifest_value(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+fn stored_format_version(path: &Path) -> Option<serde_json::Value> {
+    manifest_value(path).get("format_version").cloned()
+}
+
 #[test]
 fn manifest_carries_no_format_version() {
     let (_dir, project_path) = sealed("project_format_no_version");
@@ -244,6 +248,8 @@ fn manifest_carries_no_format_version() {
             path: vec![Point { x: 1, y: 1 }],
             radius: 2.0,
             softness: 0.5,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }],
         None,
     )
@@ -342,6 +348,8 @@ fn the_brush_stroke_round_trips() {
         path: vec![Point { x: -3, y: 4 }, Point { x: 10, y: 20 }],
         radius: 12.5,
         softness: 0.25,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }];
     let text = serde_json::to_string(&ops).unwrap();
     let back: Vec<Op> = serde_json::from_str(&text).unwrap();
@@ -350,6 +358,231 @@ fn the_brush_stroke_round_trips() {
         text.contains("brush-stroke"),
         "externally-tagged brush-stroke missing: {text}"
     );
+}
+
+/// The stroke list in `fixtures/retouch/stroke-list.json`, whose strokes carry
+/// neither a mode nor an opacity.
+fn stroke_list_fixture() -> String {
+    std::fs::read_to_string(common::fixtures_dir().join("retouch/stroke-list.json"))
+        .expect("the stroke list fixture must read")
+}
+
+fn stroke(mode: BrushMode, opacity: f32) -> Op {
+    Op::BrushStroke {
+        source_id: 3,
+        path: vec![Point { x: -4, y: 9 }, Point { x: 30, y: -2 }],
+        radius: 6.5,
+        softness: 0.0,
+        mode,
+        opacity,
+    }
+}
+
+/// Every stroke shape that needs format 2.
+fn non_default_strokes() -> [Op; 5] {
+    [
+        stroke(BrushMode::Lighten, 1.0),
+        stroke(BrushMode::Darken, 1.0),
+        stroke(BrushMode::Detail, 1.0),
+        stroke(BrushMode::Normal, 0.5),
+        stroke(BrushMode::Normal, 1.0 - f32::EPSILON / 2.0),
+    ]
+}
+
+fn required_version(path: &Path) -> u32 {
+    project::required_format_version(Project::open(path).unwrap().history())
+}
+
+#[test]
+fn required_format_version_is_two_for_a_listed_non_default_stroke() {
+    let (_dir, path) = sealed("project_format_required_fold");
+    assert_eq!(required_version(&path), 1, "a sealed project");
+    project::append_ops(&path, vec![stroke(BrushMode::Normal, 1.0)], None).unwrap();
+    assert_eq!(required_version(&path), 1, "a default stroke");
+    for (i, op) in non_default_strokes().into_iter().enumerate() {
+        let (_dir, other) = sealed(&format!("project_format_required_fold_{i}"));
+        project::append_ops(&other, vec![op.clone()], None).unwrap();
+        assert_eq!(required_version(&other), 2, "{op:?}");
+        // A default stroke after it leaves the earlier checkpoint listed.
+        project::append_ops(&other, vec![stroke(BrushMode::Normal, 1.0)], None).unwrap();
+        assert_eq!(required_version(&other), 2, "{op:?} then a default stroke");
+    }
+}
+
+#[test]
+fn required_format_version_never_lowers_a_stored_version() {
+    let (_dir, path) = sealed("project_format_required_monotone");
+    let default = || vec![stroke(BrushMode::Normal, 1.0)];
+
+    let at_two = with_manifest(&path, "stored-two", |m| {
+        m.insert("format_version".into(), serde_json::json!(2));
+    });
+    project::append_ops(&at_two, default(), None).unwrap();
+    assert_eq!(stored_format_version(&at_two), Some(serde_json::json!(2)));
+
+    for (name, stored) in [("stored-zero", 0), ("stored-one", 1)] {
+        let copy = with_manifest(&path, name, |m| {
+            m.insert("format_version".into(), serde_json::json!(stored));
+        });
+        project::append_ops(&copy, default(), None).unwrap();
+        assert_eq!(
+            stored_format_version(&copy),
+            Some(serde_json::json!(stored)),
+            "{name}: a default-only save rewrites nothing"
+        );
+        project::append_ops(&copy, vec![stroke(BrushMode::Detail, 1.0)], None).unwrap();
+        assert_eq!(
+            stored_format_version(&copy),
+            Some(serde_json::json!(2)),
+            "{name}: a non-default stroke raises it"
+        );
+    }
+}
+
+#[test]
+fn required_format_version_two_opens_and_three_is_refused() {
+    let (_dir, path) = sealed("project_format_required_supported");
+    project::append_ops(&path, vec![stroke(BrushMode::Lighten, 0.5)], None).unwrap();
+    let head = Project::open(&path).unwrap().manifest().checkpoint.clone();
+    assert_eq!(stored_format_version(&path), Some(serde_json::json!(2)));
+    assert_eq!(Project::open(&path).unwrap().manifest().checkpoint, head);
+
+    let newer = with_manifest(&path, "v3", |m| {
+        m.insert("format_version".into(), serde_json::json!(3));
+    });
+    assert!(matches!(
+        open_err(&newer),
+        project::ProjectError::NewerFormat {
+            found: 3,
+            supported: 2,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn format_version_stamp_marks_only_non_default_strokes() {
+    let (_dir, path) = sealed("project_format_stamp_default");
+    let keys = |p: &Path| -> Vec<String> {
+        manifest_value(p)
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    };
+    let before = keys(&path);
+    project::append_ops(&path, vec![stroke(BrushMode::Normal, 1.0)], None).unwrap();
+    assert_eq!(
+        stored_format_version(&path),
+        None,
+        "default strokes: no field"
+    );
+    assert_eq!(keys(&path), before, "the default manifest keeps its keys");
+
+    for (i, op) in non_default_strokes().into_iter().enumerate() {
+        let (_dir, other) = sealed(&format!("project_format_stamp_{i}"));
+        project::append_ops(&other, vec![op.clone()], None).unwrap();
+        assert_eq!(
+            stored_format_version(&other),
+            Some(serde_json::json!(2)),
+            "{op:?}"
+        );
+    }
+}
+
+#[test]
+fn brush_stroke_mode_opacity_absent_fields_read_as_defaults() {
+    let default = stroke(BrushMode::Normal, 1.0);
+
+    let literal: Vec<Op> = serde_json::from_str(
+        r#"[{"brush-stroke":{"source_id":3,"path":[{"x":-4,"y":9},{"x":30,"y":-2}],"radius":6.5,"softness":0}}]"#,
+    )
+    .unwrap();
+    assert_eq!(literal, vec![default.clone()]);
+
+    let fixture: Vec<Op> = serde_json::from_str(&stroke_list_fixture()).unwrap();
+    assert_eq!(fixture.len(), 3);
+    for op in &fixture {
+        assert!(
+            matches!(op, Op::BrushStroke { mode: BrushMode::Normal, opacity, .. } if *opacity == 1.0),
+            "a fixture stroke without the fields must read normal / 1.0: {op:?}"
+        );
+    }
+
+    let (_dir, project_path) = sealed("project_format_stroke_defaults");
+    let appended = project::append_ops(&project_path, vec![default.clone()], None).unwrap();
+    let entry = format!("checkpoints/{}.json", appended.checkpoint);
+    let raw: serde_json::Value = serde_json::from_slice(
+        &Index::read(&project_path)
+            .unwrap()
+            .read_entry(&project_path, &entry)
+            .unwrap(),
+    )
+    .unwrap();
+    let written = raw["ops"][0]["brush-stroke"].as_object().unwrap();
+    assert!(
+        !written.contains_key("mode") && !written.contains_key("opacity"),
+        "a default stroke's checkpoint entry carries neither key: {raw}"
+    );
+    let reopened = Project::open(&project_path).unwrap();
+    assert_eq!(reopened.checkpoint().ops, vec![default]);
+}
+
+#[test]
+fn brush_stroke_mode_opacity_default_keeps_its_bytes_and_id() {
+    let without_fields = r#"[{"brush-stroke":{"source_id":2,"path":[{"x":120,"y":256},{"x":380,"y":256}],"radius":18.0,"softness":0.3}}]"#;
+    let ops: Vec<Op> = serde_json::from_str(without_fields).unwrap();
+    let bytes = serde_json::to_vec(&ops).unwrap();
+    assert_eq!(String::from_utf8(bytes.clone()).unwrap(), without_fields);
+
+    let id = |ops_json: &[u8]| {
+        Checkpoint::derive_child_id("parent", "fingerprint", &blake3::hash(ops_json).to_hex(), 7)
+    };
+    assert_eq!(id(&bytes), id(without_fields.as_bytes()));
+}
+
+#[test]
+fn brush_stroke_mode_opacity_non_default_round_trips() {
+    let modes = [
+        (BrushMode::Normal, "normal"),
+        (BrushMode::Lighten, "lighten"),
+        (BrushMode::Darken, "darken"),
+        (BrushMode::Detail, "detail"),
+    ];
+    for (mode, name) in modes {
+        for opacity in [1.0_f32, 0.25, 1e-6] {
+            let op = stroke(mode, opacity);
+            let text = serde_json::to_string(&op).unwrap();
+            assert_eq!(serde_json::from_str::<Op>(&text).unwrap(), op, "{text}");
+
+            let value = serde_json::to_value(&op).unwrap();
+            let fields = value["brush-stroke"].as_object().unwrap();
+            let written_mode = (mode != BrushMode::Normal).then(|| serde_json::json!(name));
+            assert_eq!(fields.get("mode"), written_mode.as_ref(), "{text}");
+            assert_eq!(fields.contains_key("opacity"), opacity != 1.0, "{text}");
+        }
+    }
+
+    let lighten = serde_json::to_value(stroke(BrushMode::Lighten, 1.0)).unwrap();
+    assert!(
+        lighten["brush-stroke"].get("opacity").is_none(),
+        "{lighten}"
+    );
+    let half = serde_json::to_value(stroke(BrushMode::Normal, 0.5)).unwrap();
+    assert_eq!(half["brush-stroke"]["opacity"], serde_json::json!(0.5));
+    assert!(half["brush-stroke"].get("mode").is_none(), "{half}");
+}
+
+#[test]
+fn brush_stroke_mode_opacity_refuses_an_unknown_mode() {
+    for bad in ["screen", "Normal"] {
+        let text = format!(
+            r#"{{"brush-stroke":{{"source_id":1,"path":[],"radius":2.0,"softness":0.5,"mode":"{bad}"}}}}"#
+        );
+        let err = serde_json::from_str::<Op>(&text).unwrap_err();
+        assert!(err.to_string().contains("unknown variant"), "{bad}: {err}");
+    }
 }
 
 #[test]
@@ -718,7 +951,7 @@ fn open_err(path: &Path) -> project::ProjectError {
 #[test]
 fn newer_format_version_is_refused() {
     let (_dir, project_path) = sealed("project_format_newer");
-    for found in [2u32, 7] {
+    for found in [3u32, 7] {
         let newer = with_manifest(&project_path, &format!("v{found}"), |m| {
             m.insert("format_version".into(), serde_json::json!(found));
         });
@@ -726,14 +959,14 @@ fn newer_format_version_is_refused() {
         assert!(
             matches!(
                 &err,
-                project::ProjectError::NewerFormat { found: f, supported: 1, .. } if *f == found
+                project::ProjectError::NewerFormat { found: f, supported: 2, .. } if *f == found
             ),
             "expected NewerFormat for version {found}: {err:?}"
         );
         assert_eq!(
             err.to_string(),
             format!(
-                "{}: saved by a newer FocusForge (project format {found}; this build reads up to 1). Update FocusForge to open it.",
+                "{}: saved by a newer FocusForge (project format {found}; this build reads up to 2). Update FocusForge to open it.",
                 newer.display()
             )
         );
@@ -743,14 +976,14 @@ fn newer_format_version_is_refused() {
 #[test]
 fn newer_format_version_is_refused_before_the_manifest_is_decoded() {
     let (_dir, project_path) = sealed("project_format_newer_undecodable");
-    let newer = with_manifest(&project_path, "v2-no-registration", |m| {
-        m.insert("format_version".into(), serde_json::json!(2));
+    let newer = with_manifest(&project_path, "v3-no-registration", |m| {
+        m.insert("format_version".into(), serde_json::json!(3));
         m.remove("registration")
             .expect("the sealed manifest must carry a registration key to remove");
     });
     let err = open_err(&newer);
     assert!(
-        matches!(&err, project::ProjectError::NewerFormat { found: 2, .. }),
+        matches!(&err, project::ProjectError::NewerFormat { found: 3, .. }),
         "expected NewerFormat, not a parse error: {err:?}"
     );
 }
@@ -766,6 +999,7 @@ fn format_version_absent_or_current_opens() {
     let cases = [
         ("absent", None),
         ("one", Some(serde_json::json!(1))),
+        ("two", Some(serde_json::json!(2))),
         ("zero", Some(serde_json::json!(0))),
         ("null", Some(serde_json::Value::Null)),
     ];

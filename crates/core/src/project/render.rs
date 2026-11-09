@@ -11,6 +11,7 @@
 //! some stroke meets. A [`PendingState`] -- a composite plus strokes not yet
 //! saved -- renders the same way, with no project.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use crate::align::{Registration, WarpingReader};
@@ -42,6 +43,9 @@ pub struct CheckpointImage {
     /// whose document keeps values outside the 16-bit range.
     pub sample_format: SampleFormat,
     body: Body,
+    /// Ceiling on the memory the source frame set may take when a stroke
+    /// opens it; `None` takes the host-derived budget.
+    memory_cap: Option<u64>,
 }
 
 enum Body {
@@ -115,6 +119,7 @@ impl CheckpointImage {
             description: composite.description.clone(),
             sample_format,
             body,
+            memory_cap: None,
         }
     }
 
@@ -182,6 +187,7 @@ impl CheckpointImage {
             description: held.composite_description.clone(),
             sample_format: stack.sample_format(),
             body: Body::Held(held.composite.clone()),
+            memory_cap: None,
         })
     }
 
@@ -215,6 +221,7 @@ impl CheckpointImage {
                 info,
                 strokes,
             },
+            memory_cap: None,
         })
     }
 
@@ -306,7 +313,14 @@ impl CheckpointImage {
                 strokes,
             } => {
                 let project = project.expect("a saved checkpoint renders against its project");
-                render_ops(project, checkpoint, ancestor, strokes, tile, sink)
+                render_ops(
+                    project,
+                    (checkpoint, ancestor),
+                    strokes,
+                    tile,
+                    self.memory_cap,
+                    sink,
+                )
             }
             Body::Held(composite) => render_held(composite, spp, tile, sink),
             Body::Pending {
@@ -398,9 +412,13 @@ fn check_pending_sources(paths: &[PathBuf], composite: &Path) -> Result<(), Proj
 /// TIFF or RAW). `context_path` names the error when opening fails -- the
 /// project's own path for a checkpoint's sources, the composite's for a
 /// pending state, which has no project of its own.
-fn open_sources(paths: &[PathBuf], context_path: &Path) -> Result<FrameSet, ProjectError> {
-    open_frame_set(paths, HostBudget::host_derived(&crate::host::snapshot()))
-        .map_err(|err| ProjectError::container(context_path, err))
+fn open_sources(
+    paths: &[PathBuf],
+    context_path: &Path,
+    memory_cap: Option<u64>,
+) -> Result<FrameSet, ProjectError> {
+    let budget = HostBudget::host_derived(&crate::host::snapshot()).capped_to(memory_cap);
+    open_frame_set(paths, budget).map_err(|err| ProjectError::container(context_path, err))
 }
 
 /// [`open_sources`] plus the shape check a checkpoint's own recorded fuse
@@ -412,8 +430,9 @@ fn open_checkpoint_sources(
     checkpoint: &Checkpoint,
     paths: &[PathBuf],
     record: &FuseRecord,
+    memory_cap: Option<u64>,
 ) -> Result<FrameSet, ProjectError> {
-    let set = open_sources(paths, project.path())?;
+    let set = open_sources(paths, project.path(), memory_cap)?;
     if set.reader.len() != record.sources.len()
         || set.reader.stack_context().samples_per_pixel != record.composite.samples_per_pixel
     {
@@ -435,7 +454,7 @@ fn open_pending_sources(
     composite: &Path,
     samples_per_pixel: u32,
 ) -> Result<FrameSet, ProjectError> {
-    let set = open_sources(paths, composite)?;
+    let set = open_sources(paths, composite, None)?;
     let found = set.reader.stack_context().samples_per_pixel;
     if found != samples_per_pixel {
         return Err(ProjectError::container(
@@ -572,46 +591,96 @@ fn stream_plane_to_sink<S: DocumentSample>(
     }
 }
 
-/// A sink blending each of `strokes` that meets a band over it, in log order,
-/// from its frame read through `warping` at the crop `origin`, then handing the
-/// band to `sink`. `context` names the error when a frame read fails.
+/// The extent a render of `tile` reads, and the strokes meeting it, ready for
+/// [`blend_bands`]. No stroke meeting it means `tile` itself and an empty list.
+fn plan<'a>(
+    info: ZMapInfo,
+    strokes: &'a [PlacedStroke],
+    tile: Rect,
+) -> (Rect, Vec<blend::PlacedStroke<'a>>) {
+    let placed: Vec<blend::PlacedStroke> = strokes
+        .iter()
+        .map(|stroke| blend::PlacedStroke {
+            op: &stroke.op,
+            frame: stroke.source,
+            footprint: stroke.footprint,
+        })
+        .collect();
+    let extent = blend::read_extent(info, &placed, tile);
+    let touching = placed
+        .into_iter()
+        .filter(|stroke| stroke.footprint.intersect(extent).is_some())
+        .collect();
+    (extent, touching)
+}
+
+/// A sink for the rows of `extent` that blends `strokes` over `tile` in log
+/// order, frames read through `warping` at `origin`, and hands `sink` the
+/// tile's bands. A band waits for the rows its [`blend::read_extent`] needs;
+/// rows no later band needs are dropped. `context` names a failed frame read.
+#[allow(clippy::too_many_arguments)]
 fn blend_bands<'a, 'b, S: DocumentSample>(
-    strokes: &'a [&'a PlacedStroke],
+    strokes: &'a [blend::PlacedStroke<'a>],
     info: ZMapInfo,
     warping: &'a WarpingReader<'a>,
     origin: (u32, u32),
     samples_per_pixel: usize,
     context: &'a Path,
+    (extent, tile): (Rect, Rect),
     sink: &'a mut RenderSink<'b, S>,
 ) -> impl FnMut(&[S], Rect) -> Result<(), ProjectError> + 'a {
+    let spp = samples_per_pixel;
+    let row = extent.width as usize * spp;
+    let tile_end = tile.y + tile.height;
+    let mut window: Vec<S> = Vec::new();
+    let mut top = extent.y;
+    let mut queued: VecDeque<Rect> = VecDeque::new();
     let mut blended: Vec<S> = Vec::new();
     move |band, rect| {
-        let placed: Vec<blend::PlacedStroke> = strokes
-            .iter()
-            .filter(|stroke| stroke.footprint.intersect(rect).is_some())
-            .map(|stroke| blend::PlacedStroke {
-                op: &stroke.op,
-                frame: stroke.source,
-                footprint: stroke.footprint,
-            })
-            .collect();
-        if placed.is_empty() {
-            return sink(band, rect);
+        window.extend_from_slice(band);
+        let arrived = rect.y + rect.height;
+        if let Some(part) = tile.intersect(rect) {
+            queued.push_back(part);
         }
-        blended.clear();
-        blended.extend_from_slice(band);
-        blend::apply_strokes(
-            info,
-            rect,
-            &mut blended,
-            &placed,
-            warping,
-            origin,
-            samples_per_pixel,
-            blend::apply::<S>,
-        )
-        .map_err(|err| ProjectError::container(context, err))?;
-        sink(&blended, rect)
+        while let Some(&out) = queued.front() {
+            let need = blend::read_extent(info, strokes, out);
+            if need.y + need.height > arrived {
+                break;
+            }
+            queued.pop_front();
+            blended.clear();
+            for y in need.y..need.y + need.height {
+                let start = (y - top) as usize * row + (need.x - extent.x) as usize * spp;
+                blended.extend_from_slice(&window[start..start + need.width as usize * spp]);
+            }
+            blend::apply_strokes(
+                info,
+                need,
+                &mut blended,
+                strokes,
+                warping,
+                origin,
+                spp,
+                blend::apply::<S>,
+            )
+            .map_err(|err| ProjectError::container(context, err))?;
+            crop_bands(out, samples_per_pixel as u32, &mut *sink)(&blended, need)?;
+        }
+        let next = queued.front().map_or(arrived.max(tile.y), |out| out.y);
+        let keep = if next < tile_end {
+            let rest = Rect {
+                height: tile_end - next,
+                y: next,
+                ..tile
+            };
+            blend::read_extent(info, strokes, rest).y
+        } else {
+            arrived
+        };
+        let keep = keep.clamp(top, arrived);
+        window.drain(..(keep - top) as usize * row);
+        top = keep;
+        Ok(())
     }
 }
 
@@ -628,10 +697,7 @@ fn render_pending<S: DocumentSample>(
     tile: Rect,
     sink: &mut RenderSink<'_, S>,
 ) -> Result<(), ProjectError> {
-    let touching: Vec<&PlacedStroke> = strokes
-        .iter()
-        .filter(|stroke| stroke.footprint.intersect(tile).is_some())
-        .collect();
+    let (extent, touching) = plan(info, strokes, tile);
     if touching.is_empty() {
         return render_held(composite, spp, tile, sink);
     }
@@ -645,9 +711,10 @@ fn render_pending<S: DocumentSample>(
         registration.origin(),
         spp as usize,
         composite,
+        (extent, tile),
         sink,
     );
-    render_held(composite, spp, tile, &mut blend)
+    render_held(composite, spp, extent, &mut blend)
 }
 
 /// `ancestor`'s stored composite over `tile`, each stroke the tile meets
@@ -655,17 +722,20 @@ fn render_pending<S: DocumentSample>(
 /// alignment the fusion used.
 fn render_ops<S: DocumentSample>(
     project: &mut Project,
-    checkpoint: &Checkpoint,
-    ancestor: &FuseRecord,
+    (checkpoint, ancestor): (&Checkpoint, &FuseRecord),
     strokes: &[PlacedStroke],
     tile: Rect,
+    memory_cap: Option<u64>,
     sink: &mut RenderSink<'_, S>,
 ) -> Result<(), ProjectError> {
     let spp = ancestor.composite.samples_per_pixel;
-    let touching: Vec<&PlacedStroke> = strokes
-        .iter()
-        .filter(|stroke| stroke.footprint.intersect(tile).is_some())
-        .collect();
+    let info = ZMapInfo::new(
+        ancestor.composite.width,
+        ancestor.composite.height,
+        ancestor.sources.len() as u32,
+    )
+    .expect("prepare built the same extent");
+    let (extent, touching) = plan(info, strokes, tile);
     if touching.is_empty() {
         return stream_plane_to_sink(
             project,
@@ -680,15 +750,9 @@ fn render_ops<S: DocumentSample>(
         .iter()
         .map(|s| project.source_path(s))
         .collect();
-    let set = open_checkpoint_sources(project, checkpoint, &paths, ancestor)?;
+    let set = open_checkpoint_sources(project, checkpoint, &paths, ancestor, memory_cap)?;
     let gained = GainReader::new(&*set.reader, ancestor.registration.gains());
     let warping = warp(&set, &gained, &ancestor.registration, paths.len(), spp);
-    let info = ZMapInfo::new(
-        ancestor.composite.width,
-        ancestor.composite.height,
-        paths.len() as u32,
-    )
-    .expect("prepare built the same extent");
     let project_path = project.path().to_path_buf();
     let mut blend = blend_bands(
         &touching,
@@ -697,12 +761,13 @@ fn render_ops<S: DocumentSample>(
         ancestor.registration.origin(),
         spp as usize,
         &project_path,
+        (extent, tile),
         sink,
     );
     stream_plane_to_sink(
         project,
         &ancestor.composite,
-        &mut crop_bands(tile, spp, &mut blend),
+        &mut crop_bands(extent, spp, &mut blend),
     )
 }
 
@@ -711,9 +776,17 @@ fn render_ops<S: DocumentSample>(
 /// above white included. [`CheckpointImage::prepare`] then the render, into a
 /// `.partial` sibling of `path`, renamed onto it only once every band has
 /// been written; removed instead on any error, so a refused or interrupted
-/// render leaves nothing behind.
-pub fn render_checkpoint(project: &mut Project, id: &str, path: &Path) -> Result<(), ProjectError> {
-    let image = CheckpointImage::prepare(project, id)?;
+/// render leaves nothing behind. `memory_cap` lowers the budget of the source
+/// frame set an op-bearing checkpoint opens; a cap below the frames' decode
+/// reservation refuses the render.
+pub fn render_checkpoint(
+    project: &mut Project,
+    id: &str,
+    path: &Path,
+    memory_cap: Option<u64>,
+) -> Result<(), ProjectError> {
+    let mut image = CheckpointImage::prepare(project, id)?;
+    image.memory_cap = memory_cap;
     match image.sample_format {
         SampleFormat::U16 => write_tiff(
             &image,

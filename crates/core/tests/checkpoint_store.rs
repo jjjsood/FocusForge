@@ -16,7 +16,7 @@ use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
-    self, AppendRequest, Metrics, Op, Point, Project, ProjectError, SealRequest,
+    self, AppendRequest, BrushMode, Metrics, Op, Point, Project, ProjectError, SealRequest,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 
@@ -197,6 +197,8 @@ fn stroke(source_id: u16, x: i32, y: i32, radius: f32) -> Op {
         path: vec![Point { x, y }],
         radius,
         softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }
 }
 
@@ -980,7 +982,7 @@ fn hiding_a_parent_keeps_its_child_byte_identical() {
         let render = dir.join(format!("{tag}-render.tif"));
         let export = dir.join(format!("{tag}-export.tif"));
         project::materialize_zmap(&mut project, &checkpoint, &zmap).unwrap();
-        project::render_checkpoint(&mut project, &child.checkpoint, &render).unwrap();
+        project::render_checkpoint(&mut project, &child.checkpoint, &render, None).unwrap();
         project::export_checkpoint(
             &mut project,
             &child.checkpoint,

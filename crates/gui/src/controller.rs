@@ -27,7 +27,7 @@ use crate::analytics::{self, AnalyticsView, CountError, CountPriority, RowValue}
 use crate::appearance_settings::{self, AppearanceSettings, SourcePresentation};
 use crate::brush;
 use crate::calculator::{Calculator, CalculatorView};
-use crate::canvas::{FrameView, OverlayDraw, PaneSource};
+use crate::canvas::{FrameView, OverlayDraw, PaneSource, SharedOrigin};
 use crate::checkpoints;
 use crate::diagnostics::{
     DiagnosticsEntryView, DiagnosticsScan, DiagnosticsScanEntry, DiagnosticsStatus,
@@ -424,6 +424,10 @@ struct InputState {
 struct BrushState {
     size: f32,
     soft: f32,
+    mode: job::BrushMode,
+    /// A whole percentage, `1.0..=100.0`.
+    opacity: f32,
+    mode_menu_open: bool,
     picking: bool,
 }
 
@@ -432,6 +436,9 @@ impl Default for BrushState {
         Self {
             size: 64.0,
             soft: 30.0,
+            mode: job::BrushMode::Normal,
+            opacity: 100.0,
+            mode_menu_open: false,
             picking: false,
         }
     }
@@ -490,6 +497,12 @@ pub struct BrushToolbarView {
     pub soft: f32,
     /// The linear slider's own thumb position, `0.0..=1.0`.
     pub soft_fraction: f32,
+    pub mode: job::BrushMode,
+    /// A whole percentage, `1.0..=100.0`.
+    pub opacity: f32,
+    /// The opacity slider's thumb position, `0.01..=1.0`.
+    pub opacity_fraction: f32,
+    pub mode_menu_open: bool,
     pub picking: bool,
     /// Whether the active tab's edit session has an op to undo/redo.
     pub can_undo: bool,
@@ -523,6 +536,10 @@ pub struct BrushCursorView {
     /// The shared source point projected into each pane's local coordinates.
     pub frame_position: (f32, f32),
     pub composite_position: (f32, f32),
+    /// The active brush mode's one-letter tag, empty while `picking`.
+    pub mode_tag: &'static str,
+    /// The tag chip's top-left on both axes of the cursor square.
+    pub tag_origin: f32,
 }
 
 /// The diagnostics panel's own state: the data directory a bundle is
@@ -670,9 +687,18 @@ struct ProjectTab {
     /// whenever the selected row or planes are replaced (a restore, a new
     /// checkpoint).
     edit: Option<job::EditState>,
+    /// The readers that tell where this tab's Lighten and Darken strokes act,
+    /// once opened for the current row and frames.
+    origin: Option<Arc<job::OriginReaders>>,
+    /// Whether opening or reading [`Self::origin`] failed for the current
+    /// row and frames; they are not opened again until those change.
+    origin_failed: bool,
     /// Bumped whenever the session this tab holds, or is opening, is dropped:
     /// an opening session lands only while its generation is still this one.
     session_generation: u64,
+    /// The memory limit the frame set behind [`Self::edit`] and
+    /// [`Self::origin`] was last opened, or re-opened, under.
+    frames_cap: Option<u64>,
     /// This tab's own failed, cancelled or sources-missing run, if its most
     /// recent attempt did not succeed -- `None` once a later success clears
     /// it. Keyed by tab rather than by path so it survives an Unsaved ->
@@ -768,14 +794,67 @@ struct EditSlot {
     /// Set when a worker starts, until [`AppController::take_session_started`].
     started: bool,
     parked: Arc<Mutex<Vec<ParkedSession>>>,
+    /// Frame sets being re-opened under a changed memory limit: tab id,
+    /// session generation and the limit each was started for.
+    reopening: Vec<(u64, u64, Option<u64>)>,
+    parked_reopens: Arc<Mutex<Vec<ParkedReopen>>>,
 }
 
 type ParkedSession = (u64, u64, Result<job::EditState, String>);
+
+type ParkedReopen = (u64, u64, Option<u64>, Result<job::SharedFrames, String>);
 
 impl EditSlot {
     fn opening(&self, tab_id: u64, generation: u64) -> bool {
         self.in_flight.contains(&(tab_id, generation))
     }
+
+    /// Whether the tab's frame set is being re-opened for `generation`.
+    fn reopening(&self, tab_id: u64, generation: u64) -> bool {
+        self.reopening
+            .iter()
+            .any(|&(tab, started, _)| (tab, started) == (tab_id, generation))
+    }
+}
+
+/// The origin readers being opened and where their workers park the results:
+/// tab id, the session generation each was started for, the checkpoint the
+/// worker renders into the plane cache (if any), and the readers or why they
+/// failed.
+#[derive(Default)]
+struct OriginSlot {
+    in_flight: Vec<(u64, u64, Option<String>)>,
+    /// Set when a worker starts, until [`AppController::take_origin_started`].
+    started: bool,
+    parked: Arc<Mutex<Vec<ParkedOrigin>>>,
+}
+
+type ParkedOrigin = (u64, u64, Result<Arc<job::OriginReaders>, String>);
+
+impl OriginSlot {
+    fn opening(&self, tab_id: u64, generation: u64) -> bool {
+        self.in_flight
+            .iter()
+            .any(|(tab, started, _)| (*tab, *started) == (tab_id, generation))
+    }
+
+    /// The checkpoints the running workers render into the plane cache.
+    fn rendering(&self) -> Vec<String> {
+        self.in_flight
+            .iter()
+            .filter_map(|(.., id)| id.clone())
+            .collect()
+    }
+}
+
+/// Where an origin worker finds the composite the strokes were drawn over.
+enum OriginComposite {
+    Cached(PathBuf),
+    Render {
+        project_path: PathBuf,
+        scratch_root: PathBuf,
+        id: String,
+    },
 }
 
 /// Whether the active tab has an editor session, is opening one, or cannot.
@@ -949,7 +1028,10 @@ impl ProjectTab {
             run: job::RunState::Idle,
             request: None,
             edit: None,
+            origin: None,
+            origin_failed: false,
             session_generation: 0,
+            frames_cap: None,
             failure: None,
         }
     }
@@ -1188,6 +1270,8 @@ impl ProjectTab {
                 path: stroke.path_so_far(),
                 radius: stroke.radius(),
                 softness: stroke.softness(),
+                mode: stroke.mode(),
+                opacity: stroke.opacity(),
             });
         }
         ops
@@ -1198,6 +1282,8 @@ impl ProjectTab {
     /// lands. Returns whether an installed session was dropped.
     fn drop_session(&mut self) -> bool {
         self.session_generation += 1;
+        self.origin = None;
+        self.origin_failed = false;
         self.edit.take().is_some()
     }
 
@@ -1555,6 +1641,7 @@ struct ShellState {
     render: RenderSlot,
     thumbnails: ThumbnailSlot,
     edits: EditSlot,
+    origin: OriginSlot,
     /// The open export modal, if any -- [`AppController::checkpoint_export_requested`].
     export_dialog: Option<ExportDialog>,
     /// The last confirmed export format and settings, which the next modal
@@ -2264,6 +2351,12 @@ impl AppController {
         true
     }
 
+    /// The memory budget a tab's frame sets are opened with: the host-derived
+    /// budget, lowered to the Performance memory limit when one is set.
+    fn frame_set_budget(&self) -> job::HostBudget {
+        job::host_budget().capped_to(self.performance.max_host_memory_bytes())
+    }
+
     /// Opens the active tab's edit session over its row's Z-Map and its own
     /// frames on a worker unless the tab already holds or is opening one,
     /// replaying an op-bearing row's stroke chain there. `Opening` also
@@ -2277,7 +2370,10 @@ impl AppController {
         if tab.edit.is_some() {
             return SessionOpen::Open;
         }
-        if self.state.edits.opening(tab.id, tab.session_generation) {
+        if self.state.edits.opening(tab.id, tab.session_generation)
+            || self.state.edits.reopening(tab.id, tab.session_generation)
+            || self.state.origin.opening(tab.id, tab.session_generation)
+        {
             return SessionOpen::Opening;
         }
         let (composite, zmap) = match self.active_tab_planes() {
@@ -2291,10 +2387,18 @@ impl AppController {
         // `can_edit` guarantees `tab.frames` equals the fused sources, in
         // the same order, by the time editor mode is entered -- so indexing
         // `registration`'s per-frame transforms by position here matches.
-        let Some((_, registration)) = tab.fused() else {
+        let Some((fused_frames, registration)) = tab.fused() else {
             return SessionOpen::Unavailable;
         };
-        let frames = tab.frames.clone();
+        let source = match &tab.origin {
+            Some(origin) if fused_frames == tab.frames => {
+                job::FrameSource::Reader(Arc::clone(origin.sources()))
+            }
+            _ => job::FrameSource::Open {
+                frames: tab.frames.clone(),
+                budget: self.frame_set_budget(),
+            },
+        };
         let base_ops = tab.base_ops();
         let chain = tab
             .selected_checkpoint
@@ -2306,23 +2410,29 @@ impl AppController {
         let tile_size = self
             .resident_tile_size_for_test
             .unwrap_or(job::RESIDENT_TILE_SIZE);
+        if matches!(source, job::FrameSource::Open { .. }) {
+            let cap = self.performance.max_host_memory_bytes();
+            self.state
+                .active_mut()
+                .expect("the active tab was just read")
+                .frames_cap = cap;
+        }
         let slot = &mut self.state.edits;
         slot.in_flight.push((tab_id, generation));
         slot.started = true;
         let parked = Arc::clone(&slot.parked);
         std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(|| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 job::open_edit_session(
                     zmap.as_deref(),
                     &composite,
-                    &frames,
+                    source,
                     registration,
                     tile_size,
-                    job::host_budget(),
                     base_ops,
                     chain,
                 )
-            })
+            }))
             .map_err(|_| "the session worker panicked".to_string())
             .and_then(|opened| opened.map_err(|err| err.to_string()));
             parked
@@ -2339,6 +2449,7 @@ impl AppController {
     /// active tab in editor mode, drops the window to stacking. Returns
     /// `true` once no session is being opened -- the poll's cue to stop.
     pub fn settle_edit_session(&mut self) -> bool {
+        self.settle_reopened_frame_sets();
         let parked = std::mem::take(
             &mut *self
                 .state
@@ -2372,13 +2483,342 @@ impl AppController {
                 }
             }
         }
-        self.state.edits.in_flight.is_empty()
+        self.reopen_frame_sets();
+        self.state.edits.in_flight.is_empty() && self.state.edits.reopening.is_empty()
+    }
+
+    /// Re-opens the frame set of every tab holding a session or origin
+    /// readers that was opened under a memory limit other than the one in
+    /// force, on a worker each. A tab that is opening a session or readers,
+    /// or already re-opening, waits for the settle that follows.
+    fn reopen_frame_sets(&mut self) {
+        let cap = self.performance.max_host_memory_bytes();
+        let budget = self.frame_set_budget();
+        let slot = &mut self.state.edits;
+        for tab in &mut self.state.projects {
+            let (id, generation) = (tab.id, tab.session_generation);
+            if (tab.edit.is_none() && tab.origin.is_none())
+                || tab.frames_cap == cap
+                || slot.opening(id, generation)
+                || slot.reopening(id, generation)
+                || self.state.origin.opening(id, generation)
+            {
+                continue;
+            }
+            let frames = if tab.edit.is_some() {
+                tab.frames.clone()
+            } else if let Some((frames, _)) = tab.fused() {
+                frames
+            } else {
+                continue;
+            };
+            tab.frames_cap = cap;
+            slot.reopening.push((id, generation, cap));
+            slot.started = true;
+            let parked = Arc::clone(&slot.parked_reopens);
+            std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    job::FrameSource::Open { frames, budget }
+                        .into_reader()
+                        .map_err(|err| err.to_string())
+                }))
+                .map_err(|_| "the re-open worker panicked".to_string())
+                .and_then(|opened| opened);
+                parked
+                    .lock()
+                    .expect("no thread panicked while holding the parked re-opens")
+                    .push((id, generation, cap, result));
+            });
+        }
+    }
+
+    /// Installs the re-opened frame sets into the session and origin readers
+    /// of the tabs they were opened for. A result for a tab that is gone, at
+    /// another generation or opened under a limit no longer in force is
+    /// dropped; a refused one leaves the tab on its frames and warns.
+    fn settle_reopened_frame_sets(&mut self) {
+        let parked = std::mem::take(
+            &mut *self
+                .state
+                .edits
+                .parked_reopens
+                .lock()
+                .expect("no thread panicked while holding the parked re-opens"),
+        );
+        let landed = !parked.is_empty();
+        let cap = self.performance.max_host_memory_bytes();
+        for (tab_id, generation, opened_cap, result) in parked {
+            let reopening = &mut self.state.edits.reopening;
+            if let Some(at) = reopening
+                .iter()
+                .position(|&key| key == (tab_id, generation, opened_cap))
+            {
+                reopening.remove(at);
+            }
+            let Some(index) = self.tab_index(tab_id) else {
+                continue;
+            };
+            let tab = &mut self.state.projects[index];
+            if tab.session_generation != generation || opened_cap != cap {
+                continue;
+            }
+            match result {
+                Ok(reader) => {
+                    if let Some(origin) = &tab.origin {
+                        tab.origin = Some(Arc::new(origin.with_sources(Arc::clone(&reader))));
+                    }
+                    if let Some(edit) = &mut tab.edit {
+                        edit.sources = reader;
+                    }
+                }
+                Err(reason) => {
+                    tracing::warn!(error = %reason, "the frame set could not be re-opened");
+                    let (title, text) = match self.performance.max_host_memory.as_ref() {
+                        Some(cap) => (
+                            "Memory limit too small",
+                            format!(
+                                "The memory limit of {} is too small for this project's frames. \
+                                 This project keeps the frames it has open until the limit is raised.",
+                                cap.text
+                            ),
+                        ),
+                        None => (
+                            "Frames not re-opened",
+                            format!(
+                                "The frames could not be re-opened: {reason}. \
+                                 This project keeps the frames it has open."
+                            ),
+                        ),
+                    };
+                    let mut record = Notification::new(Kind::Warning, Source::Run, title, text);
+                    self.fill_project(&mut record, Some(index));
+                    self.publish_notification(record);
+                }
+            }
+        }
+        let wants_session = self.state.mode == ShellMode::Editor
+            || self.state.active().is_some_and(ProjectTab::on_ops_row);
+        if landed && wants_session && self.state.active().is_some_and(|tab| tab.edit.is_none()) {
+            self.ensure_edit_session();
+        }
     }
 
     /// Whether an editor session started opening since the last call -- the
     /// bridge's cue to start polling [`Self::settle_edit_session`].
     pub fn take_session_started(&mut self) -> bool {
         std::mem::take(&mut self.state.edits.started)
+    }
+
+    /// Opens the active tab's origin readers on a worker when the overlay is
+    /// on and a Lighten or Darken stroke is among its strokes, unless they are
+    /// open, opening or failed for the current row and frames. A saved
+    /// op-bearing row's fused ancestor is rendered into the plane cache first
+    /// when it is not there.
+    pub fn ensure_origin_readers(&mut self) {
+        self.start_origin_readers(false);
+    }
+
+    /// [`Self::ensure_origin_readers`]; `picking` asks for the readers for an
+    /// eyedropper read, which needs a session, with the overlay off too.
+    fn start_origin_readers(&mut self, picking: bool) {
+        let Some(tab) = self.state.active() else {
+            return;
+        };
+        let wanted = if picking {
+            tab.edit.is_some()
+        } else {
+            self.state.overlay.on
+        };
+        if !wanted
+            || tab.origin.is_some()
+            || tab.origin_failed
+            || self.state.origin.opening(tab.id, tab.session_generation)
+            || self.state.edits.opening(tab.id, tab.session_generation)
+            || self.state.edits.reopening(tab.id, tab.session_generation)
+            || !tab.overlay_ops().iter().any(|op| {
+                matches!(
+                    op,
+                    job::Op::BrushStroke {
+                        mode: job::BrushMode::Lighten | job::BrushMode::Darken,
+                        ..
+                    }
+                )
+            })
+        {
+            return;
+        }
+        let Some((frames, registration)) = tab.fused() else {
+            return;
+        };
+        let source = match &tab.edit {
+            Some(edit) if frames == tab.frames => {
+                job::FrameSource::Reader(Arc::clone(&edit.sources))
+            }
+            Some(_) => {
+                tracing::error!("the origin readers' frames differ from the edit session's");
+                self.state
+                    .active_mut()
+                    .expect("the active tab was just read")
+                    .origin_failed = true;
+                return;
+            }
+            None => job::FrameSource::Open {
+                frames,
+                budget: self.frame_set_budget(),
+            },
+        };
+        let (tab_id, generation) = (tab.id, tab.session_generation);
+        let Some(composite) = self.origin_composite() else {
+            return;
+        };
+        let memory_cap = self.performance.max_host_memory_bytes();
+        let rendering = match &composite {
+            OriginComposite::Render { id, .. } => Some(id.clone()),
+            OriginComposite::Cached(_) => None,
+        };
+        if matches!(source, job::FrameSource::Open { .. }) {
+            self.state
+                .active_mut()
+                .expect("the active tab was just read")
+                .frames_cap = memory_cap;
+        }
+        let slot = &mut self.state.origin;
+        slot.in_flight.push((tab_id, generation, rendering));
+        slot.started = true;
+        let parked = Arc::clone(&slot.parked);
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let composite = match composite {
+                    OriginComposite::Cached(path) => path,
+                    OriginComposite::Render {
+                        project_path,
+                        scratch_root,
+                        id,
+                    } => {
+                        job::render_checkpoint_planes(&project_path, &scratch_root, &id, memory_cap)
+                            .map_err(|err| err.to_string())?
+                            .0
+                    }
+                };
+                job::OriginReaders::open(&composite, source, registration)
+                    .map_err(|err| err.to_string())
+            }))
+            .map_err(|_| "the origin worker panicked".to_string())
+            .and_then(|opened| opened)
+            .map(Arc::new);
+            parked
+                .lock()
+                .expect("no thread panicked while holding the parked origin readers")
+                .push((tab_id, generation, result));
+        });
+    }
+
+    /// The composite the active tab's strokes were drawn over: its row's
+    /// planes when they carry no strokes, else the fused ancestor's, cached or
+    /// to be rendered. `None` while the planes are not ready, or while a
+    /// render of the ancestor already writes the cache.
+    fn origin_composite(&mut self) -> Option<OriginComposite> {
+        let scratch_root = self.scratch_root();
+        let tab = self.state.active()?;
+        if tab.base_ops().is_empty() {
+            return match self.active_tab_planes() {
+                TabPlanes::Ready(composite, _) => Some(OriginComposite::Cached(composite)),
+                TabPlanes::Pending | TabPlanes::None => None,
+            };
+        }
+        let GuiProject::Opened(project) = &tab.project else {
+            return None;
+        };
+        let ancestor = project
+            .history()
+            .ancestors(&tab.plane_key()?)
+            .ok()?
+            .into_iter()
+            .find(|checkpoint| checkpoint.ops.is_empty())?
+            .id
+            .clone();
+        match job::cached_checkpoint_planes(project, &scratch_root, &ancestor) {
+            Ok(job::CheckpointPlanes::Ready(composite, _)) => {
+                Some(OriginComposite::Cached(composite))
+            }
+            Ok(job::CheckpointPlanes::NeedsRender) => {
+                // Two writers of one checkpoint's planes share a partial file.
+                let rendered_elsewhere = self
+                    .state
+                    .render
+                    .in_flight
+                    .as_ref()
+                    .is_some_and(|(_, id)| *id == ancestor)
+                    || self.state.origin.rendering().contains(&ancestor);
+                (!rendered_elsewhere).then(|| OriginComposite::Render {
+                    project_path: project.path().to_path_buf(),
+                    scratch_root,
+                    id: ancestor,
+                })
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the origin readers' composite could not be located");
+                None
+            }
+        }
+    }
+
+    /// Installs the parked origin readers without waiting on a worker. They
+    /// land only on a tab that still exists at the generation they were
+    /// started for; a failed open is logged once and not retried until the
+    /// row or frames change. Returns `true` once none is being opened.
+    pub fn settle_origin_readers(&mut self) -> bool {
+        let parked = std::mem::take(
+            &mut *self
+                .state
+                .origin
+                .parked
+                .lock()
+                .expect("no thread panicked while holding the parked origin readers"),
+        );
+        let scratch_root = self.scratch_root();
+        for (tab_id, generation, result) in parked {
+            let mut rendered = None;
+            self.state.origin.in_flight.retain(|(tab, started, id)| {
+                let ours = (*tab, *started) == (tab_id, generation);
+                if ours {
+                    rendered.clone_from(id);
+                }
+                !ours
+            });
+            let Some(index) = self.tab_index(tab_id) else {
+                continue;
+            };
+            let tab = &mut self.state.projects[index];
+            if tab.session_generation != generation {
+                continue;
+            }
+            match result {
+                Ok(readers) => {
+                    if let Some(id) = &rendered {
+                        tab.note_viewed(&scratch_root, id);
+                    }
+                    tab.origin = Some(readers);
+                }
+                Err(reason) => {
+                    tracing::warn!(error = %reason, "the origin readers could not be opened");
+                    tab.origin_failed = true;
+                }
+            }
+        }
+        let wants_session = self.state.mode == ShellMode::Editor
+            || self.state.active().is_some_and(ProjectTab::on_ops_row);
+        if wants_session && self.state.active().is_some_and(|tab| tab.edit.is_none()) {
+            self.ensure_edit_session();
+        }
+        self.reopen_frame_sets();
+        self.state.origin.in_flight.is_empty()
+    }
+
+    /// Whether origin readers started opening since the last call -- the
+    /// bridge's cue to start polling [`Self::settle_origin_readers`].
+    pub fn take_origin_started(&mut self) -> bool {
+        std::mem::take(&mut self.state.origin.started)
     }
 
     /// Discards the active tab's own in-progress stroke, if any: restores
@@ -2465,6 +2905,7 @@ impl AppController {
         let sources = tab.fused()?.0.len();
         let mut draw = OverlayDraw::for_opacity(sources as u32, self.state.overlay.opacity);
         draw.ops = tab.overlay_ops().into();
+        draw.origin = tab.origin.clone().map(SharedOrigin);
         Some(draw)
     }
 
@@ -3299,6 +3740,22 @@ impl AppController {
                 action: Action::PickSourceUnderPointer,
                 ..
             } => self.pick_source_under_pointer(),
+            ActionEvent::Fired {
+                action: Action::BrushModeNormal,
+                ..
+            } => self.set_brush_mode(job::BrushMode::Normal),
+            ActionEvent::Fired {
+                action: Action::BrushModeLighten,
+                ..
+            } => self.set_brush_mode(job::BrushMode::Lighten),
+            ActionEvent::Fired {
+                action: Action::BrushModeDarken,
+                ..
+            } => self.set_brush_mode(job::BrushMode::Darken),
+            ActionEvent::Fired {
+                action: Action::BrushModeDetail,
+                ..
+            } => self.set_brush_mode(job::BrushMode::Detail),
             ActionEvent::Start {
                 action: Action::Paint,
                 x,
@@ -3448,6 +3905,10 @@ impl AppController {
             size_fraction: fraction_from_size(size, ceiling),
             soft: self.state.brush.soft,
             soft_fraction: self.state.brush.soft / 100.0,
+            mode: self.state.brush.mode,
+            opacity: self.state.brush.opacity,
+            opacity_fraction: self.state.brush.opacity / 100.0,
+            mode_menu_open: self.state.brush.mode_menu_open,
             picking: self.state.brush.picking,
             can_undo: self.edit_session().is_some_and(job::EditState::can_undo),
             can_redo: self.edit_session().is_some_and(job::EditState::can_redo),
@@ -3476,7 +3937,7 @@ impl AppController {
         let hovered = picking
             .then(|| {
                 let (pane, local) = self.anchor_pane();
-                self.source_index_at(pane, local)
+                self.source_index_at(pane, local).ok().flatten()
             })
             .flatten()
             .filter(|&source| source != job::NO_SOURCE);
@@ -3491,6 +3952,17 @@ impl AppController {
             pick_color: job::source_color(source, sources),
             frame_position: viewport.from_source_in(source_point, left),
             composite_position: viewport.from_source_in(source_point, right),
+            mode_tag: if picking {
+                ""
+            } else {
+                match self.state.brush.mode {
+                    job::BrushMode::Normal => "N",
+                    job::BrushMode::Lighten => "L",
+                    job::BrushMode::Darken => "D",
+                    job::BrushMode::Detail => "T",
+                }
+            },
+            tag_origin: paths.tag_origin,
         })
     }
 
@@ -3509,6 +3981,38 @@ impl AppController {
         self.emit(ShellEvent::EditorChanged);
     }
 
+    /// The opacity slider's own callback: `fraction` is `0.0..=1.0` along
+    /// the track and lands on a whole percentage of at least 1, so the
+    /// stroke it freezes is never fully transparent.
+    pub fn set_brush_opacity_fraction(&mut self, fraction: f32) {
+        self.state.brush.opacity = (fraction * 100.0).round().clamp(1.0, 100.0);
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// Picks the brush's blend mode and closes the mode list.
+    pub fn set_brush_mode(&mut self, mode: job::BrushMode) {
+        self.state.brush.mode = mode;
+        self.state.brush.mode_menu_open = false;
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// Opens or closes the mode list. A no-op outside the editor.
+    pub fn toggle_brush_mode_menu(&mut self) {
+        if self.mode() != ShellMode::Editor {
+            return;
+        }
+        self.state.brush.mode_menu_open = !self.state.brush.mode_menu_open;
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// Closes the mode list; nothing else changes.
+    pub fn close_brush_mode_menu(&mut self) {
+        if self.state.brush.mode_menu_open {
+            self.state.brush.mode_menu_open = false;
+            self.emit(ShellEvent::EditorChanged);
+        }
+    }
+
     /// Toggles the pipette's armed state.
     pub fn toggle_pipette(&mut self) {
         self.state.brush.picking = !self.state.brush.picking;
@@ -3522,6 +4026,12 @@ impl AppController {
         let ceiling = self.brush_size_ceiling();
         let size = self.state.brush.size.clamp(1.0, ceiling as f32);
         (size / 2.0, self.state.brush.soft / 100.0)
+    }
+
+    /// The brush's blend mode and opacity in the storage units core's
+    /// retouch ops take (`opacity` as a fraction of one).
+    fn brush_mode_opacity(&self) -> (job::BrushMode, f32) {
+        (self.state.brush.mode, self.state.brush.opacity / 100.0)
     }
 
     /// `Ctrl + Z`: steps the active tab's pending strokes back one op and
@@ -3590,20 +4100,48 @@ impl AppController {
     /// the latest stroke covering the pixel by more than half, else the
     /// stored Z-Map's index. `None` off the image or with nothing to read;
     /// callers decide what `NO_SOURCE` means to them.
-    fn source_index_at(&self, pane: PaneSource, local: (f32, f32)) -> Option<u16> {
-        let tab = self.state.active()?;
-        let viewport = tab.viewport.as_ref()?;
-        let (sx, sy) = viewport.to_source_in(local, self.pane_rect(pane)?);
+    fn source_index_at(
+        &self,
+        pane: PaneSource,
+        local: (f32, f32),
+    ) -> Result<Option<u16>, job::RetouchError> {
+        let Some(tab) = self.state.active() else {
+            return Ok(None);
+        };
+        let (Some(viewport), Some(rect), Some(edit)) = (
+            tab.viewport.as_ref(),
+            self.pane_rect(pane),
+            tab.edit.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        let (sx, sy) = viewport.to_source_in(local, rect);
+        let info = edit.info();
         if sx < 0.0 || sy < 0.0 {
-            return None;
+            return Ok(None);
         }
         let (x, y) = (sx.floor() as u32, sy.floor() as u32);
-        let edit = tab.edit.as_ref()?;
-        let info = edit.info();
         if x >= info.width() || y >= info.height() {
-            return None;
+            return Ok(None);
         }
-        job::top_source(&edit.drawn_ops(), info, x, y).or_else(|| edit.stored_source(x, y))
+        let ops = edit.drawn_ops();
+        let pixel = job::Rect {
+            x,
+            y,
+            width: 1,
+            height: 1,
+        };
+        let conditions = if job::needs_mode_conditions(&ops, info, pixel) {
+            match (&tab.origin, tab.origin_failed) {
+                (Some(origin), false) => {
+                    origin.conditions(&ops, info, pixel, std::num::NonZeroU32::MIN)?
+                }
+                _ => return Ok(None),
+            }
+        } else {
+            job::ModeConditions::default()
+        };
+        Ok(job::top_source(&ops, info, x, y, &conditions).or_else(|| edit.stored_source(x, y)))
     }
 
     /// `Alt + click`, or the armed pipette's `Start`: reads the frame the
@@ -3611,8 +4149,17 @@ impl AppController {
     /// brush source.
     /// `NO_SOURCE` and a point off the image leave the source unchanged.
     fn pick_source_at(&mut self, pane: PaneSource, local: (f32, f32)) {
-        let Some(source) = self.source_index_at(pane, local) else {
-            return;
+        self.start_origin_readers(true);
+        let source = match self.source_index_at(pane, local) {
+            Ok(Some(source)) => source,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, "the frame under the pointer could not be read");
+                if let Some(tab) = self.state.active_mut() {
+                    tab.origin_failed = true;
+                }
+                return;
+            }
         };
         if source == job::NO_SOURCE {
             return;
@@ -3634,6 +4181,10 @@ impl AppController {
     /// softness for the stroke. Both panes share one viewport, so the stroke
     /// is the same whichever pane the press lands in.
     fn paint_start(&mut self, x: f32, y: f32) {
+        if self.state.brush.mode_menu_open {
+            self.close_brush_mode_menu();
+            return;
+        }
         if self.state.brush.picking {
             let (pane, local) = self.anchor_pane();
             self.pick_source_at(pane, local);
@@ -3658,6 +4209,7 @@ impl AppController {
             return;
         };
         let (radius, softness) = self.brush_radius_softness();
+        let (mode, opacity) = self.brush_mode_opacity();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -3672,6 +4224,8 @@ impl AppController {
             source,
             radius,
             softness,
+            mode,
+            opacity,
             sx as f32 - 0.5,
             sy as f32 - 0.5,
         ));
@@ -3715,17 +4269,22 @@ impl AppController {
             return;
         };
         let (source_id, radius, softness) = (stroke.source(), stroke.radius(), stroke.softness());
+        let (mode, opacity) = (stroke.mode(), stroke.opacity());
         let op = job::Op::BrushStroke {
             source_id,
             path: segment,
             radius,
             softness,
+            mode,
+            opacity,
         };
         let so_far = job::Op::BrushStroke {
             source_id,
             path: stroke.path_so_far(),
             radius,
             softness,
+            mode,
+            opacity,
         };
         let region = job::footprint(&op, edit.info())
             .expect("a live stroke's own points are pre-clamped to what validate accepts");
@@ -3768,6 +4327,8 @@ impl AppController {
             path: stroke.finish(),
             radius: stroke.radius(),
             softness: stroke.softness(),
+            mode: stroke.mode(),
+            opacity: stroke.opacity(),
         };
         let has_footprint = job::footprint(&op, edit.info()).ok().flatten().is_some();
         let mut touched = stroke.tick_rects;
@@ -5417,6 +5978,10 @@ impl AppController {
                 self.close_analytics();
                 return ChromeKey::Consumed;
             }
+            if self.state.brush.mode_menu_open {
+                self.close_brush_mode_menu();
+                return ChromeKey::Consumed;
+            }
             return ChromeKey::None;
         }
         if !mods.ctrl {
@@ -6267,8 +6832,8 @@ impl AppController {
             .values()
             .map(|pixels| pixels.rgba.len() as u64 * 2)
             .sum();
-        let host_budget = job::host_budget().capped_to(self.performance.max_host_memory_bytes());
-        let budget = host_budget
+        let budget = self
+            .frame_set_budget()
             .reduced_by(self.preview_cache_bytes)
             .reduced_by(self.published_preview_bytes.load(Ordering::Acquire));
         let remaining = budget.bytes();
@@ -8040,6 +8605,7 @@ impl AppController {
                 self.host_notes.rejected = None;
                 self.save_performance();
                 self.refresh_source_previews();
+                self.reopen_frame_sets();
             }
             Err(_) => self.host_notes.rejected = Some(text.to_string()),
         }
@@ -9322,6 +9888,7 @@ impl AppController {
     fn active_tab_planes(&mut self) -> TabPlanes {
         let scratch_root = self.scratch_root();
         let render_free = self.state.render.in_flight.is_none();
+        let origin_rendering = self.state.origin.rendering();
         let Some(tab) = self.state.active_mut() else {
             return TabPlanes::None;
         };
@@ -9376,7 +9943,7 @@ impl AppController {
                 TabPlanes::None
             }
             Ok(job::CheckpointPlanes::NeedsRender) => {
-                if render_free {
+                if render_free && !origin_rendering.contains(&key) {
                     let project_path = project.path().to_path_buf();
                     tab.row_planes = Some(RowPlanes::Pending);
                     let tab_id = tab.id;
@@ -9398,10 +9965,11 @@ impl AppController {
     ) {
         self.state.render.in_flight = Some((tab_id, key.clone()));
         self.state.render.started = true;
+        let memory_cap = self.performance.max_host_memory_bytes();
         let outcome = Arc::clone(&self.state.render.outcome);
         std::thread::spawn(move || {
             let result = job::render_outcome(std::panic::catch_unwind(|| {
-                job::render_checkpoint_planes(&project_path, &scratch_root, &key)
+                job::render_checkpoint_planes(&project_path, &scratch_root, &key, memory_cap)
             }));
             *outcome
                 .lock()

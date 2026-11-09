@@ -19,7 +19,8 @@ use focusforge_core::project::export::{
     ExportFormat, ExportOptions, MetadataOptions, export_checkpoint,
 };
 use focusforge_core::project::{
-    Metrics, Op, Plane, Point, Project, SealRequest, append_ops_onto, materialize_plane, seal_at,
+    BrushMode, Metrics, Op, Plane, Point, Project, SealRequest, append_ops_onto, materialize_plane,
+    seal_at,
 };
 use focusforge_core::retouch::blend;
 use focusforge_core::zmap::ZMapInfo;
@@ -81,6 +82,8 @@ fn dab() -> Op {
         path: vec![Point { x: 1, y: 1 }],
         radius: 0.5,
         softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }
 }
 
@@ -189,6 +192,8 @@ fn build_edited_with_samples(name: &str, samples_per_pixel: u32) -> Edited {
             path: vec![Point { x: 2, y: 1 }],
             radius: 1.5,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }],
         None,
         t0 + 60,
@@ -528,6 +533,8 @@ fn live_export_writes_the_unsaved_state_and_changes_nothing() {
         path: vec![Point { x: 1, y: 1 }],
         radius: 0.5,
         softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     };
     controller
         .edit_session_mut()
@@ -547,6 +554,8 @@ fn live_export_writes_the_unsaved_state_and_changes_nothing() {
         path: vec![Point { x: 1, y: 1 }],
         radius: 0.5,
         softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     };
     controller
         .edit_session_mut()
@@ -654,6 +663,8 @@ fn live_export_writes_the_unsaved_state_and_changes_nothing() {
             path: vec![Point { x: 30, y: 30 }],
             radius: 8.0,
             softness: 0.5,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         })
         .expect("the stroke inside the map applies");
     let before: std::collections::BTreeSet<PathBuf> = fs::read_dir(&frames)
@@ -1040,6 +1051,8 @@ fn build_raw_edited(name: &str) -> (Edited, Vec<tempfile::NamedTempFile>) {
             path: vec![Point { x: 20, y: 10 }],
             radius: 4.0,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }],
         None,
         t0 + 60,

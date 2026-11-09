@@ -123,7 +123,7 @@ fn exported(dir: &Path, project: &Path, id: &str) -> Vec<u16> {
 fn rendered(dir: &Path, project: &Path, id: &str) -> Vec<u16> {
     let out = dir.join(format!("render-{id}.tif"));
     let mut open = Project::open(project).unwrap();
-    project::render_checkpoint(&mut open, id, &out).unwrap();
+    project::render_checkpoint(&mut open, id, &out, None).unwrap();
     common::read_whole(&out).0
 }
 
@@ -266,6 +266,57 @@ fn retouch_refuses_bad_ops_and_leaves_project_untouched() {
         "wrapped.json",
         &serde_json::json!({"ops": [good]}),
     );
+}
+
+/// `stroke` with `field` set inside the brush-stroke body.
+fn with_field(mut op: Value, field: &str, value: Value) -> Value {
+    op["brush-stroke"][field] = value;
+    op
+}
+
+#[test]
+fn mode_opacity_bad_values_are_refused_with_their_position() {
+    let (dir, project) = fresh_project("retouch_mode_opacity_refused");
+    let good = stroke(1, 4.0, 0.2, &[(40, 40), (60, 50)]);
+    let opacity = |value: f64| with_field(good.clone(), "opacity", serde_json::json!(value));
+
+    let list = Value::Array(vec![good.clone(), good.clone(), opacity(0.0)]);
+    let stderr = refuse(&dir, &project, "opacity-zero.json", &list);
+    assert!(
+        stderr.contains("op #2") && stderr.contains("opacity"),
+        "{stderr}"
+    );
+    for value in [-0.5, 1.5] {
+        let list = Value::Array(vec![good.clone(), opacity(value), good.clone()]);
+        let stderr = refuse(&dir, &project, "opacity-range.json", &list);
+        assert!(
+            stderr.contains("op #1") && stderr.contains("opacity"),
+            "{value}: {stderr}"
+        );
+    }
+
+    let blur = with_field(good.clone(), "mode", serde_json::json!("blur"));
+    let list = Value::Array(vec![good.clone(), blur, good.clone()]);
+    let stderr = refuse(&dir, &project, "mode-blur.json", &list);
+    assert!(
+        stderr.contains("op #1") && stderr.contains("blur"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn mode_opacity_valid_and_absent_values_append_one_state_per_op() {
+    let (dir, project) = fresh_project("retouch_mode_opacity_valid");
+    let good = stroke(1, 4.0, 0.2, &[(40, 40), (60, 50)]);
+    let list = Value::Array(vec![
+        good.clone(),
+        with_field(good.clone(), "opacity", serde_json::json!(0.5)),
+        with_field(good.clone(), "mode", serde_json::json!("normal")),
+        with_field(good.clone(), "opacity", serde_json::json!(1e-9)),
+        with_field(good.clone(), "mode", serde_json::json!("lighten")),
+    ]);
+    let ops = write_json(&dir, "valid.json", &list);
+    assert_eq!(retouch_ok(&dir, &project, &ops, &[]).len(), 5);
 }
 
 #[test]

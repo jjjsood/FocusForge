@@ -5,7 +5,8 @@
 //! worst |delta| is exactly 0.
 
 use focusforge_core::algorithm::TileReader;
-use focusforge_core::project::{Op, Point};
+use focusforge_core::io::TiffStack;
+use focusforge_core::project::{BrushMode, Op, Point};
 use focusforge_core::retouch::blend;
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::ZMapInfo;
@@ -36,6 +37,8 @@ fn stroke(path: Vec<Point>, radius: f32, softness: f32) -> Op {
         path,
         radius,
         softness,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }
 }
 
@@ -65,21 +68,32 @@ fn frame_samples(
     }
 }
 
+/// What one device-versus-CPU blend left behind.
+struct Outcome {
+    /// Worst |delta| between device and CPU samples.
+    worst: i32,
+    /// Samples the CPU blend changed.
+    changed: usize,
+    /// Pixels of `region` with a non-zero scaled alpha that the CPU left as
+    /// they were.
+    untouched: usize,
+}
+
 /// Blends `op` over `out_rect`'s samples, on the device and on the CPU, from
-/// the fixture, and returns the worst |delta| between them.
+/// the fixture.
 fn parity_case(
+    stack: &TiffStack,
     blender: &Blender,
     label: &str,
     op: &Op,
     out_rect: Rect,
     region: Rect,
     spp: usize,
-) -> i32 {
-    let stack = common::open_stack();
+) -> Outcome {
     let native = stack.header(0).samples_per_pixel as usize;
     let info = ZMapInfo::new(512, 512, 8).unwrap();
-    let base = frame_samples(&stack, OUT_FRAME, out_rect, spp, native);
-    let src = frame_samples(&stack, SRC_FRAME, region, spp, native);
+    let base = frame_samples(stack, OUT_FRAME, out_rect, spp, native);
+    let src = frame_samples(stack, SRC_FRAME, region, spp, native);
 
     let mut cpu = base.clone();
     blend::apply(op, info, out_rect, &mut cpu, region, &src, spp).expect("cpu blend");
@@ -90,8 +104,69 @@ fn parity_case(
 
     let (worst, at) = worst_delta(&gpu, &cpu);
     let changed = cpu.iter().zip(&base).filter(|(c, b)| c != b).count();
+    let Op::BrushStroke { opacity, .. } = op else {
+        unreachable!("parity cases are brush strokes")
+    };
+    let q = u64::from(blend::opacity_q16(*opacity));
+    let mut untouched = 0;
+    for y in region.y..region.y + region.height {
+        for x in region.x..region.x + region.width {
+            let alpha = u64::from(blend::alpha(op, info, x, y).unwrap());
+            if (alpha * q + 32768) >> 16 == 0 {
+                continue;
+            }
+            let at = ((y - out_rect.y) as usize * out_rect.width as usize
+                + (x - out_rect.x) as usize)
+                * spp;
+            untouched += usize::from(cpu[at..at + spp] == base[at..at + spp]);
+        }
+    }
     println!("blend {label}: worst |delta|={worst} at sample {at}, {changed} samples changed");
-    worst
+    Outcome {
+        worst,
+        changed,
+        untouched,
+    }
+}
+
+type Place = (&'static str, Rect, Rect, Vec<(&'static str, Vec<Point>)>);
+
+/// The regions and paths the parity cases cover: a region at the origin, and
+/// one at a non-zero origin inside a larger output rect; each with a path
+/// crossing the region's edge, a single point and a path doubling back.
+fn places() -> Vec<Place> {
+    let regions = [
+        ("origin", rect(0, 0, 128, 96), rect(0, 0, 128, 96)),
+        ("offset", rect(40, 30, 300, 200), rect(97, 61, 150, 120)),
+    ];
+    regions
+        .into_iter()
+        .map(|(place, out_rect, region)| {
+            let (x, y) = (region.x as i32, region.y as i32);
+            let (w, h) = (region.width as i32, region.height as i32);
+            let paths = vec![
+                (
+                    "crossing the edge",
+                    vec![
+                        pt(x - 20, y + h / 2),
+                        pt(x + w / 2, y + h / 3),
+                        pt(x + w + 20, y + h / 2),
+                    ],
+                ),
+                ("one point", vec![pt(x + w / 2, y + h / 2)]),
+                (
+                    "doubling back",
+                    vec![
+                        pt(x + 10, y + 10),
+                        pt(x + w - 10, y + h - 10),
+                        pt(x + 10, y + 10),
+                        pt(x + w / 2, y + h - 5),
+                    ],
+                ),
+            ];
+            (place, out_rect, region, paths)
+        })
+        .collect()
 }
 
 #[test]
@@ -101,36 +176,9 @@ fn blend_parity_matches_cpu() {
     };
     let blender = blender(shared);
 
-    // A region at the origin, and one at a non-zero origin inside a larger
-    // output rect.
-    let regions = [
-        ("origin", rect(0, 0, 128, 96), rect(0, 0, 128, 96)),
-        ("offset", rect(40, 30, 300, 200), rect(97, 61, 150, 120)),
-    ];
+    let stack = common::open_stack();
     let mut touched = 0;
-    for (place, out_rect, region) in regions {
-        let (x, y) = (region.x as i32, region.y as i32);
-        let (w, h) = (region.width as i32, region.height as i32);
-        let paths = [
-            (
-                "crossing the edge",
-                vec![
-                    pt(x - 20, y + h / 2),
-                    pt(x + w / 2, y + h / 3),
-                    pt(x + w + 20, y + h / 2),
-                ],
-            ),
-            ("one point", vec![pt(x + w / 2, y + h / 2)]),
-            (
-                "doubling back",
-                vec![
-                    pt(x + 10, y + 10),
-                    pt(x + w - 10, y + h - 10),
-                    pt(x + 10, y + 10),
-                    pt(x + w / 2, y + h - 5),
-                ],
-            ),
-        ];
+    for (place, out_rect, region, paths) in places() {
         for spp in [3, 1] {
             for softness in [0.0f32, 0.5, 1.0] {
                 for radius in [1.5f32, 12.0, 40.0] {
@@ -138,8 +186,9 @@ fn blend_parity_matches_cpu() {
                         let op = stroke(path.clone(), radius, softness);
                         let label =
                             format!("{place} spp {spp} soft {softness} radius {radius} {shape}");
-                        let worst = parity_case(&blender, &label, &op, out_rect, region, spp);
-                        assert_eq!(worst, 0, "{label}: expected bit-exact agreement");
+                        let case =
+                            parity_case(&stack, &blender, &label, &op, out_rect, region, spp);
+                        assert_eq!(case.worst, 0, "{label}: expected bit-exact agreement");
                         touched += 1;
                     }
                 }
@@ -298,4 +347,138 @@ fn blend_refuses_oversized_region() {
         other => panic!("expected a buffer refusal, got {other}"),
     }
     assert_eq!(out, base, "a refused region is not truncated or blended");
+}
+
+fn styled(path: Vec<Point>, radius: f32, softness: f32, mode: BrushMode, opacity: f32) -> Op {
+    Op::BrushStroke {
+        source_id: SRC_FRAME as u16,
+        path,
+        radius,
+        softness,
+        mode,
+        opacity,
+    }
+}
+
+#[test]
+fn blend_parity_per_mode_matches_cpu() {
+    let Some(shared) = shared_device_or_skip() else {
+        return;
+    };
+    let blender = blender(shared);
+    let stack = common::open_stack();
+
+    let modes = [
+        BrushMode::Normal,
+        BrushMode::Lighten,
+        BrushMode::Darken,
+        BrushMode::Detail,
+    ];
+    // (opacity, softness): three opacities at softness 0.5, then the two
+    // softness extremes at full opacity.
+    let settings = [
+        (1.0f32, 0.5f32),
+        (0.5, 0.5),
+        (0.01, 0.5),
+        (1.0, 0.0),
+        (1.0, 1.0),
+    ];
+    let mut cases = 0;
+    for mode in modes {
+        let mut changed = [0usize; 5];
+        let mut untouched = 0;
+        for (place, out_rect, region, paths) in places() {
+            for spp in [3, 1] {
+                for (n, (opacity, softness)) in settings.into_iter().enumerate() {
+                    for radius in [1.5f32, 12.0, 40.0] {
+                        for (shape, path) in &paths {
+                            let op = styled(path.clone(), radius, softness, mode, opacity);
+                            let label = format!(
+                                "{mode:?} opacity {opacity} {place} spp {spp} soft {softness} radius {radius} {shape}"
+                            );
+                            let case =
+                                parity_case(&stack, &blender, &label, &op, out_rect, region, spp);
+                            assert_eq!(case.worst, 0, "{label}: expected bit-exact agreement");
+                            changed[n] += case.changed;
+                            untouched += case.untouched;
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "{mode:?}: changed samples per setting {changed:?}, {untouched} pixels left untouched"
+        );
+        assert!(
+            changed.iter().all(|&c| c > 0),
+            "{mode:?} changes samples at every setting"
+        );
+        if matches!(mode, BrushMode::Lighten | BrushMode::Darken) {
+            assert!(
+                untouched > 0,
+                "{mode:?} leaves a pixel with alpha untouched"
+            );
+        }
+    }
+
+    // The largest f32 below 1.0 is Q16 full: the kernel takes it, as the CPU blend does.
+    let region = rect(0, 0, 128, 96);
+    let op = styled(
+        vec![pt(64, 48)],
+        12.0,
+        0.5,
+        BrushMode::Normal,
+        1.0 - f32::EPSILON / 2.0,
+    );
+    let case = parity_case(
+        &stack,
+        &blender,
+        "Normal at Q16 full",
+        &op,
+        region,
+        region,
+        3,
+    );
+    assert_eq!(case.worst, 0, "an opacity that rounds to Q16 full is exact");
+    cases += 1;
+    println!("blend parity per mode: {cases} cases, all exact");
+    assert_eq!(cases, 721);
+}
+
+#[test]
+fn blend_refuses_a_detail_margin_past_the_coordinate_range() {
+    let Some(shared) = shared_device_or_skip() else {
+        return;
+    };
+    let blender = blender(shared);
+    let info = ZMapInfo::new(16_400, 64, 8).unwrap();
+    let tile = rect(16_370, 0, 30, 8);
+    let base: Vec<u16> = (0..30 * 8).map(|i| i * 9).collect();
+    let src = vec![7u16; 30 * 8];
+
+    // The footprint ends below 2^14, so Normal blends there.
+    let normal = styled(vec![pt(16_372, 4)], 6.0, 0.5, BrushMode::Normal, 1.0);
+    let mut out = base.clone();
+    blender
+        .apply(&normal, info, tile, &mut out, tile, &src, 1)
+        .expect("Normal blends below the coordinate range");
+    assert_ne!(out, base, "the Normal stroke changed samples");
+
+    let detail = styled(vec![pt(16_372, 4)], 6.0, 0.5, BrushMode::Detail, 1.0);
+    let mut out = base.clone();
+    let err = blender
+        .apply(&detail, info, tile, &mut out, tile, &src, 1)
+        .expect_err("a read margin reaching 2^14");
+    assert!(
+        matches!(
+            err,
+            BlendError::Refused {
+                limit: "coordinate",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert_eq!(out, base, "a refused stroke leaves `out` untouched");
 }

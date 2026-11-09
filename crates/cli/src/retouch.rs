@@ -28,11 +28,20 @@ struct RetouchReport {
     wall_seconds: f64,
 }
 
-/// Reads the op list: a bare JSON array of ops.
+/// Reads the op list: a bare JSON array of ops. An element that does not
+/// decode as an op is reported by its 0-based position.
 fn read_ops(path: &Path) -> Result<Vec<Op>, String> {
     let file = std::fs::File::open(path).map_err(|err| format!("{}: {err}", path.display()))?;
-    serde_json::from_reader(std::io::BufReader::new(file))
-        .map_err(|err| format!("{}: {err}", path.display()))
+    let values: Vec<serde_json::Value> = serde_json::from_reader(std::io::BufReader::new(file))
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            serde_json::from_value(value)
+                .map_err(|err| format!("{}: op #{index}: {err}", path.display()))
+        })
+        .collect()
 }
 
 /// Runs the subcommand: nothing is written unless every op is valid.

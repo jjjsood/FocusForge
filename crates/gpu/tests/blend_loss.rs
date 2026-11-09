@@ -5,7 +5,7 @@
 
 #![cfg(feature = "gpu-tests")]
 
-use focusforge_core::project::{Op, Point};
+use focusforge_core::project::{BrushMode, Op, Point};
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::ZMapInfo;
 use focusforge_gpu::blend::{BlendError, Blender};
@@ -31,6 +31,8 @@ fn blend_on_a_lost_device_returns_an_error() {
         path: vec![Point { x: 16, y: 16 }],
         radius: 10.0,
         softness: 0.5,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     };
     let base: Vec<u16> = (0..32 * 32).map(|i| i * 3).collect();
     let src = vec![40_000u16; 32 * 32];

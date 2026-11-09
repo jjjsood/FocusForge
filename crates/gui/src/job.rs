@@ -8,6 +8,7 @@
 //! The one module in this crate besides `entry.rs`/`settings_panel.rs`/the
 //! canvas files allowed to name `focusforge_core`.
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -36,8 +37,9 @@ pub use focusforge_core::project::export::{
 };
 use focusforge_core::project::{self, Project, ProjectError};
 use focusforge_core::registry::{self, LookupError};
+use focusforge_core::retouch::blend;
 use focusforge_core::retouch::blend::Blend;
-use focusforge_core::retouch::{RetouchError, blend};
+use focusforge_core::retouch::replay_mode_conditions;
 use focusforge_core::tile::SampleFormat;
 pub use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::zmap::{ZMapError, ZMapInfo, ZMapReader};
@@ -49,11 +51,13 @@ pub use focusforge_core::align::{Registration, Transform};
 pub use focusforge_core::equalize::UNIT_GAIN;
 pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage, StageCacheError};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
-pub use focusforge_core::project::Op;
+pub use focusforge_core::project::{BrushMode, Op};
 pub use focusforge_core::project::{
     HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, kept_entries, now_unix,
 };
-pub use focusforge_core::retouch::{footprint, top_source};
+pub use focusforge_core::retouch::{
+    ModeConditions, RetouchError, footprint, needs_mode_conditions, top_source,
+};
 pub use focusforge_core::update::{
     CheckFailure, HttpReleaseSource, ReleaseSource, UpdateCheck, check as check_for_update,
     parse_version,
@@ -1546,16 +1550,18 @@ pub fn cached_checkpoint_planes(
 /// Renders checkpoint `id` of the project at `project_path` into its plane
 /// cache, over a project opened on the calling thread. An op-bearing
 /// checkpoint re-hashes its sources on every call and refuses on any
-/// missing or changed frame. A Z-Map that fails to materialize is logged and
-/// answered as `None`: the composite is the image, the map only analysis.
+/// missing or changed frame, and its source frames open under `memory_cap`.
+/// A Z-Map that fails to materialize is logged and answered as `None`: the
+/// composite is the image, the map only analysis.
 pub fn render_checkpoint_planes(
     project_path: &Path,
     scratch_root: &Path,
     id: &str,
+    memory_cap: Option<u64>,
 ) -> Result<(PathBuf, Option<PathBuf>), PlaneCacheError> {
     let mut project = Project::open(project_path)?;
     let (composite, zmap) = checkpoint_plane_paths(scratch_root, project_path, id);
-    let zmap = write_checkpoint_planes(&mut project, id, &composite, zmap)?;
+    let zmap = write_checkpoint_planes(&mut project, id, &composite, zmap, memory_cap)?;
     Ok((composite, zmap))
 }
 
@@ -1564,11 +1570,12 @@ fn write_checkpoint_planes(
     id: &str,
     composite: &Path,
     zmap: PathBuf,
+    memory_cap: Option<u64>,
 ) -> Result<Option<PathBuf>, PlaneCacheError> {
     if let Some(dir) = composite.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    project::render_checkpoint(project, id, composite)?;
+    project::render_checkpoint(project, id, composite, memory_cap)?;
     let checkpoint = project.history().get(id)?.clone();
     match project::materialize_zmap(project, &checkpoint, &zmap) {
         Ok(()) => Ok(Some(zmap)),
@@ -2003,6 +2010,34 @@ fn render_region(
     rendered
 }
 
+/// `job`'s strokes with their footprints, the strokes that miss the map left out.
+fn placed_strokes(
+    info: ZMapInfo,
+    job: &RegionRender,
+) -> Result<Vec<blend::PlacedStroke<'_>>, String> {
+    let mut placed = Vec::new();
+    for op in &job.ops {
+        let Op::BrushStroke { source_id, .. } = op else {
+            return Err(RetouchError::Unsupported.to_string());
+        };
+        if let Some(footprint) = blend::footprint(op, info).map_err(|error| error.to_string())? {
+            placed.push(blend::PlacedStroke {
+                op,
+                frame: usize::from(*source_id),
+                footprint,
+            });
+        }
+    }
+    Ok(placed)
+}
+
+/// The samples `job` reads: its region grown by the margin its Detail strokes need.
+fn read_extent_of(info: ZMapInfo, job: &RegionRender) -> Rect {
+    placed_strokes(info, job).map_or(job.region, |placed| {
+        blend::read_extent(info, &placed, job.region)
+    })
+}
+
 /// [`render_region`] in sample type `S`, each stroke blended by `blend_stroke`.
 fn blend_region<S: Blend>(
     input: &RenderInput,
@@ -2021,34 +2056,24 @@ fn blend_region<S: Blend>(
 ) -> Result<Vec<S>, String> {
     let region = job.region;
     let spp = input.samples_per_pixel;
-    let mut out = vec![S::default(); region.width as usize * region.height as usize * spp];
-    S::read_tile(&*input.base, 0, region, &mut out).map_err(|error| error.to_string())?;
+    let placed = placed_strokes(input.info, job)?;
+    // A Detail stroke blurs samples past the region, so the ops run over the
+    // extent that covers them and only `region` is kept.
+    let extent = blend::read_extent(input.info, &placed, region);
+    let mut out = vec![S::default(); extent.width as usize * extent.height as usize * spp];
+    S::read_tile(&*input.base, 0, extent, &mut out).map_err(|error| error.to_string())?;
     match job.pre {
         PreImage::Base => {}
-        PreImage::Current => local.overlay_into(region, &mut out),
+        PreImage::Current => local.overlay_into(extent, &mut out),
         PreImage::Snapshot => {
-            snapshot.capture(local, region);
-            snapshot.overlay_into(region, &mut out);
-        }
-    }
-    let mut placed = Vec::new();
-    for op in &job.ops {
-        let Op::BrushStroke { source_id, .. } = op else {
-            return Err(RetouchError::Unsupported.to_string());
-        };
-        let footprint = blend::footprint(op, input.info).map_err(|error| error.to_string())?;
-        if let Some(footprint) = footprint {
-            placed.push(blend::PlacedStroke {
-                op,
-                frame: usize::from(*source_id),
-                footprint,
-            });
+            snapshot.capture(local, extent);
+            snapshot.overlay_into(extent, &mut out);
         }
     }
     with_registered_sources(&*input.sources, &input.registration, |reader, origin| {
         blend::apply_strokes(
             input.info,
-            region,
+            extent,
             &mut out,
             &placed,
             reader,
@@ -2058,8 +2083,16 @@ fn blend_region<S: Blend>(
         )
     })
     .map_err(|error| error.to_string())?;
-    local.install(region, &out);
-    Ok(out)
+    let row = region.width as usize * spp;
+    let mut kept = Vec::with_capacity(row * region.height as usize);
+    for y in region.y..region.y + region.height {
+        let start = ((y - extent.y) as usize * extent.width as usize
+            + (region.x - extent.x) as usize)
+            * spp;
+        kept.extend_from_slice(&out[start..start + row]);
+    }
+    local.install(region, &kept);
+    Ok(kept)
 }
 
 impl EditState {
@@ -2272,10 +2305,13 @@ impl EditState {
             return;
         }
         let jobs: Vec<RegionRender> = self.region_renders.queued.drain(..).collect();
-        let regions: Vec<Rect> = jobs.iter().map(|job| job.region).collect();
-        let (mut local, mut snapshot) = (self.tiles.subset(&regions), self.snapshot.clone());
-        let ends_drag = jobs.iter().any(|job| job.ends_drag);
         let input = self.render_input();
+        let extents: Vec<Rect> = jobs
+            .iter()
+            .map(|job| read_extent_of(input.info, job))
+            .collect();
+        let (mut local, mut snapshot) = (self.tiles.subset(&extents), self.snapshot.clone());
+        let ends_drag = jobs.iter().any(|job| job.ends_drag);
         self.region_renders.in_flight = true;
         let parked = Arc::clone(&self.region_renders.parked);
         let wake = Arc::clone(wake);
@@ -2312,21 +2348,125 @@ impl EditState {
     }
 }
 
+/// A frame set opened once and shared by the readers of a tab.
+pub type SharedFrames = Arc<dyn FrameReader>;
+
+/// Where an edit session or the origin readers get the stroke source frames.
+pub enum FrameSource {
+    /// A frame set that is already open and read once for the whole tab.
+    Reader(Arc<dyn FrameReader>),
+    /// `frames`, opened with `budget`.
+    Open {
+        frames: Vec<PathBuf>,
+        budget: HostBudget,
+    },
+}
+
+impl FrameSource {
+    /// The frame set this source names, opened if it is not yet.
+    pub fn into_reader(self) -> Result<Arc<dyn FrameReader>, EditSessionError> {
+        match self {
+            FrameSource::Reader(reader) => Ok(reader),
+            FrameSource::Open { frames, budget } => {
+                Ok(Arc::from(open_frame_set(&frames, budget)?.reader))
+            }
+        }
+    }
+}
+
+/// Opens `composite` and the frame set it is edited from, which must hold
+/// the same sample type.
+fn open_base_and_sources(
+    composite: &Path,
+    source: FrameSource,
+) -> Result<(Arc<TiffStack>, Arc<dyn FrameReader>), EditSessionError> {
+    let base = Arc::new(TiffStack::open_staged(composite)?);
+    let sources = source.into_reader()?;
+    if base.sample_format() != sources.sample_format() {
+        return Err(EditSessionError::SampleFormatMismatch {
+            path: composite.to_path_buf(),
+            composite: base.sample_format(),
+            sources: sources.sample_format(),
+        });
+    }
+    Ok((base, sources))
+}
+
+/// What deciding whether a Lighten or Darken stroke acts reads: the composite
+/// the strokes were drawn over, the stroke source frames and their
+/// registration.
+pub struct OriginReaders {
+    ancestor: Arc<TiffStack>,
+    sources: Arc<dyn FrameReader>,
+    registration: Registration,
+}
+
+impl OriginReaders {
+    /// Opens `ancestor_composite` (the fused composite, before any stroke)
+    /// over `source`; the composite and the frames must hold one sample type.
+    pub fn open(
+        ancestor_composite: &Path,
+        source: FrameSource,
+        registration: Registration,
+    ) -> Result<Self, EditSessionError> {
+        let (ancestor, sources) = open_base_and_sources(ancestor_composite, source)?;
+        Ok(Self {
+            ancestor,
+            sources,
+            registration,
+        })
+    }
+
+    /// The stroke source frames the readers sample.
+    pub fn sources(&self) -> &Arc<dyn FrameReader> {
+        &self.sources
+    }
+
+    /// These readers over `sources`, a re-opened set of the same frame files.
+    pub fn with_sources(&self, sources: Arc<dyn FrameReader>) -> Self {
+        Self {
+            ancestor: Arc::clone(&self.ancestor),
+            sources,
+            registration: self.registration.clone(),
+        }
+    }
+
+    /// Replays `ops` over the ancestor composite and returns where each
+    /// Lighten or Darken stroke acts on the `step` lattice of `rect`.
+    pub fn conditions(
+        &self,
+        ops: &[Op],
+        info: ZMapInfo,
+        rect: Rect,
+        step: NonZeroU32,
+    ) -> Result<ModeConditions, RetouchError> {
+        let spp = self.sources.frame(0).samples_per_pixel as usize;
+        with_registered_sources(&*self.sources, &self.registration, |frames, origin| {
+            let base = &*self.ancestor;
+            match self.ancestor.sample_format() {
+                SampleFormat::U16 => {
+                    replay_mode_conditions::<u16>(ops, info, rect, step, base, frames, origin, spp)
+                }
+                SampleFormat::F32 => {
+                    replay_mode_conditions::<f32>(ops, info, rect, step, base, frames, origin, spp)
+                }
+            }
+        })
+    }
+}
+
 /// Builds an [`EditState`] over the whole map: `composite` is the image edits
 /// blend over, the resident cache is gridded at `tile_size` px, `base_ops`
 /// are the ops `composite` already shows (oldest first), and `chain` (a row's
 /// ops, oldest first) is replayed over it and kept as the state's chain. An
 /// op that cannot be applied ends the replay; a region that cannot be
 /// rendered is skipped.
-// The inputs are independent; none of them groups naturally with another.
-#[allow(clippy::too_many_arguments)]
 pub fn open_edit_session(
     zmap: Option<&Path>,
     composite: &Path,
-    frames: &[PathBuf],
+    source: FrameSource,
     registration: Registration,
     tile_size: u32,
-    budget: HostBudget,
     base_ops: Vec<Op>,
     chain: Vec<Op>,
 ) -> Result<EditState, EditSessionError> {
@@ -2336,14 +2476,14 @@ pub fn open_edit_session(
         width: 1,
         height: 1,
     };
-    let base = Arc::new(TiffStack::open_staged(composite)?);
+    let (base, sources) = open_base_and_sources(composite, source)?;
     let header = base.header(0);
     let mut first = vec![0u16; header.samples_per_pixel as usize];
     base.read_tile_into(0, pixel, &mut first)?;
     let info = ZMapInfo::new(
         header.width,
         header.height,
-        u32::try_from(frames.len()).unwrap_or(u32::MAX),
+        u32::try_from(sources.len()).unwrap_or(u32::MAX),
     )?;
     // Each plane is mapped on its first read; the mapping outlives the file,
     // which a save removes together with the row's other held files. A map
@@ -2360,14 +2500,6 @@ pub fn open_edit_session(
             })
             .ok()
     });
-    let sources: Arc<dyn FrameReader> = Arc::from(open_frame_set(frames, budget)?.reader);
-    if base.sample_format() != sources.sample_format() {
-        return Err(EditSessionError::SampleFormatMismatch {
-            path: composite.to_path_buf(),
-            composite: base.sample_format(),
-            sources: sources.sample_format(),
-        });
-    }
     let samples_per_pixel = sources.frame(0).samples_per_pixel;
     let tiles = crate::canvas::ResidentTiles::new(
         tile_size,

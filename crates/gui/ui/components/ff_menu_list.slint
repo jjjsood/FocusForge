@@ -18,6 +18,8 @@ export component FFMenuList inherits Rectangle {
     // entries are just "Name"/"Capture time") hides the grey id column
     // rather than showing it as a second, meaningless label.
     in property <bool> show-choice-ids: true;
+    // The chosen row's label in the accent colour instead of a check glyph.
+    in property <bool> chosen-accent: false;
     callback option-selected(string);
 
     height: root.choices.length * 24px;
@@ -40,7 +42,7 @@ export component FFMenuList inherits Rectangle {
 
                 Text {
                     text: choice-label;
-                    color: Theme.text-primary;
+                    color: root.chosen-accent && root.choice-ids[i] == root.selected ? Theme.accent-default : Theme.text-primary;
                     font-size: Theme.text-value.size;
                     horizontal-stretch: 1;
                     vertical-alignment: center;
@@ -52,7 +54,7 @@ export component FFMenuList inherits Rectangle {
                     font-size: Theme.text-section.size;
                     vertical-alignment: center;
                 }
-                if root.choice-ids[i] == root.selected: Text {
+                if root.choice-ids[i] == root.selected && !root.chosen-accent: Text {
                     text: "\u{2713}";
                     color: Theme.accent-default;
                     vertical-alignment: center;

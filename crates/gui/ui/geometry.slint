@@ -207,9 +207,27 @@ export global ShellGeometry {
     out property <length> editor-toolbar-size-track-x: 56px;
     out property <length> editor-toolbar-soft-caption-x: 188px;
     out property <length> editor-toolbar-soft-track-x: 236px;
-    out property <length> editor-toolbar-pipette-x: 376px;
-    out property <length> editor-toolbar-undo-x: 436px;
-    out property <length> editor-toolbar-redo-x: 468px;
+    out property <length> editor-toolbar-mode-menu-x: 376px;
+    out property <length> editor-toolbar-mode-menu-width: 80px;
+    out property <length> editor-toolbar-opacity-caption-x: 472px;
+    out property <length> editor-toolbar-opacity-track-x: 522px;
+    out property <length> editor-toolbar-pipette-x: 662px;
+    out property <length> editor-toolbar-undo-x: 722px;
+    out property <length> editor-toolbar-redo-x: 754px;
+    // Below this toolbar width the three sliders draw their narrow tracks:
+    // the 72 px row would leave Save checkpoint less than 17 px of clearance.
+    out property <length> editor-toolbar-narrow-below: 974px;
+    out property <length> editor-toolbar-track-width: 72px;
+    out property <length> editor-toolbar-narrow-track-width: 44px;
+    // Each narrowed track pulls every later control left by this much.
+    out property <length> editor-toolbar-track-shrink: 28px;
+    public pure function editor-toolbar-narrow(toolbar-width: length) -> bool {
+        toolbar-width < editor-toolbar-narrow-below
+    }
+    // How far left a control that follows `tracks` sliders sits.
+    public pure function editor-toolbar-shift(toolbar-width: length, tracks: int) -> length {
+        editor-toolbar-narrow(toolbar-width) ? tracks * editor-toolbar-track-shrink : 0px
+    }
     out property <length> editor-toolbar-icon-width: 27px;
     out property <length> editor-toolbar-save-checkpoint-right-inset: 13px;
     out property <length> editor-toolbar-save-checkpoint-width: 163px;
@@ -245,4 +263,6 @@ export global ShellGeometry {
     out property <length> analytics-mm-width: 100px;
     out property <length> analytics-count-width: 56px;
     out property <length> analytics-bar-height: 10px;
+    // The brush cursor's mode chip: a square of this side.
+    out property <length> brush-tag-side: 16px;
 }

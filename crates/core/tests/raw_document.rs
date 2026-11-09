@@ -22,8 +22,8 @@ use focusforge_core::project::export::{
     PngCompression, TiffBits, TiffCompression, to_8bit,
 };
 use focusforge_core::project::{
-    self, BlobKind, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op,
-    PendingState, Point, Project, ProjectError, SealRequest,
+    self, BlobKind, BrushMode, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind,
+    Metrics, Op, PendingState, Point, Project, ProjectError, SealRequest,
 };
 use focusforge_core::tile::{Sample, SampleFormat};
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
@@ -211,6 +211,8 @@ fn stroked_raw(name: &str) -> StrokedRaw {
         path: vec![Point { x: 4, y: 11 }, Point { x: 32, y: 11 }],
         radius: 40.0,
         softness: 0.5,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     };
     let edited = project::append_ops_onto(&project_path, &root, vec![stroke.clone()], None, 1)
         .expect("the stroke must append")
@@ -390,12 +392,21 @@ fn raw_view_render_keeps_headroom() {
     let mut raw = stroked_raw("raw_document_view");
     let dir = tmp_dir("raw_document_view_out");
     let view = dir.join("view.tif");
-    project::render_checkpoint(&mut raw.project, &raw.edited, &view).unwrap();
+    project::render_checkpoint(&mut raw.project, &raw.edited, &view, None).unwrap();
     assert_eq!(
         bits(&read_f32(&view)),
         bits(&raw.edited_f32),
         "the view render is the f32 render"
     );
+
+    let capped = dir.join("capped.tif");
+    let err = project::render_checkpoint(&mut raw.project, &raw.edited, &capped, Some(1))
+        .expect_err("a cap below the decode reservation refuses the render");
+    assert!(
+        err.to_string().contains("memory limit allows"),
+        "the refusal names the cap: {err}"
+    );
+    assert!(!capped.exists(), "a refused render leaves no file");
 }
 
 #[test]
@@ -469,6 +480,8 @@ fn one_render_for_held_saved_and_pending() {
         path: vec![Point { x: 4, y: 11 }, Point { x: 32, y: 11 }],
         radius: 40.0,
         softness: 0.5,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     };
     let edited = project::append_ops_onto(&project_path, &root, vec![stroke.clone()], None, 1)
         .expect("the stroke must append")

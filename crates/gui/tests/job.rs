@@ -18,7 +18,7 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{self, FuseOutcome, FuseOutput, FuseRequest, StageObserver};
-use focusforge_core::project::{self, Op, Point, Project};
+use focusforge_core::project::{self, BrushMode, Op, Point, Project};
 use focusforge_core::registry;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use focusforge_gui::canvas::CanvasFeed;
@@ -4278,6 +4278,8 @@ fn dab(x: i32) -> job::Op {
         path: vec![Point { x, y: 10 }],
         radius: 0.5,
         softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }
 }
 
@@ -6482,7 +6484,7 @@ fn checkpoint_planes_survive_an_unreadable_zmap() {
     common::corrupt_blob(&project_path, &blob);
     let scratch = common::tree("zmapless_planes_cache");
 
-    let (composite, zmap) = job::render_checkpoint_planes(&project_path, &scratch, &id)
+    let (composite, zmap) = job::render_checkpoint_planes(&project_path, &scratch, &id, None)
         .expect("the composite renders without its Z-Map");
     assert!(composite.is_file());
     assert_eq!(zmap, None, "no Z-Map is offered");
@@ -6496,8 +6498,8 @@ fn checkpoint_planes_survive_an_unreadable_zmap() {
         job::CheckpointPlanes::Ready(_, None)
     ));
 
-    let (_, head_zmap) =
-        job::render_checkpoint_planes(&project_path, &scratch, &head).expect("the head renders");
+    let (_, head_zmap) = job::render_checkpoint_planes(&project_path, &scratch, &head, None)
+        .expect("the head renders");
     assert!(
         head_zmap.is_some_and(|zmap| zmap.is_file()),
         "the head keeps its Z-Map"
@@ -6517,7 +6519,7 @@ fn a_save_makes_the_previous_plane_files_stale() {
         job::cached_checkpoint_planes(&first, &scratch, &first_id).unwrap(),
         job::CheckpointPlanes::NeedsRender
     ));
-    job::render_checkpoint_planes(&project_path, &scratch, &first_id).unwrap();
+    job::render_checkpoint_planes(&project_path, &scratch, &first_id, None).unwrap();
     assert!(matches!(
         job::cached_checkpoint_planes(&first, &scratch, &first_id).unwrap(),
         job::CheckpointPlanes::Ready(..)
@@ -8064,16 +8066,45 @@ fn open_session(
     composite: &Path,
     sources: &[PathBuf],
 ) -> Result<job::EditState, job::EditSessionError> {
+    open_session_at(files, composite, sources, job::host_budget())
+}
+
+fn open_session_at(
+    files: &RawFiles,
+    composite: &Path,
+    sources: &[PathBuf],
+    budget: job::HostBudget,
+) -> Result<job::EditState, job::EditSessionError> {
     job::open_edit_session(
         Some(&files.zmap),
         composite,
-        sources,
+        job::FrameSource::Open {
+            frames: sources.to_vec(),
+            budget,
+        },
         Registration::default(),
         16,
-        job::host_budget(),
         Vec::new(),
         Vec::new(),
     )
+}
+
+#[test]
+fn raw_edit_session_below_the_cap_is_refused_naming_the_cap() {
+    let files = raw_files("job_raw_session_cap");
+    let frame = common::workspace_root().join("fixtures/blackmagic-micro-dng/frame.dng");
+    let capped = job::host_budget().capped_to(Some(1 << 20));
+    let Err(err) = open_session_at(&files, &files.composite, &[frame], capped) else {
+        panic!("a cap below one developed frame refuses the session");
+    };
+    assert!(
+        matches!(err, job::EditSessionError::Frames(_)),
+        "the refusal is a frame-set error: {err}"
+    );
+    assert!(
+        err.to_string().contains("memory limit allows"),
+        "the refusal names the cap: {err}"
+    );
 }
 
 fn raw_stroke() -> Op {
@@ -8082,6 +8113,8 @@ fn raw_stroke() -> Op {
         path: vec![Point { x: 4, y: 11 }, Point { x: 32, y: 11 }],
         radius: 40.0,
         softness: 0.5,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }
 }
 
@@ -8196,6 +8229,75 @@ fn raw_project_live_retouch_matches_saved_and_export() {
     exported.read_tile_into(0, whole, &mut got).unwrap();
     let narrowed: Vec<u16> = live.iter().map(|&s| u16::narrow(s)).collect();
     assert_eq!(got, narrowed, "16-bit export");
+}
+
+fn raw_stroke_in(mode: BrushMode, source_id: u16, (x, y): (i32, i32), radius: f32) -> Op {
+    Op::BrushStroke {
+        source_id,
+        path: vec![Point { x, y }, Point { x: x + 3, y: y + 2 }],
+        radius,
+        softness: 0.3,
+        mode,
+        opacity: 0.8,
+    }
+}
+
+#[test]
+fn raw_detail_region_reads_its_margin_and_installs_only_the_region() {
+    // Pass radius 2, margin 6: the region's edge samples blur past the region.
+    let earlier = raw_stroke_in(BrushMode::Normal, 2, (16, 10), 9.0);
+    let detail = raw_stroke_in(BrushMode::Detail, 1, (18, 10), 6.0);
+    let both = vec![earlier.clone(), detail.clone()];
+    let region = Rect {
+        x: 14,
+        y: 6,
+        width: 9,
+        height: 8,
+    };
+    let files = raw_files("raw_detail_region");
+    let expected = cut(&pending_f32(&raw_pending(&files, both.clone())), region);
+    let alone = cut(
+        &pending_f32(&raw_pending(&files, vec![detail.clone()])),
+        region,
+    );
+    assert_ne!(bits(&expected), bits(&alone), "the earlier stroke matters");
+
+    for pre in [
+        job::PreImage::Base,
+        job::PreImage::Current,
+        job::PreImage::Snapshot,
+    ] {
+        let mut session = open_session(&files, &files.composite, &files.sources).unwrap();
+        let ops = if matches!(pre, job::PreImage::Base) {
+            both.clone()
+        } else {
+            live_region(&mut session, raw_whole(), vec![earlier.clone()]);
+            vec![detail.clone()]
+        };
+        session.tiles.take_rendered_regions();
+        session
+            .render_region_now(&job::RegionRender {
+                region,
+                pre,
+                ops,
+                ends_drag: false,
+            })
+            .expect("the region renders");
+        assert_eq!(
+            session.tiles.take_rendered_regions(),
+            vec![region],
+            "{pre:?} installs only the region"
+        );
+        let mut got = vec![f32::NAN; (region.width * region.height * 3) as usize];
+        session.tiles.overlay_into(region, &mut got);
+        assert_eq!(bits(&got), bits(&expected), "{pre:?}: region samples");
+        if matches!(pre, job::PreImage::Base) {
+            let mut around = vec![f32::NAN; (RAW_W * RAW_H * 3) as usize];
+            session.tiles.overlay_into(raw_whole(), &mut around);
+            let filled = around.iter().filter(|s| !s.is_nan()).count();
+            assert_eq!(filled, got.len(), "no texel outside the region is filled");
+        }
+    }
 }
 
 #[test]

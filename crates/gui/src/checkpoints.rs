@@ -357,6 +357,7 @@ pub fn build_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use focusforge_core::project::BrushMode;
 
     fn checkpoint(id: &str, created_at: i64) -> Checkpoint {
         Checkpoint {
@@ -627,6 +628,8 @@ mod tests {
             path: vec![focusforge_core::project::Point { x, y: 0 }],
             radius: 1.0,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }
     }
 

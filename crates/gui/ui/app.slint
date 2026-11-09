@@ -17,6 +17,7 @@ import { ShellGeometry } from "geometry.slint";
 import { FFTabStrip, ProjectTabView } from "shell/tab_strip.slint";
 export { ProjectTabView }
 import { FFToolbar } from "shell/toolbar.slint";
+import { FFMenuList } from "components/ff_menu_list.slint";
 import { FFEditorToolbar } from "shell/editor_toolbar.slint";
 import { FFCanvas } from "shell/canvas.slint";
 import { ComparisonWindow } from "comparison_window.slint";
@@ -54,6 +55,10 @@ export component AppWindow inherits Window {
     // The editor toolbar, forwarded one-for-one from `FFEditorToolbar` below.
     callback brush-size-fraction-changed(float);
     callback brush-softness-fraction-changed(float);
+    callback brush-opacity-fraction-changed(float);
+    callback brush-mode-menu-toggled();
+    callback brush-mode-menu-dismissed();
+    callback brush-mode-selected(string);
     callback pipette-toggled();
     callback undo-requested();
     callback redo-requested();
@@ -78,6 +83,11 @@ export component AppWindow inherits Window {
     in property <int> brush-size-ceiling: 1;
     in property <string> brush-soft-text: "";
     in property <float> brush-soft-fraction: 0.0;
+    in property <string> brush-mode-label: "";
+    in property <string> brush-mode-id: "";
+    in property <bool> brush-mode-menu-open: false;
+    in property <string> brush-opacity-text: "";
+    in property <float> brush-opacity-fraction: 0.0;
     in property <bool> brush-picking: false;
     in property <bool> can-undo: false;
     in property <bool> can-redo: false;
@@ -90,6 +100,8 @@ export component AppWindow inherits Window {
     in property <string> cursor-core-commands;
     in property <bool> cursor-picking: false;
     in property <color> cursor-pick-color;
+    in property <string> cursor-mode-tag: "";
+    in property <length> cursor-tag-origin;
     in property <bool> cursor-visible: false;
     in property <length> cursor-frame-x;
     in property <length> cursor-frame-y;
@@ -209,6 +221,10 @@ export component AppWindow inherits Window {
         size-ceiling: root.brush-size-ceiling;
         soft-text: root.brush-soft-text;
         soft-fraction: root.brush-soft-fraction;
+        mode-label: root.brush-mode-label;
+        mode-menu-open: root.brush-mode-menu-open;
+        opacity-text: root.brush-opacity-text;
+        opacity-fraction: root.brush-opacity-fraction;
         picking: root.brush-picking;
         can-undo: root.can-undo;
         can-redo: root.can-redo;
@@ -216,6 +232,8 @@ export component AppWindow inherits Window {
 
         brush-size-fraction-changed(f) => { root.brush-size-fraction-changed(f); }
         brush-softness-fraction-changed(f) => { root.brush-softness-fraction-changed(f); }
+        brush-opacity-fraction-changed(f) => { root.brush-opacity-fraction-changed(f); }
+        brush-mode-menu-toggled => { root.brush-mode-menu-toggled(); }
         pipette-toggled => { root.pipette-toggled(); }
         undo-requested => { root.undo-requested(); }
         redo-requested => { root.redo-requested(); }
@@ -420,6 +438,8 @@ export component AppWindow inherits Window {
             cursor-core-commands: root.cursor-core-commands;
             cursor-picking: root.cursor-picking;
             cursor-pick-color: root.cursor-pick-color;
+            cursor-mode-tag: root.cursor-mode-tag;
+            cursor-tag-origin: root.cursor-tag-origin;
         cursor-visible: root.cursor-visible;
         cursor-frame-x: root.cursor-frame-x;
         cursor-frame-y: root.cursor-frame-y;
@@ -751,6 +771,32 @@ export component AppWindow inherits Window {
     callback projects-save-project-requested();
     callback projects-recent-clicked(int);
     out property <length> gallery-width: projects-overlay.gallery-width;
+
+    // The mode list paints over the canvas and dock; a press anywhere
+    // else closes it and goes no further.
+    if root.mode == "editor" && root.brush-mode-menu-open: Rectangle {
+        width: root.width;
+        height: root.height;
+
+        TouchArea {
+            clicked => { root.brush-mode-menu-dismissed(); }
+        }
+        FFMenuList {
+            x: ShellGeometry.icon-bar-width + ShellGeometry.editor-toolbar-mode-menu-x
+                - ShellGeometry.editor-toolbar-shift(
+                    root.width - ShellGeometry.dock-width - ShellGeometry.icon-bar-width, 2);
+            y: ShellGeometry.strip-height
+                + (ShellGeometry.toolbar-height - ShellGeometry.toolbar-button-height) / 2
+                + ShellGeometry.toolbar-button-height;
+            width: ShellGeometry.editor-toolbar-mode-menu-width;
+            choices: ["Normal", "Lighten", "Darken", "Detail"];
+            choice-ids: ["normal", "lighten", "darken", "detail"];
+            show-choice-ids: false;
+            chosen-accent: true;
+            selected: root.brush-mode-id;
+            option-selected(picked) => { root.brush-mode-selected(picked); }
+        }
+    }
 
     projects-overlay := FFProjectsOverlay {
         x: ShellGeometry.icon-bar-width;

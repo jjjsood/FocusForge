@@ -14,8 +14,8 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::{
-    self, BlobKind, InMemoryCheckpoint, InMemoryKind, Metrics, Op, ParentRef, Point, Project,
-    SealRequest,
+    self, BlobKind, BrushMode, InMemoryCheckpoint, InMemoryKind, Metrics, Op, ParentRef, Point,
+    Project, SealRequest,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 use proptest::collection::vec;
@@ -182,6 +182,8 @@ fn brush_stroke(g: Geometry) -> BoxedStrategy<Op> {
             path,
             radius,
             softness,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         })
         .boxed()
 }

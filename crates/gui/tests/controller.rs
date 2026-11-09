@@ -6,12 +6,13 @@
 
 mod common;
 
+use std::f32::consts::FRAC_1_SQRT_2;
 use std::fs;
 use std::sync::{Arc, Mutex};
 
 use focusforge_core::align::Registration;
 use focusforge_core::io::Rect;
-use focusforge_core::project::{self, Op, Point, Project};
+use focusforge_core::project::{self, BrushMode, Op, Point, Project};
 use focusforge_core::zmap::ZMapReader;
 use focusforge_gpu::blend::Blender;
 use focusforge_gpu::device::SharedDevice;
@@ -327,6 +328,7 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("ff_menu.slint"), "key-pressed(event)")
             | (Some("ff_slider.slint"), "pointer-event(event)")
             | (Some("ff_slider.slint"), "key-pressed(event)")
+            | (Some("ff_slider.slint"), "focus-changed-event(reason)")
             | (Some("ff_image_row.slint"), "pointer-event(event)")
             | (Some("ff_image_row.slint"), "moved")
             | (Some("images_panel.slint"), "clicked")
@@ -580,6 +582,8 @@ fn one_dab(source_id: u16) -> Op {
         path: vec![Point { x: 20, y: 20 }],
         radius: 4.0,
         softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }
 }
 
@@ -1735,6 +1739,8 @@ fn pressing_the_checkpoints_scrollbar_thumb_grabs_it_without_jumping() {
             path: vec![Point { x: 1, y: 1 }],
             radius: 0.5,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         };
         append_ops_at(&project_path, vec![op], None, noon + i * 60)
             .unwrap_or_else(|err| panic!("checkpoint {i} must append: {err}"));
@@ -4117,9 +4123,13 @@ fn displayed_whole(controller: &mut AppController) -> Vec<u16> {
 /// The head checkpoint of the saved project at `path`, rendered whole by the
 /// one function every export and view goes through.
 fn saved_render(path: &Path) -> Vec<u16> {
+    saved_render_at(path, &saved(path).checkpoint().id.clone())
+}
+
+/// Checkpoint `id` of the saved project at `path`, rendered whole.
+fn saved_render_at(path: &Path, id: &str) -> Vec<u16> {
     let mut project = saved(path);
-    let id = project.checkpoint().id.clone();
-    let image = project::CheckpointImage::prepare(&project, &id).expect("the checkpoint prepares");
+    let image = project::CheckpointImage::prepare(&project, id).expect("the checkpoint prepares");
     let full = image.full();
     let mut out = vec![0u16; (full.width * full.height * 3) as usize];
     image
@@ -4209,6 +4219,8 @@ fn drag_produces_one_brush_stroke() {
             path: vec![Point { x: 10, y: 10 }, Point { x: 40, y: 30 }],
             radius,
             softness: 0.25,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }],
         "one op, its straight path resampled down to its two ends"
     );
@@ -4221,6 +4233,8 @@ fn drag_produces_one_brush_stroke() {
             path: vec![Point { x: 20, y: 21 }],
             radius,
             softness: 0.25,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }),
         "a press-release with no motion is a one-point op"
     );
@@ -4402,6 +4416,8 @@ fn brush_controls_convert_to_storage_units() {
                 path: vec![Point { x: 17, y: 42 }],
                 radius: view.size / 2.0,
                 softness: view.soft / 100.0,
+                mode: BrushMode::Normal,
+                opacity: 1.0,
             }),
             "pressed at {press_at:?}"
         );
@@ -4721,6 +4737,7 @@ fn overlay_for(sources: u32, opacity: f32) -> OverlayDraw {
         table: focusforge_core::zmap::overlay_table(sources, None),
         ops: Arc::from([]),
         alpha: focusforge_core::display::alpha_from_opacity(opacity),
+        origin: None,
     }
 }
 
@@ -4840,6 +4857,7 @@ fn overlay_controls_match_the_render_parameters() {
             table: focusforge_core::zmap::overlay_table(3, None),
             ops: Arc::from([]),
             alpha: focusforge_core::display::alpha_from_opacity(0.3),
+            origin: None,
         }),
         "matches display::overlay_cpu's own blend, with no solo source"
     );
@@ -4863,7 +4881,10 @@ fn cursor_geometry_follows_radius_softness_and_zoom() {
         let view = c.brush_cursor_view().unwrap();
         let ring = radius * scale;
         let core = radius * 0.75 * scale;
-        assert_eq!(view.extent, 2.0 * ring + 2.0);
+        assert_eq!(
+            view.extent,
+            2.0 * (ring + 1.0).max(FRAC_1_SQRT_2 * ring + 18.0)
+        );
         assert!(
             view.ring_commands
                 .contains(&format!("A {ring:.2} {ring:.2}")),
@@ -4910,6 +4931,128 @@ fn cursor_geometry_follows_radius_softness_and_zoom() {
     assert_eq!(moved.ring_commands, here.ring_commands);
     assert_eq!(moved.core_commands, here.core_commands);
     assert_ne!(moved.composite_position, here.composite_position);
+}
+
+/// The tag each `BrushMode` shows on the cursor.
+const MODE_TAGS: [(BrushMode, &str); 4] = [
+    (BrushMode::Normal, "N"),
+    (BrushMode::Lighten, "L"),
+    (BrushMode::Darken, "D"),
+    (BrushMode::Detail, "T"),
+];
+
+fn cursor_tag(c: &AppController) -> &'static str {
+    c.brush_cursor_view().unwrap().mode_tag
+}
+
+#[test]
+fn brush_cursor_view_carries_the_mode_tag() {
+    use focusforge_gui::input_map::{Action, InputTable};
+    let (mut c, _) = open_editor("brush_cursor_tag");
+
+    for (mode, tag) in MODE_TAGS {
+        c.set_brush_mode(mode);
+        assert_eq!(cursor_tag(&c), tag, "set_brush_mode({mode:?})");
+    }
+    for (key, (mode, tag)) in ["1", "2", "3", "4"].into_iter().zip(MODE_TAGS) {
+        c.key(true, key, NO_MODS);
+        assert_eq!(c.brush_toolbar_view().mode, mode, "key {key}");
+        assert_eq!(cursor_tag(&c), tag, "key {key}");
+    }
+
+    // Rebinding key 1 moves the tag with it.
+    let mut table = InputTable::default();
+    let row = table
+        .bindings
+        .iter_mut()
+        .find(|b| b.editor == Some(Action::BrushModeNormal))
+        .unwrap();
+    row.editor = Some(Action::BrushModeDarken);
+    c.install_input_table(table);
+    c.key(true, "1", NO_MODS);
+    assert_eq!(cursor_tag(&c), "D", "key 1 rebound to Darken");
+
+    // No tag while the pipette is armed or Alt is held.
+    c.toggle_pipette();
+    assert_eq!(cursor_tag(&c), "", "pipette armed");
+    c.toggle_pipette();
+    assert_eq!(cursor_tag(&c), "D");
+    let (x, y) = at(20.0, 30.0);
+    c.pointer(PointerKind::Move, Button::Left, x, y, ALT);
+    assert_eq!(cursor_tag(&c), "", "Alt held");
+    c.pointer(PointerKind::Move, Button::Left, x, y, NO_MODS);
+    assert_eq!(cursor_tag(&c), "D", "Alt released");
+
+    // The chip sits outside the ring's 45 degree point, at two radii (chip
+    // bound and ring bound) and two zooms.
+    for size in [4.0f32, 120.0] {
+        set_size(&mut c, size);
+        let radius = c.brush_toolbar_view().size / 2.0;
+        for scale in [4.0f32, 5.0] {
+            if scale == 5.0 {
+                c.zoom_in();
+            }
+            let view = c.brush_cursor_view().unwrap();
+            let ring = radius * scale;
+            let expected = view.extent / 2.0 + FRAC_1_SQRT_2 * ring + 2.0;
+            assert!(
+                (view.tag_origin - expected).abs() < 1e-3,
+                "size {size} scale {scale}: {} vs {expected}",
+                view.tag_origin
+            );
+        }
+        c.zoom_out();
+    }
+}
+
+#[test]
+fn mode_keys_drive_the_next_stroke_but_not_the_live_one() {
+    let (mut c, _) = open_editor("brush_mode_keys");
+    set_size(&mut c, 6.0);
+    c.select_frame(1);
+    c.set_overlay_on(true);
+    let opacity = c.brush_toolbar_view().opacity / 100.0;
+
+    c.key(true, "2", NO_MODS);
+    press(&mut c, at(10.0, 10.0));
+    let (x, y) = at(14.0, 16.0);
+    c.pointer_moved(x, y);
+
+    c.key(true, "3", NO_MODS);
+    let (x, y) = at(20.0, 20.0);
+    c.pointer_moved(x, y);
+    c.flush_live_stroke();
+
+    assert_eq!(c.brush_toolbar_view().mode, BrushMode::Darken);
+    assert_eq!(cursor_tag(&c), "D", "the tag follows the key mid-stroke");
+    let live = c
+        .edit_session()
+        .unwrap()
+        .stroke
+        .as_ref()
+        .expect("a live stroke");
+    assert_eq!(
+        live.mode(),
+        BrushMode::Lighten,
+        "the live stroke keeps its mode"
+    );
+    let drawn = c.overlay_draw().expect("the overlay is on").ops;
+    assert_eq!(
+        looks(&drawn[drawn.len() - 1..]),
+        vec![(BrushMode::Lighten, opacity)],
+        "the overlay op"
+    );
+
+    release(&mut c, at(20.0, 20.0));
+    common::settle_region_renders(&mut c);
+    assert_eq!(looks(&ops(&c)), vec![(BrushMode::Lighten, opacity)]);
+
+    drag(&mut c, &[(40.0, 10.0), (40.0, 20.0)]);
+    assert_eq!(
+        looks(&ops(&c)),
+        vec![(BrushMode::Lighten, opacity), (BrushMode::Darken, opacity)],
+        "the next stroke carries the key-selected mode"
+    );
 }
 
 #[test]
@@ -5085,6 +5228,8 @@ fn zmap_unreadable_leaves_the_image_working() {
             path: vec![Point { x: 20, y: 20 }],
             radius: 4.0,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         },
     );
     assert_eq!(ops(&c).len(), 1, "a stroke appends");
@@ -5190,18 +5335,748 @@ fn overlay_pixels(c: &AppController, zmap: &Path) -> Vec<[u8; 3]> {
         width: info.width(),
         height: info.height(),
     };
-    let stored = read_whole_zmap(zmap);
-    let mut colors = vec![[0u8; 3]; stored.len()];
-    focusforge_core::retouch::overlay_colors(
-        &draw.ops,
-        info,
-        whole,
-        NonZeroU32::MIN,
-        &draw.table,
-        &stored,
-        &mut colors,
+    draw.colors(info, whole, NonZeroU32::MIN, &read_whole_zmap(zmap))
+}
+
+/// Polls until the active tab's origin readers are open, have failed to
+/// open, or are not wanted.
+fn settle_origin_readers(c: &mut AppController) {
+    let start = Instant::now();
+    loop {
+        c.ensure_origin_readers();
+        if c.settle_origin_readers() {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the origin readers did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn alt_click_at(c: &mut AppController, (x, y): (u32, u32)) {
+    let (sx, sy) = at(x as f32, y as f32);
+    c.pointer(PointerKind::Down, Button::Left, sx, sy, ALT);
+    c.pointer(PointerKind::Up, Button::Left, sx, sy, ALT);
+}
+
+/// A frame other than `not`, so a pick that changes nothing is told apart
+/// from one that lands on `not`.
+fn frame_other_than(not: &[u16]) -> usize {
+    (0..3)
+        .find(|f| !not.contains(&(*f as u16)))
+        .expect("a frame outside the excluded ones")
+}
+
+/// A hard-edged single dab.
+fn dab(source_id: u16, centre: (u32, u32), radius: f32, mode: BrushMode, opacity: f32) -> Op {
+    Op::BrushStroke {
+        source_id,
+        path: vec![Point {
+            x: centre.0 as i32,
+            y: centre.1 as i32,
+        }],
+        radius,
+        softness: 0.0,
+        mode,
+        opacity,
+    }
+}
+
+/// Whether `(x, y)` lies at least `margin` px inside the disc of `radius`
+/// around `centre`.
+fn deep_inside(centre: (u32, u32), radius: f32, margin: f32, (x, y): (u32, u32)) -> bool {
+    let (dx, dy) = (x as f32 - centre.0 as f32, y as f32 - centre.1 as f32);
+    (dx * dx + dy * dy).sqrt() <= radius - margin
+}
+
+/// The map pixels in row-major order.
+fn map_pixels() -> impl Iterator<Item = (u32, u32)> {
+    (0..MAP_HEIGHT).flat_map(|y| (0..MAP_WIDTH).map(move |x| (x, y)))
+}
+
+fn map_index((x, y): (u32, u32)) -> usize {
+    (y * MAP_WIDTH + x) as usize
+}
+
+/// An editor holding one Lighten dab, with pixels deep inside it where it
+/// changes the sealed composite and where it does not, each over a stored
+/// source other than the stroke's.
+struct LightenCase {
+    zmap: PathBuf,
+    stroke_source: u16,
+    acts: ((u32, u32), u16),
+    idle: ((u32, u32), u16),
+}
+
+fn lighten_case(name: &str, opacity: f32) -> (AppController, LightenCase) {
+    const RADIUS: f32 = 10.0;
+    let (mut c, root) = open_editor(name);
+    let sealed = Sealed::read(&mut c, &root);
+    let (composite, zmap) = c.materialize_active_tab_planes().unwrap();
+    let stored = read_whole_zmap(&zmap);
+    // The first source and place where the stroke is brighter than the
+    // composite in some pixels and not in others.
+    let candidates = (0..3)
+        .flat_map(|source| [(16, 18), (29, 30), (42, 42)].map(move |centre| (source, centre)));
+    for (stroke_source, centre) in candidates {
+        let op = dab(stroke_source, centre, RADIUS, BrushMode::Lighten, opacity);
+        let rendered = pending_render(&composite, &root, &sealed, vec![op.clone()]);
+        let (mut acts, mut idle) = (None, None);
+        for p in map_pixels() {
+            let (i, source) = (map_index(p), stored[map_index(p)]);
+            if !deep_inside(centre, RADIUS, 2.0, p)
+                || source == NO_SOURCE
+                || source == stroke_source
+            {
+                continue;
+            }
+            let changed = rendered[i * 3..i * 3 + 3] != sealed.composite[i * 3..i * 3 + 3];
+            let slot = if changed { &mut acts } else { &mut idle };
+            slot.get_or_insert((p, source));
+        }
+        if let (Some(acts), Some(idle)) = (acts, idle) {
+            common::paint(&mut c, op);
+            common::settle_region_renders(&mut c);
+            return (
+                c,
+                LightenCase {
+                    zmap,
+                    stroke_source,
+                    acts,
+                    idle,
+                },
+            );
+        }
+    }
+    panic!("no Lighten dab acts at some of its pixels and not at others");
+}
+
+#[test]
+fn overlay_and_pipette_skip_a_lighten_stroke_where_it_does_not_act() {
+    for (index, (opacity, overlay_on)) in [(1.0, true), (0.6, false)].into_iter().enumerate() {
+        let (mut c, case) = lighten_case(&format!("lighten_skips_{index}"), opacity);
+        let frames = c.frame_count().unwrap();
+        c.set_overlay_on(overlay_on);
+        if !overlay_on {
+            // A pick requests the readers when the overlay is off.
+            alt_click_at(&mut c, case.idle.0);
+        }
+        settle_origin_readers(&mut c);
+        let expected = [
+            (case.idle.0, case.idle.1),
+            (case.acts.0, case.stroke_source),
+        ];
+        if overlay_on {
+            let table = focusforge_core::zmap::overlay_table(frames, None);
+            let pixels = overlay_pixels(&c, &case.zmap);
+            for (p, shown) in expected {
+                assert_eq!(
+                    pixels[map_index(p)],
+                    table[usize::from(shown)],
+                    "opacity {opacity}: the overlay at {p:?}"
+                );
+            }
+        }
+        for (p, shown) in expected {
+            c.select_frame(frame_other_than(&[shown]));
+            alt_click_at(&mut c, p);
+            assert_eq!(
+                c.brush_source(),
+                Some(shown),
+                "opacity {opacity}: Alt + click at {p:?}"
+            );
+        }
+        c.toggle_pipette();
+        for ((x, y), shown) in expected {
+            let (sx, sy) = at(x as f32, y as f32);
+            c.pointer(PointerKind::Move, Button::Left, sx, sy, NO_MODS);
+            assert_eq!(
+                c.brush_cursor_view().unwrap().pick_color,
+                job::source_color(shown, frames),
+                "opacity {opacity}: the armed cursor at ({x}, {y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn pipette_keeps_source_when_condition_read_fails() {
+    let (mut c, _root) = open_editor("origin_read_fails");
+    let zmap = c.held_checkpoints().last().unwrap().zmap.clone();
+    let stored = read_whole_zmap(&zmap);
+    let table = focusforge_core::zmap::overlay_table(c.frame_count().unwrap(), None);
+    c.set_overlay_on(true);
+    let (normal_at, lighten_at) = ((14, 14), (40, 40));
+    common::paint(&mut c, dab(2, normal_at, 5.0, BrushMode::Normal, 1.0));
+    common::paint(&mut c, dab(1, lighten_at, 5.0, BrushMode::Lighten, 1.0));
+    common::settle_region_renders(&mut c);
+    // The session's mapped composite outlives the file; the readers open it again.
+    let composite = c.materialize_active_tab_planes().unwrap().0;
+    fs::remove_file(composite).unwrap();
+
+    c.ensure_origin_readers();
+    assert!(c.take_origin_started(), "the readers start opening");
+    settle_origin_readers(&mut c);
+    assert!(
+        c.overlay_draw().unwrap().origin.is_none(),
+        "the failed open leaves no readers"
     );
-    colors
+    let pixels = overlay_pixels(&c, &zmap);
+    assert_eq!(
+        pixels[map_index(lighten_at)],
+        table[usize::from(stored[map_index(lighten_at)])],
+        "the stored colour stays under the Lighten stroke"
+    );
+    assert_eq!(
+        pixels[map_index(normal_at)],
+        table[2],
+        "a Normal stroke still shows its source"
+    );
+
+    let selected = frame_other_than(&[1, stored[map_index(lighten_at)]]);
+    c.select_frame(selected);
+    alt_click_at(&mut c, lighten_at);
+    assert_eq!(
+        c.brush_source(),
+        Some(selected as u16),
+        "a pick under the Lighten stroke changes nothing"
+    );
+    for _ in 0..3 {
+        settle_origin_readers(&mut c);
+        assert!(!c.take_origin_started(), "a failed open is not retried");
+    }
+}
+
+/// Whether the active tab's origin readers read through `session`'s frames.
+fn readers_share_sources(c: &AppController) -> bool {
+    let origin = c
+        .overlay_draw()
+        .and_then(|draw| draw.origin)
+        .expect("the origin readers are open");
+    Arc::ptr_eq(
+        &c.edit_session().expect("a session is open").sources,
+        origin.0.sources(),
+    )
+}
+
+#[test]
+fn origin_readers_share_the_session_frame_reader() {
+    let (mut c, _case) = lighten_case("origin_shares_reader", 1.0);
+    c.set_overlay_on(true);
+    settle_origin_readers(&mut c);
+    assert!(c.take_origin_started(), "the readers opened once");
+    assert!(readers_share_sources(&c), "after the Lighten dab");
+
+    common::paint(&mut c, dab(0, (30, 30), 6.0, BrushMode::Darken, 0.6));
+    common::settle_region_renders(&mut c);
+    settle_origin_readers(&mut c);
+    assert!(!c.take_origin_started(), "no second open");
+    assert!(readers_share_sources(&c), "after the Darken dab");
+}
+
+/// A saved project over three `set` frames holding one Lighten dab over its
+/// fuse.
+fn saved_lighten_row(name: &str, set: &str) -> PathBuf {
+    let mut c = scratch_controller(name);
+    common::open_fixture_tab(&mut c, name, set, 3);
+    c.set_param_value(
+        "prepare",
+        "equalize",
+        focusforge_core::params::ParamValue::Bool(false),
+    );
+    assert!(c.start_fuse());
+    settle_all(&mut c);
+    common::enter_editor(&mut c);
+    let path = save_to_proposed(&mut c);
+    common::paint(&mut c, dab(1, (30, 30), 10.0, BrushMode::Lighten, 1.0));
+    assert!(c.save_active_project(|_| None));
+    path
+}
+
+/// [`saved_lighten_row`] reopened with its overlay on and its planes rendered.
+fn reopened_lighten_row(path: &Path, name: &str) -> AppController {
+    let mut r = reopen(path, name);
+    r.set_overlay_on(true);
+    assert_eq!(r.materialize_active_tab_planes(), None, "the row renders");
+    common::settle_render(&mut r);
+    r
+}
+
+#[test]
+fn session_adopts_the_origin_readers_frame_reader() {
+    let path = saved_lighten_row("origin_adopted", "mantis-64");
+
+    let mut early = reopened_lighten_row(&path, "origin_adopted_early");
+    settle_origin_readers(&mut early);
+    assert!(early.overlay_draw().unwrap().origin.is_some());
+    common::enter_editor(&mut early);
+    assert!(readers_share_sources(&early), "readers settled first");
+
+    let mut racing = reopened_lighten_row(&path, "origin_adopted_racing");
+    racing.ensure_origin_readers();
+    assert!(racing.take_origin_started(), "the readers start opening");
+    assert!(racing.set_mode(ShellMode::Editor));
+    assert!(
+        !racing.take_session_started(),
+        "the session waits for the readers instead of opening frames of its own"
+    );
+    settle_origin_readers(&mut racing);
+    common::settle_session(&mut racing);
+    assert!(racing.edit_session().is_some(), "the session opened");
+    assert!(
+        readers_share_sources(&racing),
+        "session opened while the readers were opening"
+    );
+}
+
+fn memory_cap(text: &str) -> performance_settings::PerformanceSettings {
+    performance_settings::PerformanceSettings {
+        max_host_memory: performance_settings::parse_cap(text).unwrap(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn edit_session_frame_set_budget_honours_the_memory_cap() {
+    let set = "mantis-64-deflate-p1-strip-ii";
+    let path = saved_lighten_row("origin_capped", set);
+
+    let mut tight = reopened_lighten_row(&path, "origin_capped_1b");
+    tight.install_performance(memory_cap("1"));
+    settle_origin_readers(&mut tight);
+    assert!(tight.take_origin_started(), "the open was tried once");
+    assert!(
+        tight.overlay_draw().unwrap().origin.is_none(),
+        "1 B holds no decoded segment"
+    );
+    for _ in 0..3 {
+        settle_origin_readers(&mut tight);
+        assert!(
+            !tight.take_origin_started(),
+            "a refused open is not retried"
+        );
+    }
+
+    let mut roomy = reopened_lighten_row(&path, "origin_capped_1mib");
+    roomy.install_performance(memory_cap("1048576"));
+    settle_origin_readers(&mut roomy);
+    assert!(
+        roomy.overlay_draw().unwrap().origin.is_some(),
+        "1 MiB opens the readers"
+    );
+}
+
+#[test]
+fn edit_session_below_the_memory_cap_drops_to_stacking() {
+    let path = saved_lighten_row("session_capped", "mantis-64-deflate-p1-strip-ii");
+    let mut c = reopened_lighten_row(&path, "session_capped_reopened");
+    assert!(
+        c.edit_session().is_none(),
+        "a reopened row holds no session"
+    );
+
+    c.install_performance(memory_cap("1"));
+    assert!(c.set_mode(ShellMode::Editor));
+    let start = Instant::now();
+    while c.mode() == ShellMode::Editor && c.edit_session().is_none() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the session open did not settle"
+        );
+        c.settle_checkpoint_render();
+        c.settle_edit_session();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(c.mode(), ShellMode::Stacking, "the open was refused");
+    assert!(c.edit_session().is_none());
+
+    c.install_performance(memory_cap("1048576"));
+    common::enter_editor(&mut c);
+}
+
+const DEFLATE_SET: &str = "mantis-64-deflate-p1-strip-ii";
+
+/// Fuses a new tab over three decoded-TIFF frames and opens its editor
+/// session; `cap` is the limit it opens under.
+fn open_capped_session(c: &mut AppController, name: &str, cap: &str) {
+    c.install_performance(memory_cap(cap));
+    common::open_fixture_tab(c, name, DEFLATE_SET, 3);
+    c.set_param_value(
+        "prepare",
+        "equalize",
+        focusforge_core::params::ParamValue::Bool(false),
+    );
+    assert!(c.start_fuse());
+    settle_all(c);
+    common::enter_editor(c);
+}
+
+/// The active tab's session reader.
+fn session_reader(c: &AppController) -> Arc<dyn focusforge_core::io::FrameReader> {
+    Arc::clone(&c.edit_session().expect("a session is open").sources)
+}
+
+/// Every resident display sample of the active tab's session.
+fn resident_samples(c: &AppController) -> Vec<u16> {
+    let map = map_rect(c);
+    let mut out = vec![0u16; (map.width * map.height * 3) as usize];
+    c.edit_session().unwrap().tiles.overlay_into(map, &mut out);
+    out
+}
+
+fn memory_warnings(c: &AppController) -> Vec<String> {
+    c.notifications()
+        .iter()
+        .filter(|n| n.kind == focusforge_gui::notifications::Kind::Warning)
+        .map(|n| n.message.clone())
+        .collect()
+}
+
+#[test]
+fn changed_memory_limit_reopens_the_session_frames() {
+    let mut c = scratch_controller("limit_reopens");
+    c.set_resident_tile_size_for_test(16);
+    open_capped_session(&mut c, "limit_reopens_a", "1048576");
+    common::paint(&mut c, dab(1, (20, 20), 8.0, BrushMode::Normal, 1.0));
+    common::paint(&mut c, dab(2, (40, 40), 8.0, BrushMode::Normal, 1.0));
+    c.undo();
+    common::settle_region_renders(&mut c);
+    let with_one = resident_samples(&c);
+    c.redo();
+    common::settle_region_renders(&mut c);
+    let with_both = resident_samples(&c);
+    assert_ne!(with_one, with_both, "the redone stroke is visible");
+    c.undo();
+    common::settle_region_renders(&mut c);
+    assert_eq!(resident_samples(&c), with_one);
+    let old_a = session_reader(&c);
+
+    c.set_mode(ShellMode::Stacking);
+    open_capped_session(&mut c, "limit_reopens_b", "1048576");
+    let old_b = session_reader(&c);
+
+    c.set_host_memory_cap("2MiB");
+    assert!(c.take_session_started(), "the re-opens started");
+    common::settle_session(&mut c);
+
+    assert!(!Arc::ptr_eq(&old_b, &session_reader(&c)), "tab B re-opened");
+    c.select_project(0);
+    let new_a = session_reader(&c);
+    assert!(!Arc::ptr_eq(&old_a, &new_a), "tab A re-opened");
+    let session = c.edit_session().unwrap();
+    assert_eq!(session.op_count(), 1);
+    assert!(session.can_undo() && session.can_redo());
+    assert_eq!(resident_samples(&c), with_one, "resident tiles kept");
+    c.redo();
+    common::settle_region_renders(&mut c);
+    assert_eq!(
+        resident_samples(&c),
+        with_both,
+        "the new reader renders the same samples"
+    );
+
+    c.set_host_memory_cap("2MiB");
+    assert!(!c.take_session_started(), "the same limit starts nothing");
+    assert!(Arc::ptr_eq(&new_a, &session_reader(&c)));
+}
+
+#[test]
+fn changed_memory_limit_keeps_origin_readers_shared() {
+    let path = saved_lighten_row("limit_origin", DEFLATE_SET);
+    let mut r = reopened_lighten_row(&path, "limit_origin_session");
+    r.install_performance(memory_cap("1048576"));
+    settle_origin_readers(&mut r);
+    common::enter_editor(&mut r);
+    assert!(readers_share_sources(&r));
+    let (_, zmap) = r.materialize_active_tab_planes().unwrap();
+    let before = overlay_pixels(&r, &zmap);
+    let old = session_reader(&r);
+
+    r.set_host_memory_cap("2MiB");
+    common::settle_session(&mut r);
+    assert!(
+        !Arc::ptr_eq(&old, &session_reader(&r)),
+        "the session re-opened"
+    );
+    assert!(readers_share_sources(&r), "the readers follow the swap");
+    assert_eq!(overlay_pixels(&r, &zmap), before);
+
+    let mut v = reopened_lighten_row(&path, "limit_origin_view");
+    v.install_performance(memory_cap("1048576"));
+    settle_origin_readers(&mut v);
+    let (_, zmap) = v.materialize_active_tab_planes().unwrap();
+    let before = overlay_pixels(&v, &zmap);
+    let old = Arc::clone(v.overlay_draw().unwrap().origin.unwrap().0.sources());
+    assert!(v.edit_session().is_none(), "readers without a session");
+    v.set_host_memory_cap("2MiB");
+    assert!(v.take_session_started());
+    common::settle_session(&mut v);
+    let new = Arc::clone(v.overlay_draw().unwrap().origin.unwrap().0.sources());
+    assert!(!Arc::ptr_eq(&old, &new), "the readers' frames re-opened");
+    assert_eq!(overlay_pixels(&v, &zmap), before);
+}
+
+/// Polls `settle_edit_session` to rest and returns how many different
+/// readers the active tab's session held on the way, counting the first.
+fn readers_installed(c: &mut AppController) -> usize {
+    let mut last = c.edit_session().map(|_| session_reader(c));
+    let mut changes = 0;
+    let start = Instant::now();
+    loop {
+        let done = c.settle_edit_session();
+        if c.edit_session().is_some() {
+            let now = session_reader(c);
+            if last.as_ref().is_none_or(|last| !Arc::ptr_eq(last, &now)) {
+                changes += 1;
+            }
+            last = Some(now);
+        }
+        if done {
+            return changes;
+        }
+        assert!(start.elapsed() < Duration::from_secs(60), "no settle");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn memory_limit_reopen_drops_stale_results() {
+    // Changed while the session is still opening: it lands, then re-opens.
+    let path = saved_lighten_row("limit_stale", DEFLATE_SET);
+    let mut c = reopened_lighten_row(&path, "limit_stale_reopened");
+    c.install_performance(memory_cap("1048576"));
+    assert!(c.set_mode(ShellMode::Editor));
+    assert!(c.take_session_started(), "the session is opening");
+    c.set_host_memory_cap("2MiB");
+    assert_eq!(readers_installed(&mut c), 2, "opened, then re-opened");
+    c.take_session_started();
+    c.set_host_memory_cap("2MiB");
+    assert!(
+        !c.take_session_started(),
+        "now opened at the limit in force"
+    );
+
+    // Changed twice while the first re-open runs: only the second installs.
+    c.set_host_memory_cap("3MiB");
+    c.set_host_memory_cap("4MiB");
+    assert_eq!(readers_installed(&mut c), 1);
+    c.take_session_started();
+    c.set_host_memory_cap("4MiB");
+    assert!(!c.take_session_started());
+
+    // A row change while a refused re-open runs: its result is dropped
+    // without a warning.
+    c.set_host_memory_cap("1");
+    c.select_checkpoint_row(0);
+    c.select_checkpoint_row(1);
+    common::settle_session(&mut c);
+    assert!(
+        memory_warnings(&c).is_empty(),
+        "a re-open from before the row change warned"
+    );
+}
+
+#[test]
+fn memory_limit_reopen_holds_back_the_session_open() {
+    let path = saved_lighten_row("limit_holds", DEFLATE_SET);
+    let mut r = reopened_lighten_row(&path, "limit_holds_reopened");
+    r.install_performance(memory_cap("1048576"));
+    settle_origin_readers(&mut r);
+    r.set_host_memory_cap("2MiB");
+    assert!(r.take_session_started());
+    assert!(r.set_mode(ShellMode::Editor));
+    assert!(
+        !r.take_session_started(),
+        "no session open beside the re-open"
+    );
+    common::enter_editor(&mut r);
+    assert!(
+        readers_share_sources(&r),
+        "the session adopted the new frames"
+    );
+}
+
+#[test]
+fn refused_memory_limit_reopen_keeps_the_session() {
+    let mut c = scratch_controller("limit_refused");
+    c.set_resident_tile_size_for_test(16);
+    open_capped_session(&mut c, "limit_refused", "1048576");
+    common::paint(&mut c, dab(1, (20, 20), 8.0, BrushMode::Normal, 1.0));
+    common::settle_region_renders(&mut c);
+    let old = session_reader(&c);
+
+    c.set_host_memory_cap("1");
+    assert!(c.take_session_started());
+    common::settle_session(&mut c);
+    assert!(
+        Arc::ptr_eq(&old, &session_reader(&c)),
+        "the old reader stays"
+    );
+    assert_eq!(c.edit_session().unwrap().op_count(), 1);
+    assert_eq!(c.mode(), ShellMode::Editor);
+    let warnings = memory_warnings(&c);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("limit of 1 "), "{}", warnings[0]);
+
+    c.set_host_memory_cap("1");
+    assert!(!c.take_session_started(), "the same limit starts nothing");
+    assert_eq!(memory_warnings(&c).len(), 1);
+
+    c.set_host_memory_cap("1048576");
+    assert!(c.take_session_started());
+    common::settle_session(&mut c);
+    assert!(!Arc::ptr_eq(&old, &session_reader(&c)), "raised: re-opened");
+    assert_eq!(memory_warnings(&c).len(), 1);
+}
+
+#[test]
+fn overlay_waits_for_lighten_darken_samples() {
+    // Open session: stored colours until the readers settle.
+    let (mut c, case) = lighten_case("origin_waits", 1.0);
+    let table = focusforge_core::zmap::overlay_table(c.frame_count().unwrap(), None);
+    c.set_overlay_on(true);
+    let (acts, acts_stored) = case.acts;
+    let waiting = c.overlay_draw().unwrap();
+    assert!(waiting.origin.is_none());
+    assert_eq!(
+        overlay_pixels(&c, &case.zmap)[map_index(acts)],
+        table[usize::from(acts_stored)],
+        "the stored colour shows while the readers are not open"
+    );
+    let selected = frame_other_than(&[case.stroke_source]);
+    c.select_frame(selected);
+    alt_click_at(&mut c, acts);
+    assert_eq!(
+        c.brush_source(),
+        Some(selected as u16),
+        "a pick waits for the readers too"
+    );
+    settle_origin_readers(&mut c);
+    let ready = c.overlay_draw().unwrap();
+    assert!(ready.origin.is_some());
+    assert_ne!(ready, waiting, "the readers' arrival changes the draw");
+    assert_eq!(
+        overlay_pixels(&c, &case.zmap)[map_index(acts)],
+        table[usize::from(case.stroke_source)],
+        "the replayed origin shows once they are open"
+    );
+
+    // Only Normal strokes: no readers.
+    let (mut normal, _) = open_editor("origin_normal_only");
+    normal.set_overlay_on(true);
+    common::paint(&mut normal, dab(2, (20, 20), 5.0, BrushMode::Normal, 1.0));
+    normal.ensure_origin_readers();
+    alt_click_at(&mut normal, (20, 20));
+    assert!(!normal.take_origin_started(), "no Lighten or Darken stroke");
+    assert!(normal.overlay_draw().unwrap().origin.is_none());
+
+    saved_lighten_replays_from_the_fused_ancestor();
+}
+
+/// A saved Lighten stroke over a saved Normal one, reopened with no session
+/// and no cached planes: the overlay shows its source exactly where the
+/// row's render differs from its parent's.
+fn saved_lighten_replays_from_the_fused_ancestor() {
+    const NORMAL: ((u32, u32), f32) = ((20, 30), 14.0);
+    const LIGHTEN: ((u32, u32), f32) = ((36, 30), 14.0);
+    let name = "origin_saved_checkpoint";
+    let mut c = scratch_controller(name);
+    let root = open_fused_tab(&mut c, &format!("{name}_frames"), 3);
+    common::enter_editor(&mut c);
+    // Sources for which Lighten acts over the Normal stroke in some pixels
+    // and rests in others.
+    let sealed = Sealed::read(&mut c, &root);
+    let composite = c.materialize_active_tab_planes().unwrap().0;
+    let (normal_source, lighten_source) = (0..3)
+        .flat_map(|n| (0..3).map(move |l| (n, l)))
+        .filter(|(n, l)| n != l)
+        .find(|&(n, l)| {
+            let normal = dab(n, NORMAL.0, NORMAL.1, BrushMode::Normal, 0.8);
+            let lighten = dab(l, LIGHTEN.0, LIGHTEN.1, BrushMode::Lighten, 1.0);
+            let below = pending_render(&composite, &root, &sealed, vec![normal.clone()]);
+            let above = pending_render(&composite, &root, &sealed, vec![normal, lighten]);
+            let (mut acts, mut rests) = (false, false);
+            for p in map_pixels().filter(|&p| deep_inside(LIGHTEN.0, LIGHTEN.1, 2.0, p)) {
+                let i = map_index(p) * 3;
+                let acted = above[i..i + 3] != below[i..i + 3];
+                let in_normal = deep_inside(NORMAL.0, NORMAL.1, 2.0, p);
+                if !in_normal && deep_inside(NORMAL.0, NORMAL.1 + 2.0, 0.0, p) {
+                    continue;
+                }
+                match (acted, in_normal) {
+                    (_, false) => {}
+                    (true, true) => acts = true,
+                    (false, true) => rests = true,
+                }
+            }
+            acts && rests
+        })
+        .expect("sources whose Lighten stroke acts over a Normal one in some pixels and rests in others");
+    let path = save_to_proposed(&mut c);
+    let normal = dab(normal_source, NORMAL.0, NORMAL.1, BrushMode::Normal, 0.8);
+    common::paint(&mut c, normal);
+    assert!(c.save_active_project(|_| None));
+    let parent = saved(&path).checkpoint().id.clone();
+    let lighten = dab(
+        lighten_source,
+        LIGHTEN.0,
+        LIGHTEN.1,
+        BrushMode::Lighten,
+        1.0,
+    );
+    common::paint(&mut c, lighten);
+    assert!(c.save_active_project(|_| None));
+    let row = saved(&path).checkpoint().id.clone();
+    let row_render = saved_render_at(&path, &row);
+    let parent_render = saved_render_at(&path, &parent);
+
+    let mut r = reopen(&path, "origin_saved_checkpoint_reopened");
+    r.set_overlay_on(true);
+    assert!(r.edit_session().is_none(), "no session");
+    assert_eq!(r.materialize_active_tab_planes(), None, "the row renders");
+    common::settle_render(&mut r);
+    let (_, zmap) = r.materialize_active_tab_planes().unwrap();
+    let stored = read_whole_zmap(&zmap);
+    let table = focusforge_core::zmap::overlay_table(3, None);
+    let waiting = overlay_pixels(&r, &zmap);
+    settle_origin_readers(&mut r);
+    assert!(r.overlay_draw().unwrap().origin.is_some());
+    let ready = overlay_pixels(&r, &zmap);
+
+    let (mut acts_inside, mut idle_inside) = (0, 0);
+    for p in map_pixels().filter(|&p| deep_inside(LIGHTEN.0, LIGHTEN.1, 2.0, p)) {
+        let i = map_index(p);
+        let in_normal = deep_inside(NORMAL.0, NORMAL.1, 2.0, p);
+        let near_normal = deep_inside(NORMAL.0, NORMAL.1 + 2.0, 0.0, p);
+        let below = match (in_normal, near_normal) {
+            (true, _) => table[usize::from(normal_source)],
+            (false, false) => table[usize::from(stored[i])],
+            (false, true) => continue,
+        };
+        let acted = row_render[i * 3..i * 3 + 3] != parent_render[i * 3..i * 3 + 3];
+        assert_eq!(
+            waiting[i], below,
+            "stored colours before the readers: {p:?}"
+        );
+        assert_eq!(
+            ready[i],
+            if acted {
+                table[usize::from(lighten_source)]
+            } else {
+                below
+            },
+            "the replayed origin at {p:?}"
+        );
+        match (acted, in_normal) {
+            (_, false) => {}
+            (true, true) => acts_inside += 1,
+            (false, true) => idle_inside += 1,
+        }
+    }
+    assert!(acts_inside > 0, "Lighten acts over the Normal stroke");
+    assert!(idle_inside > 0, "Lighten rests over the Normal stroke");
 }
 
 #[test]
@@ -5991,6 +6866,8 @@ fn live_stroke_previews_each_new_segment() {
         path,
         radius,
         softness,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     };
 
     // A quarter-pixel trace, some steps sub-pixel, wandering across tiles.
@@ -6062,7 +6939,15 @@ fn live_stroke_previews_each_new_segment() {
 
     release(&mut c, at(trace[44].0, trace[44].1));
     common::settle_region_renders(&mut c);
-    let mut live = LiveStroke::new(source, radius, softness, trace[0].0, trace[0].1);
+    let mut live = LiveStroke::new(
+        source,
+        radius,
+        softness,
+        BrushMode::Normal,
+        1.0,
+        trace[0].0,
+        trace[0].1,
+    );
     for w in trace.windows(2) {
         live.push(w[1].0 - w[0].0, w[1].1 - w[0].1);
     }
@@ -6702,12 +7587,12 @@ fn background_region_render_matches_the_synchronous_one() {
     let mut fresh = job::open_edit_session(
         Some(&zmap),
         &composite,
-        &(0..3)
-            .map(|i| root.join(format!("{i:02}.tif")))
-            .collect::<Vec<_>>(),
+        job::FrameSource::Open {
+            frames: (0..3).map(|i| root.join(format!("{i:02}.tif"))).collect(),
+            budget: job::host_budget(),
+        },
         registration,
         16,
-        job::host_budget(),
         Vec::new(),
         ops(&c),
     )
@@ -7173,6 +8058,8 @@ fn modal_opening_mid_stroke_leaves_no_live_drag() {
             path: vec![Point { x: 10, y: 10 }, Point { x: 20, y: 15 }],
             radius: c.brush_toolbar_view().size / 2.0,
             softness: c.brush_toolbar_view().soft_fraction,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }],
         "the stroke ends on the next pointer-up, with nothing added after the modal opened"
     );
@@ -7290,6 +8177,8 @@ fn paint(controller: &mut AppController, x: i32) {
             path: vec![Point { x, y: 20 }],
             radius: 4.0,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         })
         .expect("a dab inside the map applies");
 }
@@ -7977,15 +8866,48 @@ fn duplicated_tab_keeps_crop_and_remembered_values() {
 // never paints what the canvas shows.
 // ---------------------------------------------------------------------
 
+/// The blend mode and opacity percentage of each scripted stroke, in
+/// drawing order: every mode, every opacity below 100 %.
+const SCRIPTED_LOOKS: [(BrushMode, u32); 6] = [
+    (BrushMode::Lighten, 70),
+    (BrushMode::Darken, 40),
+    (BrushMode::Detail, 55),
+    (BrushMode::Normal, 85),
+    (BrushMode::Lighten, 25),
+    (BrushMode::Detail, 60),
+];
+
+/// Picks the brush's mode and an opacity of `percent` through the toolbar's
+/// own setters.
+fn set_look(c: &mut AppController, mode: BrushMode, percent: u32) {
+    c.set_brush_mode(mode);
+    c.set_brush_opacity_fraction(percent as f32 / 100.0);
+}
+
+/// The mode and opacity each op of `ops` carries.
+fn looks(ops: &[Op]) -> Vec<(BrushMode, f32)> {
+    ops.iter()
+        .map(|op| match op {
+            Op::BrushStroke { mode, opacity, .. } => (*mode, *opacity),
+            other => panic!("a brush stroke, got {other:?}"),
+        })
+        .collect()
+}
+
 /// The strokes the live-view tests paint: three softness classes, each a
-/// press-and-release dab then a ticked drag from another frame.
+/// press-and-release dab then a ticked drag from another frame, every
+/// stroke in its own mode and opacity.
 fn paint_scripted_strokes(c: &mut AppController) {
     set_size(c, 10.0);
     for (i, softness) in [0.0f32, 0.5, 1.0].into_iter().enumerate() {
         c.set_brush_softness_fraction(softness);
         c.select_frame((i + 1) % 3);
         let x = 8.0 + 16.0 * i as f32;
+        let (mode, percent) = SCRIPTED_LOOKS[2 * i];
+        set_look(c, mode, percent);
         drag(c, &[(x, 10.0)]);
+        let (mode, percent) = SCRIPTED_LOOKS[2 * i + 1];
+        set_look(c, mode, percent);
         drag_ticked(
             c,
             &[
@@ -7997,6 +8919,11 @@ fn paint_scripted_strokes(c: &mut AppController) {
         );
     }
     assert_eq!(ops(c).len(), 6);
+    let expected: Vec<(BrushMode, f32)> = SCRIPTED_LOOKS
+        .iter()
+        .map(|&(mode, percent)| (mode, percent as f32 / 100.0))
+        .collect();
+    assert_eq!(looks(&ops(c)), expected, "each stroke carries its own look");
 }
 
 /// Gives `c` the blend kernel on `device`, when there is one.
@@ -8085,6 +9012,8 @@ fn live_soft_edge_is_a_blend_not_a_dither() {
         path: rounded(&[(20.0, 30.0), (36.0, 30.0)]),
         radius,
         softness,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     };
     let source = sealed.frame_view(1);
 
@@ -8162,6 +9091,8 @@ fn live_tick_reblends_only_its_footprint(name: &str, device: Option<&SharedDevic
         path,
         radius,
         softness,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     };
 
     // Segments that double back over each other, so alpha would compound
@@ -8308,6 +9239,15 @@ fn live_stroke_at_the_image_edge_matches_the_saved_render() {
 #[test]
 fn brush_stroke_appends_soft_op() {
     let (mut c, _) = open_editor("brush_soft_op");
+    let fresh = c.brush_toolbar_view();
+    assert_eq!(
+        fresh.mode,
+        BrushMode::Normal,
+        "a fresh window starts at Normal"
+    );
+    assert_eq!(fresh.opacity, 100.0);
+    assert_eq!(fresh.opacity_fraction, 1.0);
+    assert!(!fresh.mode_menu_open);
     set_size(&mut c, 14.0);
     c.select_frame(2);
     let view = c.brush_toolbar_view();
@@ -8326,15 +9266,180 @@ fn brush_stroke_appends_soft_op() {
                 path: vec![Point { x: 12, y: 20 }, Point { x: 18, y: 30 }],
                 radius,
                 softness: 0.0,
+                mode: BrushMode::Normal,
+                opacity: 1.0,
             },
             Op::BrushStroke {
                 source_id: 2,
                 path: vec![Point { x: 36, y: 20 }, Point { x: 42, y: 30 }],
                 radius,
                 softness: 1.0,
+                mode: BrushMode::Normal,
+                opacity: 1.0,
             },
         ]
     );
+}
+
+#[test]
+fn brush_stroke_appends_mode_and_opacity() {
+    let (mut c, _) = open_editor("brush_mode_opacity");
+    set_size(&mut c, 6.0);
+    c.select_frame(1);
+    let mut expected = Vec::new();
+    for (m, mode) in [
+        BrushMode::Normal,
+        BrushMode::Lighten,
+        BrushMode::Darken,
+        BrushMode::Detail,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (p, percent) in [1u32, 37, 50, 99, 100].into_iter().enumerate() {
+            set_look(&mut c, mode, percent);
+            let view = c.brush_toolbar_view();
+            assert_eq!((view.mode, view.opacity), (mode, percent as f32));
+            let i = 5 * m + p;
+            let (x, y) = (4.0 + 5.0 * (i % 10) as f32, 8.0 + 24.0 * (i / 10) as f32);
+            drag(&mut c, &[(x, y), (x, y + 8.0)]);
+            expected.push((mode, percent as f32 / 100.0));
+        }
+    }
+    assert_eq!(looks(&ops(&c)), expected);
+}
+
+#[test]
+fn mode_and_opacity_freeze_at_stroke_start() {
+    let (mut c, _) = open_editor("brush_look_freeze");
+    set_size(&mut c, 6.0);
+    c.select_frame(1);
+    c.set_overlay_on(true);
+    set_look(&mut c, BrushMode::Darken, 40);
+    press(&mut c, at(10.0, 10.0));
+    let (x, y) = at(14.0, 16.0);
+    c.pointer_moved(x, y);
+
+    set_look(&mut c, BrushMode::Lighten, 90);
+    let (x, y) = at(20.0, 20.0);
+    c.pointer_moved(x, y);
+    c.flush_live_stroke();
+
+    let frozen = (BrushMode::Darken, 0.4);
+    let live = c
+        .edit_session()
+        .unwrap()
+        .stroke
+        .as_ref()
+        .expect("a live stroke");
+    assert_eq!(
+        (live.mode(), live.opacity()),
+        frozen,
+        "the tick ops' source"
+    );
+    let drawn = c.overlay_draw().expect("the overlay is on").ops;
+    assert_eq!(
+        looks(&drawn[drawn.len() - 1..]),
+        vec![frozen],
+        "the overlay op"
+    );
+
+    release(&mut c, at(20.0, 20.0));
+    common::settle_region_renders(&mut c);
+    assert_eq!(looks(&ops(&c)), vec![frozen], "the appended op");
+
+    drag(&mut c, &[(40.0, 10.0), (40.0, 20.0)]);
+    assert_eq!(
+        looks(&ops(&c)),
+        vec![frozen, (BrushMode::Lighten, 0.9)],
+        "the next stroke takes the new look"
+    );
+}
+
+#[test]
+fn opacity_slider_clamps_to_one_percent() {
+    let (mut c, _) = open_editor("opacity_slider_clamp");
+    for (fraction, percent) in [
+        (-0.3f32, 1.0f32),
+        (0.0, 1.0),
+        (0.004, 1.0),
+        (0.504, 50.0),
+        (1.0, 100.0),
+        (1.7, 100.0),
+    ] {
+        c.set_brush_opacity_fraction(fraction);
+        let view = c.brush_toolbar_view();
+        assert_eq!(view.opacity, percent, "fraction {fraction}");
+        assert_eq!(
+            view.opacity_fraction,
+            percent / 100.0,
+            "thumb at {fraction}"
+        );
+    }
+    for percent in 1..=100u32 {
+        c.set_brush_opacity_fraction(percent as f32 / 100.0);
+        assert_eq!(c.brush_toolbar_view().opacity, percent as f32);
+    }
+
+    let path = save_to_proposed(&mut c);
+    let known = saved_ids(&path);
+    set_size(&mut c, 6.0);
+    c.select_frame(1);
+    c.set_brush_opacity_fraction(0.0);
+    drag(&mut c, &[(10.0, 10.0), (20.0, 20.0)]);
+    assert_eq!(
+        looks(&ops(&c)),
+        vec![(BrushMode::Normal, 0.01)],
+        "accepted by append"
+    );
+    assert!(c.save_active_project(|_| None));
+    assert_eq!(
+        looks(&added_checkpoint(&path, &known).ops),
+        vec![(BrushMode::Normal, 0.01)],
+        "the 1 % stroke saved"
+    );
+}
+
+#[test]
+fn mode_list_closes_on_choice_field_escape_and_canvas_press() {
+    use focusforge_gui::ChromeKey;
+    let (mut c, _) = open_editor("brush_mode_list");
+    let open = |c: &AppController| c.brush_toolbar_view().mode_menu_open;
+    let escape = |c: &mut AppController| c.chrome_key("\u{1b}", NO_MODS);
+    set_size(&mut c, 6.0);
+    c.select_frame(1);
+
+    c.toggle_brush_mode_menu();
+    assert!(open(&c), "a press on the field opens the list");
+    c.toggle_brush_mode_menu();
+    assert!(!open(&c), "a second press on the field closes it");
+
+    c.toggle_brush_mode_menu();
+    c.set_brush_mode(BrushMode::Detail);
+    assert!(!open(&c), "a choice closes the list");
+    assert_eq!(c.brush_toolbar_view().mode, BrushMode::Detail);
+
+    c.toggle_brush_mode_menu();
+    assert!(matches!(escape(&mut c), ChromeKey::Consumed));
+    assert!(!open(&c), "Escape closes the list");
+    assert!(
+        matches!(escape(&mut c), ChromeKey::None),
+        "nothing left to close"
+    );
+
+    c.toggle_brush_mode_menu();
+    press(&mut c, at(20.0, 20.0));
+    release(&mut c, at(20.0, 20.0));
+    common::settle_region_renders(&mut c);
+    assert!(!open(&c), "a canvas press closes the list");
+    assert!(ops(&c).is_empty(), "and paints nothing");
+    assert!(!c.brush_toolbar_view().can_undo);
+    drag(&mut c, &[(20.0, 20.0), (30.0, 30.0)]);
+    assert_eq!(ops(&c).len(), 1, "the next press paints");
+
+    assert!(c.set_mode(ShellMode::Stacking));
+    c.toggle_brush_mode_menu();
+    assert!(!open(&c), "the list opens in the editor only");
 }
 
 /// `ops` over the sealed composite at `composite`, rendered whole by the
@@ -8444,11 +9549,17 @@ fn pending_strokes_append_on_save() {
     let known = saved_ids(&path);
 
     c.select_frame(1);
+    set_look(&mut c, BrushMode::Darken, 35);
     drag(&mut c, &[(10.0, 12.0), (30.0, 20.0)]);
     c.select_frame(2);
+    set_look(&mut c, BrushMode::Detail, 80);
     drag(&mut c, &[(20.0, 40.0), (44.0, 30.0)]);
     let pending = ops(&c);
     assert_eq!(pending.len(), 2);
+    assert_eq!(
+        looks(&pending),
+        vec![(BrushMode::Darken, 0.35), (BrushMode::Detail, 0.8)]
+    );
     assert!(
         fs::read(&path).unwrap() == before,
         "two strokes write nothing"
@@ -8464,6 +9575,11 @@ fn pending_strokes_append_on_save() {
     assert!(c.save_active_project(|_| None));
     let added = added_checkpoint(&path, &known);
     assert_eq!(added.ops, pending);
+    assert_eq!(
+        looks(&added.ops),
+        vec![(BrushMode::Darken, 0.35), (BrushMode::Detail, 0.8)],
+        "the saved checkpoint carries each stroke's mode and opacity"
+    );
     assert!(
         shown == saved_render(&path),
         "the newest checkpoint renders the live view"
@@ -8523,12 +9639,12 @@ fn a_session_renders_after_its_composite_file_is_removed() {
     let mut session = job::open_edit_session(
         Some(&zmap_copy),
         &composite_copy,
-        &(0..3)
-            .map(|i| root.join(format!("{i:02}.tif")))
-            .collect::<Vec<_>>(),
+        job::FrameSource::Open {
+            frames: (0..3).map(|i| root.join(format!("{i:02}.tif"))).collect(),
+            budget: job::host_budget(),
+        },
         sealed.registration.clone(),
         16,
-        job::host_budget(),
         Vec::new(),
         Vec::new(),
     )

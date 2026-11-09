@@ -17,7 +17,9 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::{TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
-use focusforge_core::project::{self, Checkpoint, Metrics, Op, Point, Project, SealRequest};
+use focusforge_core::project::{
+    self, BrushMode, Checkpoint, Metrics, Op, Point, Project, SealRequest,
+};
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use serde_json::Value;
@@ -112,6 +114,8 @@ fn one_stroke() -> Vec<Op> {
         path: vec![Point { x: 20, y: 20 }, Point { x: 24, y: 24 }],
         radius: 3.0,
         softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
     }]
 }
 
@@ -201,6 +205,8 @@ fn exported_zmap_matches_core_replay() {
             path: vec![Point { x: 200, y: 200 }],
             radius: 2.0,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }])
         .unwrap(),
     );
@@ -283,6 +289,8 @@ fn sealing_from_an_older_checkpoint_branches() {
             path: vec![Point { x: 300, y: 300 }],
             radius: 2.0,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }])
         .unwrap(),
     );
@@ -744,6 +752,8 @@ fn output_does_not_reveal_storage_kind() {
             path: vec![Point { x: 5, y: 5 }],
             radius: 1.0,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }])
         .unwrap(),
     );
@@ -1294,6 +1304,8 @@ fn validation_states_are_reported() {
             path: vec![Point { x: 2, y: 2 }],
             radius: 1.0,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }])
         .unwrap(),
     );
@@ -1377,6 +1389,8 @@ fn accept_changed_sources_list_and_delete_changed_project() {
             path: vec![Point { x: 5, y: 5 }, Point { x: 7, y: 7 }],
             radius: 1.0,
             softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }],
         None,
     )

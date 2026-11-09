@@ -5,7 +5,7 @@
 //! release -- plus the brush cursor's `Path` geometry. Plain Rust, no Slint
 //! types.
 
-use focusforge_core::project::Point;
+use focusforge_core::project::{BrushMode, Point};
 use focusforge_core::tile::Rect;
 
 /// One freehand stroke while its drag is still live: the raw `f32` trace in
@@ -17,6 +17,8 @@ pub struct LiveStroke {
     source: u16,
     radius: f32,
     softness: f32,
+    mode: BrushMode,
+    opacity: f32,
     points: Vec<(f32, f32)>,
     flushed: usize,
     /// Every tick's own re-rendered region, oldest first -- empty until a
@@ -26,13 +28,24 @@ pub struct LiveStroke {
 
 impl LiveStroke {
     /// Opens a stroke at `(x, y)` (image coordinates), freezing the brush's
-    /// source, radius and softness for the stroke's whole lifetime -- a
-    /// wheel turned mid-drag changes only the next stroke.
-    pub fn new(source: u16, radius: f32, softness: f32, x: f32, y: f32) -> Self {
+    /// source, radius, softness, blend mode and opacity for the stroke's
+    /// whole lifetime -- a wheel turned or a toolbar control changed
+    /// mid-drag affects only the next stroke.
+    pub fn new(
+        source: u16,
+        radius: f32,
+        softness: f32,
+        mode: BrushMode,
+        opacity: f32,
+        x: f32,
+        y: f32,
+    ) -> Self {
         Self {
             source,
             radius,
             softness,
+            mode,
+            opacity,
             points: vec![(x, y)],
             flushed: 0,
             tick_rects: Vec::new(),
@@ -49,6 +62,15 @@ impl LiveStroke {
 
     pub fn softness(&self) -> f32 {
         self.softness
+    }
+
+    pub fn mode(&self) -> BrushMode {
+        self.mode
+    }
+
+    /// The stroke's opacity in `(0, 1]`.
+    pub fn opacity(&self) -> f32 {
+        self.opacity
     }
 
     /// Integrates one motion delta (image-space) into the raw trace.
@@ -96,10 +118,15 @@ impl LiveStroke {
 /// size.
 const CURSOR_DASH: f32 = 11.0;
 const CURSOR_GAP: f32 = 11.0;
+/// The mode chip's side and its clearance from the ring's 45° point, in the
+/// same on-screen px; `FFBrushCursor` draws the chip at `tag_origin`.
+const CURSOR_TAG_SIDE: f32 = 16.0;
+const CURSOR_TAG_GAP: f32 = 2.0;
 
 /// The brush cursor's own `Path` geometry: a square `extent` long that the
-/// `FFBrushCursor` viewbox matches 1:1, and the `commands` strings for its
-/// ring and core.
+/// `FFBrushCursor` viewbox matches 1:1, the `commands` strings for its ring
+/// and core, and the top-left of the mode chip that sits outside the ring at
+/// its lower-right 45° point.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CursorPaths {
     pub extent: f32,
@@ -109,19 +136,25 @@ pub struct CursorPaths {
     /// A solid circle: the full `radius` for a hard brush, or
     /// `radius * (1 - softness)` behind the dashed ring otherwise.
     pub core: String,
+    /// The chip's top-left, on both axes of the square.
+    pub tag_origin: f32,
 }
 
 /// Builds [`CursorPaths`] for an on-screen `radius` (image-space radius
 /// already multiplied by the viewport's scale) and a `0.0..=1.0` softness
 /// fraction.
 pub fn cursor_paths(radius: f32, softness: f32) -> CursorPaths {
-    let extent = 2.0 * radius + 2.0;
-    let center = radius + 1.0;
+    let diagonal = std::f32::consts::FRAC_1_SQRT_2 * radius;
+    let half = (radius + 1.0).max(diagonal + CURSOR_TAG_GAP + CURSOR_TAG_SIDE);
+    let extent = 2.0 * half;
+    let center = half;
+    let tag_origin = center + diagonal + CURSOR_TAG_GAP;
     if softness <= 0.0 {
         CursorPaths {
             extent,
             ring: String::new(),
             core: full_circle(center, radius),
+            tag_origin,
         }
     } else {
         let core_radius = radius * (1.0 - softness);
@@ -134,6 +167,7 @@ pub fn cursor_paths(radius: f32, softness: f32) -> CursorPaths {
             extent,
             ring: dashed_ring(center, radius),
             core,
+            tag_origin,
         }
     }
 }
@@ -265,7 +299,7 @@ fn rdp(points: &[(f32, f32)], epsilon: f32) -> Vec<(f32, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use focusforge_core::project::Op;
+    use focusforge_core::project::{BrushMode, Op};
     use focusforge_core::retouch::blend::alpha;
     use focusforge_core::zmap::ZMapInfo;
 
@@ -289,6 +323,8 @@ mod tests {
             path,
             radius: 2.5,
             softness: 0.4,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
         }
     }
 
@@ -303,7 +339,7 @@ mod tests {
 
     #[test]
     fn take_segment_is_none_without_new_motion() {
-        let mut stroke = LiveStroke::new(1, 2.5, 0.4, 5.0, 5.0);
+        let mut stroke = LiveStroke::new(1, 2.5, 0.4, BrushMode::Normal, 1.0, 5.0, 5.0);
         assert_eq!(stroke.take_segment(), None, "a fresh stroke has no motion");
         stroke.push(3.0, 1.0);
         assert!(stroke.take_segment().is_some());
@@ -313,11 +349,11 @@ mod tests {
     #[test]
     fn segments_join_into_the_path_so_far_and_it_covers_each_segment() {
         let trace = deltas(60);
-        let fresh = LiveStroke::new(1, 2.5, 0.4, 6.0, 20.0);
+        let fresh = LiveStroke::new(1, 2.5, 0.4, BrushMode::Normal, 1.0, 6.0, 20.0);
         assert_eq!(fresh.path_so_far(), vec![Point { x: 6, y: 20 }]);
 
         for flushes in [1usize, 3, 17] {
-            let mut stroke = LiveStroke::new(1, 2.5, 0.4, 6.0, 20.0);
+            let mut stroke = LiveStroke::new(1, 2.5, 0.4, BrushMode::Normal, 1.0, 6.0, 20.0);
             let mut joined: Vec<Point> = Vec::new();
             for chunk in trace.chunks(trace.len().div_ceil(flushes)) {
                 for &(dx, dy) in chunk {
@@ -344,7 +380,7 @@ mod tests {
                     );
                 }
             }
-            let mut whole = LiveStroke::new(1, 2.5, 0.4, 6.0, 20.0);
+            let mut whole = LiveStroke::new(1, 2.5, 0.4, BrushMode::Normal, 1.0, 6.0, 20.0);
             for &(dx, dy) in &trace {
                 whole.push(dx, dy);
             }
@@ -356,7 +392,7 @@ mod tests {
     fn finish_resamples_and_simplifies() {
         // A straight run collapses to its two ends however many events it
         // arrived as.
-        let mut straight = LiveStroke::new(0, 8.0, 0.0, 2.0, 3.0);
+        let mut straight = LiveStroke::new(0, 8.0, 0.0, BrushMode::Normal, 1.0, 2.0, 3.0);
         for _ in 0..300 {
             straight.push(0.1, 0.05);
         }
@@ -366,7 +402,7 @@ mod tests {
         );
 
         // An L keeps its corner and nothing near it lies off the shape.
-        let mut corner = LiveStroke::new(0, 4.0, 0.0, 0.0, 0.0);
+        let mut corner = LiveStroke::new(0, 4.0, 0.0, BrushMode::Normal, 1.0, 0.0, 0.0);
         for _ in 0..200 {
             corner.push(0.1, 0.0);
         }
@@ -380,15 +416,53 @@ mod tests {
         assert!(path.len() <= 4, "{path:?}");
 
         // A press with no motion is a one-point path.
-        let dab = LiveStroke::new(0, 4.0, 0.0, 7.4, 9.6);
+        let dab = LiveStroke::new(0, 4.0, 0.0, BrushMode::Normal, 1.0, 7.4, 9.6);
         assert_eq!(dab.finish(), vec![Point { x: 7, y: 10 }]);
+    }
+
+    #[test]
+    fn cursor_square_holds_the_mode_tag() {
+        let diagonal = std::f32::consts::FRAC_1_SQRT_2;
+        // 4: the chip bounds the square; 58: about the crossover; 120: the
+        // ring bounds it.
+        for radius in [4.0f32, 58.0, 120.0] {
+            for softness in [0.0, 0.5] {
+                let paths = cursor_paths(radius, softness);
+                let half = (radius + 1.0).max(diagonal * radius + 18.0);
+                assert_eq!(paths.extent, 2.0 * half, "r {radius} soft {softness}");
+                assert_eq!(
+                    paths.tag_origin,
+                    half + diagonal * radius + CURSOR_TAG_GAP,
+                    "r {radius} soft {softness}"
+                );
+                assert!(
+                    paths.tag_origin + CURSOR_TAG_SIDE <= paths.extent,
+                    "the chip lies inside the square: r {radius} soft {softness}"
+                );
+                let core_radius = radius * (1.0 - softness);
+                let centred = format!("M {:.2} {:.2}", half - core_radius, half);
+                assert!(
+                    paths.core.starts_with(&centred),
+                    "the core is centred at extent / 2: {} lacks {centred}",
+                    paths.core
+                );
+            }
+        }
+        assert!(
+            cursor_paths(4.0, 0.0).extent > 2.0 * (4.0 + 1.0),
+            "chip-bound"
+        );
+        assert_eq!(cursor_paths(120.0, 0.0).extent, 2.0 * 121.0, "ring-bound");
     }
 
     #[test]
     fn cursor_core_is_the_whole_edge_for_a_hard_brush() {
         let hard = cursor_paths(10.0, 0.0);
         assert!(hard.ring.is_empty());
-        assert_eq!(hard.extent, 22.0);
+        assert_eq!(
+            hard.extent,
+            2.0 * (std::f32::consts::FRAC_1_SQRT_2 * 10.0 + 18.0)
+        );
         assert!(hard.core.contains("A 10.00 10.00"), "{}", hard.core);
 
         let soft = cursor_paths(10.0, 0.5);

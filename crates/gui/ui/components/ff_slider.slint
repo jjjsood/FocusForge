@@ -18,11 +18,16 @@ export component FFSlider inherits Rectangle {
     in property <bool> recessed: false;
     // `compact`'s own track width; ignored outside `compact`.
     in property <length> track-width: 72px;
+    // Draws the compact thumb's ring without the keyboard being there.
+    in property <bool> focused: false;
     callback fraction-changed(float);
     // Left (-1) or Right (+1) while the slider has keyboard focus.
     callback stepped(int);
 
     height: root.scale == "logarithmic" ? 40px : 26px;
+
+    // Focus arrived by Tab; a press gives focus too (`Programmatic`) and shows no ring.
+    property <bool> tab-focused: false;
 
     track-row := Rectangle {
         y: 0px;
@@ -55,6 +60,16 @@ export component FFSlider inherits Rectangle {
                 background: root.disabled ? Theme.text-disabled : root.invalid ? Theme.status-failure : Theme.accent-default;
             }
 
+            if root.compact && !root.disabled && (root.focused || (key.has-focus && root.tab-focused)): Rectangle {
+                width: thumb.width + 8px;
+                height: self.width;
+                x: thumb.x + thumb.width / 2 - self.width / 2;
+                y: parent.height / 2 - self.height / 2;
+                border-radius: self.height / 2;
+                border-width: 2px;
+                border-color: Theme.accent-default;
+            }
+
             drag-area := TouchArea {
                 enabled: !root.disabled;
                 width: parent.width;
@@ -62,6 +77,7 @@ export component FFSlider inherits Rectangle {
                 y: -8px;
                 pointer-event(event) => {
                     if event.kind == PointerEventKind.down {
+                        root.tab-focused = false;
                         key.focus();
                     }
                 }
@@ -102,6 +118,7 @@ export component FFSlider inherits Rectangle {
     key := FocusScope {
         enabled: !root.disabled;
         focus-on-click: false;
+        focus-changed-event(reason) => { root.tab-focused = reason == FocusReason.tab-navigation; }
         key-pressed(event) => {
             if root.disabled { return reject; }
             if event.text == Key.LeftArrow {

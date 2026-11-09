@@ -275,12 +275,7 @@ impl Canvas {
                     false,
                     0,
                 );
-                renderer.publish_edited(
-                    &prepared.job,
-                    &prepared.samples,
-                    &prepared.indices,
-                    edited,
-                );
+                renderer.publish_edited(&prepared.job, &prepared.samples, &prepared.colors, edited);
             }
         }
         if let Some(preparer) = self.preparer.as_ref() {
@@ -488,6 +483,8 @@ fn show_comparison_pane(
             window.set_cursor_ring_commands(cursor.ring_commands.into());
             window.set_cursor_core_commands(cursor.core_commands.into());
             window.set_cursor_picking(cursor.picking);
+            window.set_cursor_mode_tag(cursor.mode_tag.into());
+            window.set_cursor_tag_origin(cursor.tag_origin);
             window.set_cursor_pick_color(slint::Color::from_rgb_u8(
                 cursor.pick_color[0],
                 cursor.pick_color[1],
@@ -623,15 +620,17 @@ pub fn repaint(
             batch.publication,
         )
     });
-    let (feed, render_started, session_started, message_lines) = {
+    let (feed, render_started, session_started, origin_started, message_lines) = {
         let loaded = canvas.borrow().tab();
         let mut controller = controller.lock().unwrap();
         controller.fit_if_unfitted();
         let feed = controller.canvas_feed(loaded);
+        controller.ensure_origin_readers();
         (
             feed,
             controller.take_render_started(),
             controller.take_session_started(),
+            controller.take_origin_started(),
             controller.composite_message_lines(),
         )
     };
@@ -640,6 +639,9 @@ pub fn repaint(
     }
     if session_started {
         poll_edit_session(app.as_weak(), controller.clone(), canvas.clone());
+    }
+    if origin_started {
+        poll_origin_readers(app.as_weak(), controller.clone(), canvas.clone());
     }
     if controller.lock().unwrap().take_thumbnails_started() {
         poll_thumbnails(app.as_weak(), controller.clone());
@@ -776,6 +778,26 @@ fn poll_edit_session(
             repaint(&app, &controller, &canvas);
         } else {
             poll_edit_session(app_weak, controller, canvas);
+        }
+    });
+}
+
+/// Polls [`AppController::settle_origin_readers`] every [`job::POLL`] until no
+/// origin readers are being opened, then repaints -- their arrival changes
+/// what the composite overlay shows.
+fn poll_origin_readers(
+    app_weak: slint::Weak<AppWindow>,
+    controller: Arc<Mutex<AppController>>,
+    canvas: Rc<RefCell<Canvas>>,
+) {
+    slint::Timer::single_shot(job::POLL, move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if controller.lock().unwrap().settle_origin_readers() {
+            repaint(&app, &controller, &canvas);
+        } else {
+            poll_origin_readers(app_weak, controller, canvas);
         }
     });
 }
@@ -1477,13 +1499,21 @@ pub fn push_performance_view(app: &AppWindow, controller: &Arc<Mutex<AppControll
 fn performance_change(
     app_weak: &slint::Weak<AppWindow>,
     controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
     change: impl FnOnce(&mut AppController),
 ) {
     record_surface_input(InputSurface::Other);
-    change(&mut controller.lock().unwrap());
+    let session_started = {
+        let mut controller = controller.lock().unwrap();
+        change(&mut controller);
+        controller.take_session_started()
+    };
     if let Some(app) = app_weak.upgrade() {
         push_performance_view(&app, controller);
         direct_publication_scope(InputSurface::Other);
+        if session_started {
+            poll_edit_session(app.as_weak(), controller.clone(), canvas.clone());
+        }
     }
 }
 
@@ -2480,6 +2510,38 @@ pub fn push_checkpoint_panel(app: &AppWindow, controller: &mut AppController) {
     app.set_checkpoint_scroll_y(panel.scroll_y);
 }
 
+fn brush_mode_label(mode: crate::job::BrushMode) -> &'static str {
+    use crate::job::BrushMode;
+    match mode {
+        BrushMode::Normal => "Normal",
+        BrushMode::Lighten => "Lighten",
+        BrushMode::Darken => "Darken",
+        BrushMode::Detail => "Detail",
+    }
+}
+
+fn brush_mode_id(mode: crate::job::BrushMode) -> &'static str {
+    use crate::job::BrushMode;
+    match mode {
+        BrushMode::Normal => "normal",
+        BrushMode::Lighten => "lighten",
+        BrushMode::Darken => "darken",
+        BrushMode::Detail => "detail",
+    }
+}
+
+fn brush_mode_from_id(id: &str) -> Option<crate::job::BrushMode> {
+    use crate::job::BrushMode;
+    [
+        BrushMode::Normal,
+        BrushMode::Lighten,
+        BrushMode::Darken,
+        BrushMode::Detail,
+    ]
+    .into_iter()
+    .find(|mode| brush_mode_id(*mode) == id)
+}
+
 /// Pushes the editor toolbar's own state -- `AppController::brush_toolbar_view`
 /// -- the one place `ShellEvent::EditorChanged` is performed. Numeric
 /// readouts are formatted here, never in `.slint`.
@@ -2490,6 +2552,11 @@ pub fn push_editor_toolbar(app: &AppWindow, controller: &AppController) {
     app.set_brush_size_ceiling(view.size_ceiling as i32);
     app.set_brush_soft_text(format!("{:.0}%", view.soft).into());
     app.set_brush_soft_fraction(view.soft_fraction);
+    app.set_brush_mode_label(brush_mode_label(view.mode).into());
+    app.set_brush_mode_id(brush_mode_id(view.mode).into());
+    app.set_brush_mode_menu_open(view.mode_menu_open);
+    app.set_brush_opacity_text(format!("{:.0}%", view.opacity).into());
+    app.set_brush_opacity_fraction(view.opacity_fraction);
     app.set_brush_picking(view.picking);
     app.set_can_undo(view.can_undo);
     app.set_can_redo(view.can_redo);
@@ -2520,6 +2587,8 @@ fn push_brush_cursor(app: &AppWindow, controller: &AppController) {
     app.set_cursor_ring_commands(view.ring_commands.into());
     app.set_cursor_core_commands(view.core_commands.into());
     app.set_cursor_picking(view.picking);
+    app.set_cursor_mode_tag(view.mode_tag.into());
+    app.set_cursor_tag_origin(view.tag_origin);
     app.set_cursor_pick_color(slint::Color::from_rgb_u8(
         view.pick_color[0],
         view.pick_color[1],
@@ -3430,6 +3499,31 @@ pub fn install(
                 .set_brush_softness_fraction(fraction)
         }
     });
+    app.on_brush_opacity_fraction_changed({
+        let controller = controller.clone();
+        move |fraction| {
+            controller
+                .lock()
+                .unwrap()
+                .set_brush_opacity_fraction(fraction)
+        }
+    });
+    app.on_brush_mode_menu_toggled({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().toggle_brush_mode_menu()
+    });
+    app.on_brush_mode_menu_dismissed({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().close_brush_mode_menu()
+    });
+    app.on_brush_mode_selected({
+        let controller = controller.clone();
+        move |id| {
+            if let Some(mode) = brush_mode_from_id(id.as_str()) {
+                controller.lock().unwrap().set_brush_mode(mode);
+            }
+        }
+    });
     // The bottom bar's overlay controls: both change what the `Composite`
     // pane's next repaint blends in, so both go through `dispatch`.
     app.on_overlay_toggled({
@@ -3872,17 +3966,25 @@ pub fn install(
     app.on_settings_section_selected({
         let controller = controller.clone();
         let app_weak = app.as_weak();
+        let canvas = canvas.clone();
         move |section| {
             record_settings_input();
             let Some(parsed) = SettingsSection::from_slug(section.as_str()) else {
                 return;
             };
-            controller.lock().unwrap().select_settings_section(parsed);
+            let session_started = {
+                let mut controller = controller.lock().unwrap();
+                controller.select_settings_section(parsed);
+                controller.take_session_started()
+            };
             if let Some(app) = app_weak.upgrade() {
                 app.set_settings_section(parsed.slug().into());
                 push_performance_view(&app, &controller);
                 push_storage_view(&app, &controller);
                 direct_publication_scope(InputSurface::Settings);
+                if session_started {
+                    poll_edit_session(app.as_weak(), controller.clone(), canvas.clone());
+                }
             }
         }
     });
@@ -4044,32 +4146,54 @@ pub fn install(
     app.on_performance_cap_committed({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move || performance_change(&app_weak, &controller, |c| c.commit_cap_drafts())
+        let canvas = canvas.clone();
+        move || performance_change(&app_weak, &controller, &canvas, |c| c.commit_cap_drafts())
     });
     app.on_performance_host_unit_toggled({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move || performance_change(&app_weak, &controller, |c| c.toggle_host_unit_list())
+        let canvas = canvas.clone();
+        move || {
+            performance_change(&app_weak, &controller, &canvas, |c| {
+                c.toggle_host_unit_list()
+            })
+        }
     });
     app.on_performance_vram_unit_toggled({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move || performance_change(&app_weak, &controller, |c| c.toggle_vram_unit_list())
+        let canvas = canvas.clone();
+        move || {
+            performance_change(&app_weak, &controller, &canvas, |c| {
+                c.toggle_vram_unit_list()
+            })
+        }
     });
     app.on_performance_host_unit_selected({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move |unit| performance_change(&app_weak, &controller, |c| c.set_host_cap_unit(&unit))
+        let canvas = canvas.clone();
+        move |unit| {
+            performance_change(&app_weak, &controller, &canvas, |c| {
+                c.set_host_cap_unit(&unit)
+            })
+        }
     });
     app.on_performance_vram_unit_selected({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move |unit| performance_change(&app_weak, &controller, |c| c.set_vram_cap_unit(&unit))
+        let canvas = canvas.clone();
+        move |unit| {
+            performance_change(&app_weak, &controller, &canvas, |c| {
+                c.set_vram_cap_unit(&unit)
+            })
+        }
     });
     app.on_performance_unit_dismissed({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move || performance_change(&app_weak, &controller, |c| c.close_unit_lists())
+        let canvas = canvas.clone();
+        move || performance_change(&app_weak, &controller, &canvas, |c| c.close_unit_lists())
     });
     app.on_performance_host_cap_cursor_moved({
         let controller = controller.clone();
