@@ -229,18 +229,22 @@ pub fn bytes_shared_reference(stack: StackContext) -> u64 {
 /// ```text
 /// plane      = width * height * 4                      // f32 luma
 /// coarse     = plane / 3                               // the frame's own levels 1..N
-/// rows       = band_rows + 5                           // input rows of one band, with its halo
-/// stream     = width * rows * (2 * spp + 7)            // u16 band, f32 luma band, reduce passes
+/// rows       = band_rows + 5                           // priced rows of the streamed build (an over-bound)
+/// stream     = width * rows * (2 * spp + 7)            // u16 rows, f32 luma and reduced rows
 /// solve      = solve_scratch_bytes(width, height, spp) // per-solve vectors and windows
 /// seed       = seed_scratch_bytes(width, height, spp)  // detector scale space, frame features
 /// bytes_per_registration = coarse + max(stream, solve, seed)
 /// ```
 ///
-/// `band_rows` is `DEFAULT_TILE_SIZE`, the input band height
-/// `PyramidalEcc::build_pyramid` streams with. The streaming buffers are
-/// dropped before the solve allocates its own, so the two never coexist, and
+/// `band_rows` is `DEFAULT_TILE_SIZE`. The streaming pyramid build holds at
+/// most `2 * AlignPyramid::BAND_ROWS + 5` raw rows (plus the reader's `u16`
+/// widening scratch for an `f32` read), a ring of reduced rows at half width
+/// and one luma row, so the term is an upper bound.
+///
+/// The streaming buffers are dropped before the solve allocates its own, and
 /// the escalation runs after the solve's buffers are gone. At 8192x5464x3 this
-/// is ~114.7 MB (the detector searches level 4, 512x342, for 33.8 MB); at the
+/// is ~232.8 MB (coarse 59.7 MB plus the solve's 173.1 MB; the stream term is
+/// 55.1 MB, the detector searching level 4, 512x342, 33.8 MB); at the
 /// 512x512x3 fixture ~53.4 MB, nearly all of it the detector's scale space on
 /// the whole frame.
 pub fn bytes_per_registration(stack: StackContext, band_rows: u32) -> u64 {
@@ -1363,7 +1367,7 @@ mod tests {
         let pyramid = crate::align::AlignPyramid::stream(
             (width, height, spp),
             depth,
-            DEFAULT_TILE_SIZE / 2,
+            crate::align::AlignPyramid::BAND_ROWS,
             |rect, out| -> Result<(), ()> {
                 let row = (width * spp) as usize;
                 let start = rect.y as usize * row;
@@ -1379,8 +1383,12 @@ mod tests {
         // 384 x 384 level-0 solve region, the frame window (the whole 512 px
         // frame) and one 260 px patch window at 10 bytes per pixel.
         let solve = 24 * 384 * 384u64 + 512 * 512 * 10 + 260 * 260 * 10;
-        let rows = DEFAULT_TILE_SIZE as u64 + 5;
-        let stream = width as u64 * rows * (2 * spp as u64 + 7);
+        // The streaming build's real peak: the raw rows of its first band, the
+        // reduced-row ring at half width and one luma row.
+        let band = crate::align::AlignPyramid::BAND_ROWS as u64;
+        let stream = width as u64 * (2 * band + 3) * spp as u64 * 2
+            + width.div_ceil(2) as u64 * (2 * band + 5) * 4
+            + width as u64 * 4;
         // The escalation's detector runs on the whole frame: 192 bytes of
         // scale space per pixel, the frame read in and 2000 features.
         let seed = 512 * 512 * (192 + 10) + 2000 * 72;

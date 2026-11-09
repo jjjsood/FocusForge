@@ -13,10 +13,9 @@ use focusforge_core::algorithm::{
     AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus, TileReader,
 };
 use focusforge_core::align::warp::warp_from_tile;
-use focusforge_core::align::{FrameAlignment, PyramidalEcc, Transform};
+use focusforge_core::align::{AlignPyramid, FrameAlignment, PyramidalEcc, Transform};
 use focusforge_core::io::{FrameError, TiffError, TiffStack};
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
-use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 use focusforge_core::tile::{Rect, Tile};
 
 /// The sharpest `fixtures/mantis-512` frame, the one the ground-truth tests
@@ -163,10 +162,19 @@ pub fn uncached_outcomes(
 pub const PATCH_COUNT: usize = 8;
 
 /// Reads one registration makes of a frame's own pixels up to its solve: the
-/// level-1 bands (each output band of `DEFAULT_TILE_SIZE / 2` rows reads its
-/// rows plus halo), without the level-0 window or patches.
+/// level-1 build reads each input row once, the first band in one read and
+/// every later band of `AlignPyramid::BAND_ROWS` output rows in one read of
+/// its new rows (none once the frame's last row is in), without the level-0
+/// window or patches.
 pub fn streamed_band_reads(stack: &StackContext) -> usize {
-    stack.height.div_ceil(2).div_ceil(DEFAULT_TILE_SIZE / 2) as usize
+    let band = AlignPyramid::BAND_ROWS;
+    let (height, output_rows) = (stack.height, stack.height.div_ceil(2));
+    let later = (1..)
+        .map(|k| k * band)
+        .take_while(|&start| start < output_rows)
+        .filter(|&start| 2 * start + 3 < height)
+        .count();
+    1 + later
 }
 
 /// The reference frame is read as bands, one level-0 template window and one

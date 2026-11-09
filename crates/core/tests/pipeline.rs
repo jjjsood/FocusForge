@@ -1080,9 +1080,10 @@ fn align_progress_carries_an_eta() {
 fn align_eta_excludes_a_pause() {
     let control = JobControl::new();
     let observer = AlignEtaLog::default();
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
     let request = timed_align_request(
         "align_eta_pause",
-        8,
+        2 + workers + 8,
         &control,
         2,
         Duration::from_millis(20),

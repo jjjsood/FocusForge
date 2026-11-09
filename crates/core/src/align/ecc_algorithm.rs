@@ -88,7 +88,7 @@ use crate::align::{
 use crate::fuse::pyramid::{KERNEL, Plane};
 use crate::params::{EnumVariant, ParamDesc, ParamKind, ParamValue, ParamValues, StackContext};
 use crate::registry::AlignRegistration;
-use crate::tile::plan::{DEFAULT_TILE_SIZE, MAX_LEVELS};
+use crate::tile::plan::MAX_LEVELS;
 use crate::tile::{Rect, Sample, SampleFormat};
 use crate::timing::{TimingCounter, measurement_scope, record_level_iterations, record_timing};
 
@@ -531,10 +531,10 @@ impl PyramidalEcc {
         }
     }
 
-    /// Streams `frame` in from `ctx` in full-width row bands of
-    /// [`DEFAULT_TILE_SIZE`] input rows and reduces them into an
-    /// [`AlignPyramid`] of levels `1..=depth` -- never a whole-frame RGB or
-    /// luma buffer.
+    /// Streams `frame` in from `ctx` in full-width row bands of at most
+    /// `2 * AlignPyramid::BAND_ROWS + 5` input rows, each row read once, and
+    /// reduces them into an [`AlignPyramid`] of levels `1..=depth` -- never a
+    /// whole-frame RGB or luma buffer.
     fn build_pyramid(
         ctx: &AlignContext<'_>,
         frame: usize,
@@ -543,7 +543,7 @@ impl PyramidalEcc {
         let _scope = measurement_scope("pyramid_prepare");
         let stack = ctx.stack();
         let extent = (stack.width, stack.height, stack.samples_per_pixel);
-        let band_rows = DEFAULT_TILE_SIZE / 2;
+        let band_rows = AlignPyramid::BAND_ROWS;
         let streamed = match ctx.sample_format() {
             SampleFormat::U16 => AlignPyramid::stream(extent, depth, band_rows, |rect, out| {
                 ctx.read_tile_into(frame, rect, out)
@@ -1801,6 +1801,7 @@ mod tests {
     use crate::align::pyramid::max_levels;
     use crate::align::{AlignDriverOptions, FailurePolicy, align_stack_with};
     use crate::gpu::{AlignBackend, ECC_MOMENTS, EccMomentSession, EccSessionRequest};
+    use crate::tile::plan::DEFAULT_TILE_SIZE;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
