@@ -118,7 +118,7 @@ try {
   & python (Join-Path $root 'tools/package-symbols.py') verify-windows $identity
   if ($LASTEXITCODE -ne 0) { throw 'installed PE and archived PDB identity mismatch' }
   if (Get-ChildItem $product -Recurse -Filter '*.pdb' -File | Select-Object -First 1) { throw 'MSI installed a PDB' }
-  $cliVersion = & $cli --version; if ($LASTEXITCODE -ne 0 -or $cliVersion -ne "focusforge-cli $version") { throw 'CLI version mismatch' }
+  $cliVersion = & $cli --version; if ($LASTEXITCODE -ne 0 -or $cliVersion -ne "focusforge-cli $version" -and $cliVersion -ne "focusforge-cli $version (release)") { throw 'CLI version mismatch' }
   & $cli --help | Out-Null; if ($LASTEXITCODE -ne 0) { throw 'CLI help failed' }
   & python (Join-Path $root 'tools/package-cli-assets.py') verify $root $product
   if ($LASTEXITCODE -ne 0) { throw 'installed CLI assets differ' }

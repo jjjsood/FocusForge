@@ -48,6 +48,7 @@ focusforge-cli [-v]... [-q] <COMMAND>
 |---|---|
 | `-v` | increase log detail; repeat it for more detail |
 | `-q, --quiet` | log errors only |
+| `--version` | print the version and build profile, e.g. `focusforge-cli 0.2.0-rc.1 (release)`; a debug build prints `(debug)` |
 
 - Repeat `-v` for more detail: once for informational messages, twice for
   debug detail. Omit it for warnings and errors only.
@@ -251,7 +252,8 @@ and caches whole frames within the host memory budget.
 
 `stack` accepts mixed uncompressed, LZW-compressed, Deflate-compressed, and
 tiled 8-bit or 16-bit unsigned chunky TIFF frames (8-bit samples are widened
-to the 16-bit range), and 8-bit JPEG frames. RAW files use `rawler` and are
+to the 16-bit range), and 8-bit JPEG frames. A JPEG frame's EXIF orientation is applied on
+reading, so a rotated frame joins the stack upright. RAW files use `rawler` and are
 fused as unclipped 32-bit float samples that clip once, to 16 bits, at
 export. A stack cannot mix TIFF, JPEG and RAW frames. Unsupported layouts or unreadable RAW files
 stop the run with the frame and reason named.
@@ -302,14 +304,14 @@ preset's `[stack]` table accept the settings that belong to the whole run
 |---|---|---|---|
 | `align` | bool | `true` | register every frame onto the reference before fusing; `--no-align` or `align=false` fuses the frames as read |
 | `auto-crop` | bool | `true` | trim the result to the area every aligned frame covers; `--no-crop` or `auto-crop=false` keeps the full frame |
-| `equalize` | bool | `true` | brightness equalization: one gain per frame, the same on every channel, bringing each frame's whole-image mean to one target shared by all frames |
+| `equalize` | bool | `false` | brightness equalization: one gain per frame, the same on every channel, bringing each frame's whole-image mean to one target shared by all frames |
 | `equalize-max-gain` | float, 1.01 to 2.0 | `1.25` | the bound on the gain: with 1.25 a frame's gain stays between 0.8 and 1.25 |
 | `equalize-target` | float, -0.5 to 0.5 | `0.0` | the shared target in stops from the frames' average brightness; 0.0 keeps that average, +1 would double it |
 
 Equalization gives each frame one gain, leaving the source files unchanged. A
 RAW frame is measured and gained in linear light; any other frame on its
-encoded values. It is on for every algorithm and every kind of input unless
-`equalize=false` is set; `algorithms --json` lists each fusion method's
+encoded values. It is off for every algorithm and every kind of input unless
+`equalize=true` is set; `algorithms --json` lists each fusion method's
 defaults under `project_defaults`. The gains are fixed before alignment. A
 frame that would need a gain beyond the bound gets the bound and the run
 prints a notice naming the frame, the gain it needed, the smallest bound that
@@ -559,6 +561,7 @@ focusforge-cli align [OPTIONS] <DIR>
 Computes and reports each frame's transform against a reference frame,
 without fusing anything — the same alignment stage `stack` runs internally,
 reachable on its own so a result is checkable before any fusion runs.
+`<DIR>` holds TIFF, JPEG or camera RAW frames, listed the way `stack` lists them.
 
 Options:
 

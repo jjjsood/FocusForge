@@ -82,6 +82,16 @@ struct Entry {
     value: Vec<u8>,
 }
 
+/// Copies `source` to `dest` followed by `extra` zero bytes after the DNG
+/// payload, so the file's size, and with it a RAW reservation, grows while
+/// the decoded frame stays the same.
+#[allow(dead_code)]
+pub fn copy_padded(source: &std::path::Path, dest: &std::path::Path, extra: usize) {
+    let mut bytes = std::fs::read(source).expect("read DNG source");
+    bytes.resize(bytes.len() + extra, 0);
+    std::fs::write(dest, bytes).expect("write padded DNG");
+}
+
 pub fn write_dng(spec: &DngSpec, truncate_payload: bool) -> NamedTempFile {
     assert_eq!(spec.samples.len(), (spec.width * spec.height) as usize);
     assert!(matches!(spec.bits, 12 | 14));

@@ -1211,8 +1211,14 @@ mod tests {
 
     #[test]
     fn a_host_derived_budget_below_the_minimum_refuses_before_any_registration() {
-        // usable_available = 100 B, so the budget is 40 B.
-        let facts = crate::host::HostFacts::new(1_000, 100, None, None, 4);
+        // 100 B beyond the fixed part, so the budget is 65 B.
+        let facts = crate::host::HostFacts::new(
+            1 << 31,
+            crate::tile::HOST_FIXED_BYTES + 100,
+            None,
+            None,
+            4,
+        );
         let counter = Arc::new(AtomicUsize::new(0));
         let algo = RecordingAlign {
             counter,
@@ -1231,13 +1237,13 @@ mod tests {
             FailurePolicy::Strict,
             &options,
         )
-        .expect_err("a budget of 40 B cannot hold the shared term");
+        .expect_err("a budget of 65 B cannot hold the shared term");
         let required =
             bytes_shared_reference(stack) + bytes_per_registration(stack, DEFAULT_TILE_SIZE);
         assert!(
             matches!(
                 error,
-                AlgorithmError::HostMemoryTooSmall { budget_bytes: 40, required_bytes }
+                AlgorithmError::HostMemoryTooSmall { budget_bytes: 65, required_bytes }
                     if required_bytes == required
             ),
             "{error:?}"
@@ -1266,8 +1272,8 @@ mod tests {
 
     #[test]
     fn a_host_derived_budget_above_the_minimum_runs() {
-        // usable_available = 1 GiB, so the budget is about 430 MB.
-        let facts = crate::host::HostFacts::new(1 << 31, 1 << 30, None, None, 4);
+        // usable_available = 2 GiB, so the budget is about 380 MB.
+        let facts = crate::host::HostFacts::new(1 << 32, 1 << 31, None, None, 4);
         let options = AlignDriverOptions {
             budget: HostBudget::host_derived(&facts),
             ..Default::default()

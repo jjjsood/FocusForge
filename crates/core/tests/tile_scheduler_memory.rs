@@ -28,6 +28,13 @@ use std::time::Duration;
 use focusforge_core::algorithm::{AlgorithmError, TileReader};
 use focusforge_core::fuse::FusionConsumer;
 use focusforge_core::host::HostFacts;
+use focusforge_core::tile::{HOST_BUDGET_SHARE_PERCENT, HOST_FIXED_BYTES};
+
+/// The usable available memory at which a host-derived budget is exactly
+/// `budget` bytes.
+fn available_for(budget: u64) -> u64 {
+    HOST_FIXED_BYTES + (budget * 100).div_ceil(HOST_BUDGET_SHARE_PERCENT)
+}
 use focusforge_core::io::TiffStack;
 use focusforge_core::params::{self, ParamValues, StackContext};
 use focusforge_core::registry;
@@ -344,11 +351,17 @@ fn pool_decouples_from_the_in_flight_limit_at_scale() {
     }
 
     let frame_count = 600usize;
-    // usable_available = 300_000 B; budget = 40% = 120_000 B. One 128x128 RGB
+    // The host budget is 120_000 B. One 128x128 RGB
     // tile is 114_688 B whatever the frame count, so the budget covers it
     // once and `in_flight_limit()` is 1, while `pool_threads()` stays
     // decoupled from it.
-    let facts = HostFacts::new(600_000, 300_000, None, None, available_parallelism);
+    let facts = HostFacts::new(
+        2 * available_for(120_000),
+        available_for(120_000),
+        None,
+        None,
+        available_parallelism,
+    );
     let scratch_base =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tile_scheduler_memory_decouple");
     let mut options = TileSchedulerOptions::with_host_facts(scratch_base, &facts);
@@ -404,8 +417,8 @@ fn a_tile_larger_than_the_frame_is_accounted_at_the_frame_extent() {
 #[test]
 fn too_small_host_budget_is_refused_by_name() {
     let _guard = serial();
-    // usable_available = 100 B; budget = 40% = 40 B, far under one tile.
-    let facts = HostFacts::new(1_000, 100, None, None, 4);
+    // The host budget is 40 B, far under one tile.
+    let facts = HostFacts::new(2 * available_for(40), available_for(40), None, None, 4);
     let scratch_base =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tile_scheduler_memory_too_small");
     let mut options = TileSchedulerOptions::with_host_facts(scratch_base, &facts);
@@ -470,9 +483,15 @@ impl TileReader for ScratchReader {
 #[test]
 fn host_refusal_counts_reader_scratch() {
     let _guard = serial();
-    // usable_available = 2_000_000 B; budget = 40% = 800_000 B, above the
-    // 114_688 B of tile and below the 1_114_688 B with scratch.
-    let facts = HostFacts::new(4_000_000, 2_000_000, None, None, 4);
+    // The host budget is 800_000 B, above the 114_688 B of tile and below
+    // the 1_114_688 B with scratch.
+    let facts = HostFacts::new(
+        2 * available_for(800_000),
+        available_for(800_000),
+        None,
+        None,
+        4,
+    );
     let scratch_base =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tile_scheduler_memory_scratch_refusal");
     let mut options = TileSchedulerOptions::with_host_facts(scratch_base, &facts);
@@ -755,7 +774,8 @@ fn f32_tile_budget_counts_four_byte_samples() {
     assert_eq!(f32_bytes - u16_bytes, side * side * spp * 2);
 
     let stack_ctx = StackContext::new(8, 128, 128, 3);
-    let build = |reader: &dyn TileReader, usable: u64, name: &str| {
+    let build = |reader: &dyn TileReader, budget: u64, name: &str| {
+        let usable = available_for(budget);
         let facts = HostFacts::new(usable * 4, usable, None, None, 4);
         let scratch_base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
         let mut options = TileSchedulerOptions::with_host_facts(scratch_base, &facts);
@@ -763,8 +783,7 @@ fn f32_tile_budget_counts_four_byte_samples() {
         options.levels = 0;
         TileScheduler::new(reader, stack_ctx, 3, &options).map(|s| s.bytes_per_tile())
     };
-    // The host budget is 40% of the usable bytes.
-    let exact = f32_bytes * 5 / 2;
+    let exact = f32_bytes;
     assert_eq!(
         build(&ZeroReaderF32, exact, "f32_budget_exact").unwrap(),
         f32_bytes
@@ -773,7 +792,7 @@ fn f32_tile_budget_counts_four_byte_samples() {
         build(&ZeroReader, exact, "f32_budget_u16").unwrap(),
         u16_bytes
     );
-    match build(&ZeroReaderF32, exact - 2, "f32_budget_short") {
+    match build(&ZeroReaderF32, exact - 1, "f32_budget_short") {
         Err(TileError::HostMemoryTooSmall {
             budget_bytes,
             bytes_per_tile,

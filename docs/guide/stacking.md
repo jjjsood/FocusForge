@@ -80,9 +80,9 @@ the top while you scroll.
 
 ## PREPARE: even out brightness
 
-![The PREPARE section with More... open: the Equalize brightness switch on, Max brightness gain at 1.25 and Target brightness (stops) at 0.0.](../assets/manual/stacking/stacking-prepare.png)
+![The PREPARE section with More... open: the Equalize brightness switch off, with the Max brightness gain and Target brightness (stops) rows greyed, reading 1.25 and 0.0.](../assets/manual/stacking/stacking-prepare.png)
 
-*PREPARE with its More... bar open, at the defaults.*
+*PREPARE with its More... bar open, at the defaults: equalization is off.*
 
 ### Brightness equalization
 
@@ -91,13 +91,14 @@ a little stronger or weaker, the lens lets in slightly less light as focus
 moves closer, mains light flickers. Fused as they are, such differences show
 as blotches where the result switches from one frame to another.
 [Brightness equalization](../glossary.md#brightness-equalization) prevents
-that. Before aligning, FocusForge gives every frame one brightness factor (a
-gain), the same on every colour channel, so that every frame reaches the same
-average brightness.
+that. With **Equalize brightness** on, FocusForge gives every frame one
+brightness factor (a gain) before aligning, the same on every colour channel,
+so that every frame reaches the same average brightness. It is off by default:
+turn it on for a stack whose frames differ in brightness.
 
 | Setting | Range | Default | What it does |
 |---|---|---|---|
-| **Equalize brightness** | on / off | on | Gives each frame one gain so that all frames share one average brightness before they are aligned. |
+| **Equalize brightness** | on / off | off | Gives each frame one gain so that all frames share one average brightness before they are aligned. |
 | **Max brightness gain** | 1.01 to 2.00, in steps of 0.01 | 1.25 | Limits how much a frame may be brightened or darkened. 1.25 allows a frame to be made up to 1.25 times brighter or down to 0.8 times as bright (1 ÷ 1.25), about a third of a stop either way. |
 | **Target brightness (stops)** | −0.5 to +0.5, in steps of 0.1 | 0.0 | Moves the shared brightness the frames are brought to. 0.0 keeps the frames' average brightness; each stop doubles (+1) or halves (−1) it, so the range covers half a stop up or down. |
 
@@ -118,21 +119,21 @@ Things to know:
 
 **When to change these settings:**
 
-- **Leave equalization on** for almost every stack. Small flash-to-flash
-  variation, the slight darkening of a focus-ring stack and mild flicker are
-  exactly what it is for.
-- **Switch it off** when the brightness change between frames is intended, or
-  when you have already matched the frames in another program and want them
-  fused exactly as they are.
+- **Switch equalization on** for a stack whose brightness varies by accident.
+  Small flash-to-flash variation, the slight darkening of a focus-ring stack
+  and mild flicker are exactly what it is for.
+- **Leave it off** when the frames already match, when the brightness change
+  between frames is intended, or when you have matched the frames in another
+  program and want them fused exactly as they are.
 - **Raise Max brightness gain** when FocusForge reports that a frame was held
   at the limit (see below) and you know that frame is only somewhat darker or
   brighter. Do not use it to rescue a frame that is far off, such as one whose
   flash did not fire: leave that frame out with **Exclude** in
   [the Images panel](images-panel.md) instead.
 
-![The PREPARE section with Equalize brightness switched off: the Max brightness gain and Target brightness (stops) rows are greyed, the target still reads −0.2, and the PREPARE heading has no DEFAULT badge.](../assets/manual/stacking/stacking-prepare-off.png)
+![The PREPARE section with Equalize brightness switched on and the target moved to −0.2: all three rows are active and the PREPARE heading has no DEFAULT badge.](../assets/manual/stacking/stacking-prepare-on.png)
 
-*Equalization switched off: the sliders grey out but keep their values.*
+*Equalization switched on, with the target moved to −0.2.*
 
 ### Set a brightness target
 

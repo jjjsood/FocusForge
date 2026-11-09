@@ -148,7 +148,7 @@ instead of starting over:
 focusforge-cli stack path/to/frames/ --algorithm laplacian --resume
 ```
 
-`--resume` matches the earlier run by a fingerprint over the stack's inputs;
+`--resume` matches the earlier run by a fingerprint over the stack's inputs, including each frame's orientation;
 it refuses, rather than guessing, when no matching cancelled state exists or
 it disagrees with this invocation.
 

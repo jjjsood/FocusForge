@@ -357,8 +357,8 @@ fn bound_below_one_segment_is_refused() {
     let error = DecodedTiffStack::open(path, 13_823).unwrap_err();
     let message = error.to_string();
     assert!(matches!(error, TiffError::DecodedCacheTooSmall { .. }));
-    assert!(message.contains("13823"));
-    assert!(message.contains("13824"));
+    assert!(message.contains("allows 0 MB"), "{message}");
+    assert!(message.contains("needs 1 MB"), "{message}");
     assert!(DecodedTiffStack::open(compressed_set("mantis-64-deflate-p1-tile-ii"), 13_824).is_ok());
 }
 
@@ -529,7 +529,14 @@ fn first_differing_bit_depth_is_a_typed_frame_mismatch() {
 
 #[test]
 fn bound_follows_host_budget_and_ceiling() {
-    let facts = FixedFacts(HostFacts::new(1_000, 101, Some(500), Some(99), 4));
+    const F: u64 = focusforge_core::tile::HOST_FIXED_BYTES;
+    let facts = FixedFacts(HostFacts::new(
+        F + 1_000,
+        F + 101,
+        Some(F + 500),
+        Some(F + 99),
+        4,
+    ));
     let derived = HostBudget::host_derived(&facts.facts());
     let split = derived.partition_for_decoded_cache();
     assert_eq!(
@@ -583,9 +590,15 @@ fn bound_follows_host_budget_and_ceiling() {
         .unwrap();
     assert!(reader.cache_stats().peak_resident_bytes <= 15_000);
     for facts in [
-        FixedFacts(HostFacts::new(1_000, 800, None, None, 4)),
+        FixedFacts(HostFacts::new(F + 1_000, F + 800, None, None, 4)),
         FixedFacts(HostFacts::fallback()),
-        FixedFacts(HostFacts::new(1_000, 101, Some(500), Some(99), 4)),
+        FixedFacts(HostFacts::new(
+            F + 1_000,
+            F + 101,
+            Some(F + 500),
+            Some(F + 99),
+            4,
+        )),
     ] {
         let host = HostBudget::host_derived(&facts.facts());
         for limit in [host.bytes() - 1, host.bytes(), host.bytes() + 1] {

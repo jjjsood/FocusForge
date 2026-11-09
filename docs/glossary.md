@@ -37,8 +37,8 @@ See: [Branch from an older checkpoint](guide/history.md#branch-from-an-older-che
 
 The **PREPARE** step that gives every frame one brightness factor (a gain),
 so all frames share the same average brightness before they are aligned and
-fused. It is on by default; **Max brightness gain** (1.25) limits how far a
-frame may be changed.
+fused. It is off by default; with it on, **Max brightness gain** (1.25) limits
+how far a frame may be changed.
 See: [Brightness equalization](guide/stacking.md#brightness-equalization).
 
 ## Brightness target
@@ -59,7 +59,8 @@ See: [Paint a stroke](guide/retouch.md#paint-a-stroke).
 ## Budget
 
 The amount of memory FocusForge allows itself for a fuse: the host
-memory budget (40 % of the memory free when a run starts) and the VRAM budget
+memory budget (65 % of the memory free when a run starts, after about
+1.6 GB set aside for the run itself) and the VRAM budget
 on the graphics card, measured the first time a fuse uses it. FocusForge
 works through a stack in pieces so that it stays within its budget.
 See: [Memory caps and budgets](guide/settings-window.md#memory-caps-and-budgets).
