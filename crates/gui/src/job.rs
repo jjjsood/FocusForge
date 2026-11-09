@@ -1551,8 +1551,8 @@ pub fn cached_checkpoint_planes(
 /// cache, over a project opened on the calling thread. An op-bearing
 /// checkpoint re-hashes its sources on every call and refuses on any
 /// missing or changed frame, and its source frames open under `memory_cap`.
-/// A Z-Map that fails to materialize is logged and
-/// answered as `None`: the composite is the image, the map only analysis.
+/// A Z-Map that fails to materialize is logged and answered as `None`: the
+/// composite is the image, the map only analysis.
 pub fn render_checkpoint_planes(
     project_path: &Path,
     scratch_root: &Path,
