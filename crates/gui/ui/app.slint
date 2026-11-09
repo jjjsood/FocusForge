@@ -100,6 +100,8 @@ export component AppWindow inherits Window {
     in property <string> cursor-core-commands;
     in property <bool> cursor-picking: false;
     in property <color> cursor-pick-color;
+    in property <string> cursor-mode-tag: "";
+    in property <length> cursor-tag-origin;
     in property <bool> cursor-visible: false;
     in property <length> cursor-frame-x;
     in property <length> cursor-frame-y;
@@ -436,6 +438,8 @@ export component AppWindow inherits Window {
             cursor-core-commands: root.cursor-core-commands;
             cursor-picking: root.cursor-picking;
             cursor-pick-color: root.cursor-pick-color;
+            cursor-mode-tag: root.cursor-mode-tag;
+            cursor-tag-origin: root.cursor-tag-origin;
         cursor-visible: root.cursor-visible;
         cursor-frame-x: root.cursor-frame-x;
         cursor-frame-y: root.cursor-frame-y;

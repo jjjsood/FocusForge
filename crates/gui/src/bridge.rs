@@ -483,6 +483,8 @@ fn show_comparison_pane(
             window.set_cursor_ring_commands(cursor.ring_commands.into());
             window.set_cursor_core_commands(cursor.core_commands.into());
             window.set_cursor_picking(cursor.picking);
+            window.set_cursor_mode_tag(cursor.mode_tag.into());
+            window.set_cursor_tag_origin(cursor.tag_origin);
             window.set_cursor_pick_color(slint::Color::from_rgb_u8(
                 cursor.pick_color[0],
                 cursor.pick_color[1],
@@ -2577,6 +2579,8 @@ fn push_brush_cursor(app: &AppWindow, controller: &AppController) {
     app.set_cursor_ring_commands(view.ring_commands.into());
     app.set_cursor_core_commands(view.core_commands.into());
     app.set_cursor_picking(view.picking);
+    app.set_cursor_mode_tag(view.mode_tag.into());
+    app.set_cursor_tag_origin(view.tag_origin);
     app.set_cursor_pick_color(slint::Color::from_rgb_u8(
         view.pick_color[0],
         view.pick_color[1],

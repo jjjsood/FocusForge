@@ -176,7 +176,7 @@ impl fmt::Display for Trigger {
     }
 }
 
-/// The ten actions the table can name.
+/// The fourteen actions the table can name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     ZoomAtCursor,
@@ -189,10 +189,14 @@ pub enum Action {
     Redo,
     PickSourceUnderPointer,
     Paint,
+    BrushModeNormal,
+    BrushModeLighten,
+    BrushModeDarken,
+    BrushModeDetail,
 }
 
 impl Action {
-    pub const ALL: [Action; 10] = [
+    pub const ALL: [Action; 14] = [
         Action::ZoomAtCursor,
         Action::StepSourceFrame,
         Action::PanHorizontal,
@@ -203,6 +207,10 @@ impl Action {
         Action::Redo,
         Action::PickSourceUnderPointer,
         Action::Paint,
+        Action::BrushModeNormal,
+        Action::BrushModeLighten,
+        Action::BrushModeDarken,
+        Action::BrushModeDetail,
     ];
 }
 
@@ -211,7 +219,8 @@ impl Action {
 #[error(
     "unknown action {spelling:?} -- accepted actions: zoom-at-cursor, step-source-frame, \
      pan-horizontal, pan, brush-size, brush-softness, undo, redo, \
-     pick-source-under-pointer, paint"
+     pick-source-under-pointer, paint, brush-mode-normal, brush-mode-lighten, \
+     brush-mode-darken, brush-mode-detail"
 )]
 pub struct ActionParseError {
     pub spelling: String,
@@ -232,6 +241,10 @@ impl FromStr for Action {
             "redo" => Ok(Action::Redo),
             "pick-source-under-pointer" => Ok(Action::PickSourceUnderPointer),
             "paint" => Ok(Action::Paint),
+            "brush-mode-normal" => Ok(Action::BrushModeNormal),
+            "brush-mode-lighten" => Ok(Action::BrushModeLighten),
+            "brush-mode-darken" => Ok(Action::BrushModeDarken),
+            "brush-mode-detail" => Ok(Action::BrushModeDetail),
             _ => Err(ActionParseError {
                 spelling: s.to_string(),
             }),
@@ -252,6 +265,10 @@ impl fmt::Display for Action {
             Action::Redo => "redo",
             Action::PickSourceUnderPointer => "pick-source-under-pointer",
             Action::Paint => "paint",
+            Action::BrushModeNormal => "brush-mode-normal",
+            Action::BrushModeLighten => "brush-mode-lighten",
+            Action::BrushModeDarken => "brush-mode-darken",
+            Action::BrushModeDetail => "brush-mode-detail",
         };
         write!(f, "{s}")
     }
@@ -267,10 +284,10 @@ pub struct Binding {
 
 const M: Modifiers = Modifiers::NONE;
 
-/// Nine trigger-keyed entries, presented as six display rows -- the ninth
+/// Thirteen trigger-keyed entries, presented as ten display rows -- the ninth
 /// (`Paint`'s drag) is a hidden row, absent from `DISPLAY_GROUPS`.
 /// `defaults_match_the_settled_table` asserts the mapping row for row.
-pub const DEFAULT_BINDINGS: [Binding; 9] = [
+pub const DEFAULT_BINDINGS: [Binding; 13] = [
     Binding {
         trigger: Trigger::Wheel(M),
         stacking: Some(Action::ZoomAtCursor),
@@ -338,9 +355,29 @@ pub const DEFAULT_BINDINGS: [Binding; 9] = [
         stacking: None,
         editor: Some(Action::Paint),
     },
+    Binding {
+        trigger: Trigger::Key { key: '1', mods: M },
+        stacking: None,
+        editor: Some(Action::BrushModeNormal),
+    },
+    Binding {
+        trigger: Trigger::Key { key: '2', mods: M },
+        stacking: None,
+        editor: Some(Action::BrushModeLighten),
+    },
+    Binding {
+        trigger: Trigger::Key { key: '3', mods: M },
+        stacking: None,
+        editor: Some(Action::BrushModeDarken),
+    },
+    Binding {
+        trigger: Trigger::Key { key: '4', mods: M },
+        stacking: None,
+        editor: Some(Action::BrushModeDetail),
+    },
 ];
 
-/// The six display rows the settings table shows, `—` where the column is
+/// The ten display rows the settings table shows, `—` where the column is
 /// `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputRowView {
@@ -349,10 +386,21 @@ pub struct InputRowView {
     pub editor: String,
 }
 
-/// The `DEFAULT_BINDINGS` indices each of the six display rows groups --
+/// The `DEFAULT_BINDINGS` indices each of the ten display rows groups --
 /// `[5, 6]` (Ctrl+Z / Ctrl+Shift+Z) is the one row whose two triggers name
 /// *different* actions per mode column.
-const DISPLAY_GROUPS: [&[usize]; 6] = [&[0], &[1], &[2], &[3, 4], &[5, 6], &[7]];
+const DISPLAY_GROUPS: [&[usize]; 10] = [
+    &[0],
+    &[1],
+    &[2],
+    &[3, 4],
+    &[5, 6],
+    &[7],
+    &[9],
+    &[10],
+    &[11],
+    &[12],
+];
 
 fn column(
     bindings: &[Binding],
@@ -402,7 +450,7 @@ impl InputTable {
         }
     }
 
-    /// The six display rows the settings table shows.
+    /// The ten display rows the settings table shows.
     pub fn display_rows(&self) -> Vec<InputRowView> {
         DISPLAY_GROUPS
             .iter()

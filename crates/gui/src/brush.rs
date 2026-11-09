@@ -118,10 +118,15 @@ impl LiveStroke {
 /// size.
 const CURSOR_DASH: f32 = 11.0;
 const CURSOR_GAP: f32 = 11.0;
+/// The mode chip's side and its clearance from the ring's 45° point, in the
+/// same on-screen px; `FFBrushCursor` draws the chip at `tag_origin`.
+const CURSOR_TAG_SIDE: f32 = 16.0;
+const CURSOR_TAG_GAP: f32 = 2.0;
 
 /// The brush cursor's own `Path` geometry: a square `extent` long that the
-/// `FFBrushCursor` viewbox matches 1:1, and the `commands` strings for its
-/// ring and core.
+/// `FFBrushCursor` viewbox matches 1:1, the `commands` strings for its ring
+/// and core, and the top-left of the mode chip that sits outside the ring at
+/// its lower-right 45° point.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CursorPaths {
     pub extent: f32,
@@ -131,19 +136,25 @@ pub struct CursorPaths {
     /// A solid circle: the full `radius` for a hard brush, or
     /// `radius * (1 - softness)` behind the dashed ring otherwise.
     pub core: String,
+    /// The chip's top-left, on both axes of the square.
+    pub tag_origin: f32,
 }
 
 /// Builds [`CursorPaths`] for an on-screen `radius` (image-space radius
 /// already multiplied by the viewport's scale) and a `0.0..=1.0` softness
 /// fraction.
 pub fn cursor_paths(radius: f32, softness: f32) -> CursorPaths {
-    let extent = 2.0 * radius + 2.0;
-    let center = radius + 1.0;
+    let diagonal = std::f32::consts::FRAC_1_SQRT_2 * radius;
+    let half = (radius + 1.0).max(diagonal + CURSOR_TAG_GAP + CURSOR_TAG_SIDE);
+    let extent = 2.0 * half;
+    let center = half;
+    let tag_origin = center + diagonal + CURSOR_TAG_GAP;
     if softness <= 0.0 {
         CursorPaths {
             extent,
             ring: String::new(),
             core: full_circle(center, radius),
+            tag_origin,
         }
     } else {
         let core_radius = radius * (1.0 - softness);
@@ -156,6 +167,7 @@ pub fn cursor_paths(radius: f32, softness: f32) -> CursorPaths {
             extent,
             ring: dashed_ring(center, radius),
             core,
+            tag_origin,
         }
     }
 }
@@ -409,10 +421,48 @@ mod tests {
     }
 
     #[test]
+    fn cursor_square_holds_the_mode_tag() {
+        let diagonal = std::f32::consts::FRAC_1_SQRT_2;
+        // 4: the chip bounds the square; 58: about the crossover; 120: the
+        // ring bounds it.
+        for radius in [4.0f32, 58.0, 120.0] {
+            for softness in [0.0, 0.5] {
+                let paths = cursor_paths(radius, softness);
+                let half = (radius + 1.0).max(diagonal * radius + 18.0);
+                assert_eq!(paths.extent, 2.0 * half, "r {radius} soft {softness}");
+                assert_eq!(
+                    paths.tag_origin,
+                    half + diagonal * radius + CURSOR_TAG_GAP,
+                    "r {radius} soft {softness}"
+                );
+                assert!(
+                    paths.tag_origin + CURSOR_TAG_SIDE <= paths.extent,
+                    "the chip lies inside the square: r {radius} soft {softness}"
+                );
+                let core_radius = radius * (1.0 - softness);
+                let centred = format!("M {:.2} {:.2}", half - core_radius, half);
+                assert!(
+                    paths.core.starts_with(&centred),
+                    "the core is centred at extent / 2: {} lacks {centred}",
+                    paths.core
+                );
+            }
+        }
+        assert!(
+            cursor_paths(4.0, 0.0).extent > 2.0 * (4.0 + 1.0),
+            "chip-bound"
+        );
+        assert_eq!(cursor_paths(120.0, 0.0).extent, 2.0 * 121.0, "ring-bound");
+    }
+
+    #[test]
     fn cursor_core_is_the_whole_edge_for_a_hard_brush() {
         let hard = cursor_paths(10.0, 0.0);
         assert!(hard.ring.is_empty());
-        assert_eq!(hard.extent, 22.0);
+        assert_eq!(
+            hard.extent,
+            2.0 * (std::f32::consts::FRAC_1_SQRT_2 * 10.0 + 18.0)
+        );
         assert!(hard.core.contains("A 10.00 10.00"), "{}", hard.core);
 
         let soft = cursor_paths(10.0, 0.5);

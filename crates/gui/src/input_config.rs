@@ -171,10 +171,10 @@ fn validate(parsed: ConfigFile, src: &str, path: PathBuf) -> Loaded {
         // and a partial or out-of-order file must never shift or delete an
         // unrelated row.
         //
-        // A trigger that parses but names none of the table's nine known
+        // A trigger that parses but names none of the table's thirteen known
         // triggers is refused the same way an unparseable spelling is: this
         // table's rows are display-indexed (`InputTable::display_rows`,
-        // `DEFAULT_BINDINGS`'s fixed nine-slot layout), so a trigger this
+        // `DEFAULT_BINDINGS`'s fixed thirteen-slot layout), so a trigger this
         // table has no row for cannot be shown in the settings modal, and
         // silently accepting it would show a table that does not match the
         // active bindings. Refusing is final -- "rebind" means reassigning
@@ -287,7 +287,8 @@ const HEADER: &str = "\
 # refused.
 #
 # Accepted actions: zoom-at-cursor, step-source-frame, pan-horizontal, pan,
-# brush-size, brush-softness, undo, redo, pick-source-under-pointer, paint.
+# brush-size, brush-softness, undo, redo, pick-source-under-pointer, paint,
+# brush-mode-normal, brush-mode-lighten, brush-mode-darken, brush-mode-detail.
 #
 # Omit `stacking` or `editor` to leave that mode with no binding.
 ";

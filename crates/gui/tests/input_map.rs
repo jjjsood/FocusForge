@@ -12,6 +12,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use focusforge_core::project::BrushMode;
 use focusforge_gui::input_map::InputTable;
 use focusforge_gui::input_map::{
     Action, ActionEvent, Binding, Button, DEFAULT_BINDINGS, Modifiers, PointerKind, Trigger,
@@ -38,8 +39,8 @@ fn sink() -> (Arc<Mutex<Vec<ShellEvent>>>, EventSink) {
 #[test]
 fn defaults_match_the_settled_table() {
     // Written out literally rather than derived from the code under test:
-    // six displayed rows map to the first eight trigger keys, and the ninth
-    // (the paint drag) is a hidden row.
+    // ten displayed rows map to all trigger keys but the ninth (the paint
+    // drag), which is a hidden row.
     let expected = [
         (
             Trigger::Wheel(NONE),
@@ -115,7 +116,20 @@ fn defaults_match_the_settled_table() {
             Some(Action::Paint),
         ),
     ];
+    let mode_keys = [
+        ('1', Action::BrushModeNormal),
+        ('2', Action::BrushModeLighten),
+        ('3', Action::BrushModeDarken),
+        ('4', Action::BrushModeDetail),
+    ];
+    let expected: Vec<_> = expected
+        .into_iter()
+        .chain(
+            mode_keys.map(|(key, action)| (Trigger::Key { key, mods: NONE }, None, Some(action))),
+        )
+        .collect();
 
+    assert_eq!(DEFAULT_BINDINGS.len(), 13);
     assert_eq!(DEFAULT_BINDINGS.len(), expected.len());
     for (i, (binding, (trigger, stacking, editor))) in
         DEFAULT_BINDINGS.iter().zip(expected.iter()).enumerate()
@@ -128,10 +142,10 @@ fn defaults_match_the_settled_table() {
 
 #[test]
 fn modes_differ_only_by_declared_overrides() {
-    // Only the Shift wheel row, the undo/redo rows and the paint drag
-    // differ -- the table's explicit overrides. Every other row's stacking
-    // and editor columns must match.
-    let overridden = [2usize, 5, 6, 8];
+    // Only the Shift wheel row, the undo/redo rows, the paint drag and the
+    // four mode keys differ -- the table's explicit overrides. Every other
+    // row's stacking and editor columns must match.
+    let overridden = [2usize, 5, 6, 8, 9, 10, 11, 12];
     let table = InputTable::default();
     for (i, binding) in table.bindings.iter().enumerate() {
         if overridden.contains(&i) {
@@ -168,7 +182,7 @@ fn user_file_overrides_a_default() {
     // A row matches a default **by trigger identity**: every row below
     // keeps its default trigger spelling and overrides only the action it
     // names, which is what a file row can unambiguously do against this
-    // table's fixed nine-trigger layout. (Renaming *which* physical
+    // table's fixed thirteen-trigger layout. (Renaming *which* physical
     // gesture performs an action -- e.g. moving `Pan` from `middle-drag`
     // onto `right-drag` -- is refused instead: the schema has no field
     // identifying which default row an unrecognised trigger is meant to
@@ -360,6 +374,23 @@ fn first_run_writes_the_defaults() {
 fn written_defaults_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     input_config::write_defaults(dir.path()).unwrap();
+
+    let contents = fs::read_to_string(dir.path().join("settings.toml")).unwrap();
+    let (header, rows) = contents
+        .split_once("[[input.bindings]]")
+        .expect("the file holds binding rows after its header");
+    for spelling in [
+        "brush-mode-normal",
+        "brush-mode-lighten",
+        "brush-mode-darken",
+        "brush-mode-detail",
+    ] {
+        assert!(header.contains(spelling), "header names {spelling}");
+        assert!(
+            rows.contains(&format!("editor = \"{spelling}\"")),
+            "a row binds {spelling}"
+        );
+    }
 
     let loaded = input_config::load(dir.path());
     assert!(
@@ -851,6 +882,144 @@ fn undo_and_redo_are_blocked_under_the_settings_modal() {
     ));
 }
 
+/// The mode `controller` would paint its next stroke with.
+fn brush_mode(controller: &AppController) -> BrushMode {
+    controller.brush_toolbar_view().mode
+}
+
+fn press_key(controller: &mut AppController, text: &str, mods: Modifiers) {
+    controller.key(true, text, mods);
+}
+
+#[test]
+fn mode_keys_select_each_brush_mode() {
+    let mut editor = AppController::new_with_mode_for_test(ShellMode::Editor);
+    let (events, cb) = sink();
+    editor.set_sink(cb);
+
+    for (text, mode) in [
+        ("3", BrushMode::Darken),
+        ("1", BrushMode::Normal),
+        ("4", BrushMode::Detail),
+        ("2", BrushMode::Lighten),
+    ] {
+        press_key(&mut editor, text, NONE);
+        assert_eq!(brush_mode(&editor), mode, "key {text}");
+    }
+    assert_eq!(
+        fired(&events),
+        vec![
+            Action::BrushModeDarken,
+            Action::BrushModeNormal,
+            Action::BrushModeDetail,
+            Action::BrushModeLighten,
+        ]
+    );
+
+    editor.toggle_brush_mode_menu();
+    assert!(editor.brush_toolbar_view().mode_menu_open);
+    press_key(&mut editor, "3", NONE);
+    let view = editor.brush_toolbar_view();
+    assert_eq!(view.mode, BrushMode::Darken);
+    assert!(!view.mode_menu_open, "a mode key closes the open list");
+
+    // Shift+1 reports `!` and Ctrl+1 is a different trigger: neither selects.
+    let before = brush_mode(&editor);
+    press_key(
+        &mut editor,
+        "!",
+        Modifiers {
+            shift: true,
+            ..NONE
+        },
+    );
+    press_key(&mut editor, "1", Modifiers { ctrl: true, ..NONE });
+    assert_eq!(brush_mode(&editor), before);
+    assert_eq!(fired(&events), vec![Action::BrushModeDarken]);
+}
+
+#[test]
+fn mode_actions_rebind_from_the_settings_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let toml = format!(
+        "[input]\n{}",
+        row_toml("1", None, Some(Action::BrushModeDetail))
+    );
+    fs::write(dir.path().join("settings.toml"), toml).unwrap();
+    let loaded = input_config::load(dir.path());
+    assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+
+    let mut editor = AppController::new_with_mode_for_test(ShellMode::Editor);
+    editor.install_input_source(&loaded.provenance, &loaded.problems);
+    editor.install_input_table(loaded.table);
+    press_key(&mut editor, "1", NONE);
+    assert_eq!(brush_mode(&editor), BrushMode::Detail);
+    press_key(&mut editor, "2", NONE);
+    assert_eq!(
+        brush_mode(&editor),
+        BrushMode::Lighten,
+        "other rows keep their defaults"
+    );
+
+    let rows = editor.input_rows();
+    let row = rows
+        .iter()
+        .find(|row| row.input == "1")
+        .unwrap_or_else(|| panic!("a row for key 1: {rows:?}"));
+    assert_eq!(row.editor, "brush-mode-detail");
+    let (line, refusals) = editor.input_source();
+    assert!(line.contains("1 binding differs"), "{line}");
+    assert!(refusals.is_empty());
+
+    // A mode nobody defined is refused by name and line; the table stays whole.
+    let (path, problem) =
+        expect_one_problem("[[bindings]]\ntrigger = \"1\"\neditor = \"brush-mode-soft\"\n");
+    match problem {
+        input_config::ConfigError::UnknownAction {
+            spelling,
+            line,
+            path: p,
+        } => {
+            assert_eq!(spelling, "brush-mode-soft");
+            assert_eq!(line, 4, "the line of the editor value in the whole file");
+            assert_eq!(p, path);
+        }
+        other => panic!("expected UnknownAction, got {other}"),
+    }
+    let mut refused = AppController::new_with_mode_for_test(ShellMode::Editor);
+    press_key(&mut refused, "2", NONE);
+    assert_eq!(brush_mode(&refused), BrushMode::Lighten);
+}
+
+#[test]
+fn mode_keys_respect_mode_and_modal_blocking() {
+    let mut stacking = AppController::new();
+    let (events, cb) = sink();
+    stacking.set_sink(cb);
+    let before = brush_mode(&stacking);
+    for text in ["1", "2", "3", "4"] {
+        press_key(&mut stacking, text, NONE);
+    }
+    assert!(events.lock().unwrap().is_empty(), "stacking mode: no event");
+    assert_eq!(brush_mode(&stacking), before);
+
+    let mut editor = AppController::new_with_mode_for_test(ShellMode::Editor);
+    let (events, cb) = sink();
+    editor.set_sink(cb);
+    editor.open_settings();
+    press_key(&mut editor, "3", NONE);
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "settings modal: no event"
+    );
+    assert_eq!(brush_mode(&editor), BrushMode::Normal);
+
+    editor.close_settings();
+    press_key(&mut editor, "3", NONE);
+    assert_eq!(fired(&events), vec![Action::BrushModeDarken]);
+    assert_eq!(brush_mode(&editor), BrushMode::Darken);
+}
+
 #[test]
 fn alt_is_only_the_pipette() {
     let alt = Modifiers { alt: true, ..NONE };
@@ -872,7 +1041,7 @@ fn alt_is_only_the_pipette() {
     assert!(DEFAULT_BINDINGS.iter().all(|b| b.trigger != alt_wheel));
 
     let rows = table.display_rows();
-    assert_eq!(rows.len(), 6);
+    assert_eq!(rows.len(), 10);
     assert!(
         rows.iter()
             .all(|row| !row.input.to_lowercase().contains("alt + wheel")
@@ -1006,7 +1175,7 @@ fn paint_drag_is_a_hidden_table_row() {
     assert_eq!(table.action(&left_drag, ShellMode::Stacking), None);
 
     let rows = table.display_rows();
-    assert_eq!(rows.len(), 6, "the settings table has six rows");
+    assert_eq!(rows.len(), 10, "the settings table has ten rows");
     assert!(
         rows.iter()
             .all(|row| !format!("{} {} {}", row.input, row.stacking, row.editor).contains("paint")),
@@ -1167,6 +1336,18 @@ fn input_map_tab_uses_only_shared_settings_components() {
     for shared in ["FFSettingsSection {", "FFInputTableRow {"] {
         assert!(tab.contains(shared), "the tab does not draw {shared}");
     }
+    // The scrolling frame fills the tab and places the scrollbar at its
+    // right edge; those lines are the only literal sizing the tab writes.
+    let frame = [
+        "width: 100%;",
+        "height: 100%;",
+        "x: parent.width - self.width - Theme.space-2;",
+    ];
+    let tab: String = tab
+        .lines()
+        .filter(|line| !frame.contains(&line.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
     for needle in [
         "font-size",
         "font-weight",

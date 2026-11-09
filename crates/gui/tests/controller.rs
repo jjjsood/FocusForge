@@ -6,6 +6,7 @@
 
 mod common;
 
+use std::f32::consts::FRAC_1_SQRT_2;
 use std::fs;
 use std::sync::{Arc, Mutex};
 
@@ -4880,7 +4881,10 @@ fn cursor_geometry_follows_radius_softness_and_zoom() {
         let view = c.brush_cursor_view().unwrap();
         let ring = radius * scale;
         let core = radius * 0.75 * scale;
-        assert_eq!(view.extent, 2.0 * ring + 2.0);
+        assert_eq!(
+            view.extent,
+            2.0 * (ring + 1.0).max(FRAC_1_SQRT_2 * ring + 18.0)
+        );
         assert!(
             view.ring_commands
                 .contains(&format!("A {ring:.2} {ring:.2}")),
@@ -4927,6 +4931,128 @@ fn cursor_geometry_follows_radius_softness_and_zoom() {
     assert_eq!(moved.ring_commands, here.ring_commands);
     assert_eq!(moved.core_commands, here.core_commands);
     assert_ne!(moved.composite_position, here.composite_position);
+}
+
+/// The tag each `BrushMode` shows on the cursor.
+const MODE_TAGS: [(BrushMode, &str); 4] = [
+    (BrushMode::Normal, "N"),
+    (BrushMode::Lighten, "L"),
+    (BrushMode::Darken, "D"),
+    (BrushMode::Detail, "T"),
+];
+
+fn cursor_tag(c: &AppController) -> &'static str {
+    c.brush_cursor_view().unwrap().mode_tag
+}
+
+#[test]
+fn brush_cursor_view_carries_the_mode_tag() {
+    use focusforge_gui::input_map::{Action, InputTable};
+    let (mut c, _) = open_editor("brush_cursor_tag");
+
+    for (mode, tag) in MODE_TAGS {
+        c.set_brush_mode(mode);
+        assert_eq!(cursor_tag(&c), tag, "set_brush_mode({mode:?})");
+    }
+    for (key, (mode, tag)) in ["1", "2", "3", "4"].into_iter().zip(MODE_TAGS) {
+        c.key(true, key, NO_MODS);
+        assert_eq!(c.brush_toolbar_view().mode, mode, "key {key}");
+        assert_eq!(cursor_tag(&c), tag, "key {key}");
+    }
+
+    // Rebinding key 1 moves the tag with it.
+    let mut table = InputTable::default();
+    let row = table
+        .bindings
+        .iter_mut()
+        .find(|b| b.editor == Some(Action::BrushModeNormal))
+        .unwrap();
+    row.editor = Some(Action::BrushModeDarken);
+    c.install_input_table(table);
+    c.key(true, "1", NO_MODS);
+    assert_eq!(cursor_tag(&c), "D", "key 1 rebound to Darken");
+
+    // No tag while the pipette is armed or Alt is held.
+    c.toggle_pipette();
+    assert_eq!(cursor_tag(&c), "", "pipette armed");
+    c.toggle_pipette();
+    assert_eq!(cursor_tag(&c), "D");
+    let (x, y) = at(20.0, 30.0);
+    c.pointer(PointerKind::Move, Button::Left, x, y, ALT);
+    assert_eq!(cursor_tag(&c), "", "Alt held");
+    c.pointer(PointerKind::Move, Button::Left, x, y, NO_MODS);
+    assert_eq!(cursor_tag(&c), "D", "Alt released");
+
+    // The chip sits outside the ring's 45 degree point, at two radii (chip
+    // bound and ring bound) and two zooms.
+    for size in [4.0f32, 120.0] {
+        set_size(&mut c, size);
+        let radius = c.brush_toolbar_view().size / 2.0;
+        for scale in [4.0f32, 5.0] {
+            if scale == 5.0 {
+                c.zoom_in();
+            }
+            let view = c.brush_cursor_view().unwrap();
+            let ring = radius * scale;
+            let expected = view.extent / 2.0 + FRAC_1_SQRT_2 * ring + 2.0;
+            assert!(
+                (view.tag_origin - expected).abs() < 1e-3,
+                "size {size} scale {scale}: {} vs {expected}",
+                view.tag_origin
+            );
+        }
+        c.zoom_out();
+    }
+}
+
+#[test]
+fn mode_keys_drive_the_next_stroke_but_not_the_live_one() {
+    let (mut c, _) = open_editor("brush_mode_keys");
+    set_size(&mut c, 6.0);
+    c.select_frame(1);
+    c.set_overlay_on(true);
+    let opacity = c.brush_toolbar_view().opacity / 100.0;
+
+    c.key(true, "2", NO_MODS);
+    press(&mut c, at(10.0, 10.0));
+    let (x, y) = at(14.0, 16.0);
+    c.pointer_moved(x, y);
+
+    c.key(true, "3", NO_MODS);
+    let (x, y) = at(20.0, 20.0);
+    c.pointer_moved(x, y);
+    c.flush_live_stroke();
+
+    assert_eq!(c.brush_toolbar_view().mode, BrushMode::Darken);
+    assert_eq!(cursor_tag(&c), "D", "the tag follows the key mid-stroke");
+    let live = c
+        .edit_session()
+        .unwrap()
+        .stroke
+        .as_ref()
+        .expect("a live stroke");
+    assert_eq!(
+        live.mode(),
+        BrushMode::Lighten,
+        "the live stroke keeps its mode"
+    );
+    let drawn = c.overlay_draw().expect("the overlay is on").ops;
+    assert_eq!(
+        looks(&drawn[drawn.len() - 1..]),
+        vec![(BrushMode::Lighten, opacity)],
+        "the overlay op"
+    );
+
+    release(&mut c, at(20.0, 20.0));
+    common::settle_region_renders(&mut c);
+    assert_eq!(looks(&ops(&c)), vec![(BrushMode::Lighten, opacity)]);
+
+    drag(&mut c, &[(40.0, 10.0), (40.0, 20.0)]);
+    assert_eq!(
+        looks(&ops(&c)),
+        vec![(BrushMode::Lighten, opacity), (BrushMode::Darken, opacity)],
+        "the next stroke carries the key-selected mode"
+    );
 }
 
 #[test]

@@ -88,6 +88,8 @@ export component FFCanvas inherits Rectangle {
     in property <string> cursor-core-commands;
     in property <bool> cursor-picking: false;
     in property <color> cursor-pick-color;
+    in property <string> cursor-mode-tag: "";
+    in property <length> cursor-tag-origin;
     in property <bool> cursor-visible: false;
     in property <length> cursor-frame-x;
     in property <length> cursor-frame-y;
@@ -306,6 +308,8 @@ export component FFCanvas inherits Rectangle {
             core-commands: root.cursor-core-commands;
             picking: root.cursor-picking;
             pick-color: root.cursor-pick-color;
+            mode-tag: root.cursor-mode-tag;
+            tag-origin: root.cursor-tag-origin;
         }
     }
 
@@ -325,6 +329,8 @@ export component FFCanvas inherits Rectangle {
             core-commands: root.cursor-core-commands;
             picking: root.cursor-picking;
             pick-color: root.cursor-pick-color;
+            mode-tag: root.cursor-mode-tag;
+            tag-origin: root.cursor-tag-origin;
         }
     }
 

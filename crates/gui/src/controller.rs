@@ -536,6 +536,10 @@ pub struct BrushCursorView {
     /// The shared source point projected into each pane's local coordinates.
     pub frame_position: (f32, f32),
     pub composite_position: (f32, f32),
+    /// The active brush mode's one-letter tag, empty while `picking`.
+    pub mode_tag: &'static str,
+    /// The tag chip's top-left on both axes of the cursor square.
+    pub tag_origin: f32,
 }
 
 /// The diagnostics panel's own state: the data directory a bundle is
@@ -3546,6 +3550,22 @@ impl AppController {
                 action: Action::PickSourceUnderPointer,
                 ..
             } => self.pick_source_under_pointer(),
+            ActionEvent::Fired {
+                action: Action::BrushModeNormal,
+                ..
+            } => self.set_brush_mode(job::BrushMode::Normal),
+            ActionEvent::Fired {
+                action: Action::BrushModeLighten,
+                ..
+            } => self.set_brush_mode(job::BrushMode::Lighten),
+            ActionEvent::Fired {
+                action: Action::BrushModeDarken,
+                ..
+            } => self.set_brush_mode(job::BrushMode::Darken),
+            ActionEvent::Fired {
+                action: Action::BrushModeDetail,
+                ..
+            } => self.set_brush_mode(job::BrushMode::Detail),
             ActionEvent::Start {
                 action: Action::Paint,
                 x,
@@ -3742,6 +3762,17 @@ impl AppController {
             pick_color: job::source_color(source, sources),
             frame_position: viewport.from_source_in(source_point, left),
             composite_position: viewport.from_source_in(source_point, right),
+            mode_tag: if picking {
+                ""
+            } else {
+                match self.state.brush.mode {
+                    job::BrushMode::Normal => "N",
+                    job::BrushMode::Lighten => "L",
+                    job::BrushMode::Darken => "D",
+                    job::BrushMode::Detail => "T",
+                }
+            },
+            tag_origin: paths.tag_origin,
         })
     }
 
