@@ -924,6 +924,51 @@ fn rig_counting(tag: &str, second: [&str; 2], state: CountState) -> (Rig, Snapsh
     (rig, gate)
 }
 
+#[test]
+fn long_names_keep_their_tail_in_analytics_and_dock_rows() {
+    use focusforge_gui::appearance_settings::SourcePresentation;
+    let (rig, gate) = rig_counting(
+        "analytics_long_names",
+        ["s0.tif", LONG_NAME],
+        CountState::Pending,
+    );
+    let tail = |chars: usize| {
+        let skip = LONG_NAME.chars().count() - chars;
+        format!(
+            "\u{2026}{}",
+            LONG_NAME.chars().skip(skip).collect::<String>()
+        )
+    };
+    // Frames list in name order, so the long name comes first.
+    let analytics = rig.app.get_analytics_rows();
+    assert_eq!(analytics.row_data(0).unwrap().name, tail(15));
+    assert_eq!(analytics.row_data(1).unwrap().name, "s0.tif");
+    for (presentation, budget) in [
+        (SourcePresentation::List, 21),
+        (SourcePresentation::Large, 21),
+        (SourcePresentation::ImageList, 13),
+    ] {
+        let mut controller = rig.controller.lock().unwrap();
+        controller.set_source_presentation(presentation);
+        focusforge_gui::bridge::push_images_panel(&rig.app, &controller);
+        drop(controller);
+        let rows = rig.app.get_images_rows();
+        let long = rows.row_data(0).unwrap();
+        let at = format!("{presentation:?}");
+        assert_eq!(long.name.chars().count(), budget, "{at}: {}", long.name);
+        assert!(long.name.starts_with('\u{2026}'), "{at}: {}", long.name);
+        assert!(long.name.ends_with("_0001.tif"), "{at}: {}", long.name);
+        assert_eq!(long.full_name, LONG_NAME, "{at}");
+        let short = rows.row_data(1).unwrap();
+        assert_eq!(
+            (short.name.as_str(), short.full_name.as_str()),
+            ("s0.tif", "s0.tif"),
+            "{at}"
+        );
+    }
+    gate.finish(&rig);
+}
+
 /// The window's `FFImageRow`s that take space, as the dock draws them.
 fn dock_rows(rig: &Rig) -> usize {
     ElementQuery::from_root(&rig.app)

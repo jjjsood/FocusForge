@@ -83,22 +83,20 @@ pub fn open_frame_set(paths: &[PathBuf], budget: HostBudget) -> Result<FrameSet,
         }
     }
     if first_format == "RAW" {
-        let shares = budget.partition_for_decoded_cache();
+        let (reader, scheduler_budget) = RawStack::open_files_for_budget(paths, budget)?;
         return Ok(FrameSet {
-            reader: Box::new(RawStack::open_files_with_budget(
-                paths,
-                shares.cache.bytes(),
-            )?),
+            reader: Box::new(reader),
             kind: ReaderKind::Raw,
-            scheduler_budget: shares.scheduler,
+            scheduler_budget,
         });
     }
     if first_format == "JPEG" {
         let shares = budget.partition_for_decoded_cache();
         return Ok(FrameSet {
-            reader: Box::new(JpegStack::open_files_with_budget(
+            reader: Box::new(JpegStack::open_files_bounded(
                 paths,
                 shares.cache.bytes(),
+                shares.cache_bound(),
             )?),
             kind: ReaderKind::Jpeg,
             scheduler_budget: shares.scheduler,
@@ -120,7 +118,11 @@ pub fn open_frame_set(paths: &[PathBuf], budget: HostBudget) -> Result<FrameSet,
         ReaderKind::Decoded => {
             let shares = budget.partition_for_decoded_cache();
             Ok(FrameSet {
-                reader: Box::new(DecodedTiffStack::open_files(paths, shares.cache.bytes())?),
+                reader: Box::new(DecodedTiffStack::open_files_bounded(
+                    paths,
+                    shares.cache.bytes(),
+                    shares.cache_bound(),
+                )?),
                 kind,
                 scheduler_budget: shares.scheduler,
             })

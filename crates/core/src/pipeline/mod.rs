@@ -595,9 +595,14 @@ pub fn run(
             }
         })
     };
-    let develop_budget = options.budget.bytes();
-    options.budget = opened.scheduler_budget;
+    let develop_budget = options.budget;
     let frame_reader: &dyn FrameReader = &*opened.reader;
+    let scratch_needed = frame_reader.develop_scratch_bytes()?;
+    // A developed stack is never read through the decoded-frame cache again,
+    // so its scheduler keeps the whole budget.
+    if scratch_needed == 0 {
+        options.budget = opened.scheduler_budget;
+    }
     let frame_names: Vec<String> = request
         .frames
         .iter()
@@ -652,7 +657,6 @@ pub fn run(
         .min(control.admission_cap())
         .max(1);
     let cancel_requested = || control.state() == ControlState::CancelRequested;
-    let scratch_needed = frame_reader.develop_scratch_bytes()?;
     {
         let (sealed, output_dir) = match &request.output {
             FuseOutput::Seal(path) | FuseOutput::Append(path) => (

@@ -3637,6 +3637,23 @@ fn raw_frames(dir: &Path, count: usize, width: u32, height: u32) -> Vec<PathBuf>
 }
 
 #[test]
+fn raw_scheduler_full_budget_after_develop() {
+    let frames = raw_frames(&scratch("raw_full_budget_frames"), 2, 64, 64);
+    let reservation = 64 * 64 * 30 + std::fs::metadata(&frames[0]).expect("frame size").len();
+    let cap = 2 * reservation;
+    let mut request = base_request("raw_full_budget", frames, ParamValues::new());
+    request.output = FuseOutput::Hold(scratch("raw_full_budget_hold"));
+    request.max_host_memory = Some(cap);
+    let FuseOutcome::Completed(report) =
+        focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+            .expect("the capped RAW run completes")
+    else {
+        panic!("the run must complete");
+    };
+    assert_eq!(report.max_bytes_in_flight, cap);
+}
+
+#[test]
 fn raw_run_previews_its_f32_composite_and_heat() {
     let frames = raw_frames(&scratch("raw_preview_frames"), 3, 320, 256);
     let mut explicit = ParamValues::new();

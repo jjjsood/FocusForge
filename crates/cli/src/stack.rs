@@ -1107,7 +1107,16 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         if let Some(tile_size) = job_opts.tile_size {
             options.tile_size = tile_size;
         }
-        options.budget = opened.scheduler_budget;
+        // A developed stack's scheduler keeps the whole budget, as in the run.
+        let scheduler_budget = if frame_reader
+            .develop_scratch_bytes()
+            .is_ok_and(|bytes| bytes > 0)
+        {
+            preflight_budget
+        } else {
+            opened.scheduler_budget
+        };
+        options.budget = scheduler_budget;
         let scheduler = match TileScheduler::new(frame_reader, stack_ctx, spp, &options) {
             Ok(scheduler) => scheduler,
             Err(err) => return failed(&status, start, err),
@@ -1144,7 +1153,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
             margin: geometry.margin(),
             tiles: geometry.tiles().len(),
             in_flight_limit: scheduler.in_flight_limit(),
-            max_bytes_in_flight: opened.scheduler_budget.bytes(),
+            max_bytes_in_flight: scheduler_budget.bytes(),
             backend: backend
                 .map(|b| b.info().to_string())
                 .unwrap_or_else(|| "cpu".to_string()),
