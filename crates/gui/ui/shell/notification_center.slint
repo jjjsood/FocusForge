@@ -98,6 +98,7 @@ export component FFNotificationCenter inherits Rectangle {
 
             VerticalLayout {
                 alignment: start;
+                padding-bottom: ShellGeometry.settings-content-inset-bottom;
 
                 for row in root.rows: FFNotificationRow {
                     kind: row.kind;
