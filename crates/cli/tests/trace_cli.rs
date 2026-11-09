@@ -127,6 +127,8 @@ fn chrome_trace_nesting() {
         // prepare boundary; the default chain policy solves serially.
         "--align-set",
         "reference-policy=anchor",
+        "--set",
+        "equalize=true",
         "--no-cache",
         "--quiet",
         // Not the default tile, which covers this fixture whole: the
@@ -334,7 +336,7 @@ fn chrome_trace_nesting() {
     }
     assert!(
         summary_u64(summary[0], "prepare_equalize_ns") > 0,
-        "the default brightness equalization is charged to prepare_equalize_ns: {summary:?}"
+        "an equalized run charges its brightness gains to prepare_equalize_ns: {summary:?}"
     );
     for capability in [
         "gpu_execution_available",
