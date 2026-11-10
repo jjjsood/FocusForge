@@ -140,7 +140,7 @@ fn reduce_row(src: &[f32], dst: &mut [f32]) {
 
 impl AlignPyramid {
     /// Output rows of level 1 per streamed band.
-    pub const BAND_ROWS: u32 = 32;
+    pub const BAND_ROWS: u32 = 64;
 
     /// Builds levels `1..=depth` of a `width x height`, `spp`-sample frame
     /// from `read`, which fills a full-width rect of `S` samples. Each input
@@ -349,7 +349,7 @@ mod tests {
                 let expected = gaussian_levels(assembler.finish().unwrap(), depth).unwrap();
                 let row = width as usize * spp as usize;
 
-                for band_rows in [1u32, 2, 3, 5, 32, 256] {
+                for band_rows in [1u32, 2, 3, 5, 32, 64, 256] {
                     let narrow = AlignPyramid::stream(
                         (width, height, spp),
                         depth,
@@ -386,8 +386,8 @@ mod tests {
     #[test]
     fn stream_reads_every_input_row_exactly_once_in_order() {
         let width = 8u32;
-        for height in [8u32, 9, 70] {
-            for band_rows in [1u32, 2, 5, 32] {
+        for height in [8u32, 9, 70, 200] {
+            for band_rows in [1u32, 2, 5, 32, 64] {
                 let mut reads: Vec<Rect> = Vec::new();
                 AlignPyramid::stream::<u16, ()>((width, height, 1), 1, band_rows, |rect, out| {
                     reads.push(rect);
