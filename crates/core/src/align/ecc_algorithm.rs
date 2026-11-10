@@ -1124,32 +1124,67 @@ fn smooths_level0(region: Rect, (width, height): (u32, u32)) -> bool {
 /// the edge sample repeated past the border.
 fn smooth_level0(plane: &mut Plane) {
     let (w, h) = (plane.width() as usize, plane.height() as usize);
-    let tap = |i: usize, d: usize, n: usize| {
-        (i + d)
-            .saturating_sub(SMOOTHING_PASS_RADIUS_PX as usize)
-            .min(n - 1)
-    };
+    let radius = SMOOTHING_PASS_RADIUS_PX as usize;
     let cur = plane.data_mut();
     let mut next = vec![0f32; cur.len()];
     for _ in 0..LEVEL0_SMOOTHING_PASSES {
-        for y in 0..h {
-            for x in 0..w {
-                next[y * w + x] = KERNEL
-                    .iter()
-                    .enumerate()
-                    .map(|(d, k)| k * cur[y * w + tap(x, d, w)])
-                    .sum();
-            }
+        for (src, dst) in cur.chunks_exact(w).zip(next.chunks_exact_mut(w)) {
+            smooth_row(src, dst);
         }
-        for y in 0..h {
-            for x in 0..w {
-                cur[y * w + x] = KERNEL
-                    .iter()
-                    .enumerate()
-                    .map(|(d, k)| k * next[tap(y, d, h) * w + x])
-                    .sum();
-            }
+        for (y, out) in cur.chunks_exact_mut(w).enumerate() {
+            let row = |d: usize| {
+                let r = (y + d).saturating_sub(radius).min(h - 1);
+                &next[r * w..][..w]
+            };
+            smooth_column([row(0), row(1), row(2), row(3), row(4)], out);
         }
+    }
+}
+
+/// One output sample: the five taps summed left to right, products unfused.
+#[inline(always)]
+fn binomial_taps([a, b, c, d, e]: [f32; 5]) -> f32 {
+    let [k0, k1, k2, k3, k4] = KERNEL;
+    k0 * a + k1 * b + k2 * c + k3 * d + k4 * e
+}
+
+/// Smooths one row along x. The samples within the kernel radius of either
+/// end read clamped taps; the interior is one loop over five shifted slices.
+fn smooth_row(src: &[f32], dst: &mut [f32]) {
+    let w = src.len();
+    let radius = SMOOTHING_PASS_RADIUS_PX as usize;
+    let (from, to) = if w > 2 * radius {
+        (radius, w - radius)
+    } else {
+        (w, w)
+    };
+    for x in (0..from).chain(to..w) {
+        dst[x] = binomial_taps(std::array::from_fn(|d| {
+            src[(x + d).saturating_sub(radius).min(w - 1)]
+        }));
+    }
+    if from < to {
+        let n = to - from;
+        let (s0, s1, s2, s3, s4) = (
+            &src[..n],
+            &src[1..][..n],
+            &src[2..][..n],
+            &src[3..][..n],
+            &src[4..][..n],
+        );
+        let out = &mut dst[from..to];
+        for i in 0..n {
+            out[i] = binomial_taps([s0[i], s1[i], s2[i], s3[i], s4[i]]);
+        }
+    }
+}
+
+/// Smooths along y: `out[x]` from the five already-clamped source `rows`.
+fn smooth_column(rows: [&[f32]; 5], out: &mut [f32]) {
+    let n = out.len();
+    let [r0, r1, r2, r3, r4] = rows.map(|r| &r[..n]);
+    for x in 0..n {
+        out[x] = binomial_taps([r0[x], r1[x], r2[x], r3[x], r4[x]]);
     }
 }
 
@@ -2144,6 +2179,130 @@ mod tests {
             Plane::from_f32_vec(plane.data().to_vec(), plane.width(), plane.height(), 1).unwrap();
         smooth_level0(&mut copy);
         copy
+    }
+
+    /// The per-sample clamped-tap smoothing every sample of
+    /// [`smooth_level0`] must equal bit for bit.
+    fn smooth_level0_reference(plane: &mut Plane) {
+        let (w, h) = (plane.width() as usize, plane.height() as usize);
+        let tap = |i: usize, d: usize, n: usize| {
+            (i + d)
+                .saturating_sub(SMOOTHING_PASS_RADIUS_PX as usize)
+                .min(n - 1)
+        };
+        let cur = plane.data_mut();
+        let mut next = vec![0f32; cur.len()];
+        for _ in 0..LEVEL0_SMOOTHING_PASSES {
+            for y in 0..h {
+                for x in 0..w {
+                    next[y * w + x] = KERNEL
+                        .iter()
+                        .enumerate()
+                        .map(|(d, k)| k * cur[y * w + tap(x, d, w)])
+                        .sum();
+                }
+            }
+            for y in 0..h {
+                for x in 0..w {
+                    cur[y * w + x] = KERNEL
+                        .iter()
+                        .enumerate()
+                        .map(|(d, k)| k * next[tap(y, d, h) * w + x])
+                        .sum();
+                }
+            }
+        }
+    }
+
+    /// Value classes the smoothing is compared over, each a sample generator.
+    const SMOOTHING_VALUE_CLASSES: [&str; 8] = [
+        "positive zero",
+        "negative zero",
+        "signed subnormals",
+        "16-bit integers",
+        "unit interval",
+        "signed above one",
+        "all negative zero",
+        "mixed zero signs",
+    ];
+
+    fn smoothing_plane(w: usize, h: usize, class: usize, seed: &mut u64) -> Plane {
+        let mut next = || {
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (*seed >> 33) as u32
+        };
+        let data: Vec<f32> = (0..w * h)
+            .map(|_| {
+                let r = next();
+                let unit = r as f32 / (1u32 << 31) as f32;
+                match class {
+                    0 => 0.0,
+                    1 if r & 1 == 0 => -0.0,
+                    1 => 0.0,
+                    2 => f32::from_bits((r & 0x3f) | ((r >> 8 & 1) << 31)),
+                    3 => (r & 0xffff) as f32,
+                    4 => unit,
+                    5 => (unit - 0.5) * 40.0,
+                    6 => -0.0,
+                    _ if r & 3 == 0 => -0.0,
+                    _ if r & 3 == 1 => 0.0,
+                    _ => unit - 0.5,
+                }
+            })
+            .collect();
+        Plane::from_f32_vec(data, w as u32, h as u32, 1).unwrap()
+    }
+
+    fn assert_smoothing_matches_the_reference(w: usize, h: usize) {
+        let mut seed = 0x9e37_79b9_7f4a_7c15 ^ (w * 1009 + h) as u64;
+        for (class, name) in SMOOTHING_VALUE_CLASSES.iter().enumerate() {
+            let mut plane = smoothing_plane(w, h, class, &mut seed);
+            let mut expected =
+                Plane::from_f32_vec(plane.data().to_vec(), w as u32, h as u32, 1).unwrap();
+            smooth_level0(&mut plane);
+            smooth_level0_reference(&mut expected);
+            for (i, (got, want)) in plane.data().iter().zip(expected.data()).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "{w}x{h} {name}, sample {i}: {got:e} vs {want:e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn smooth_level0_matches_the_scalar_reference() {
+        for (w, h) in [
+            (5, 5),
+            (6, 7),
+            (7, 5),
+            (8, 9),
+            (16, 17),
+            (31, 33),
+            (64, 3),
+            (3, 64),
+            (65, 65),
+            (257, 31),
+            (700, 4),
+            (4, 700),
+            (333, 200),
+            (1, 300),
+            (300, 1),
+        ] {
+            assert_smoothing_matches_the_reference(w, h);
+        }
+    }
+
+    #[test]
+    fn smooth_level0_clamps_both_edges_of_a_narrow_plane() {
+        for w in 1..=6 {
+            for h in 1..=6 {
+                assert_smoothing_matches_the_reference(w, h);
+            }
+        }
     }
 
     #[test]
