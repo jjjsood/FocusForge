@@ -56,6 +56,9 @@ pub struct StackReport {
     pub tiles: usize,
     pub frame_tiles_read: usize,
     pub in_flight_limit: usize,
+    /// The width, in tile columns, of the vertical bands tiles were admitted
+    /// in; `null` when they were admitted in plan order.
+    pub band_columns: Option<usize>,
     /// This group's *configured* host in-flight-tile limit (`in_flight_limit`,
     /// above), not a measured peak: `Job::run` does not expose the
     /// scheduler's per-segment `TileRunReport`. `device_peak_in_flight` is
@@ -1476,6 +1479,7 @@ fn build_stack_report(
         tiles: report.tiles,
         frame_tiles_read: report.frame_tiles_read,
         in_flight_limit: report.in_flight_limit,
+        band_columns: report.band_columns,
         // `Job::run` does not expose the per-segment `TileRunReport`
         // `TileScheduler::run` returns, so the true observed peak
         // concurrency is not available through this engine. The configured
@@ -1575,10 +1579,14 @@ fn render(report: &StackReport) -> String {
         format!("{} - {}", report.algorithm, report.display_name),
     ];
     lines.extend(report.params.iter().map(param_line));
-    lines.push(format!(
+    let mut tile_line = format!(
         "tile_size={} levels={} margin={} tiles={} in_flight_limit={}",
         report.tile_size, report.levels, report.margin, report.tiles, report.in_flight_limit,
-    ));
+    );
+    if let Some(columns) = report.band_columns {
+        tile_line.push_str(&format!(" band_columns={columns}"));
+    }
+    lines.push(tile_line);
     lines.push(format!(
         "max_bytes_in_flight={} accounted_bytes_in_flight={} budget={:?} backed_off={}",
         report.max_bytes_in_flight,
@@ -1740,6 +1748,7 @@ mod tests {
             tiles: 4,
             frame_tiles_read: 32,
             in_flight_limit: 5,
+            band_columns: Some(3),
             peak_in_flight: 4,
             max_bytes_in_flight: 1 << 30,
             accounted_bytes_in_flight: 1 << 29,
@@ -1792,6 +1801,7 @@ mod tests {
             "margin=96",
             "tiles=4",
             "in_flight_limit=5",
+            "band_columns=3",
             "max_bytes_in_flight=1073741824",
             "accounted_bytes_in_flight=536870912",
             "budget=Host",

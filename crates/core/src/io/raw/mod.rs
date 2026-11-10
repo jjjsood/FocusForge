@@ -806,6 +806,20 @@ impl TileReader for RawStack {
         let developed = self.developed(frame).map_err(crate::io::FrameError::from)?;
         Ok(Some(developed.means()))
     }
+
+    /// Every scratch block a `width x height` read can touch at any origin,
+    /// clamped to the frame.
+    fn read_page_cache_bytes(&self, width: u32, height: u32) -> u64 {
+        let (frame_width, frame_height) = self.dimensions();
+        block_span(width, frame_width) * block_span(height, frame_height) * PIXEL_BYTES as u64
+    }
+}
+
+/// The pixels along one axis of the scratch blocks a read of `n` pixels can
+/// touch at any origin, at most `dim`.
+fn block_span(n: u32, dim: u32) -> u64 {
+    let blocks = (n as usize + SCRATCH_BLOCK - 1).div_ceil(SCRATCH_BLOCK);
+    (blocks * SCRATCH_BLOCK).min(dim as usize) as u64
 }
 
 /// Bytes `frames` developed frames of `width` x `height` occupy in scratch

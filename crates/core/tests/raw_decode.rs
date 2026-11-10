@@ -1771,12 +1771,28 @@ impl TileReader for NarrowOnly<'_> {
 /// The pixel `PROBE` of the weighted-average fusion of the two square frames
 /// `reader` serves.
 fn fused_probe_pixel(reader: &dyn TileReader, label: &str) -> Vec<u16> {
+    fused_rect(reader, 2, label, None, PROBE).2
+}
+
+/// The scheduler's initial in-flight limit, its band width and the samples of
+/// `rect` in the weighted-average fusion of the `frame_count` square frames `reader`
+/// serves, with `facts` as the host the scheduler probes when given.
+fn fused_rect(
+    reader: &dyn TileReader,
+    frame_count: usize,
+    label: &str,
+    facts: Option<HostFacts>,
+    rect: Rect,
+) -> (usize, Option<usize>, Vec<u16>) {
     use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
+    use focusforge_core::host::FixedFacts;
     use focusforge_core::io::TiffStack;
     use focusforge_core::params::{self, ParamValues, StackContext};
-    use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
+    use focusforge_core::tile::{
+        HostSources, MonotonicClock, NoopPreprocess, TileScheduler, TileSchedulerOptions,
+    };
 
-    let (width, height, frame_count) = (SIDE, SIDE, 2);
+    let (width, height) = (SIDE, SIDE);
     let context = StackContext::new(frame_count, width, height, 3);
     let algo = focusforge_core::registry::find_stack("weighted-average")
         .expect("weighted-average resolves");
@@ -1790,7 +1806,15 @@ fn fused_probe_pixel(reader: &dyn TileReader, label: &str) -> Vec<u16> {
     let mut options = TileSchedulerOptions::explicit_budget(out_dir.join(label), 1 << 30);
     options.apply_support(algo.tile_support(&values));
     options.tile_size = 80;
+    if let Some(facts) = facts {
+        options.host = HostSources {
+            probe: Arc::new(FixedFacts(facts)),
+            clock: Arc::new(MonotonicClock::new()),
+        };
+    }
     let scheduler = TileScheduler::new(reader, context, 3, &options).expect("scheduler builds");
+    let in_flight_limit = scheduler.in_flight_limit();
+    let band_columns = scheduler.band_columns();
     let consumer = FusionConsumer::create(
         algo,
         values,
@@ -1811,11 +1835,12 @@ fn fused_probe_pixel(reader: &dyn TileReader, label: &str) -> Vec<u16> {
         .expect("fusion runs");
     consumer.finish().expect("fusion finishes");
 
-    TiffStack::open_files(&[composite])
+    let samples = TiffStack::open_files(&[composite])
         .expect("composite reopens")
-        .read_tile(0, PROBE)
+        .read_tile(0, rect)
         .expect("composite read")
-        .samples
+        .samples;
+    (in_flight_limit, band_columns, samples)
 }
 
 /// A frame of 2x2-cell checkerboard texture: cells alternate between `level`
@@ -2865,4 +2890,100 @@ fn scratch_space_query_failure_refuses_the_run() {
     assert!(text.contains("volume query refused"), "{text}");
     assert!(text.contains(&root.path().display().to_string()), "{text}");
     assert_scratch_empty(&root.path().join("scratch"));
+}
+
+#[test]
+fn page_cache_working_set_is_the_block_span_before_and_after_develop() {
+    // 130 x 70: three blocks of 64 across, two down, both edges ragged.
+    let dng = gradient_dng(130, 70, 0);
+    let root = target_tmp();
+    let paths = copies_of(&dng, 2, root.path());
+    let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+    // (rect width, rect height, bytes): a rect can touch one block more than
+    // it covers, whatever its origin, and the frame clamps the span.
+    let cases = [
+        (1, 1, 64 * 64 * 6),
+        (1, 65, 64 * 70 * 6),
+        (32, 32, 128 * 70 * 6),
+        (64, 64, 128 * 70 * 6),
+        (130, 70, 130 * 70 * 6),
+        (512, 512, 130 * 70 * 6),
+    ];
+    let check = |stack: &RawStack, when: &str| {
+        for (width, height, bytes) in cases {
+            assert_eq!(
+                stack.read_page_cache_bytes(width, height),
+                bytes,
+                "{width}x{height} {when}"
+            );
+        }
+    };
+    check(&stack, "before develop");
+    let scratch = root.path().join("scratch");
+    std::fs::create_dir(&scratch).expect("scratch root");
+    stack
+        .develop_once(
+            &scratch,
+            HostBudget::explicit(u64::MAX),
+            2,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
+        .expect("the pass develops every frame");
+    check(&stack, "after develop");
+}
+
+#[test]
+fn page_cache_bands_output_identical() {
+    let files = [
+        gradient_dng(SIDE, SIDE, 0),
+        gradient_dng(SIDE, SIDE, 700),
+        gradient_dng(SIDE, SIDE, 1500),
+    ];
+    let stack = open_pair(&files);
+    let root = target_tmp();
+    stack
+        .develop_once(
+            root.path(),
+            HostBudget::explicit(u64::MAX),
+            2,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
+        .expect("the pass develops every frame");
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: SIDE,
+        height: SIDE,
+    };
+    let host =
+        |cgroup_limit| HostFacts::new(64_000_000_000, 50_000_000_000, cgroup_limit, Some(0), 16);
+    // Fallback facts give no bands: plain plan order.
+    let (plan_limit, plan_bands, in_plan_order) = fused_rect(
+        &stack,
+        3,
+        "bands-plan-order",
+        Some(HostFacts::fallback()),
+        whole,
+    );
+    assert_eq!(plan_bands, None);
+    // A limit above the fixed part by less than one working set gives
+    // one-column bands.
+    let tight = host(Some(HOST_FIXED_BYTES + 1_000));
+    let (banded_limit, banded_bands, in_bands) =
+        fused_rect(&stack, 3, "bands-one-column", Some(tight), whole);
+    assert_eq!(banded_bands, Some(1));
+    assert_eq!(banded_limit, plan_limit, "bands leave the in-flight limit");
+    assert_eq!(in_bands.len(), (SIDE * SIDE * 3) as usize);
+    assert!(
+        in_plan_order
+            .iter()
+            .any(|&sample| sample != in_plan_order[0]),
+        "the composite must carry detail for the comparison to mean anything"
+    );
+    assert!(
+        in_bands == in_plan_order,
+        "the band order changed the composite"
+    );
 }

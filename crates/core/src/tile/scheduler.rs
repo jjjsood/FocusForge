@@ -218,12 +218,42 @@ impl TileSchedulerOptions {
     }
 }
 
+/// The order a run hands `tiles` to the pool. Without bands it is the order
+/// given (plan order); with `band_columns` of `w` it walks the plan in
+/// vertical bands of `w` tile columns, band by band, row by row within a band,
+/// so a tile's vertical neighbour starts `w` tiles after it instead of a whole
+/// plan row later and its shared pages are still cached. Columns are ranked
+/// over the whole `plan`, so a resume subset lands in the same bands.
+fn dispatch_order<'a>(
+    plan: &TilePlan,
+    tiles: &'a [PlannedTile],
+    band_columns: Option<usize>,
+) -> Vec<&'a PlannedTile> {
+    let mut order: Vec<&PlannedTile> = tiles.iter().collect();
+    if let Some(width) = band_columns {
+        let mut columns: Vec<u32> = plan.tiles().iter().map(|t| t.interior().x).collect();
+        columns.sort_unstable();
+        columns.dedup();
+        let band = |tile: &PlannedTile| {
+            let rank = columns
+                .binary_search(&tile.interior().x)
+                .expect("a tile's column origin is one of the plan's");
+            rank / width.max(1)
+        };
+        order.sort_by_key(|tile| (band(tile), tile.interior().y, tile.interior().x));
+    }
+    order
+}
+
 /// What one [`TileScheduler::run`] call measured and produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TileRunReport {
     pub tiles: usize,
     pub frame_tiles_read: usize,
     pub in_flight_limit: usize,
+    /// The width, in tile columns, of the vertical bands tiles were admitted
+    /// in; `None` when they were admitted in plan order.
+    pub band_columns: Option<usize>,
     pub peak_in_flight: usize,
     /// The budget's byte value, as reported by `HostBudget::bytes()` at
     /// construction.
@@ -335,7 +365,6 @@ pub struct TileScheduler<'a> {
     samples_per_pixel: u32,
     plan: TilePlan,
     scratch_base: PathBuf,
-    in_flight: usize,
     pool_threads: usize,
     bytes_per_tile: u64,
     budget: HostBudget,
@@ -382,8 +411,16 @@ impl<'a> TileScheduler<'a> {
             });
         }
 
-        let in_flight = in_flight_for_budget(bytes, options.budget.bytes(), pool_threads);
-        let gate = HostBudgetGate::new(options.budget, bytes, pool_threads, options.host.clone());
+        let working_set = reader
+            .read_page_cache_bytes(read_width, read_height)
+            .saturating_mul(stack.frame_count as u64);
+        let gate = HostBudgetGate::new(
+            options.budget,
+            bytes,
+            working_set,
+            pool_threads,
+            options.host.clone(),
+        );
 
         Ok(TileScheduler {
             reader,
@@ -391,7 +428,6 @@ impl<'a> TileScheduler<'a> {
             samples_per_pixel,
             plan,
             scratch_base: options.scratch_base.clone(),
-            in_flight,
             pool_threads,
             bytes_per_tile: bytes,
             budget: options.budget,
@@ -404,11 +440,19 @@ impl<'a> TileScheduler<'a> {
     }
 
     /// The number of tiles the scheduler allows to be in flight at once at
-    /// the start of a run, derived from the memory budget at
+    /// the start of a run, derived from the memory budget alone at
     /// construction. The runtime back-off may shrink the *actual* admission
     /// limit during a run -- see `TileRunReport::final_in_flight_limit`.
     pub fn in_flight_limit(&self) -> usize {
-        self.in_flight
+        self.gate.initial_limit()
+    }
+
+    /// The width, in tile columns, of the vertical bands a run admits tiles
+    /// in: how many tiles' page-cache working sets the host's memory limit
+    /// holds. `None` when the reader reports no working set or the host
+    /// facts are unavailable; tiles are then admitted in plan order.
+    pub fn band_columns(&self) -> Option<usize> {
+        self.gate.band_columns()
     }
 
     /// The bytes one in-flight tile is accounted at: one frame tile, its
@@ -540,8 +584,9 @@ impl<'a> TileScheduler<'a> {
         let parent = tracing::Span::current();
 
         let install_result: Result<(), RunStop> = pool.install(|| {
-            tiles
-                .par_iter()
+            dispatch_order(&self.plan, tiles, self.gate.band_columns())
+                .into_iter()
+                .par_bridge()
                 .try_for_each(|planned: &PlannedTile| -> Result<(), RunStop> {
                     // The budget admission permit is acquired first, above
                     // the control check below: the rayon pool's own thread
@@ -655,7 +700,8 @@ impl<'a> TileScheduler<'a> {
             report: TileRunReport {
                 tiles: tiles.len(),
                 frame_tiles_read: frame_tiles_read.load(Ordering::Relaxed),
-                in_flight_limit: self.in_flight,
+                in_flight_limit: self.gate.initial_limit(),
+                band_columns: self.gate.band_columns(),
                 peak_in_flight: peak.load(Ordering::SeqCst),
                 max_bytes_in_flight: self.budget.bytes(),
                 budget_provenance: self.budget.provenance(),
@@ -706,5 +752,63 @@ mod tests {
         let bytes = bytes_per_tile(4, 4, 1, 2, 0);
         let in_flight = in_flight_for_budget(bytes, u64::MAX, 4);
         assert_eq!(in_flight, 4);
+    }
+
+    /// 7 columns by 3 rows of 64 px tiles, indices row-major.
+    fn seven_column_plan() -> TilePlan {
+        TilePlan::new(7 * 64, 3 * 64, 64, 0).unwrap()
+    }
+
+    fn order(plan: &TilePlan, tiles: &[PlannedTile], band_columns: Option<usize>) -> Vec<usize> {
+        dispatch_order(plan, tiles, band_columns)
+            .into_iter()
+            .map(PlannedTile::index)
+            .collect()
+    }
+
+    #[test]
+    fn dispatch_order_walks_bands_of_the_given_width_row_by_row() {
+        let plan = seven_column_plan();
+        assert_eq!(
+            order(&plan, plan.tiles(), Some(3)),
+            [
+                0, 1, 2, 7, 8, 9, 14, 15, 16, // columns 0-2
+                3, 4, 5, 10, 11, 12, 17, 18, 19, // columns 3-5
+                6, 13, 20, // column 6
+            ]
+        );
+        assert_eq!(
+            order(&plan, plan.tiles(), Some(1)),
+            [
+                0, 7, 14, 1, 8, 15, 2, 9, 16, 3, 10, 17, 4, 11, 18, 5, 12, 19, 6, 13, 20
+            ]
+        );
+    }
+
+    #[test]
+    fn dispatch_order_is_plan_order_without_bands_or_with_one_band() {
+        let plan = seven_column_plan();
+        let plan_order: Vec<usize> = (0..21).collect();
+        assert_eq!(order(&plan, plan.tiles(), None), plan_order);
+        assert_eq!(order(&plan, plan.tiles(), Some(7)), plan_order);
+        assert_eq!(order(&plan, plan.tiles(), Some(100)), plan_order);
+    }
+
+    #[test]
+    fn dispatch_order_of_a_resume_subset_keeps_the_plan_wide_bands() {
+        let plan = seven_column_plan();
+        let pick = |indices: &[usize]| -> Vec<PlannedTile> {
+            plan.tiles()
+                .iter()
+                .filter(|tile| indices.contains(&tile.index()))
+                .copied()
+                .collect()
+        };
+        let subset = pick(&[1, 2, 3, 8, 10, 13]);
+        assert_eq!(order(&plan, &subset, Some(3)), [1, 2, 8, 3, 10, 13]);
+        // No tile in columns 0-2: columns 3 and 4 still share the second band
+        // and column 6 stays in the third.
+        let right = pick(&[3, 4, 6, 10, 13]);
+        assert_eq!(order(&plan, &right, Some(3)), [3, 4, 10, 6, 13]);
     }
 }

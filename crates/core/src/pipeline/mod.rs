@@ -190,6 +190,9 @@ pub struct FuseReport {
     pub tiles: usize,
     pub frame_tiles_read: usize,
     pub in_flight_limit: usize,
+    /// The width, in tile columns, of the vertical bands tiles were admitted
+    /// in; `None` when they were admitted in plan order.
+    pub band_columns: Option<usize>,
     pub max_bytes_in_flight: u64,
     /// The bytes the scheduler accounted for at its in-flight limit:
     /// `in_flight_limit` tiles, each counted with the method's working bytes
@@ -1264,6 +1267,7 @@ pub fn run(
 
     let final_progress = control.progress();
     let in_flight_limit = scheduler.in_flight_limit();
+    let band_columns = scheduler.band_columns();
     let tiles = final_progress.unit_total;
     let frame_tiles_read = match &backend_consumer {
         Some(consumer) => consumer.fallback_tiles() * frame_reader.len(),
@@ -1385,6 +1389,7 @@ pub fn run(
         tiles,
         frame_tiles_read,
         in_flight_limit,
+        band_columns,
         max_bytes_in_flight: scheduler.budget().bytes(),
         accounted_bytes_in_flight: in_flight_limit as u64 * scheduler.bytes_per_tile(),
         budget_provenance: scheduler.budget().provenance(),
