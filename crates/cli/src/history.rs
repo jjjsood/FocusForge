@@ -19,7 +19,8 @@ pub enum HistoryCommand {
     /// List every visible checkpoint, newest first.
     List(ListArgs),
     /// Delete one checkpoint: it is hidden, and dropped from the project once no
-    /// visible checkpoint is built on it; its space is reclaimed by
+    /// visible checkpoint is built on it and no stroke paints from it (a
+    /// checkpoint a stroke paints from stays stored); its space is reclaimed by
     /// `history compact`. Refuses the last visible checkpoint.
     Delete(DeleteArgs),
     /// Rewrite the project to its live checkpoints only and report the bytes
@@ -258,6 +259,7 @@ struct DeleteReport {
     hidden: String,
     removed: Vec<String>,
     head: String,
+    strokes_using: usize,
 }
 
 fn delete(
@@ -288,6 +290,7 @@ fn delete(
         hidden: deleted.hidden,
         removed: deleted.removed,
         head: deleted.head,
+        strokes_using: deleted.strokes_using,
     };
     if json {
         match serde_json::to_string_pretty(&report) {
@@ -296,10 +299,11 @@ fn delete(
         }
     } else {
         println!(
-            "{}\nhidden: {}\nremoved: {}\nhead: {}",
+            "{}\nhidden: {}\nremoved: {}\nstrokes using it: {}\nhead: {}",
             report.project,
             report.hidden,
             report.removed.join(", "),
+            report.strokes_using,
             report.head
         );
     }

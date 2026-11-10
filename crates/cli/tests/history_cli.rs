@@ -17,7 +17,9 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::{TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
-use focusforge_core::project::{self, Checkpoint, Metrics, Op, Point, Project, SealRequest};
+use focusforge_core::project::{
+    self, BrushMode, Checkpoint, Metrics, Op, Point, Project, SealRequest, StrokeSource,
+};
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use serde_json::Value;
@@ -527,20 +529,41 @@ fn delete_reports_what_it_removed_in_text() {
     let (dir, project) = fresh_project("delete_reports_what_it_removed_in_text");
     let root = root_id(&project);
     let leaf = retouch(&dir, &project, &one_stroke(), None).remove(0);
-    let output = run(
+    let user = retouch(
         &dir,
-        &[
-            "history",
-            "delete",
-            project.to_str().unwrap(),
-            "--checkpoint",
-            &leaf,
-        ],
-    );
-    assert!(output.success, "stderr: {}", output.stderr);
-    assert!(output.stdout.contains(&format!("hidden: {leaf}")));
-    assert!(output.stdout.contains(&format!("removed: {leaf}")));
-    assert!(output.stdout.contains(&format!("head: {root}")));
+        &project,
+        &[Op::BrushStroke {
+            source: StrokeSource::Checkpoint(leaf.clone()),
+            path: vec![Point { x: 22, y: 22 }],
+            radius: 3.0,
+            softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
+        }],
+        Some(&root),
+    )
+    .remove(0);
+    let delete = |id: &str, json: bool| {
+        let mut args = vec!["history", "delete", project.to_str().unwrap()];
+        args.extend(["--checkpoint", id]);
+        if json {
+            args.push("--json");
+        }
+        let output = run(&dir, &args);
+        assert!(output.success, "stderr: {}", output.stderr);
+        output.stdout
+    };
+
+    let report: Value = serde_json::from_str(&delete(&leaf, true)).unwrap();
+    assert_eq!(report["strokes_using"], 1);
+    assert_eq!(report["removed"], serde_json::json!([]));
+
+    let text = delete(&user, false);
+    assert!(text.contains(&format!("hidden: {user}")), "{text}");
+    assert!(text.contains("strokes using it: 0"), "{text}");
+    let removed = text.lines().find(|l| l.starts_with("removed:")).unwrap();
+    assert!(removed.contains(&user) && removed.contains(&leaf), "{text}");
+    assert!(text.contains(&format!("head: {root}")), "{text}");
 }
 
 #[test]
@@ -963,6 +986,18 @@ fn help_lists_every_command() {
             output.stdout
         );
     }
+
+    let output = run(&dir, &["history", "delete", "--help"]);
+    assert!(
+        output
+            .stdout
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("no stroke paints from it"),
+        "history delete --help does not state the stroke rule: {}",
+        output.stdout
+    );
 
     let subcommand_flags: [(&str, &[&str]); 3] = [
         ("list", &["--json"]),

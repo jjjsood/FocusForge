@@ -318,11 +318,11 @@ pub fn kept_entries(
 
 /// Writes the [`kept_entries`], each under its own parent, hides `deletes`
 /// (see [`super::delete_checkpoint`]) and stops listing hidden checkpoints
-/// nothing visible is built on, sparing `keep` and its ancestors. Everything
-/// is appended to `target` (the project there when `onto_existing`) and
-/// committed at once. Returns the id written per written entry. On error
-/// `target` is left as it was; bad references and unknown deletes are refused
-/// before any write.
+/// nothing visible is built on and no kept checkpoint's stroke paints from,
+/// sparing `keep` and its ancestors. Everything is appended to `target` (the
+/// project there when `onto_existing`) and committed at once. Returns the id
+/// written per written entry. On error `target` is left as it was; bad
+/// references and unknown deletes are refused before any write.
 pub fn seal_in_memory(
     target: &Path,
     entries: &[InMemoryCheckpoint],
@@ -461,7 +461,8 @@ fn write_entries(
 }
 
 /// Hides `deletes` on `project`, then stops listing hidden checkpoints
-/// nothing visible is built on, sparing `keep` and its ancestors.
+/// nothing visible is built on and no kept checkpoint's stroke paints from,
+/// sparing `keep` and its ancestors.
 fn apply_deletes(
     project: &mut Project,
     deletes: &[ParentRef],

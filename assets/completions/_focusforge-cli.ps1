@@ -161,7 +161,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
             [CompletionResult]::new('list', 'list', [CompletionResultType]::ParameterValue, 'List every visible checkpoint, newest first')
-            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete one checkpoint: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by `history compact`. Refuses the last visible checkpoint')
+            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete one checkpoint: it is hidden, and dropped from the project once no visible checkpoint is built on it and no stroke paints from it (a checkpoint a stroke paints from stays stored); its space is reclaimed by `history compact`. Refuses the last visible checkpoint')
             [CompletionResult]::new('compact', 'compact', [CompletionResultType]::ParameterValue, 'Rewrite the project to its live checkpoints only and report the bytes reclaimed')
             [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
             break
@@ -198,7 +198,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
         }
         'focusforge-cli;history;help' {
             [CompletionResult]::new('list', 'list', [CompletionResultType]::ParameterValue, 'List every visible checkpoint, newest first')
-            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete one checkpoint: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by `history compact`. Refuses the last visible checkpoint')
+            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete one checkpoint: it is hidden, and dropped from the project once no visible checkpoint is built on it and no stroke paints from it (a checkpoint a stroke paints from stays stored); its space is reclaimed by `history compact`. Refuses the last visible checkpoint')
             [CompletionResult]::new('compact', 'compact', [CompletionResultType]::ParameterValue, 'Rewrite the project to its live checkpoints only and report the bytes reclaimed')
             [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
             break
@@ -336,7 +336,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
         }
         'focusforge-cli;help;history' {
             [CompletionResult]::new('list', 'list', [CompletionResultType]::ParameterValue, 'List every visible checkpoint, newest first')
-            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete one checkpoint: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by `history compact`. Refuses the last visible checkpoint')
+            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete one checkpoint: it is hidden, and dropped from the project once no visible checkpoint is built on it and no stroke paints from it (a checkpoint a stroke paints from stays stored); its space is reclaimed by `history compact`. Refuses the last visible checkpoint')
             [CompletionResult]::new('compact', 'compact', [CompletionResultType]::ParameterValue, 'Rewrite the project to its live checkpoints only and report the bytes reclaimed')
             break
         }

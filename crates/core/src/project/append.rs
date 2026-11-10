@@ -462,34 +462,40 @@ pub struct Deleted {
     pub hidden: String,
     /// Every checkpoint the project no longer lists: `hidden` and the
     /// checkpoints hidden earlier, whichever have no visible checkpoint built
-    /// on them. Their bytes stay in the file as dead data.
+    /// on them and no stroke of a listed checkpoint painting from them. Their
+    /// bytes stay in the file as dead data.
     pub removed: Vec<String>,
     pub head: String,
+    /// How many stored strokes paint from `hidden`.
+    pub strokes_using: usize,
 }
 
 /// Hides `id`, then stops listing every hidden checkpoint no visible one is
-/// built on, with the blobs only those needed; nothing is re-parented.
+/// built on and no stroke of a listed checkpoint paints from, with the blobs
+/// only those needed; nothing is re-parented.
 /// Refuses an unknown or hidden `id` ([`ProjectError::UnknownCheckpoint`]) and
 /// the last visible checkpoint ([`ProjectError::LastVisibleDelete`]) before
 /// writing. When the head goes, the newest visible checkpoint becomes the head
 /// and the manifest is rebuilt from it ([`Project::fuse_state`]).
 pub fn delete_checkpoint(project_path: &Path, id: &str) -> Result<Deleted, ProjectError> {
     let mut project = Project::open(project_path)?;
+    let strokes_using = project.history().strokes_using(id);
     let (removed, head) = hide_and_collect(&mut project, Some(id), None)?;
     project.commit()?;
     Ok(Deleted {
         hidden: id.to_string(),
         removed,
         head,
+        strokes_using,
     })
 }
 
 /// [`delete_checkpoint`]'s body on an open project, left for the caller to
 /// commit: hides `hide` when given, then stops listing every hidden
-/// checkpoint nothing visible is built on, returning the ids dropped and the
-/// head. `keep` counts as visible for that, so it and its ancestors stay
-/// listed even when hidden. With nothing to hide and nothing to drop, nothing
-/// is written.
+/// checkpoint nothing visible is built on and no kept checkpoint's stroke
+/// paints from, returning the ids dropped and the head. `keep` counts as
+/// visible for that, so it and its ancestors stay listed even when hidden.
+/// With nothing to hide and nothing to drop, nothing is written.
 pub(super) fn hide_and_collect(
     project: &mut Project,
     hide: Option<&str>,
@@ -513,24 +519,33 @@ pub(super) fn hide_and_collect(
         }
     }
 
-    let hidden_set: HashSet<&str> = history
+    // Needed: every visible checkpoint and `keep`, closed under "built on"
+    // (parent) and "painted from" (a stroke's checkpoint source).
+    let mut needed: HashSet<&str> = history
         .all()
         .into_iter()
-        .filter(|c| c.hidden)
+        .filter(|c| !c.hidden && Some(c.id.as_str()) != hide)
         .map(|c| c.id.as_str())
-        .chain(hide)
-        .filter(|id| Some(*id) != keep)
+        .chain(keep)
         .collect();
+    let mut pending: Vec<&str> = needed.iter().copied().collect();
+    while let Some(id) = pending.pop() {
+        let checkpoint = history.get(id)?;
+        let links = checkpoint
+            .parent
+            .as_deref()
+            .into_iter()
+            .chain(checkpoint.ops.iter().filter_map(Op::checkpoint_source));
+        for link in links {
+            if needed.insert(link) {
+                pending.push(link);
+            }
+        }
+    }
     let removed: Vec<String> = history
         .all()
         .into_iter()
-        .filter(|c| {
-            hidden_set.contains(c.id.as_str())
-                && history
-                    .descendants(&c.id)
-                    .iter()
-                    .all(|d| hidden_set.contains(d.id.as_str()))
-        })
+        .filter(|c| !needed.contains(c.id.as_str()))
         .map(|c| c.id.clone())
         .collect();
     let removed_set: HashSet<&str> = removed.iter().map(String::as_str).collect();

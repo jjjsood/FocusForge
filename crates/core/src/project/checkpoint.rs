@@ -166,6 +166,16 @@ impl Op {
             opacity: 1.0,
         }
     }
+
+    /// The id of the checkpoint this stroke paints from, `None` for a stroke
+    /// painted from a frame.
+    pub fn checkpoint_source(&self) -> Option<&str> {
+        let Op::BrushStroke { source, .. } = self;
+        match source {
+            StrokeSource::Checkpoint(id) => Some(id),
+            StrokeSource::Frame(_) => None,
+        }
+    }
 }
 
 /// The stored shape of [`Op`]: a stroke's source is two optional fields so
@@ -272,13 +282,7 @@ fn is_full_opacity(opacity: &f32) -> bool {
 
 /// The checkpoints `checkpoint`'s strokes are painted from, in op order.
 fn stroke_sources(checkpoint: &Checkpoint) -> impl Iterator<Item = &str> {
-    checkpoint.ops.iter().filter_map(|op| {
-        let Op::BrushStroke { source, .. } = op;
-        match source {
-            StrokeSource::Checkpoint(id) => Some(id.as_str()),
-            StrokeSource::Frame(_) => None,
-        }
-    })
+    checkpoint.ops.iter().filter_map(Op::checkpoint_source)
 }
 
 /// Refuses a stroke painted from a checkpoint `by_id` lacks, and any chain of
@@ -573,6 +577,16 @@ impl History {
             result.push(&self.by_id[&cid]);
         }
         result
+    }
+
+    /// How many strokes, across every stored checkpoint (hidden ones too),
+    /// paint from the checkpoint `id`; 0 for an id nothing paints from.
+    pub fn strokes_using(&self, id: &str) -> usize {
+        self.by_id
+            .values()
+            .flat_map(|c| c.ops.iter())
+            .filter(|op| op.checkpoint_source() == Some(id))
+            .count()
     }
 }
 
