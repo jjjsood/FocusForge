@@ -24,7 +24,7 @@ use focusforge_core::params::{self, ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::develop_tile_share;
 use focusforge_core::project::{self, PROJECT_EXTENSION};
 use focusforge_core::registry;
-use focusforge_core::tile::{TileScheduler, TileSchedulerOptions};
+use focusforge_core::tile::{InFlightBound, TileScheduler, TileSchedulerOptions};
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
@@ -59,9 +59,17 @@ pub struct StackReport {
     pub tiles: usize,
     pub frame_tiles_read: usize,
     pub in_flight_limit: usize,
+    /// The term that set `in_flight_limit` before its floor of 1:
+    /// `host_budget` (the memory budget, also when it holds no whole tile or
+    /// ties the thread count) or `thread_cap` (the pool's thread count).
+    pub in_flight_bound: InFlightBound,
     /// The width, in tile columns, of the vertical bands tiles were admitted
     /// in; `null` when they were admitted in plan order.
     pub band_columns: Option<usize>,
+    /// The file-cache bytes one tile's reads kept hot across all frames,
+    /// which sized `band_columns`; `null` when the reader reported none
+    /// (TIFF, JPEG, or RAW frames developed into memory).
+    pub page_cache_bytes_per_tile: Option<u64>,
     /// This group's *configured* host in-flight-tile limit (`in_flight_limit`,
     /// above), not a measured peak: `Job::run` does not expose the
     /// scheduler's per-segment `TileRunReport`. `device_peak_in_flight` is
@@ -273,6 +281,13 @@ pub struct DryRunPlan {
     pub margin: u32,
     pub tiles: usize,
     pub in_flight_limit: usize,
+    /// The term that set `in_flight_limit`, as in the run report.
+    pub in_flight_bound: InFlightBound,
+    /// The file-cache bytes one tile's reads would keep hot across all
+    /// frames, as in the run report; `null` for input without one and when
+    /// `developed_store` is `memory`. With alignment the run's figure can be
+    /// larger than this unwarped one.
+    pub page_cache_bytes_per_tile: Option<u64>,
     /// Host bytes available to the tile scheduler after input caching and any
     /// frames kept in memory.
     pub max_bytes_in_flight: u64,
@@ -1187,6 +1202,11 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
             margin: geometry.margin(),
             tiles: geometry.tiles().len(),
             in_flight_limit: scheduler.in_flight_limit(),
+            in_flight_bound: scheduler.in_flight_bound(),
+            page_cache_bytes_per_tile: match developed_store {
+                Some(DevelopStore::Memory) => None,
+                _ => scheduler.page_cache_bytes_per_tile(),
+            },
             max_bytes_in_flight: scheduler_budget.bytes(),
             developed_store,
             backend: backend
@@ -1511,7 +1531,9 @@ fn build_stack_report(
         tiles: report.tiles,
         frame_tiles_read: report.frame_tiles_read,
         in_flight_limit: report.in_flight_limit,
+        in_flight_bound: report.in_flight_bound,
         band_columns: report.band_columns,
+        page_cache_bytes_per_tile: report.page_cache_bytes_per_tile,
         // `Job::run` does not expose the per-segment `TileRunReport`
         // `TileScheduler::run` returns, so the true observed peak
         // concurrency is not available through this engine. The configured
@@ -1781,7 +1803,9 @@ mod tests {
             tiles: 4,
             frame_tiles_read: 32,
             in_flight_limit: 5,
+            in_flight_bound: InFlightBound::ThreadCap,
             band_columns: Some(3),
+            page_cache_bytes_per_tile: Some(1 << 20),
             peak_in_flight: 4,
             max_bytes_in_flight: 1 << 30,
             developed_store: None,

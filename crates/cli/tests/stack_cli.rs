@@ -600,6 +600,8 @@ fn report_json_has_every_field() {
         "tiles",
         "frame_tiles_read",
         "in_flight_limit",
+        "in_flight_bound",
+        "page_cache_bytes_per_tile",
         "peak_in_flight",
         "max_bytes_in_flight",
         "accounted_bytes_in_flight",
@@ -708,6 +710,54 @@ fn stage_timings_are_reported_for_every_entered_stage() {
         "human report must name each entered stage: {}",
         human.stdout
     );
+}
+
+#[test]
+fn tiff_stack_json_reports_no_page_cache_working_set() {
+    let cwd = tmp_dir("tiff_no_page_cache_working_set");
+    let frames = common::fixtures_dir().join("mantis-64").join("frames");
+    let json = |name: &str, extra: &[&str]| -> serde_json::Value {
+        let output = cwd.join(name);
+        std::fs::create_dir(&output).unwrap();
+        let mut args = vec![
+            "stack",
+            frames.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--algorithm",
+            "dummy-stack",
+            "--json",
+            "--no-align",
+            "--no-crop",
+        ];
+        args.extend(extra);
+        let out = run_cli_in(&cwd, &args);
+        assert!(out.success, "stderr: {}", out.stderr);
+        serde_json::from_str(&out.stdout).expect("--json must parse")
+    };
+
+    let stacked = json("run", &[]);
+    let dry = json("dry", &["--dry-run"]);
+    assert!(stacked["page_cache_bytes_per_tile"].is_null(), "{stacked}");
+    assert!(stacked["band_columns"].is_null(), "{stacked}");
+    assert!(dry["page_cache_bytes_per_tile"].is_null(), "{dry}");
+
+    // One byte under a tile's accounted bytes: the budget cannot hold a tile,
+    // so the limit floors at 1 and the budget is what set it.
+    let limit = stacked["in_flight_limit"].as_u64().expect("limit");
+    let per_tile = stacked["accounted_bytes_in_flight"]
+        .as_u64()
+        .expect("bytes")
+        / limit;
+    let ceiling = (per_tile - 1).to_string();
+    for (what, extra) in [("run", vec![]), ("dry run", vec!["--dry-run"])] {
+        let mut extra = extra;
+        extra.extend(["--max-host-memory", &ceiling]);
+        let report = json(&format!("tight-{}", what.replace(' ', "-")), &extra);
+        assert_eq!(report["in_flight_limit"], 1, "{what}: {report}");
+        assert_eq!(report["in_flight_bound"], "host_budget", "{what}: {report}");
+        assert!(report["page_cache_bytes_per_tile"].is_null(), "{what}");
+    }
 }
 
 #[test]

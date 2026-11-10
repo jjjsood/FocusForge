@@ -44,7 +44,7 @@ use std::time::Instant;
 use crate::host::{FactsOrigin, HostFacts, HostProbe};
 use crate::params::Provenance;
 use crate::tile::control::{ADMISSION_RECHECK, TileControl};
-use crate::tile::scheduler::{DEFAULT_MAX_BYTES_IN_FLIGHT, in_flight_for_budget};
+use crate::tile::scheduler::{DEFAULT_MAX_BYTES_IN_FLIGHT, InFlightBound, in_flight_for_budget};
 
 /// The share of the available memory beyond [`HOST_FIXED_BYTES`] that a
 /// host-derived budget claims: `share * (usable_available - fixed) / 100`.
@@ -397,6 +397,7 @@ pub struct HostBudgetGate {
     state: Mutex<GateState>,
     condvar: Condvar,
     initial_limit: usize,
+    initial_bound: InFlightBound,
     band_columns: Option<usize>,
     bytes_per_tile: u64,
     peak: AtomicUsize,
@@ -424,7 +425,8 @@ impl HostBudgetGate {
         cap: usize,
         sources: HostSources,
     ) -> Self {
-        let initial_limit = in_flight_for_budget(bytes_per_tile, budget.bytes(), cap);
+        let (initial_limit, initial_bound) =
+            in_flight_for_budget(bytes_per_tile, budget.bytes(), cap);
         let arms_back_off = budget.arms_back_off();
         // The probe is read only for a host-derived budget (capped or not) or
         // a reader with a page-cache working set: an `explicit` budget, or a
@@ -446,6 +448,7 @@ impl HostBudgetGate {
             }),
             condvar: Condvar::new(),
             initial_limit,
+            initial_bound,
             band_columns,
             bytes_per_tile,
             peak: AtomicUsize::new(0),
@@ -498,6 +501,11 @@ impl HostBudgetGate {
     /// The limit this gate was constructed with, before any back-off.
     pub fn initial_limit(&self) -> usize {
         self.initial_limit
+    }
+
+    /// The term that set [`Self::initial_limit`] before the floor of 1.
+    pub fn initial_bound(&self) -> InFlightBound {
+        self.initial_bound
     }
 
     /// How many tile columns' working sets the page cache holds, when the
@@ -841,7 +849,7 @@ mod tests {
         let facts = host_facts(50_000_000_000, Some((4_000_000_000, 3_000_000_000)));
         let host = HostBudget::host_derived(&facts);
         // (3.0e9 - 1.563e9) * 65 % / 1.0e8 = 9 tiles by the budget alone.
-        assert_eq!(in_flight_for_budget(TILE, host.bytes(), 32), 9);
+        assert_eq!(in_flight_for_budget(TILE, host.bytes(), 32).0, 9);
         // (name, budget, limit, band columns for that limit)
         for (name, budget, limit, bands) in [
             ("host", host, 9, 5),
@@ -895,7 +903,7 @@ mod tests {
             let gate = HostBudgetGate::new(budget, TILE, 0, 32, sources_of(probe.clone()));
             assert_eq!(
                 gate.initial_limit(),
-                in_flight_for_budget(TILE, 500_000_000, 32)
+                in_flight_for_budget(TILE, 500_000_000, 32).0
             );
             assert_eq!(probe.calls(), 0, "{:?}", budget.provenance());
             assert_eq!(gate.band_columns(), None);
@@ -910,7 +918,7 @@ mod tests {
         let gate = HostBudgetGate::new(budget, TILE, 0, 32, sources_of(probe.clone()));
         assert_eq!(
             gate.initial_limit(),
-            in_flight_for_budget(TILE, budget.bytes(), 32)
+            in_flight_for_budget(TILE, budget.bytes(), 32).0
         );
         assert_eq!(probe.calls(), 1);
         assert_eq!(gate.band_columns(), None);

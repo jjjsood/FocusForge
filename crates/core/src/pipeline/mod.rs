@@ -47,7 +47,7 @@ use crate::project::{
 };
 use crate::tile::scheduler::pool_threads;
 use crate::tile::{
-    NoopPreprocess, SampleFormat, TileConsumer, TileError, TilePlan, TileScheduler,
+    InFlightBound, NoopPreprocess, SampleFormat, TileConsumer, TileError, TilePlan, TileScheduler,
     TileSchedulerOptions,
 };
 use crate::timing::{Stage, StageTimer, StageTimings, equalize_scope};
@@ -191,9 +191,14 @@ pub struct FuseReport {
     pub tiles: usize,
     pub frame_tiles_read: usize,
     pub in_flight_limit: usize,
+    /// The term that set `in_flight_limit` before the floor of 1.
+    pub in_flight_bound: InFlightBound,
     /// The width, in tile columns, of the vertical bands tiles were admitted
     /// in; `None` when they were admitted in plan order.
     pub band_columns: Option<usize>,
+    /// The file-cache bytes one tile's reads kept hot across all frames,
+    /// which sized `band_columns`; `None` when the reader reported none.
+    pub page_cache_bytes_per_tile: Option<u64>,
     pub max_bytes_in_flight: u64,
     /// Where the developed frames were kept; `None` for a reader that
     /// develops nothing.
@@ -1316,7 +1321,9 @@ pub fn run(
 
     let final_progress = control.progress();
     let in_flight_limit = scheduler.in_flight_limit();
+    let in_flight_bound = scheduler.in_flight_bound();
     let band_columns = scheduler.band_columns();
+    let page_cache_bytes_per_tile = scheduler.page_cache_bytes_per_tile();
     let tiles = final_progress.unit_total;
     let frame_tiles_read = match &backend_consumer {
         Some(consumer) => consumer.fallback_tiles() * frame_reader.len(),
@@ -1438,7 +1445,9 @@ pub fn run(
         tiles,
         frame_tiles_read,
         in_flight_limit,
+        in_flight_bound,
         band_columns,
+        page_cache_bytes_per_tile,
         max_bytes_in_flight: scheduler.budget().bytes(),
         developed_store,
         accounted_bytes_in_flight: in_flight_limit as u64 * scheduler.bytes_per_tile(),

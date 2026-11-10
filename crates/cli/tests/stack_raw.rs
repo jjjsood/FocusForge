@@ -984,6 +984,59 @@ fn raw_in_ram_frames_narrow_the_scheduler_budget() {
     assert!(stacked["developed_store"].is_null(), "{stacked}");
 }
 
+#[test]
+fn raw_run_and_dry_run_report_working_set_and_bound() {
+    let cwd = common::tmp_dir("stack_raw_working_set_and_bound");
+    let (input, reservation, frames) = gradient_raw_stack(&cwd);
+    let roomy = (1u64 << 30).to_string();
+    let tight = (reservation + frames / 2).to_string();
+    let args = |output: &str, ceiling: &str, extra: &[&str]| {
+        let output = cwd.join(output);
+        std::fs::create_dir(&output).expect("output directory");
+        let mut args = vec!["--max-host-memory", ceiling];
+        args.extend(SMALL_TILES);
+        args.extend(extra);
+        stack_json_args(&input, &output, &args)
+    };
+
+    // (store, working set one tile's reads keep hot across all frames)
+    for (name, ceiling, store, working_set) in [
+        ("ram", &roomy, "memory", serde_json::Value::Null),
+        ("disk", &tight, "scratch_file", serde_json::json!(frames)),
+    ] {
+        let stacked = json_of(&run(&cwd, &args(name, ceiling, &[])));
+        let dry = json_of(&run(
+            &cwd,
+            &args(&format!("{name}-dry"), ceiling, &["--dry-run"]),
+        ));
+        for (what, report) in [("run", &stacked), ("dry run", &dry)] {
+            assert_eq!(report["developed_store"], store, "{name} {what}: {report}");
+            assert_eq!(
+                report["page_cache_bytes_per_tile"], working_set,
+                "{name} {what}: {report}"
+            );
+        }
+        assert_eq!(
+            dry["in_flight_bound"], stacked["in_flight_bound"],
+            "{name}: plan and run name the same bound"
+        );
+        // The thread cap binds exactly when the budget would allow more tiles
+        // than the limit, whatever the core count.
+        let limit = stacked["in_flight_limit"].as_u64().expect("limit");
+        let per_tile = stacked["accounted_bytes_in_flight"]
+            .as_u64()
+            .expect("bytes")
+            / limit;
+        let allowed = stacked["max_bytes_in_flight"].as_u64().expect("budget") / per_tile;
+        let bound = if allowed > limit {
+            "thread_cap"
+        } else {
+            "host_budget"
+        };
+        assert_eq!(stacked["in_flight_bound"], bound, "{name}: {stacked}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn raw_stack_output_is_identical_in_ram_and_on_disk() {

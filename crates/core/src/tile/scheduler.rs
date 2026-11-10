@@ -365,11 +365,24 @@ fn bytes_per_tile(
     pixels * (samples_per_pixel as u64 * sample_bytes + 1 + working_bytes_per_pixel)
 }
 
+/// The term that set the initial in-flight limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InFlightBound {
+    /// The memory budget allowed fewer tiles than the pool has threads, or no
+    /// whole tile (the limit then floors at 1). A tie with the thread count
+    /// reports this bound.
+    HostBudget,
+    /// The pool's thread count: the budget would have allowed more tiles.
+    ThreadCap,
+}
+
 /// The pure arithmetic behind the budget: how many tiles can be live at
 /// once under `max_bytes_in_flight`, floored at 1 (never 0, so a budget
 /// smaller than one tile still makes forward progress) and capped at
 /// `available_parallelism` (never more workers than the host has, and never
-/// scaling with it either -- the cap is a ceiling, not a target).
+/// scaling with it either -- the cap is a ceiling, not a target), with the
+/// term that set it.
 ///
 /// `pub(crate)`, not private: `crate::tile::budget::HostBudgetGate` calls
 /// this directly to compute its own initial limit.
@@ -377,13 +390,17 @@ pub(crate) fn in_flight_for_budget(
     bytes_per_tile: u64,
     max_bytes_in_flight: u64,
     available_parallelism: usize,
-) -> usize {
+) -> (usize, InFlightBound) {
     let available_parallelism = available_parallelism.max(1);
     if bytes_per_tile == 0 {
-        return available_parallelism;
+        return (available_parallelism, InFlightBound::ThreadCap);
     }
-    let raw = (max_bytes_in_flight / bytes_per_tile).max(1);
-    (raw.min(available_parallelism as u64)) as usize
+    let by_budget = max_bytes_in_flight / bytes_per_tile;
+    if by_budget <= available_parallelism as u64 {
+        (by_budget.max(1) as usize, InFlightBound::HostBudget)
+    } else {
+        (available_parallelism, InFlightBound::ThreadCap)
+    }
 }
 
 /// The out-of-core tile scheduler. Typed on `&dyn TileReader`, never on a
@@ -398,6 +415,7 @@ pub struct TileScheduler<'a> {
     scratch_base: PathBuf,
     pool_threads: usize,
     bytes_per_tile: u64,
+    page_cache_bytes_per_tile: u64,
     budget: HostBudget,
     gate: HostBudgetGate,
 }
@@ -451,6 +469,7 @@ impl<'a> TileScheduler<'a> {
             scratch_base: options.scratch_base.clone(),
             pool_threads,
             bytes_per_tile: bytes,
+            page_cache_bytes_per_tile: working_set,
             budget: options.budget,
             gate,
         })
@@ -468,12 +487,24 @@ impl<'a> TileScheduler<'a> {
         self.gate.initial_limit()
     }
 
+    /// The term that set [`Self::in_flight_limit`] before the floor of 1.
+    pub fn in_flight_bound(&self) -> InFlightBound {
+        self.gate.initial_bound()
+    }
+
     /// The width, in tile columns, of the vertical bands a run admits tiles
     /// in: how many tiles' page-cache working sets the host's memory limit
     /// holds. `None` when the reader reports no working set or the host
     /// facts are unavailable; tiles are then admitted in plan order.
     pub fn band_columns(&self) -> Option<usize> {
         self.gate.band_columns()
+    }
+
+    /// The file-cache bytes one tile's reads keep hot across all frames,
+    /// which sizes [`Self::band_columns`]; `None` when the reader reports
+    /// none.
+    pub fn page_cache_bytes_per_tile(&self) -> Option<u64> {
+        (self.page_cache_bytes_per_tile > 0).then_some(self.page_cache_bytes_per_tile)
     }
 
     /// The bytes one in-flight tile is accounted at: one frame tile, its
@@ -754,15 +785,16 @@ mod tests {
         let bytes = bytes_per_tile(512, 512, 3, 2, 0);
         assert_eq!(bytes, 1_835_008);
         // A method holding 70 B/px more floors a 1 GiB budget to 53 tiles.
-        let in_flight = in_flight_for_budget(bytes_per_tile(512, 512, 3, 2, 70), 1u64 << 30, 64);
+        let (in_flight, _) =
+            in_flight_for_budget(bytes_per_tile(512, 512, 3, 2, 70), 1u64 << 30, 64);
         assert_eq!(in_flight, 53);
-        assert_eq!(in_flight_for_budget(bytes, 1u64 << 30, 32), 32);
+        assert_eq!(in_flight_for_budget(bytes, 1u64 << 30, 32).0, 32);
     }
 
     #[test]
     fn budget_below_one_tile_floors_at_one_never_zero() {
         let bytes = bytes_per_tile(512, 512, 3, 2, 0);
-        let in_flight = in_flight_for_budget(bytes, 1, 32);
+        let (in_flight, _) = in_flight_for_budget(bytes, 1, 32);
         assert_eq!(in_flight, 1);
     }
 
@@ -771,8 +803,60 @@ mod tests {
         // A tiny tile (so the budget alone would allow hundreds live)
         // must still be capped by the host's reported parallelism.
         let bytes = bytes_per_tile(4, 4, 1, 2, 0);
-        let in_flight = in_flight_for_budget(bytes, u64::MAX, 4);
+        let (in_flight, _) = in_flight_for_budget(bytes, u64::MAX, 4);
         assert_eq!(in_flight, 4);
+    }
+
+    #[test]
+    fn in_flight_bound_names_the_term_that_set_the_limit() {
+        use InFlightBound::{HostBudget as Budget, ThreadCap as Threads};
+        // (bytes per tile, budget, threads, limit, bound)
+        for (bytes, budget, threads, limit, bound) in [
+            (1_000, 5_500, 32, 5, Budget),
+            (1_000, 1u64 << 30, 32, 32, Threads),
+            (1_000, 4_000, 4, 4, Budget),
+            (1_000, 3_999, 4, 3, Budget),
+            (1_000, 4_000_000, 4, 4, Threads),
+            (1_000, 1, 32, 1, Budget),
+            (1_000, 0, 1, 1, Budget),
+            (0, 1, 8, 8, Threads),
+            (0, u64::MAX, 0, 1, Threads),
+        ] {
+            assert_eq!(
+                in_flight_for_budget(bytes, budget, threads),
+                (limit, bound),
+                "{bytes} B/tile, {budget} B, {threads} threads"
+            );
+        }
+        let bytes = bytes_per_tile(512, 512, 3, 2, 70);
+        assert_eq!(
+            in_flight_for_budget(bytes, 1u64 << 30, 64),
+            (53, Budget),
+            "reference scale"
+        );
+    }
+
+    #[test]
+    fn in_flight_bound_is_the_same_with_and_without_a_working_set() {
+        for (budget, threads, bound) in [
+            (5_500, 8, InFlightBound::HostBudget),
+            (50_000, 8, InFlightBound::ThreadCap),
+        ] {
+            for working_set in [0, 4_000] {
+                let gate = HostBudgetGate::new(
+                    HostBudget::explicit(budget),
+                    1_000,
+                    working_set,
+                    threads,
+                    HostSources::default(),
+                );
+                assert_eq!(gate.initial_bound(), bound, "{budget} B, set {working_set}");
+                assert_eq!(
+                    (gate.initial_limit(), gate.initial_bound()),
+                    in_flight_for_budget(1_000, budget, threads)
+                );
+            }
+        }
     }
 
     /// 7 columns by 3 rows of 64 px tiles, indices row-major.
