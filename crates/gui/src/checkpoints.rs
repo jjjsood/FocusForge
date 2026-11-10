@@ -371,6 +371,7 @@ mod tests {
             label: None,
             fuse: None,
             hidden: false,
+            colour_index: None,
         }
     }
 

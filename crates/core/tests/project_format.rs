@@ -400,6 +400,49 @@ fn required_format_version_is_two_for_a_listed_non_default_stroke() {
     }
 }
 
+/// A default stroke painted from checkpoint `id`.
+fn checkpoint_stroke(id: &str) -> Op {
+    Op::BrushStroke {
+        source: StrokeSource::Checkpoint(id.to_string()),
+        path: vec![Point { x: 2, y: 3 }, Point { x: 9, y: 5 }],
+        radius: 4.0,
+        softness: 0.5,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
+    }
+}
+
+fn head_id(path: &Path) -> String {
+    Project::open(path).unwrap().manifest().checkpoint.clone()
+}
+
+#[test]
+fn required_format_version_is_two_for_a_checkpoint_stroke() {
+    let (_dir, path) = sealed("project_format_required_checkpoint");
+    let root = head_id(&path);
+    project::append_ops(&path, vec![checkpoint_stroke(&root)], None).unwrap();
+    assert_eq!(required_version(&path), 2, "a stroke naming the root");
+
+    let (_dir, later) = sealed("project_format_required_checkpoint_later");
+    project::append_ops(&later, vec![stroke(BrushMode::Normal, 1.0)], None).unwrap();
+    let mid = head_id(&later);
+    assert_eq!(required_version(&later), 1, "a frame stroke");
+    project::append_ops(&later, vec![checkpoint_stroke(&mid)], None).unwrap();
+    assert_eq!(
+        required_version(&later),
+        2,
+        "a stroke naming a later checkpoint"
+    );
+
+    let (_dir, frame) = sealed("project_format_required_checkpoint_frame");
+    project::append_ops(&frame, vec![stroke(BrushMode::Normal, 1.0)], None).unwrap();
+    assert_eq!(
+        required_version(&frame),
+        1,
+        "the same stroke, frame-sourced"
+    );
+}
+
 #[test]
 fn required_format_version_never_lowers_a_stored_version() {
     let (_dir, path) = sealed("project_format_required_monotone");
@@ -1078,6 +1121,100 @@ fn open_err(path: &Path) -> project::ProjectError {
     match Project::open(path) {
         Ok(_) => panic!("{} must be refused", path.display()),
         Err(err) => err,
+    }
+}
+
+/// A copy of `src` whose checkpoint `holder` has its first stroke rewritten to
+/// be painted from checkpoint `named`.
+fn with_stroke_source(src: &Path, name: &str, holder: &str, named: &str) -> PathBuf {
+    let dst = src.with_extension(format!("{name}.ffp"));
+    rewrite_entry(src, &dst, &format!("checkpoints/{holder}.json"), |bytes| {
+        let mut record: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        let stroke = record["ops"][0]["brush-stroke"].as_object_mut().unwrap();
+        stroke.remove("source_id");
+        stroke.insert("source".into(), serde_json::json!({ "checkpoint": named }));
+        serde_json::to_vec(&record).unwrap()
+    });
+    dst
+}
+
+#[test]
+fn stamped_project_reopens() {
+    let (_dir, path) = sealed("project_format_stamped_reopens");
+    let root = head_id(&path);
+    let strokes = vec![checkpoint_stroke(&root), stroke(BrushMode::Detail, 0.5)];
+    let ids = project::append_op_chain(&path, None, strokes.clone(), None, 5_000).unwrap();
+    assert_eq!(stored_format_version(&path), Some(serde_json::json!(2)));
+
+    let project = Project::open(&path).unwrap();
+    let read: Vec<Op> = project
+        .history()
+        .op_chain(ids.last().unwrap())
+        .unwrap()
+        .into_iter()
+        .cloned()
+        .collect();
+    assert_eq!(read, strokes);
+}
+
+#[test]
+fn dangling_stroke_source_is_refused() {
+    let (_dir, path) = sealed("project_format_dangling_source");
+    let root = head_id(&path);
+    let ghost = "0123456789abcdef0123456789abcdef";
+
+    // A save naming a missing checkpoint fails and leaves the file as it was.
+    let err = project::append_ops(&path, vec![checkpoint_stroke(ghost)], None).unwrap_err();
+    assert!(
+        matches!(&err, project::ProjectError::DanglingStrokeSource { referenced, .. } if referenced == ghost),
+        "{err:?}"
+    );
+    assert_eq!(head_id(&path), root);
+    assert_eq!(stored_format_version(&path), None);
+
+    // An opened file whose record was rewritten to name one is refused.
+    let tail = project::append_ops(&path, vec![checkpoint_stroke(&root)], None)
+        .unwrap()
+        .checkpoint;
+    let bad = with_stroke_source(&path, "dangling", &tail, ghost);
+    let err = open_err(&bad);
+    assert!(
+        matches!(&err, project::ProjectError::DanglingStrokeSource { checkpoint, referenced, .. }
+            if *checkpoint == tail && referenced == ghost),
+        "{err:?}"
+    );
+    let text = err.to_string();
+    for part in [bad.to_string_lossy().as_ref(), tail.as_str(), ghost] {
+        assert!(text.contains(part), "`{part}` missing from: {text}");
+    }
+}
+
+#[test]
+fn stroke_source_cycle_is_refused() {
+    let (_dir, path) = sealed("project_format_source_cycle");
+    let first = project::append_ops(&path, vec![stroke(BrushMode::Normal, 1.0)], None)
+        .unwrap()
+        .checkpoint;
+    let second = project::append_ops(&path, vec![stroke(BrushMode::Normal, 1.0)], None)
+        .unwrap()
+        .checkpoint;
+
+    for (name, holder, named) in [("self", &second, &second), ("descendant", &first, &second)] {
+        let bad = with_stroke_source(&path, name, holder, named);
+        let err = open_err(&bad);
+        assert!(
+            matches!(&err, project::ProjectError::StrokeSourceCycle { checkpoint, referenced, .. }
+                if checkpoint == holder && referenced == named),
+            "{name}: {err:?}"
+        );
+        let text = err.to_string();
+        for part in [
+            bad.to_string_lossy().as_ref(),
+            holder.as_str(),
+            named.as_str(),
+        ] {
+            assert!(text.contains(part), "{name}: `{part}` missing from: {text}");
+        }
     }
 }
 

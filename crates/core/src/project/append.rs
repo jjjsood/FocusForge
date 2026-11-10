@@ -247,6 +247,7 @@ fn write_fused(
             metrics: manifest.metrics,
         }),
         hidden: false,
+        colour_index: Some(project.history().next_colour_index()),
     };
 
     project.put_blob(composite)?;
@@ -424,6 +425,7 @@ pub(super) fn append_ops_on(
         label,
         fuse: None,
         hidden: false,
+        colour_index: Some(project.history().next_colour_index()),
     };
     project.put_checkpoint(&checkpoint)?;
     project.set_manifest(new_manifest)?;

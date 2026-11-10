@@ -78,8 +78,8 @@ pub fn run(command: HistoryCommand) -> ExitCode {
 
 /// Maps a refusal to its own exit code: 3 not a project, 4 truncated, 6 a
 /// missing entry, 7 a blob hash mismatch, 8 a structural link failure (a
-/// dangling parent, a parent cycle, a fingerprint disagreement, ops with no
-/// parent to record them against). Anything else stays the generic 1.
+/// dangling parent or stroke source, a parent or stroke-source cycle, a
+/// fingerprint disagreement, ops with no parent to record them against). Anything else stays the generic 1.
 pub(crate) fn exit_code_for(err: &ProjectError) -> u8 {
     match err {
         ProjectError::NotAProject { .. } => 3,
@@ -88,6 +88,8 @@ pub(crate) fn exit_code_for(err: &ProjectError) -> u8 {
         ProjectError::HashMismatch { .. } => 7,
         ProjectError::DanglingParent { .. }
         | ProjectError::ParentCycle { .. }
+        | ProjectError::DanglingStrokeSource { .. }
+        | ProjectError::StrokeSourceCycle { .. }
         | ProjectError::FingerprintDisagrees { .. }
         | ProjectError::OpsWithoutParent { .. } => 8,
         _ => 1,

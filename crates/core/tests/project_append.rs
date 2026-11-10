@@ -12,7 +12,8 @@ use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
-    self, AppendRequest, Metrics, Op, ParentRef, Point, Project, SealRequest,
+    self, AppendRequest, BrushMode, Metrics, Op, ParentRef, Point, Project, SealRequest,
+    StrokeSource,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
@@ -1013,4 +1014,258 @@ fn sealing_keeps_the_pinned_row_and_skips_unneeded_entries() {
     assert_eq!(ids.len(), 2);
     assert_eq!(all_ids(&target).len(), 2);
     assert!(is_hidden(&target, &ids[0]));
+}
+
+/// A default stroke painted from checkpoint `id`.
+fn checkpoint_stroke(id: &str) -> Op {
+    Op::BrushStroke {
+        source: StrokeSource::Checkpoint(id.to_string()),
+        path: vec![Point { x: 3, y: 4 }, Point { x: 14, y: 9 }],
+        radius: 5.0,
+        softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
+    }
+}
+
+fn manifest_entry(path: &Path) -> serde_json::Value {
+    let bytes = Index::read(path)
+        .unwrap()
+        .read_entry(path, "manifest.json")
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+fn stored_format_version(path: &Path) -> Option<serde_json::Value> {
+    manifest_entry(path).get("format_version").cloned()
+}
+
+/// Every stored stroke of every checkpoint record, as written.
+fn stored_strokes(path: &Path) -> Vec<serde_json::Value> {
+    let index = Index::read(path).unwrap();
+    let mut strokes = Vec::new();
+    for name in index.names().filter(|n| n.starts_with("checkpoints/")) {
+        let record: serde_json::Value =
+            serde_json::from_slice(&index.read_entry(path, name).unwrap()).unwrap();
+        for op in record["ops"].as_array().unwrap() {
+            strokes.push(op["brush-stroke"].clone());
+        }
+    }
+    strokes
+}
+
+/// One sealed project per save entry point, each saved through that entry
+/// point with `ops(root)` as its stroke(s). Returns the projects' paths.
+fn saved_by_every_entry_point(tag: &str, ops: impl Fn(&str) -> Vec<Op>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    let (_dir, path, _) = sealed(&format!("{tag}_append_ops"));
+    project::append_ops(&path, ops(&head_of(&path)), None).unwrap();
+    paths.push(path);
+
+    let (_dir, path, _) = sealed(&format!("{tag}_append_ops_at"));
+    project::append_ops_at(&path, ops(&head_of(&path)), None, 4_000).unwrap();
+    paths.push(path);
+
+    let (dir, path, sources) = sealed(&format!("{tag}_append_ops_onto"));
+    let root = head_of(&path);
+    append_once(&dir, &path, &sources, 1, 1);
+    project::append_ops_onto(&path, &root, ops(&root), None, 4_100).unwrap();
+    paths.push(path);
+
+    let (_dir, path, _) = sealed(&format!("{tag}_append_op_chain"));
+    let root = head_of(&path);
+    let mut chain = vec![stroke(1, 2, 2)];
+    chain.extend(ops(&root));
+    chain.push(stroke(2, 6, 6));
+    project::append_op_chain(&path, None, chain, None, 4_200).unwrap();
+    paths.push(path);
+
+    let (_dir, path, _) = sealed(&format!("{tag}_seal_in_memory"));
+    let root = head_of(&path);
+    let entries = [ops_entry(ops(&root), 4_300, saved(&root))];
+    project::seal_in_memory(&path, &entries, &[], None, true).unwrap();
+    paths.push(path);
+
+    paths
+}
+
+#[test]
+fn checkpoint_stroke_stamps_the_format_version() {
+    let paths = saved_by_every_entry_point("stamp", |root| vec![checkpoint_stroke(root)]);
+    for path in &paths {
+        assert_eq!(
+            stored_format_version(path),
+            Some(serde_json::json!(2)),
+            "{}",
+            path.display()
+        );
+        assert!(Project::open(path).is_ok());
+    }
+
+    // A later save of another kind keeps the stamp.
+    let path = &paths[0];
+    project::append_ops(path, vec![stroke(1, 1, 1)], None).unwrap();
+    assert_eq!(stored_format_version(path), Some(serde_json::json!(2)));
+
+    let dir = path.parent().unwrap().to_path_buf();
+    let sources = write_sources(&dir, 3);
+    append_once(&dir, path, &sources, 5, 5);
+    assert_eq!(
+        stored_format_version(path),
+        Some(serde_json::json!(2)),
+        "a re-fuse append"
+    );
+
+    project::container::compact(path).unwrap();
+    assert_eq!(
+        stored_format_version(path),
+        Some(serde_json::json!(2)),
+        "compact"
+    );
+    assert!(Project::open(path).is_ok());
+}
+
+fn colour_of(path: &Path, id: &str) -> u32 {
+    Project::open(path)
+        .unwrap()
+        .history()
+        .colour_index(id)
+        .unwrap()
+}
+
+/// The `colour_index` as stored in checkpoint `id`'s record.
+fn stored_colour_of(path: &Path, id: &str) -> Option<u64> {
+    let index = Index::read(path).unwrap();
+    let record: serde_json::Value = serde_json::from_slice(
+        &index
+            .read_entry(path, &format!("checkpoints/{id}.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    record.get("colour_index").map(|v| v.as_u64().unwrap())
+}
+
+#[test]
+fn checkpoint_colour_index_numbers_each_write_one_above_the_largest() {
+    let (dir, path, sources) = sealed("colour_numbers");
+    let root = head_of(&path);
+    let at = Project::open(&path).unwrap().checkpoint().created_at;
+    assert_eq!(stored_colour_of(&path, &root), Some(0));
+
+    let a = project::append_ops_at(&path, vec![stroke(1, 1, 1)], None, at + 10)
+        .unwrap()
+        .checkpoint;
+    let b = project::append_ops_at(&path, vec![stroke(2, 2, 2)], None, at + 20)
+        .unwrap()
+        .checkpoint;
+    let fused = append_once(&dir, &path, &sources, 3, 3).checkpoint;
+    let branch = project::append_ops_onto(&path, &root, vec![stroke(0, 3, 3)], None, at + 30)
+        .unwrap()
+        .checkpoint;
+    let chained =
+        project::append_op_chain(&path, Some(&a), vec![stroke(1, 4, 4)], None, at + 40).unwrap();
+    for (id, expected) in [
+        (&root, 0),
+        (&a, 1),
+        (&b, 2),
+        (&fused, 3),
+        (&branch, 4),
+        (&chained[0], 5),
+    ] {
+        assert_eq!(
+            stored_colour_of(&path, id),
+            Some(expected),
+            "stored for {id}"
+        );
+        assert_eq!(colour_of(&path, id), expected as u32, "read for {id}");
+    }
+    assert_eq!(
+        stored_format_version(&path),
+        None,
+        "the key raises no version"
+    );
+
+    // A hidden checkpoint keeps its number; dropping a leaf shifts no other.
+    project::delete_checkpoint(&path, &a).unwrap();
+    assert!(
+        Project::open(&path)
+            .unwrap()
+            .history()
+            .get(&a)
+            .unwrap()
+            .hidden
+    );
+    assert_eq!(stored_colour_of(&path, &a), Some(1));
+    project::delete_checkpoint(&path, &branch).unwrap();
+    assert!(
+        Project::open(&path)
+            .unwrap()
+            .history()
+            .get(&branch)
+            .is_err()
+    );
+    for (id, expected) in [(&root, 0), (&a, 1), (&b, 2), (&fused, 3), (&chained[0], 5)] {
+        assert_eq!(
+            stored_colour_of(&path, id),
+            Some(expected),
+            "after the delete: {id}"
+        );
+    }
+}
+
+#[test]
+fn checkpoint_colour_index_of_a_record_without_the_key_follows_creation_order() {
+    let (_dir, path, _) = sealed("colour_legacy");
+    let root = head_of(&path);
+    let at = Project::open(&path).unwrap().checkpoint().created_at;
+    let a = project::append_ops_at(&path, vec![stroke(1, 1, 1)], None, at + 10)
+        .unwrap()
+        .checkpoint;
+    let b = project::append_ops_at(&path, vec![stroke(2, 2, 2)], None, at + 20)
+        .unwrap()
+        .checkpoint;
+
+    let stripped = path.with_file_name("stripped.ffp");
+    let index = Index::read(&path).unwrap();
+    let mut writer = ContainerWriter::create(&stripped).unwrap();
+    for name in index.names() {
+        let mut bytes = index.read_entry(&path, name).unwrap();
+        if name.starts_with("checkpoints/") {
+            let mut record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            record.as_object_mut().unwrap().remove("colour_index");
+            bytes = serde_json::to_vec(&record).unwrap();
+        }
+        writer.put_bytes(name, &bytes).unwrap();
+    }
+    writer.finish().unwrap();
+
+    for id in [&root, &a, &b] {
+        assert_eq!(stored_colour_of(&stripped, id), None);
+    }
+    assert_eq!(
+        [&root, &a, &b].map(|id| colour_of(&stripped, id)),
+        [0, 1, 2]
+    );
+    assert_eq!(stored_format_version(&stripped), None);
+
+    // The next write continues above the derived numbers.
+    let c = project::append_ops_at(&stripped, vec![stroke(0, 5, 5)], None, at + 30)
+        .unwrap()
+        .checkpoint;
+    assert_eq!(stored_colour_of(&stripped, &c), Some(3));
+}
+
+#[test]
+fn frame_strokes_keep_the_old_format() {
+    let paths = saved_by_every_entry_point("frame_only", |_| vec![stroke(2, 7, 7)]);
+    for path in &paths {
+        assert_eq!(stored_format_version(path), None, "{}", path.display());
+        let strokes = stored_strokes(path);
+        assert!(!strokes.is_empty());
+        for stored in strokes {
+            assert!(stored.get("source_id").is_some(), "{stored}");
+            assert!(stored.get("source").is_none(), "{stored}");
+        }
+    }
 }

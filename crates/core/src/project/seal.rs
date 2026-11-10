@@ -201,6 +201,7 @@ fn seal_staged(
             metrics: manifest.metrics,
         }),
         hidden: false,
+        colour_index: Some(0),
     };
 
     let mut writer = ContainerWriter::create(request.project_path)?;

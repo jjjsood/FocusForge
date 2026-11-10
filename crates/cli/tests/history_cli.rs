@@ -1282,6 +1282,36 @@ fn validation_states_are_reported() {
     assert_eq!(output.exit_code, Some(8));
     assert!(output.stdout.is_empty());
 
+    // Exit 8: a stroke painted from a checkpoint the project lacks.
+    let mut painter = read_checkpoint_json(&project_path, &root_id);
+    painter["id"] = serde_json::json!("painter");
+    painter["parent"] = serde_json::json!(root_id);
+    painter["fuse"] = serde_json::Value::Null;
+    painter["ops"] = serde_json::json!([{"brush-stroke": {
+        "source": {"checkpoint": "ghost"},
+        "path": [{"x": 1, "y": 1}],
+        "radius": 2.0,
+        "softness": 0.0
+    }}]);
+    let dangling_source = dir.join("dangling-source.ffp");
+    mutate_container(
+        &project_path,
+        &dangling_source,
+        &[],
+        &[],
+        &[(
+            "checkpoints/painter.json".to_string(),
+            serde_json::to_vec_pretty(&painter).unwrap(),
+        )],
+    );
+    let output = run(
+        &dir,
+        &["history", "list", dangling_source.to_str().unwrap()],
+    );
+    assert_eq!(output.exit_code, Some(8));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.contains("ghost"), "{}", output.stderr);
+
     // Exit 8: also an op-bearing checkpoint with no parent at all -- its
     // own project, so the head sealed here never disturbs `project_path`.
     let ops_dir = common::tmp_dir("validation_states_are_reported_ops");
