@@ -52,6 +52,7 @@ pub mod container;
 pub mod error;
 pub mod export;
 pub mod manifest;
+pub mod pixel_grid;
 mod render;
 pub mod review;
 pub mod seal;
@@ -80,6 +81,7 @@ pub use manifest::{
     SourceResolution, required_format_version,
 };
 use manifest::{FORMAT_VERSION, FormatProbe};
+pub use pixel_grid::{GridMismatch, PixelGrid};
 pub use render::{CheckpointImage, PendingState, render_checkpoint};
 pub use review::ReviewMetrics;
 pub use seal::{
@@ -661,6 +663,35 @@ impl Project {
             .fuse
             .clone()
             .expect("open refuses an op-less checkpoint without a fuse record"))
+    }
+
+    /// The pixel grid `fuse` renders on, with its sources resolved through
+    /// [`Self::source_path`] so a held fuse made from the same files
+    /// compares equal.
+    pub fn pixel_grid<'a>(&self, fuse: &'a FuseRecord) -> PixelGrid<'a> {
+        PixelGrid {
+            hashes: Some(fuse.sources.iter().map(|s| s.hash.as_str()).collect()),
+            paths: fuse.sources.iter().map(|s| self.source_path(s)).collect(),
+            registration: &fuse.registration,
+            width: fuse.composite.width,
+            height: fuse.composite.height,
+        }
+    }
+
+    /// Why `candidate` cannot be painted from while `edited` is being
+    /// edited, `None` when their pixels line up one-to-one. Each id is
+    /// judged through the fuse it renders against, so retouch checkpoints on
+    /// one fuse are always compatible. A held retouch entry is judged by the
+    /// caller through its fused parent.
+    pub fn grid_mismatch(
+        &self,
+        edited: &str,
+        candidate: &str,
+    ) -> Result<Option<GridMismatch>, ProjectError> {
+        let (edited, candidate) = (self.fuse_state(edited)?, self.fuse_state(candidate)?);
+        Ok(self
+            .pixel_grid(&edited)
+            .mismatch(&self.pixel_grid(&candidate)))
     }
 
     /// The nearest ancestor of `id` (self included) whose `ops` is empty --

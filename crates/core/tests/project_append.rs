@@ -87,6 +87,11 @@ fn stage_planes(dir: &Path, composite_variant: u16, zmap_variant: u16) -> (PathB
 }
 
 fn write_sources(dir: &Path, count: usize) -> Vec<PathBuf> {
+    write_sources_seeded(dir, count, 0)
+}
+
+/// Like [`write_sources`], with sample content that differs per `seed`.
+fn write_sources_seeded(dir: &Path, count: usize, seed: usize) -> Vec<PathBuf> {
     (0..count)
         .map(|i| {
             let path = dir.join(format!("frame-{i:02}.tif"));
@@ -101,7 +106,7 @@ fn write_sources(dir: &Path, count: usize) -> Vec<PathBuf> {
             )
             .unwrap();
             let samples: Vec<u16> = (0..(W as usize * H as usize * SPP as usize))
-                .map(|j| ((j + i * 13) % 65_536) as u16)
+                .map(|j| ((j + i * 13 + seed * 7) % 65_536) as u16)
                 .collect();
             w.write_tile(full(W, H), &samples).unwrap();
             w.finish().unwrap();
@@ -1268,4 +1273,138 @@ fn frame_strokes_keep_the_old_format() {
             assert!(stored.get("source").is_none(), "{stored}");
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// `pixel_grid`: whether two checkpoints share one pixel grid.
+// ---------------------------------------------------------------------
+
+use focusforge_core::align::{Registration, Transform};
+use focusforge_core::project::{GridMismatch, PixelGrid, ProjectError};
+
+/// Appends a re-fuse of `sources` recorded with `registration`.
+fn append_refuse(
+    dir: &Path,
+    project_path: &Path,
+    sources: &[PathBuf],
+    registration: Registration,
+    variant: u16,
+) -> String {
+    let staging = dir.join(format!("refuse-{variant}"));
+    std::fs::create_dir_all(&staging).unwrap();
+    let (composite, zmap) = stage_planes(&staging, variant, variant);
+    let values = params();
+    let mut request = append_request(project_path, &composite, &zmap, sources, &values);
+    request.registration = registration;
+    project::append(request)
+        .expect("append must succeed")
+        .checkpoint
+}
+
+#[test]
+fn pixel_grid_checkpoints_on_one_fuse_are_always_compatible() {
+    let t = branched("pixel_grid_same_fuse");
+    let project = Project::open(&t.path).unwrap();
+    let ids = [&t.root, &t.a, &t.b, &t.c];
+    for edited in ids {
+        for candidate in ids {
+            assert_eq!(
+                project.grid_mismatch(edited, candidate).unwrap(),
+                None,
+                "{edited} vs {candidate}"
+            );
+        }
+    }
+}
+
+#[test]
+fn pixel_grid_reasons_survive_a_reopen_from_disk() {
+    let (dir, path, sources) = sealed("pixel_grid_reasons");
+    let root = head_of(&path);
+    let crop = Registration {
+        crop: Some(Rect {
+            x: 4,
+            y: 2,
+            width: 32,
+            height: 24,
+        }),
+        ..Registration::default()
+    };
+    let shifted = Registration {
+        transforms: vec![
+            Transform::identity(),
+            Transform::translation(0.25, 0.0),
+            Transform::identity(),
+        ],
+        ..Registration::default()
+    };
+    let other_dir = dir.join("other-content");
+    std::fs::create_dir_all(&other_dir).unwrap();
+    let other_sources = write_sources_seeded(&other_dir, 3, 1);
+
+    let cropped = append_refuse(&dir, &path, &sources, crop.clone(), 1);
+    let aligned = append_refuse(&dir, &path, &sources, shifted.clone(), 2);
+    let other = append_refuse(&dir, &path, &other_sources, Registration::default(), 3);
+    let both = append_refuse(&dir, &path, &other_sources, crop, 4);
+    let identities = Registration {
+        transforms: vec![Transform::identity(); 3],
+        ..Registration::default()
+    };
+    let explicit = append_refuse(&dir, &path, &sources, identities, 5);
+
+    let project = Project::open(&path).unwrap();
+    let judge = |edited: &str, candidate: &str| project.grid_mismatch(edited, candidate).unwrap();
+    for (candidate, want) in [
+        (&cropped, Some(GridMismatch::Crop)),
+        (&aligned, Some(GridMismatch::Alignment)),
+        (&other, Some(GridMismatch::SourceFrames)),
+        (&both, Some(GridMismatch::SourceFrames)),
+        (&explicit, None),
+    ] {
+        assert_eq!(judge(&root, candidate), want, "root vs {candidate}");
+        assert_eq!(judge(candidate, &root), want, "{candidate} vs root");
+    }
+}
+
+#[test]
+fn pixel_grid_unknown_candidate_is_an_error_not_a_verdict() {
+    let t = branched("pixel_grid_unknown");
+    let project = Project::open(&t.path).unwrap();
+    assert!(matches!(
+        project.grid_mismatch(&t.a, "no-such-checkpoint"),
+        Err(ProjectError::UnknownCheckpoint { .. })
+    ));
+    assert!(matches!(
+        project.grid_mismatch("no-such-checkpoint", &t.a),
+        Err(ProjectError::UnknownCheckpoint { .. })
+    ));
+}
+
+#[test]
+fn pixel_grid_held_fuse_matches_saved_by_resolved_path() {
+    let (dir, path, sources) = sealed("pixel_grid_held");
+    let root = head_of(&path);
+    let project = Project::open(&path).unwrap();
+    let fuse = project.fuse_state(&root).unwrap();
+    let saved = project.pixel_grid(&fuse);
+
+    let same_files = held_checkpoint(&dir, &sources, 7, 1_000);
+    assert_eq!(PixelGrid::held(&same_files).mismatch(&saved), None);
+    assert_eq!(saved.mismatch(&PixelGrid::held(&same_files)), None);
+
+    let copy_dir = dir.join("copies");
+    std::fs::create_dir_all(&copy_dir).unwrap();
+    let copies: Vec<PathBuf> = sources
+        .iter()
+        .map(|s| {
+            let to = copy_dir.join(s.file_name().unwrap());
+            std::fs::copy(s, &to).unwrap();
+            to
+        })
+        .collect();
+    let copied = held_checkpoint(&dir, &copies, 8, 1_000);
+    assert_eq!(
+        PixelGrid::held(&copied).mismatch(&saved),
+        Some(GridMismatch::SourceFrames)
+    );
 }
