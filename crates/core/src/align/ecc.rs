@@ -202,10 +202,11 @@ pub enum EccStatus {
 const STALL_WINDOW: usize = 10;
 
 /// Multiple of a level's [`EccParams::epsilon_px`] below which a stalled
-/// window ends the level before the cap. Recorded device-reduced level-0
-/// steps settle at 1.2e-4 to 1.8e-4 px against `epsilon_px = 1e-4`, below the
-/// floor; the nearest stall-shaped window of a level that goes on to converge
-/// peaks at 2.312 times epsilon, above it.
+/// window ends the level before the cap. In the checked-in recording of a
+/// device whose level-0 window coordinates were formed in `f32`, steps stayed
+/// at 1.2e-4 to 1.8e-4 px against `epsilon_px = 1e-4`, below the floor; the
+/// nearest stall-shaped window of a level that goes on to converge peaks at
+/// 2.312 times epsilon, above it.
 const STALL_FLOOR_FACTOR: f64 = 2.0;
 
 /// Whether the level ends as stalled after `iterations_done` iterations whose
