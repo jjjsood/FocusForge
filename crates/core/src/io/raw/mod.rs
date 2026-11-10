@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
-use memmap2::Mmap;
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
 use rawler::imgop::xyz::Illuminant;
@@ -15,10 +15,7 @@ use rawler::rawsource::RawSource;
 
 use super::frame_cache::{CacheFault, CachedFrame, FrameCache, TileFault, check_tile};
 use super::grouping::parse_exif_datetime;
-use super::{
-    DevelopStore, FrameDesc, FrameError, FrameReader, RawIdentity, cache_refusal_message,
-    map_read_only,
-};
+use super::{DevelopStore, FrameDesc, FrameError, FrameReader, RawIdentity, cache_refusal_message};
 use crate::algorithm::{AlgorithmError, TileReader};
 use crate::equalize::UNIT_GAIN;
 use crate::tile::budget::DECODED_CACHE_SHARE_DIVISOR;
@@ -204,7 +201,7 @@ pub enum RawError {
         developed: (u32, u32),
     },
     /// A developed-frame scratch directory or file could not be created,
-    /// written or mapped.
+    /// written or read.
     #[error("{}: RAW scratch I/O failed: {source}", path.display())]
     Scratch {
         /// Directory or file that failed.
@@ -252,23 +249,12 @@ const SCRATCH_BLOCK: usize = 64;
 /// Pixels per `write` call when a developed frame goes to scratch.
 const WRITE_PIXELS: usize = 1 << 16;
 
-/// A developed frame's bytes: a read-only mapping of its scratch file, or an
-/// owned buffer.
+/// A developed frame's bytes: the path of its scratch file, read with
+/// positioned reads, or an owned buffer.
 #[derive(Debug)]
 enum FrameBytes {
-    Mapped(Mmap),
+    File(PathBuf),
     Memory(Box<[u8]>),
-}
-
-impl std::ops::Deref for FrameBytes {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
-        match self {
-            Self::Mapped(map) => map,
-            Self::Memory(bytes) => bytes,
-        }
-    }
 }
 
 /// A developed frame: its `width * height` samples as native-endian
@@ -289,37 +275,107 @@ struct StoredFrame {
 }
 
 impl StoredFrame {
-    /// `count` pixels of row `y` starting at column `x`, all inside one block.
-    fn pixels(&self, x: usize, y: usize, count: usize) -> impl Iterator<Item = [f32; 3]> + '_ {
-        let (block_x, block_y) = (
-            x / SCRATCH_BLOCK * SCRATCH_BLOCK,
-            y / SCRATCH_BLOCK * SCRATCH_BLOCK,
-        );
-        let block_width = SCRATCH_BLOCK.min(self.width - block_x);
-        let block_height = SCRATCH_BLOCK.min(self.height - block_y);
-        assert!(
-            x - block_x + count <= block_width,
-            "a read stays inside one scratch block"
-        );
-        let first = block_y * self.width
-            + block_x * block_height
-            + (y - block_y) * block_width
-            + (x - block_x);
-        self.bytes[first * PIXEL_BYTES..(first + count) * PIXEL_BYTES]
-            .chunks_exact(PIXEL_BYTES)
-            .map(|pixel| {
-                std::array::from_fn(|channel| {
-                    let bytes = pixel[channel * 2..(channel + 1) * 2]
-                        .try_into()
-                        .expect("a channel is two bytes");
-                    half::f16::from_ne_bytes(bytes).to_f32()
-                })
-            })
+    /// Calls `visit(row, column, bytes)` for every run of `rect` that lies in
+    /// one block row of one block: `row` and `column` locate the run inside
+    /// `rect`, `bytes` are its pixels. A file-backed frame is opened once and
+    /// each touched block is one positioned read into one reused buffer.
+    fn read_runs(
+        &self,
+        rect: Rect,
+        mut visit: impl FnMut(usize, usize, &[u8]),
+    ) -> Result<(), RawError> {
+        let scratch = |path: &Path| {
+            let path = path.to_path_buf();
+            move |source| RawError::Scratch { path, source }
+        };
+        let mut buffer = Vec::new();
+        let file = match &self.bytes {
+            FrameBytes::File(path) => {
+                buffer.resize(read_buffer_bytes(self.width, self.height), 0);
+                Some(File::open(path).map_err(scratch(path))?)
+            }
+            FrameBytes::Memory(_) => None,
+        };
+        let (x0, y0) = (rect.x as usize, rect.y as usize);
+        for (y, rows) in block_segments(y0, rect.height as usize) {
+            let block_y = y / SCRATCH_BLOCK * SCRATCH_BLOCK;
+            let block_height = SCRATCH_BLOCK.min(self.height - block_y);
+            for (x, len) in block_segments(x0, rect.width as usize) {
+                let block_x = x / SCRATCH_BLOCK * SCRATCH_BLOCK;
+                let block_width = SCRATCH_BLOCK.min(self.width - block_x);
+                let first =
+                    block_y * self.width + block_x * block_height + (y - block_y) * block_width;
+                let span = first * PIXEL_BYTES..(first + rows * block_width) * PIXEL_BYTES;
+                let bytes = match (&self.bytes, &file) {
+                    (FrameBytes::Memory(memory), _) => &memory[span],
+                    (FrameBytes::File(path), Some(file)) => {
+                        let bytes = &mut buffer[..span.len()];
+                        read_exact_at(file, bytes, span.start as u64).map_err(scratch(path))?;
+                        &*bytes
+                    }
+                    (FrameBytes::File(_), None) => unreachable!("a file-backed frame is open"),
+                };
+                for row in 0..rows {
+                    let start = (row * block_width + x - block_x) * PIXEL_BYTES;
+                    visit(
+                        y + row - y0,
+                        x - x0,
+                        &bytes[start..start + len * PIXEL_BYTES],
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
-/// Every frame developed once. The mappings drop before the directory that
-/// holds their files.
+/// Bytes of the buffer one read of a `width` x `height` file-backed frame
+/// needs: one full block, clamped to the frame.
+fn read_buffer_bytes(width: usize, height: usize) -> usize {
+    SCRATCH_BLOCK.min(width) * SCRATCH_BLOCK.min(height) * PIXEL_BYTES
+}
+
+/// The `[f32; 3]` pixels stored as native-endian half-precision bytes.
+fn decode_pixels(bytes: &[u8]) -> impl Iterator<Item = [f32; 3]> + '_ {
+    bytes.chunks_exact(PIXEL_BYTES).map(|pixel| {
+        std::array::from_fn(|channel| {
+            let bytes = pixel[channel * 2..(channel + 1) * 2]
+                .try_into()
+                .expect("a channel is two bytes");
+            half::f16::from_ne_bytes(bytes).to_f32()
+        })
+    })
+}
+
+/// Fills `buf` from `file` at `offset`; a file that ends first is
+/// `UnexpectedEof`.
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+/// Fills `buf` from `file` at `offset`; a file that ends first is
+/// `UnexpectedEof`.
+#[cfg(not(unix))]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+            Ok(read) => {
+                buf = &mut buf[read..];
+                offset += read as u64;
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Every frame developed once. The directory that holds the scratch files
+/// outlives the frames that name them.
 #[derive(Debug)]
 struct DevelopedFrames {
     frames: Vec<StoredFrame>,
@@ -517,8 +573,8 @@ impl RawStack {
         }
     }
 
-    /// Develops frame `index` into `<dir>/<index>.f16` and maps the file, or
-    /// into an owned buffer when `dir` is `None`.
+    /// Develops frame `index` into `<dir>/<index>.f16`, or into an owned
+    /// buffer when `dir` is `None`.
     fn develop_to_store(&self, index: usize, dir: Option<&Path>) -> Result<StoredFrame, RawError> {
         let developed = self.develop_frame(index)?;
         let (width, height) = {
@@ -532,9 +588,10 @@ impl RawStack {
                     path: path.clone(),
                     source,
                 };
-                let mut file = std::fs::File::create(&path).map_err(fault)?;
+                let mut file = File::create(&path).map_err(fault)?;
                 write_samples(&mut file, &developed.samples, width).map_err(fault)?;
-                FrameBytes::Mapped(map_read_only(&path).map_err(fault)?)
+                drop(file);
+                FrameBytes::File(path)
             }
             None => {
                 let mut buffer = Vec::with_capacity(width * height * PIXEL_BYTES);
@@ -631,9 +688,9 @@ impl FrameReader for RawStack {
         )
     }
 
-    /// Develops every frame once, in parallel, into `store`: mapped scratch
-    /// files in a directory under `scratch_root` that lives as long as this
-    /// reader, or buffers owned by it. At most `workers` develops overlap,
+    /// Develops every frame once, in parallel, into `store`: scratch files in
+    /// a directory under `scratch_root` that lives as long as this reader, or
+    /// buffers owned by it. At most `workers` develops overlap,
     /// and no more than `budget` holds decode reservations for. `developed`
     /// gains one as each frame lands in its store.
     fn develop_once(
@@ -687,13 +744,13 @@ impl FrameReader for RawStack {
                         if index >= slots.len() {
                             break;
                         }
-                        let mapped = if cancelled() {
+                        let stored = if cancelled() {
                             Err(AlgorithmError::Cancelled)
                         } else {
                             self.develop_to_store(index, dir.as_ref().map(ScratchDir::path))
                                 .map_err(|error| AlgorithmError::from(FrameError::from(error)))
                         };
-                        match mapped {
+                        match stored {
                             Ok(frame) => {
                                 slots[index]
                                     .set(frame)
@@ -764,23 +821,26 @@ impl RawStack {
         let stride = desc.width as usize;
         let width = rect.width as usize;
         let row_len = width * 3;
-        for (row, source_y) in (rect.y..rect.y + rect.height).enumerate() {
-            let source = source_y as usize * stride + rect.x as usize;
-            let destination = &mut out[row * row_len..(row + 1) * row_len];
-            match &developed {
-                Developed::Cached(frame) => look_row(
-                    frame.samples[source..source + width].iter().copied(),
-                    look,
-                    scale,
-                    destination,
-                ),
-                Developed::Stored(frame) => {
-                    for (x, len) in block_segments(rect.x as usize, width) {
-                        let target = &mut destination[(x - rect.x as usize) * 3..][..len * 3];
-                        look_row(frame.pixels(x, source_y as usize, len), look, scale, target);
-                    }
+        match &developed {
+            Developed::Cached(frame) => {
+                for (row, source_y) in (rect.y..rect.y + rect.height).enumerate() {
+                    let source = source_y as usize * stride + rect.x as usize;
+                    let destination = &mut out[row * row_len..(row + 1) * row_len];
+                    look_row(
+                        frame.samples[source..source + width].iter().copied(),
+                        look,
+                        scale,
+                        destination,
+                    );
                 }
             }
+            Developed::Stored(frame) => frame
+                .read_runs(rect, |row, column, bytes| {
+                    let target =
+                        &mut out[row * row_len + column * 3..][..bytes.len() / PIXEL_BYTES * 3];
+                    look_row(decode_pixels(bytes), look, scale, target);
+                })
+                .map_err(crate::io::FrameError::from)?,
         }
         Ok(())
     }
@@ -864,6 +924,20 @@ impl TileReader for RawStack {
     fn linear_means(&self, frame: usize) -> Result<Option<[f64; 3]>, AlgorithmError> {
         let developed = self.developed(frame).map_err(crate::io::FrameError::from)?;
         Ok(Some(developed.means()))
+    }
+
+    /// The buffer one read of a file-backed frame fills block by block; none
+    /// when the frames are in memory.
+    fn read_scratch_bytes(&self, _width: u32, _height: u32) -> u64 {
+        if self
+            .scratch
+            .get()
+            .is_some_and(|frames| frames.dir.is_none())
+        {
+            return 0;
+        }
+        let (frame_width, frame_height) = self.dimensions();
+        read_buffer_bytes(frame_width as usize, frame_height as usize) as u64
     }
 
     /// Every scratch block a `width x height` read can touch at any origin,
@@ -1593,9 +1667,10 @@ fn seam<T>(path: &Path, operation: impl FnOnce() -> rawler::Result<T>) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        FrameBytes, PIXEL_BYTES, RawError, SCRATCH_BLOCK, StoredFrame, block_segments,
-        map_read_only, panic_boundary, scratch_bytes, write_samples,
+        FrameBytes, PIXEL_BYTES, RawError, SCRATCH_BLOCK, StoredFrame, decode_pixels,
+        panic_boundary, scratch_bytes, write_samples,
     };
+    use crate::tile::Rect;
     use std::path::Path;
 
     /// A frame whose sample at (x, y) is `[x, y, x + y]`, exact in half precision.
@@ -1605,30 +1680,55 @@ mod tests {
             .collect()
     }
 
-    fn scratch_frame(dir: &Path, width: usize, height: usize) -> StoredFrame {
+    /// The same frame twice: in a scratch file under `dir`, and in memory.
+    fn stored_frames(dir: &Path, width: usize, height: usize) -> (StoredFrame, StoredFrame) {
+        let samples = coordinate_samples(width, height);
         let path = dir.join("frame.f16");
         let mut file = std::fs::File::create(&path).expect("scratch file");
-        write_samples(&mut file, &coordinate_samples(width, height), width)
-            .expect("scratch writes");
-        StoredFrame {
-            bytes: FrameBytes::Mapped(map_read_only(&path).expect("scratch maps")),
+        write_samples(&mut file, &samples, width).expect("scratch writes");
+        let mut memory = Vec::new();
+        write_samples(&mut memory, &samples, width).expect("vector writes");
+        let frame = |bytes| StoredFrame {
+            bytes,
             width,
             height,
             means: [0.0; 3],
             monochrome: false,
-        }
+        };
+        (
+            frame(FrameBytes::File(path)),
+            frame(FrameBytes::Memory(memory.into_boxed_slice())),
+        )
+    }
+
+    fn read_rect(frame: &StoredFrame, rect: Rect) -> Vec<[f32; 3]> {
+        let columns = rect.width as usize;
+        let mut pixels = vec![[f32::NAN; 3]; columns * rect.height as usize];
+        frame
+            .read_runs(rect, |row, column, bytes| {
+                for (slot, pixel) in pixels[row * columns + column..]
+                    .iter_mut()
+                    .zip(decode_pixels(bytes))
+                {
+                    *slot = pixel;
+                }
+            })
+            .expect("the frame reads");
+        pixels
     }
 
     #[test]
     fn scratch_file_is_block_major() {
         let dir = tempfile::tempdir().expect("temp dir");
         for (width, height) in [(128, 64), (130, 64), (150, 70), (129, 131), (40, 30)] {
-            let frame = scratch_frame(dir.path(), width, height);
-            assert_eq!(
-                frame.bytes.len(),
-                width * height * PIXEL_BYTES,
-                "{width}x{height}"
-            );
+            let (on_disk, in_memory) = stored_frames(dir.path(), width, height);
+            let (FrameBytes::File(path), FrameBytes::Memory(memory)) =
+                (&on_disk.bytes, &in_memory.bytes)
+            else {
+                panic!("the twins are file-backed and in memory");
+            };
+            let file = std::fs::read(path).expect("scratch reads back");
+            assert_eq!(file.len(), width * height * PIXEL_BYTES, "{width}x{height}");
             // Blocks in row-major block order, rows then columns inside a block.
             let mut order: Vec<(usize, usize)> = (0..height)
                 .flat_map(|y| (0..width).map(move |x| (x, y)))
@@ -1642,52 +1742,49 @@ mod tests {
                         .flat_map(|value| half::f16::from_f32(value).to_ne_bytes())
                 })
                 .collect();
-            assert!(
-                frame.bytes[..] == expected[..],
-                "{width}x{height} layout differs"
-            );
+            assert!(file == expected, "{width}x{height} layout differs");
+            assert!(file[..] == memory[..], "{width}x{height} twins differ");
         }
     }
 
     #[test]
-    fn block_major_reads_match_row_major() {
+    fn scratch_reads_match_in_memory() {
         let dir = tempfile::tempdir().expect("temp dir");
         let starts = [0usize, 1, 17, 63, 64, 65, 127];
         let lengths = [1usize, 2, 64, 65, 130];
         for (width, height) in [(150, 70), (129, 131), (40, 30)] {
-            let frame = scratch_frame(dir.path(), width, height);
+            let (on_disk, in_memory) = stored_frames(dir.path(), width, height);
             let reference = coordinate_samples(width, height);
+            let mut rects = vec![(width - 1, height - 1, 1, 1)];
             for &y0 in &starts {
                 for &x0 in &starts {
                     for &rows in &lengths {
                         for &columns in &lengths {
-                            if x0 + columns > width || y0 + rows > height {
-                                continue;
+                            if x0 + columns <= width && y0 + rows <= height {
+                                rects.push((x0, y0, columns, rows));
                             }
-                            let mut got = Vec::new();
-                            for y in y0..y0 + rows {
-                                for (x, len) in block_segments(x0, columns) {
-                                    got.extend(frame.pixels(x, y, len));
-                                }
-                            }
-                            let want: Vec<[f32; 3]> = (y0..y0 + rows)
-                                .flat_map(|y| {
-                                    reference[y * width + x0..y * width + x0 + columns]
-                                        .iter()
-                                        .map(|pixel| pixel.map(|v| half::f16::from_f32(v).to_f32()))
-                                })
-                                .collect();
-                            assert!(
-                                got == want,
-                                "{width}x{height} rect at ({x0},{y0}) {columns}x{rows}"
-                            );
                         }
                     }
                 }
             }
-            let (x, y) = (width - 1, height - 1);
-            let got: Vec<_> = frame.pixels(x, y, 1).collect();
-            assert_eq!(got, vec![[x as f32, y as f32, (x + y) as f32]]);
+            for (x0, y0, columns, rows) in rects {
+                let rect = Rect {
+                    x: x0 as u32,
+                    y: y0 as u32,
+                    width: columns as u32,
+                    height: rows as u32,
+                };
+                let want: Vec<[f32; 3]> = (y0..y0 + rows)
+                    .flat_map(|y| {
+                        reference[y * width + x0..y * width + x0 + columns]
+                            .iter()
+                            .map(|pixel| pixel.map(|v| half::f16::from_f32(v).to_f32()))
+                    })
+                    .collect();
+                let message = format!("{width}x{height} rect at ({x0},{y0}) {columns}x{rows}");
+                assert!(read_rect(&on_disk, rect) == want, "file-backed {message}");
+                assert!(read_rect(&in_memory, rect) == want, "in-memory {message}");
+            }
         }
     }
 

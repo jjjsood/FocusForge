@@ -432,10 +432,10 @@ pub trait TileReader: Send + Sync {
     }
 
     /// The file-backed bytes one frame's [`Self::read_tile_into`] of a
-    /// `width x height` rect keeps in the page cache: pages of a mapped
-    /// scratch file, which [`Self::read_scratch_bytes`] does not count. The
-    /// scheduler sizes its admission bands from it: neighbouring tiles share
-    /// a margin, and the margin is a cache hit only while the pages in
+    /// `width x height` rect keeps in the page cache: pages of a scratch file
+    /// the reader reads, which [`Self::read_scratch_bytes`] does not count.
+    /// The scheduler sizes its admission bands from it: neighbouring tiles
+    /// share a margin, and the margin is a cache hit only while the pages in
     /// between still fit in memory. Readers with no file-backed working set
     /// keep the default.
     fn read_page_cache_bytes(&self, _width: u32, _height: u32) -> u64 {

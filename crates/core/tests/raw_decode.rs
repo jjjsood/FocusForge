@@ -654,7 +654,7 @@ fn raw_scratch_error_on_corpus_frames() {
             .expect("cached u16 read");
         developed
             .read_tile_into(0, rect, &mut got16)
-            .expect("mapped u16 read");
+            .expect("scratch u16 read");
         let differing16 = want16.iter().zip(&got16).filter(|(w, g)| w != g).count();
         let worst16 = want16.iter().zip(&got16).map(|(w, g)| w.abs_diff(*g)).max();
         let over = |limit: u16| {
@@ -671,7 +671,7 @@ fn raw_scratch_error_on_corpus_frames() {
             .expect("cached f32 read");
         developed
             .read_tile_f32_into(0, rect, &mut got)
-            .expect("mapped f32 read");
+            .expect("scratch f32 read");
         let differing = want.iter().zip(&got).filter(|(w, g)| w != g).count();
         let worst = want
             .iter()
@@ -698,7 +698,7 @@ fn raw_scratch_error_on_corpus_frames() {
         );
         assert!(
             got.iter().all(|value| value.is_finite()),
-            "{name}: a mapped read is not finite"
+            "{name}: a scratch read is not finite"
         );
     }
 }
@@ -3282,4 +3282,105 @@ fn raw_in_ram_run_needs_no_scratch_space() {
     let (mut refused, _root) = request(capped, in_ram);
     let shortfall = single_shortfall(&mut refused, in_ram);
     assert_eq!((shortfall.needed, shortfall.free), (on_disk, in_ram));
+}
+
+/// A one-frame `width` x `height` DNG stack developed into `store`; the root
+/// and the DNG must outlive the reads.
+fn developed_stack(
+    width: u32,
+    height: u32,
+    store: DevelopStore,
+) -> (RawStack, tempfile::TempDir, tempfile::NamedTempFile) {
+    let mut spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], Vec::new());
+    spec.width = width;
+    spec.height = height;
+    spec.samples = vec![512; (width * height) as usize];
+    let dng = write_dng(&spec, false);
+    let stack = RawStack::open_files(&[PathBuf::from(dng.path())]).expect("DNG opens");
+    let root = target_tmp();
+    stack
+        .develop_once(
+            root.path(),
+            store,
+            HostBudget::explicit(u64::MAX),
+            1,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
+        .expect("the pass develops the frame");
+    (stack, root, dng)
+}
+
+/// The scratch file of frame 0 under `root`.
+fn scratch_file(root: &Path) -> PathBuf {
+    std::fs::read_dir(root)
+        .expect("scratch root lists")
+        .map(|entry| entry.expect("scratch entry").path().join("0.f16"))
+        .find(|path| path.is_file())
+        .expect("frame 0 has a scratch file")
+}
+
+#[test]
+fn raw_scratch_short_read_is_a_scratch_error() {
+    use std::io::ErrorKind;
+
+    for (damage, kind) in [
+        ("truncated", ErrorKind::UnexpectedEof),
+        ("emptied", ErrorKind::UnexpectedEof),
+        ("removed", ErrorKind::NotFound),
+    ] {
+        let (stack, root, _dng) = developed_stack(100, 70, DevelopStore::ScratchFile);
+        let path = scratch_file(root.path());
+        let length = std::fs::metadata(&path).expect("scratch metadata").len();
+        match damage {
+            "truncated" | "emptied" => std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("scratch opens for writing")
+                .set_len(if damage == "emptied" { 0 } else { length / 2 })
+                .expect("scratch shrinks"),
+            _ => std::fs::remove_file(&path).expect("scratch is removed"),
+        }
+        let (width, height) = stack.dimensions();
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let count = width as usize * height as usize * 3;
+        let results = [
+            stack.read_tile_into(0, rect, &mut vec![0u16; count]),
+            stack.read_tile_f32_into(0, rect, &mut vec![0f32; count]),
+        ];
+        for result in results {
+            let error = result.expect_err("a damaged scratch file fails the read");
+            let AlgorithmError::Frame(FrameError::Raw(RawError::Scratch { path: got, source })) =
+                &error
+            else {
+                panic!("{damage}: expected RawError::Scratch, got {error:?}");
+            };
+            assert_eq!(got, &path, "{damage}: the error names the scratch file");
+            assert_eq!(source.kind(), kind, "{damage}");
+        }
+    }
+}
+
+#[test]
+fn raw_read_scratch_bytes_counts_the_read_buffer() {
+    // A 64x64 block of 6-byte pixels; a frame smaller than a block clamps it.
+    for (width, height, expected) in [(100, 70, 64 * 64 * 6), (40, 30, 40 * 30 * 6)] {
+        let (stack, _root, _dng) = developed_stack(width, height, DevelopStore::ScratchFile);
+        assert_eq!(
+            stack.read_scratch_bytes(width, height),
+            expected,
+            "{width}x{height} file-backed"
+        );
+        let (stack, _root, _dng) = developed_stack(width, height, DevelopStore::Memory);
+        assert_eq!(
+            stack.read_scratch_bytes(width, height),
+            0,
+            "{width}x{height} in memory"
+        );
+    }
 }
