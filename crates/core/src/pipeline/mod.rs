@@ -702,7 +702,7 @@ pub fn run(
             request.backend.is_some() && cap_fallback.is_none(),
         ),
     )?;
-    // Frames kept in memory are no longer available to the tiles.
+    // Frames held in memory come off the tiles' budget.
     if developed_store == Some(DevelopStore::Memory) {
         options.budget = develop_budget.reduced_by(scratch_needed);
     }
