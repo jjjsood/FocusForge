@@ -13,21 +13,21 @@
 //! # Residency
 //!
 //! A frame's pyramid holds levels 1..N only: 59.7 MB at 8192 x 5464 `f32`
-//! (a third of the 179 MB level-0 plane). Level 1 is assembled band by band
-//! and level 0 is only ever read as a bounded window around the solve
-//! region.
+//! (a third of the 179 MB level-0 plane). Level 1 is built row by row from
+//! bands of input rows, each read once, and level 0 is only ever read as a
+//! bounded window around the solve region.
 //!
 //! An anchored run holds one *shared* term for the whole run
 //! ([`crate::align::driver::bytes_shared_reference`]): the reference pyramid
 //! plus the reference templates the solver retains per level. Each concurrent
 //! registration adds its own frame pyramid, a streaming band or the solve
 //! scratch ([`crate::align::driver::bytes_per_registration`]). At the
-//! reference scale that is about 254 MB shared and 115 MB per registration.
+//! reference scale that is about 254 MB shared and 233 MB per registration.
 
 use crate::align::error::AlignError;
 use crate::fuse::PyramidError;
 pub use crate::fuse::pyramid::max_levels;
-use crate::fuse::pyramid::{Plane, gaussian_levels, reduce};
+use crate::fuse::pyramid::{KERNEL, Plane, gaussian_levels};
 use crate::tile::{Rect, Sample, Tile};
 use crate::timing::{TimingCounter, record_timing};
 
@@ -121,13 +121,34 @@ pub struct AlignPyramid {
     height: u32,
 }
 
+/// Horizontal 5-tap reduce of one luma row into `ceil(w / 2)` samples:
+/// clamp-to-edge taps added in ascending order, exactly as
+/// [`crate::fuse::pyramid::reduce`]'s first pass.
+fn reduce_row(src: &[f32], dst: &mut [f32]) {
+    let last = src.len() - 1;
+    for (x, d) in dst.iter_mut().enumerate() {
+        let at = |k: usize| src[(2 * x + k).saturating_sub(2).min(last)];
+        let mut acc = 0.0f32;
+        acc += KERNEL[0] * at(0);
+        acc += KERNEL[1] * at(1);
+        acc += KERNEL[2] * at(2);
+        acc += KERNEL[3] * at(3);
+        acc += KERNEL[4] * at(4);
+        *d = acc;
+    }
+}
+
 impl AlignPyramid {
+    /// Output rows of level 1 per streamed band.
+    pub const BAND_ROWS: u32 = 64;
+
     /// Builds levels `1..=depth` of a `width x height`, `spp`-sample frame
-    /// from `read`, which fills a full-width rect of `S` samples. Level 1
-    /// is reduced from row bands of `band_rows` output rows, each read with
-    /// a 2-row top and 3-row bottom halo; levels 2.. follow with
-    /// [`gaussian_levels`]. Each level is bit-identical to a whole-frame
-    /// `reduce` chain's. `depth == 0` reads nothing.
+    /// from `read`, which fills a full-width rect of `S` samples. Each input
+    /// row is read once, in order, in rects of at most `2 * band_rows + 5`
+    /// rows. Level 1 comes from a ring of horizontally reduced rows that the
+    /// vertical reduce drains `band_rows` output rows at a time; levels 2..
+    /// follow with [`gaussian_levels`]. Each level is bit-identical to a
+    /// whole-frame `reduce` chain's. `depth == 0` reads nothing.
     pub fn stream<S: Sample, E>(
         (width, height, spp): (u32, u32, u32),
         depth: u32,
@@ -157,59 +178,77 @@ impl AlignPyramid {
             });
         }
 
-        let band_rows = band_rows.max(1);
         let (w1, h1) = (width.div_ceil(2), height.div_ceil(2));
+        // A band taller than the level changes neither the result nor the reads.
+        let band_rows = band_rows.clamp(1, h1);
         let mut level1 = vec![0.0f32; w1 as usize * h1 as usize];
 
-        let band_len = |rows: u32| width as usize * rows as usize * spp as usize;
-        let tallest = (2 * band_rows + 5).min(height);
-        let mut band = vec![S::default(); band_len(tallest)];
+        let (wu, w1u, spp_u) = (width as usize, w1 as usize, spp as usize);
+        // The first band reads `2 * band_rows + 3` rows, later ones
+        // `2 * band_rows`; the ring holds the reduced rows `[lo, hi)` a band's
+        // taps span.
+        let mut raw = vec![S::default(); (2 * band_rows + 3).min(height) as usize * wu * spp_u];
+        let mut ring = vec![0.0f32; (2 * band_rows + 5).min(height) as usize * w1u];
+        let mut luma_row = vec![0.0f32; wu];
         record_timing(
             TimingCounter::AllocationBytes,
-            (band.capacity() * std::mem::size_of::<S>()) as u64,
+            (raw.capacity() * std::mem::size_of::<S>()
+                + (ring.capacity() + luma_row.capacity()) * std::mem::size_of::<f32>())
+                as u64,
         );
         record_timing(TimingCounter::AllocationOperations, 1);
 
+        let (mut lo, mut hi) = (0u32, 0u32);
         let mut r0 = 0u32;
         while r0 < h1 {
             let r1 = (r0 + band_rows).min(h1);
-            let in0 = (2 * r0).saturating_sub(2);
-            let in1 = (2 * r1 + 3).min(height);
-            let rows = in1 - in0;
-            band.resize(band_len(rows), S::default());
-            read(
-                Rect {
-                    x: 0,
-                    y: in0,
-                    width,
-                    height: rows,
-                },
-                &mut band,
-            )
-            .map_err(StreamError::Read)?;
+            let need_lo = (2 * r0).saturating_sub(2);
+            let need_hi = (2 * r1 + 3).min(height);
 
-            let mut assembler = LumaAssembler::new(width, rows);
-            assembler
-                .push_samples(
+            // Reduced rows of the previous band that this band still needs.
+            let kept = hi.saturating_sub(need_lo);
+            if kept > 0 {
+                ring.copy_within((need_lo - lo) as usize * w1u..(hi - lo) as usize * w1u, 0);
+            }
+            let start = need_lo.max(hi);
+            let new_rows = need_hi - start;
+            if new_rows > 0 {
+                let rows = &mut raw[..new_rows as usize * wu * spp_u];
+                read(
                     Rect {
                         x: 0,
-                        y: 0,
+                        y: start,
                         width,
-                        height: rows,
+                        height: new_rows,
                     },
-                    spp,
-                    &band,
+                    rows,
                 )
-                .expect("the band lies inside the band assembler");
-            let luma = assembler.finish().map_err(StreamError::Pyramid)?;
-            let reduced = reduce(&luma);
+                .map_err(StreamError::Read)?;
+                for (i, raw_row) in rows.chunks_exact(wu * spp_u).enumerate() {
+                    for (l, pixel) in luma_row.iter_mut().zip(raw_row.chunks_exact(spp_u)) {
+                        *l = crate::fuse::metrics::luma(pixel, spp) as f32;
+                    }
+                    reduce_row(&luma_row, &mut ring[(kept as usize + i) * w1u..][..w1u]);
+                }
+            }
+            (lo, hi) = (need_lo, need_hi);
 
-            // Output row 1 of a band that starts below the frame top is the
-            // band's first own row: its input halo is two rows.
-            let skip = usize::from(r0 > 0) * w1 as usize;
-            let own = (r1 - r0) as usize * w1 as usize;
-            level1[r0 as usize * w1 as usize..][..own]
-                .copy_from_slice(&reduced.data()[skip..skip + own]);
+            for r in r0..r1 {
+                let tap = |k: u32| {
+                    let y = (2 * r + k).saturating_sub(2).min(height - 1);
+                    &ring[(y - lo) as usize * w1u..][..w1u]
+                };
+                let (t0, t1, t2, t3, t4) = (tap(0), tap(1), tap(2), tap(3), tap(4));
+                for (x, out) in level1[r as usize * w1u..][..w1u].iter_mut().enumerate() {
+                    let mut acc = 0.0f32;
+                    acc += KERNEL[0] * t0[x];
+                    acc += KERNEL[1] * t1[x];
+                    acc += KERNEL[2] * t2[x];
+                    acc += KERNEL[3] * t3[x];
+                    acc += KERNEL[4] * t4[x];
+                    *out = acc;
+                }
+            }
             r0 = r1;
         }
 
@@ -280,9 +319,19 @@ mod tests {
 
     #[test]
     fn streamed_levels_equal_the_whole_frame_reduce_chain() {
-        for (width, height) in [(13u32, 7u32), (64, 1030), (1031, 777)] {
-            for spp in [1u32, 3] {
+        let sizes = [
+            (8u32, 8u32),
+            (9, 8),
+            (8, 9),
+            (64, 9),
+            (31, 70),
+            (64, 1030),
+            (1031, 777),
+        ];
+        for (width, height) in sizes {
+            for spp in [1u32, 3, 4] {
                 let samples = noise(width, height, spp, u64::from(width) * 31 + u64::from(spp));
+                let wide: Vec<f32> = samples.iter().map(|s| f32::from(*s)).collect();
                 let mut assembler = LumaAssembler::new(width, height);
                 let whole = Tile {
                     rect: Rect {
@@ -296,28 +345,86 @@ mod tests {
                 };
                 assembler.push_tile(&whole).unwrap();
                 let depth = max_levels(width, height).min(4);
+                assert!(depth >= 1, "{width}x{height} streams no level");
                 let expected = gaussian_levels(assembler.finish().unwrap(), depth).unwrap();
+                let row = width as usize * spp as usize;
 
-                for band_rows in [1u32, 2, 3, 256] {
-                    let pyramid = AlignPyramid::stream(
+                for band_rows in [1u32, 2, 3, 5, 32, 64, 256] {
+                    let narrow = AlignPyramid::stream(
                         (width, height, spp),
                         depth,
                         band_rows,
                         read_from(&samples, (width, spp)),
                     )
                     .unwrap_or_else(|_| panic!("{width}x{height} spp {spp} band {band_rows}"));
-                    assert_eq!(pyramid.depth(), depth);
-                    assert_eq!(pyramid.dimensions(), (width, height));
-                    for (k, level) in expected.iter().enumerate().skip(1) {
-                        assert_eq!(
-                            pyramid.level(k).data(),
-                            level.data(),
-                            "{width}x{height} spp {spp} band {band_rows} level {k}"
-                        );
+                    let widened = AlignPyramid::stream::<_, ()>(
+                        (width, height, spp),
+                        depth,
+                        band_rows,
+                        |rect, out: &mut [f32]| {
+                            out.copy_from_slice(&wide[rect.y as usize * row..][..out.len()]);
+                            Ok(())
+                        },
+                    )
+                    .unwrap_or_else(|_| panic!("f32 {width}x{height} spp {spp} band {band_rows}"));
+                    for pyramid in [&narrow, &widened] {
+                        assert_eq!(pyramid.depth(), depth);
+                        assert_eq!(pyramid.dimensions(), (width, height));
+                        for (k, level) in expected.iter().enumerate().skip(1) {
+                            assert_eq!(
+                                pyramid.level(k).data(),
+                                level.data(),
+                                "{width}x{height} spp {spp} band {band_rows} level {k}"
+                            );
+                        }
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn stream_reads_every_input_row_exactly_once_in_order() {
+        let width = 8u32;
+        for height in [8u32, 9, 70, 200] {
+            for band_rows in [1u32, 2, 5, 32, 64] {
+                let mut reads: Vec<Rect> = Vec::new();
+                AlignPyramid::stream::<u16, ()>((width, height, 1), 1, band_rows, |rect, out| {
+                    reads.push(rect);
+                    out.fill(7);
+                    Ok(())
+                })
+                .unwrap_or_else(|_| panic!("{width}x{height} band {band_rows}"));
+
+                let mut next = 0u32;
+                for rect in &reads {
+                    assert_eq!(
+                        (rect.x, rect.width, rect.y),
+                        (0, width, next),
+                        "{width}x{height} band {band_rows}: reads abut in order"
+                    );
+                    assert!(
+                        rect.height >= 1 && rect.height <= 2 * band_rows + 5,
+                        "{width}x{height} band {band_rows}: read of {} rows",
+                        rect.height
+                    );
+                    next += rect.height;
+                }
+                assert_eq!(next, height, "{width}x{height} band {band_rows}: rows read");
+            }
+        }
+    }
+
+    #[test]
+    fn a_failing_later_band_surfaces_as_a_read_error() {
+        let mut calls = 0u32;
+        let result = AlignPyramid::stream((13, 40, 1), 1, 2, |_: Rect, out: &mut [u16]| {
+            calls += 1;
+            out.fill(1);
+            if calls == 2 { Err("disk") } else { Ok(()) }
+        });
+        assert!(matches!(result, Err(StreamError::Read("disk"))));
+        assert_eq!(calls, 2, "no read follows the failed one");
     }
 
     #[test]
