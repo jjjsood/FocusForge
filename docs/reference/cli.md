@@ -432,6 +432,21 @@ group's *configured* host in-flight-tile limit, not a measured high-water
 mark — the engine this command drives does not expose the real observed
 concurrency, so the configured bound is reported instead.
 
+Tile admission fields: `in_flight_bound` says which term set
+`in_flight_limit` — `"host_budget"` (the memory budget allowed fewer tiles
+than the pool has threads, or no whole tile; a tie also reads this) or
+`"thread_cap"` (the pool's thread count, the budget would have allowed more).
+`developed_store` says where developed RAW frames live: `"memory"` when the
+host budget holds them all, otherwise `"scratch_file"` (read back with
+positioned reads); `null` for TIFF and JPEG input. `page_cache_bytes_per_tile`
+is the file-cache bytes one tile's reads keep hot across all frames, or `null`
+when the reader reports none (TIFF, JPEG, RAW developed into memory).
+`band_columns` is the width in tile columns of the vertical bands tiles are
+admitted in, sized so a band's reads fit the page cache under the memory cap;
+`null` when tiles are admitted in plan order. The human summary appends
+`band_columns=` to the tile line when present. `--dry-run --json` reports
+`in_flight_bound`, `page_cache_bytes_per_tile` and `developed_store` as well.
+
 Device (VRAM) budget fields, GPU path only:
 `max_device_bytes_in_flight` (the in-flight device-byte budget actually in
 force), `device_budget_provenance` (`"Host"` — a startup probe settled on
@@ -469,8 +484,8 @@ prevent.
 The `develop_counts` field counts full-frame RAW develops: one count per frame,
 in frame order, across every stage of this group (preparation, alignment,
 fusion and metrics together). A `stack` run develops every frame once, in a
-parallel pass before preparation, into scratch files that later reads map, so
-every count is 1 whatever the tile size or host-memory ceiling. It is `null`
+parallel pass before preparation, so every count is 1 whatever the tile size
+or host-memory ceiling. It is `null`
 for TIFF and JPEG stacks, and
 the human summary prints a `develops per frame: min= mean= max=` line only
 when the field is present.
