@@ -6,6 +6,7 @@
 //! reference that cannot be rendered is refused before anything is written.
 
 use std::fmt::Debug;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -19,8 +20,9 @@ use focusforge_core::project::{
     Project, ProjectError, SealRequest, StrokeSource, partial_path,
 };
 use focusforge_core::retouch::blend::{self, Blend};
+use focusforge_core::retouch::{ModeConditions, overlay_colors};
 use focusforge_core::tile::HostBudget;
-use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
+use focusforge_core::zmap::{ZMapInfo, ZMapWriter, checkpoint_color, overlay_table};
 
 const W: u32 = 61;
 const H: u32 = 47;
@@ -877,6 +879,88 @@ fn hidden_source_still_renders() {
             .hidden
     );
     assert_eq!(render_full::<u16>(&p, &x), visible);
+}
+
+/// The overlay colour of each pixel of `ops` over the whole image, the
+/// checkpoint colours taken from the history of the project on disk.
+fn overlay_of(p: &Project1, id: &str) -> Vec<[u8; 3]> {
+    let project = Project::open(&p.path).unwrap();
+    let history = project.history();
+    let ops: Vec<Op> = history.op_chain(id).unwrap().into_iter().cloned().collect();
+    let lookup = |checkpoint: &str| {
+        let colour = history.colour_index(checkpoint).ok()?;
+        Some(checkpoint_color(colour, FRAMES as u32))
+    };
+    let info = ZMapInfo::new(W, H, FRAMES as u32).unwrap();
+    let mut out = vec![[0u8; 3]; (W * H) as usize];
+    overlay_colors(
+        &ops,
+        info,
+        full(),
+        NonZeroU32::MIN,
+        &ModeConditions::default(),
+        &overlay_table(FRAMES as u32, None),
+        &lookup,
+        &vec![0u16; (W * H) as usize],
+        &mut out,
+    );
+    out
+}
+
+#[test]
+fn overlay_colours_checkpoint_strokes_from_the_saved_history() {
+    let p = build::<u16>("cs_overlay", 3);
+    let a = append_ops(
+        &p,
+        &p.root,
+        vec![stroke(frame(1), &[(10, 40)], 5.0, BrushMode::Normal, 1.0)],
+    );
+    let b = append_ops(
+        &p,
+        &a,
+        vec![
+            stroke(frame(2), &[(8, 8)], 5.0, BrushMode::Normal, 1.0),
+            stroke(from(&a), &[(30, 25)], 6.0, BrushMode::Normal, 1.0),
+            stroke(from(&p.root), &[(50, 10)], 6.0, BrushMode::Normal, 1.0),
+        ],
+    );
+    let table = overlay_table(FRAMES as u32, None);
+    let colour_of = |id: &str| {
+        let colour = Project::open(&p.path)
+            .unwrap()
+            .history()
+            .colour_index(id)
+            .unwrap();
+        checkpoint_color(colour, FRAMES as u32)
+    };
+    let at = |out: &[[u8; 3]], x: u32, y: u32| out[(y * W + x) as usize];
+
+    let shown = overlay_of(&p, &b);
+    assert_eq!(at(&shown, 10, 40), table[1], "a's frame stroke");
+    assert_eq!(at(&shown, 8, 8), table[2], "b's frame stroke");
+    assert_eq!(at(&shown, 30, 25), colour_of(&a), "the stroke from a");
+    assert_eq!(
+        at(&shown, 50, 10),
+        colour_of(&p.root),
+        "the stroke from the root"
+    );
+    assert_ne!(colour_of(&a), colour_of(&p.root));
+    assert!(!table.contains(&colour_of(&a)) && !table.contains(&colour_of(&p.root)));
+
+    project::seal_in_memory(&p.path, &[], &[ParentRef::Saved(a.clone())], None, true).unwrap();
+    assert!(
+        Project::open(&p.path)
+            .unwrap()
+            .history()
+            .get(&a)
+            .unwrap()
+            .hidden
+    );
+    assert_eq!(
+        overlay_of(&p, &b),
+        shown,
+        "a hidden checkpoint keeps its colour"
+    );
 }
 
 /// Wall-clock cost of a stroke painted from the fused base against the same

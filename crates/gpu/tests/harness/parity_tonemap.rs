@@ -332,10 +332,10 @@ fn overlay_parity_matches_cpu() {
                 std::num::NonZeroU32::MIN,
                 &ModeConditions::default(),
                 &table,
+                &|_| None,
                 &indices,
                 &mut colors,
-            )
-            .expect("a frame stroke has a colour");
+            );
 
             let target = DisplayTexture::new(shared.device(), crop.width, crop.height);
             render_overlay(

@@ -707,8 +707,13 @@ impl ModeConditions {
     }
 }
 
-/// The part of `rect` a valid Lighten or Darken stroke can reach.
+/// The part of `rect` a valid Lighten or Darken stroke painted from a frame
+/// can reach. A stroke painted from a checkpoint reaches nothing: it shows no
+/// origin, so it is never replayed.
 fn light_dark_reach(op: &Op, info: ZMapInfo, rect: Rect) -> Option<Rect> {
+    if op.checkpoint_source().is_some() {
+        return None;
+    }
     let stroke = validate(op, info).ok()?;
     if !matches!(stroke.mode, BrushMode::Lighten | BrushMode::Darken) {
         return None;
@@ -854,33 +859,39 @@ fn table_color(table: &[[u8; 3]], index: u16) -> [u8; 3] {
 /// The source of the latest valid stroke in `ops` that is the origin of
 /// `(x, y)`: its opacity-scaled alpha there exceeds half of full coverage and,
 /// for Lighten and Darken, `conditions` holds. `None` when no stroke is. A
-/// stroke painted from a checkpoint anywhere in `ops` is refused with
-/// [`RetouchError::CheckpointSource`].
-pub fn top_source(
-    ops: &[Op],
+/// stroke painted from a checkpoint is skipped unless `checkpoint_color` knows
+/// its id, and a Lighten or Darken one never holds, so it shows no origin.
+pub fn top_source<'a>(
+    ops: &'a [Op],
     info: ZMapInfo,
     x: u32,
     y: u32,
     conditions: &ModeConditions,
-) -> Result<Option<u16>, RetouchError> {
-    for op in ops {
-        source_frame(op)?;
-    }
-    Ok(ops.iter().enumerate().rev().find_map(|(k, op)| {
-        let Op::BrushStroke { mode, opacity, .. } = op;
+    checkpoint_color: &dyn Fn(&str) -> Option<[u8; 3]>,
+) -> Option<&'a StrokeSource> {
+    ops.iter().enumerate().rev().find_map(|(k, op)| {
+        let Op::BrushStroke {
+            source,
+            mode,
+            opacity,
+            ..
+        } = op;
+        if matches!(source, StrokeSource::Checkpoint(id) if checkpoint_color(id).is_none()) {
+            return None;
+        }
         let mask = alpha(op, info, x, y).ok()?;
-        shows_source(*mode, mask, opacity_q16(*opacity), conditions, (k, x, y))
-            .then(|| checked_frame(op))
-    }))
+        shows_source(*mode, mask, opacity_q16(*opacity), conditions, (k, x, y)).then_some(source)
+    })
 }
 
 /// Fills `out` with each sample's overlay colour over the `step`-th rows and
 /// columns of `rect`: `table`'s colour for the stored index in `indices`
 /// (clamped to the last entry), then, per valid stroke of `ops` in order, the
 /// stroke source's colour wherever the stroke is the origin (the rule of
-/// [`top_source`], with the same `conditions`). Cost follows the samples near
-/// each path. A stroke painted from a checkpoint anywhere in `ops` is refused
-/// with [`RetouchError::CheckpointSource`], leaving `out` unwritten.
+/// [`top_source`], with the same `conditions`): `table`'s colour for a frame,
+/// `checkpoint_color`'s for a checkpoint id. A stroke painted from a checkpoint
+/// `checkpoint_color` returns `None` for is skipped. Cost follows the samples
+/// near each path.
 #[allow(clippy::too_many_arguments)]
 pub fn overlay_colors(
     ops: &[Op],
@@ -889,12 +900,10 @@ pub fn overlay_colors(
     step: NonZeroU32,
     conditions: &ModeConditions,
     table: &[[u8; 3]],
+    checkpoint_color: &dyn Fn(&str) -> Option<[u8; 3]>,
     indices: &[u16],
     out: &mut [[u8; 3]],
-) -> Result<(), RetouchError> {
-    for op in ops {
-        source_frame(op)?;
-    }
+) {
     let step = step.get();
     let columns = rect.width.div_ceil(step) as usize;
     let rows = rect.height.div_ceil(step) as usize;
@@ -910,7 +919,14 @@ pub fn overlay_colors(
         let Some(active) = stroke_footprint(&stroke, info).and_then(|fp| rect.intersect(fp)) else {
             continue;
         };
-        let over = table_color(table, checked_frame(op));
+        let Op::BrushStroke { source, .. } = op;
+        let over = match source {
+            StrokeSource::Frame(n) => table_color(table, *n),
+            StrokeSource::Checkpoint(id) => match checkpoint_color(id) {
+                Some(color) => color,
+                None => continue,
+            },
+        };
         let opacity = opacity_q16(stroke.opacity);
         let ramp = Ramp::new(&stroke);
         let grid = SegmentGrid::new(&stroke, active);
@@ -937,7 +953,6 @@ pub fn overlay_colors(
             }
         }
     }
-    Ok(())
 }
 
 /// Blends the stroke `op`'s source samples over `out`. `out` holds the
@@ -2776,6 +2791,18 @@ mod tests {
         conditions: &ModeConditions,
         indices: &[u16],
     ) -> Vec<[u8; 3]> {
+        colors_known(ops, map, rect, step, conditions, &|_| None, indices)
+    }
+
+    fn colors_known(
+        ops: &[Op],
+        map: ZMapInfo,
+        rect: Rect,
+        step: u32,
+        conditions: &ModeConditions,
+        checkpoint_color: &dyn Fn(&str) -> Option<[u8; 3]>,
+        indices: &[u16],
+    ) -> Vec<[u8; 3]> {
         let mut out = vec![[0u8; 3]; indices.len()];
         overlay_colors(
             ops,
@@ -2784,11 +2811,79 @@ mod tests {
             NonZeroU32::new(step).unwrap(),
             conditions,
             &palette(),
+            checkpoint_color,
             indices,
             &mut out,
-        )
-        .unwrap();
+        );
         out
+    }
+
+    /// [`top_source`] for op lists that hold frame strokes only.
+    fn top_frame(
+        ops: &[Op],
+        map: ZMapInfo,
+        x: u32,
+        y: u32,
+        conditions: &ModeConditions,
+    ) -> Option<u16> {
+        match top_source(ops, map, x, y, conditions, &|_| None) {
+            Some(StrokeSource::Frame(n)) => Some(*n),
+            Some(StrokeSource::Checkpoint(id)) => panic!("checkpoint {id} in a frame-only list"),
+            None => None,
+        }
+    }
+
+    /// Two known checkpoint ids with distinct colours that match no table entry.
+    const AMBER: [u8; 3] = [250, 190, 10];
+    const TEAL: [u8; 3] = [10, 190, 190];
+
+    fn known_checkpoints(id: &str) -> Option<[u8; 3]> {
+        match id {
+            "amber" => Some(AMBER),
+            "teal" => Some(TEAL),
+            _ => None,
+        }
+    }
+
+    fn source_stroke(
+        source: StrokeSource,
+        mode: BrushMode,
+        opacity: f32,
+        path: Vec<Point>,
+        radius: f32,
+        softness: f32,
+    ) -> Op {
+        Op::BrushStroke {
+            source,
+            path,
+            radius,
+            softness,
+            mode,
+            opacity,
+        }
+    }
+
+    fn from_checkpoint(id: &str, path: Vec<Point>, radius: f32, softness: f32) -> Op {
+        source_stroke(
+            StrokeSource::Checkpoint(id.to_string()),
+            BrushMode::Normal,
+            1.0,
+            path,
+            radius,
+            softness,
+        )
+    }
+
+    /// Frame strokes crossed with strokes from two known checkpoints and one
+    /// the lookup does not know, the unknown one in the middle of the order.
+    fn mixed_source_strokes() -> Vec<Op> {
+        vec![
+            stroke_op(1, vec![pt(3, 5), pt(30, 20)], 7.0, 0.7),
+            from_checkpoint("amber", vec![pt(8, 24), pt(35, 3)], 6.0, 0.5),
+            from_checkpoint("ghost", vec![pt(5, 12), pt(32, 14)], 8.0, 0.6),
+            from_checkpoint("teal", vec![pt(14, 6), pt(20, 26)], 5.0, 0.8),
+            stroke_op(2, vec![pt(26, 24)], 6.0, 0.5),
+        ]
     }
 
     /// Two overlapping soft strokes from frames 1 and 3 and one the map's
@@ -2883,18 +2978,10 @@ mod tests {
             .find(|&x| alpha(&one[0], map, x, 15).unwrap() <= 32768)
             .expect("the edge falls to half");
         for x in 10..flip {
-            assert_eq!(
-                top_source(&one, map, x, 15, &none).unwrap(),
-                Some(1),
-                "inside at {x}"
-            );
+            assert_eq!(top_frame(&one, map, x, 15, &none), Some(1), "inside at {x}");
         }
         for x in flip..40 {
-            assert_eq!(
-                top_source(&one, map, x, 15, &none).unwrap(),
-                None,
-                "outside at {x}"
-            );
+            assert_eq!(top_frame(&one, map, x, 15, &none), None, "outside at {x}");
         }
 
         let two = [
@@ -2904,28 +2991,28 @@ mod tests {
         // The later stroke wins where it covers more than half, the earlier
         // one where only it does.
         assert_eq!(
-            top_source(&two, map, 13, 15, &none).unwrap(),
+            top_frame(&two, map, 13, 15, &none),
             Some(3),
             "both over half"
         );
         assert_eq!(
-            top_source(&two, map, 11, 15, &none).unwrap(),
+            top_frame(&two, map, 11, 15, &none),
             Some(1),
             "only the earlier"
         );
         assert_eq!(
-            top_source(&two, map, 20, 15, &none).unwrap(),
+            top_frame(&two, map, 20, 15, &none),
             Some(3),
             "only the later"
         );
-        assert_eq!(top_source(&two, map, 21, 15, &none).unwrap(), None);
+        assert_eq!(top_frame(&two, map, 21, 15, &none), None);
 
         let refused = [
             stroke_op(1, vec![pt(10, 15)], 10.0, 1.0),
             stroke_op(9, vec![pt(10, 15)], 10.0, 1.0),
         ];
         assert_eq!(
-            top_source(&refused, map, 10, 15, &none).unwrap(),
+            top_frame(&refused, map, 10, 15, &none),
             Some(1),
             "refused op skipped"
         );
@@ -2936,24 +3023,32 @@ mod tests {
         let map = info(40, 30);
         let table = palette();
         let last = table.len() - 1;
-        let ops = overlapping_strokes();
+        let none = ModeConditions::default();
         let rect = rect(2, 1, 35, 27);
-        for step in [1u32, 4] {
-            let indices = stored(samples(rect, step));
-            let out = colors_over(&ops, map, rect, step, &indices);
-            let mut shown = 0;
-            for (at, x, y) in lattice(rect, step) {
-                let expected =
-                    match top_source(&ops, map, x, y, &ModeConditions::default()).unwrap() {
-                        Some(source) => {
-                            shown += 1;
-                            table[usize::from(source).min(last)]
+        for ops in [overlapping_strokes(), mixed_source_strokes()] {
+            for step in [1u32, 4] {
+                let indices = stored(samples(rect, step));
+                let out = colors_known(&ops, map, rect, step, &none, &known_checkpoints, &indices);
+                let (mut frames, mut checkpoints) = (0, 0);
+                for (at, x, y) in lattice(rect, step) {
+                    let expected = match top_source(&ops, map, x, y, &none, &known_checkpoints) {
+                        Some(StrokeSource::Frame(n)) => {
+                            frames += 1;
+                            table[usize::from(*n).min(last)]
+                        }
+                        Some(StrokeSource::Checkpoint(id)) => {
+                            checkpoints += 1;
+                            known_checkpoints(id).expect("only a known checkpoint is returned")
                         }
                         None => table[usize::from(indices[at]).min(last)],
                     };
-                assert_eq!(out[at], expected, "step {step} at ({x}, {y})");
+                    assert_eq!(out[at], expected, "step {step} at ({x}, {y})");
+                }
+                assert!(frames > 5, "frame strokes show at step {step}");
+                if ops.len() == 5 {
+                    assert!(checkpoints > 5, "checkpoint strokes show at step {step}");
+                }
             }
-            assert!(shown > 20, "the strokes cover samples at step {step}");
         }
         top_source_follows_replayed_overlay::<u16>(false);
         top_source_follows_replayed_overlay::<f32>(true);
@@ -3252,7 +3347,7 @@ mod tests {
                 let mut origins = 0;
                 for x in 0..45 {
                     let product = f64::from(alpha(&op, map, x, 15).unwrap()) * f64::from(opacity);
-                    let got = top_source(ops, map, x, 15, &none).unwrap();
+                    let got = top_frame(ops, map, x, 15, &none);
                     if product >= 32769.0 {
                         assert_eq!(got, Some(2), "{mode:?} {opacity} at {x}");
                     } else if product <= 32767.0 {
@@ -3266,7 +3361,7 @@ mod tests {
                     assert!(origins > 0, "{mode:?} at {opacity} is an origin somewhere");
                 }
                 if opacity == 0.6 {
-                    let full = top_source(ops, map, 10, 15, &none).unwrap();
+                    let full = top_frame(ops, map, 10, 15, &none);
                     assert_eq!(full, Some(2), "full mask times 0.6 is above half");
                     assert!(origins < 20, "but only where the mask is above 5/6");
                 }
@@ -3343,19 +3438,11 @@ mod tests {
             let underneath = if ops.len() == 2 { Some(1) } else { None };
             for (x, want) in expected.iter().enumerate() {
                 let x = x as u32;
-                assert_eq!(
-                    top_source(&ops, map, x, 0, &conditions).unwrap(),
-                    *want,
-                    "x {x}"
-                );
+                assert_eq!(top_frame(&ops, map, x, 0, &conditions), *want, "x {x}");
                 assert_eq!(out[x as usize], table[usize::from(want.unwrap_or(0))]);
                 // With nothing replayed the Lighten or Darken stroke is never an origin.
                 let none = ModeConditions::default();
-                assert_eq!(
-                    top_source(&ops, map, x, 0, &none).unwrap(),
-                    underneath,
-                    "x {x}"
-                );
+                assert_eq!(top_frame(&ops, map, x, 0, &none), underneath, "x {x}");
                 assert_eq!(
                     unreplayed[x as usize],
                     table[usize::from(underneath.unwrap_or(0))]
@@ -3428,11 +3515,7 @@ mod tests {
                     }
                 }
                 assert_eq!(out[at], expected, "step {step} at ({x}, {y})");
-                assert_eq!(
-                    top_source(&ops, map, x, y, &none).unwrap(),
-                    top,
-                    "({x}, {y})"
-                );
+                assert_eq!(top_frame(&ops, map, x, y, &none), top, "({x}, {y})");
             }
         }
         assert!(painted > 40);
@@ -3562,46 +3645,128 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_source_is_refused_by_every_consumer() {
+    fn overlay_colors_paint_checkpoint_sources_in_their_colour() {
         let map = info(40, 30);
+        let table = palette();
+        let last = table.len() - 1;
+        let ops = mixed_source_strokes();
+        let rect = rect(2, 1, 35, 27);
         let none = ModeConditions::default();
-        let area = rect(0, 0, 40, 30);
-        let frame = stroke_op(1, vec![pt(10, 10)], 6.0, 0.5);
-        let planes = Planes {
-            width: 40,
-            spp: 1,
-            planes: vec![vec![7.0; 40 * 30]; 4],
-        };
-        let refused = |err: RetouchError| {
+        for step in [1u32, 4] {
+            let indices = stored(samples(rect, step));
+            let out = colors_known(&ops, map, rect, step, &none, &known_checkpoints, &indices);
+            let (mut amber, mut teal, mut ghost) = (0, 0, 0);
+            for (at, x, y) in lattice(rect, step) {
+                let mut expected = table[usize::from(indices[at]).min(last)];
+                for op in &ops {
+                    let Ok(a) = alpha(op, map, x, y) else {
+                        continue;
+                    };
+                    if a <= 32768 {
+                        continue;
+                    }
+                    let Op::BrushStroke { source, .. } = op;
+                    match source {
+                        StrokeSource::Frame(n) => expected = table[usize::from(*n).min(last)],
+                        StrokeSource::Checkpoint(id) => match known_checkpoints(id) {
+                            Some(color) => expected = color,
+                            None => ghost += 1,
+                        },
+                    }
+                }
+                amber += usize::from(out[at] == AMBER);
+                teal += usize::from(out[at] == TEAL);
+                assert_eq!(out[at], expected, "step {step} at ({x}, {y})");
+            }
             assert!(
-                matches!(&err, RetouchError::CheckpointSource { checkpoint } if checkpoint == "c0ffee"),
-                "{err:?}"
+                amber > 5 && teal > 5,
+                "both checkpoints show: {amber}, {teal}"
             );
+            assert!(ghost > 5, "the unknown id covers samples it must not paint");
+        }
+    }
+
+    #[test]
+    fn checkpoint_lighten_darken_strokes_show_no_origin() {
+        let map = info(60, 30);
+        let table = palette();
+        let none = ModeConditions::default();
+        let area = rect(0, 0, 60, 30);
+        let at = |op: Op| vec![op];
+        let from = |mode, opacity| {
+            source_stroke(
+                StrokeSource::Checkpoint("amber".to_string()),
+                mode,
+                opacity,
+                vec![pt(10, 15)],
+                10.0,
+                1.0,
+            )
         };
-        for at in [pt(10, 10), pt(35, 25)] {
-            let checkpoint = checkpoint_stroke(vec![at], 4.0, 0.5);
-            for ops in [
-                vec![checkpoint.clone(), frame.clone()],
-                vec![frame.clone(), checkpoint.clone()],
-            ] {
-                refused(top_source(&ops, map, 10, 10, &none).unwrap_err());
-
-                let sentinel = [9u8, 8, 7];
-                let mut out = vec![sentinel; 40 * 30];
-                let indices = vec![0u16; 40 * 30];
-                let result = overlay_colors(
-                    &ops,
-                    map,
-                    area,
-                    NonZeroU32::MIN,
-                    &none,
-                    &palette(),
-                    &indices,
-                    &mut out,
+        let indices = vec![3u16; 60 * 30];
+        fn origin_of(ops: &[Op], map: ZMapInfo, x: u32) -> Option<&StrokeSource> {
+            top_source(
+                ops,
+                map,
+                x,
+                15,
+                &ModeConditions::default(),
+                &known_checkpoints,
+            )
+        }
+        for mode in [BrushMode::Normal, BrushMode::Detail] {
+            for opacity in [1.0f32, 0.5] {
+                let ops = at(from(mode, opacity));
+                let mut origins = 0;
+                for x in 0..45 {
+                    let product =
+                        f64::from(alpha(&ops[0], map, x, 15).unwrap()) * f64::from(opacity);
+                    let got = origin_of(&ops, map, x);
+                    if product >= 32769.0 {
+                        assert_eq!(got, Some(&StrokeSource::Checkpoint("amber".into())));
+                    } else if product <= 32767.0 {
+                        assert_eq!(got, None, "{mode:?} {opacity} at {x}");
+                    }
+                    origins += usize::from(got.is_some());
+                }
+                assert_eq!(
+                    origins > 0,
+                    opacity == 1.0,
+                    "{mode:?} at {opacity}: {origins}"
                 );
-                refused(result.unwrap_err());
-                assert!(out.iter().all(|&c| c == sentinel), "out stays unwritten");
+                let colors = colors_known(&ops, map, area, 1, &none, &known_checkpoints, &indices);
+                for x in 0..45u32 {
+                    let want = if origin_of(&ops, map, x).is_some() {
+                        AMBER
+                    } else {
+                        table[3]
+                    };
+                    assert_eq!(
+                        colors[15 * 60 + x as usize],
+                        want,
+                        "{mode:?} {opacity} at {x}"
+                    );
+                }
+            }
+        }
 
+        // A Lighten or Darken checkpoint stroke is passed over to what lies beneath.
+        let beneath = stroke_op(1, vec![pt(10, 15)], 10.0, 1.0);
+        for mode in [BrushMode::Lighten, BrushMode::Darken] {
+            let over = from(mode, 1.0);
+            for ops in [vec![over.clone()], vec![beneath.clone(), over.clone()]] {
+                assert!(!needs_mode_conditions(&ops, map, area), "{mode:?}");
+                let want = (ops.len() == 2).then_some(&StrokeSource::Frame(1));
+                assert_eq!(origin_of(&ops, map, 10), want, "{mode:?}");
+                let colors = colors_known(&ops, map, area, 1, &none, &known_checkpoints, &indices);
+                let under = if want.is_some() { table[1] } else { table[3] };
+                assert_eq!(colors[15 * 60 + 10], under, "{mode:?}");
+
+                let planes = Planes {
+                    width: 60,
+                    spp: 1,
+                    planes: vec![vec![7.0; 60 * 30]; 4],
+                };
                 let replay = replay_mode_conditions::<f32>(
                     &ops,
                     map,
@@ -3612,9 +3777,15 @@ mod tests {
                     (0, 0),
                     1,
                 );
-                refused(replay.unwrap_err());
+                assert!(
+                    matches!(&replay, Err(RetouchError::CheckpointSource { checkpoint }) if checkpoint == "amber"),
+                    "{replay:?}"
+                );
             }
         }
+        // A frame Lighten stroke is still asked for.
+        let frame_lighten = mode_op(1, BrushMode::Lighten, 1.0, vec![pt(10, 15)], 10.0, 1.0);
+        assert!(needs_mode_conditions(&[frame_lighten], map, area));
     }
 
     /// For mixed-mode ops, `top_source` with the one-pixel replay of each
@@ -3632,7 +3803,7 @@ mod tests {
             let mut shown = 0;
             for (at, x, y) in lattice(area, step) {
                 let one = replay_for::<S>(&ops, &scene, rect(x, y, 1, 1), 1).unwrap();
-                let expected = match top_source(&ops, scene.map, x, y, &one).unwrap() {
+                let expected = match top_frame(&ops, scene.map, x, y, &one) {
                     Some(source) => {
                         shown += 1;
                         table[usize::from(source).min(last)]

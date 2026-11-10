@@ -39,6 +39,17 @@ pub fn source_color(index: u16, sources: u32) -> [u8; 3] {
     )
 }
 
+/// The legend colour for checkpoint number `colour_index` among `sources`
+/// frames: the golden-ratio step `colour_index * 0.618034` picks one of the
+/// `sources` hue slots and the colour sits halfway between that slot's frame
+/// hue and the next, so it never equals a [`source_color`] and is never grey.
+pub fn checkpoint_color(colour_index: u32, sources: u32) -> [u8; 3] {
+    let n = f64::from(sources);
+    let slot = (f64::from(colour_index) * 0.618034).fract() * n;
+    let hue = (slot.floor() + 0.5) / n * 360.0;
+    hsl_to_rgb(hue as f32, SATURATION, LIGHTNESS)
+}
+
 /// The overlay's colour table: `sources + 1` entries, index `i` the colour
 /// [`source_color`] gives for source `i`, last entry `NO_SOURCE_COLOR`.
 /// With `solo` set, every entry except the soloed index desaturates to
@@ -112,6 +123,48 @@ fn the_wheel_divides_evenly_across_the_source_count() {
 fn no_source_is_a_fixed_neutral_regardless_of_the_source_count() {
     assert_eq!(source_color(NO_SOURCE, 4), NO_SOURCE_COLOR);
     assert_eq!(source_color(NO_SOURCE, 61), NO_SOURCE_COLOR);
+}
+
+#[cfg(test)]
+#[test]
+fn checkpoint_color_sits_between_frame_hues_at_the_pinned_values() {
+    let hex = |c: [u8; 3]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+    let at = |sources: u32| -> Vec<String> {
+        (0..4).map(|c| hex(checkpoint_color(c, sources))).collect()
+    };
+    assert_eq!(at(61), ["#d34c45", "#4571d3", "#97d345", "#d345bc"]);
+    assert_eq!(at(8), ["#d37a45", "#459ed3", "#c2d345", "#c245d3"]);
+    // Checkpoint 0 of 8 frames sits at hue 22.5 degrees, halfway between
+    // frames 0 and 1.
+    assert_eq!(
+        checkpoint_color(0, 8),
+        hsl_to_rgb(22.5, SATURATION, LIGHTNESS)
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn checkpoint_color_never_equals_a_frame_colour_or_the_no_source_grey() {
+    for sources in [8u32, 61] {
+        let frames: Vec<[u8; 3]> = (0..sources as u16)
+            .map(|i| source_color(i, sources))
+            .collect();
+        for c in 0..64 {
+            assert!(
+                !frames.contains(&checkpoint_color(c, sources)),
+                "checkpoint {c} of {sources} frames equals a frame colour"
+            );
+        }
+    }
+    for sources in 1u32..=1024 {
+        for c in 0..64 {
+            assert_ne!(
+                checkpoint_color(c, sources),
+                NO_SOURCE_COLOR,
+                "checkpoint {c} of {sources} frames is the NO_SOURCE grey"
+            );
+        }
+    }
 }
 
 /// `NO_SOURCE` never collides with a real hue, and no real hue is ever

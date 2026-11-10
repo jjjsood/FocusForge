@@ -5308,7 +5308,7 @@ fn pipette_reads_the_overlay() {
 }
 
 #[test]
-fn pipette_refuses_a_checkpoint_stroke() {
+fn pipette_reads_beneath_a_checkpoint_stroke_without_a_colour() {
     let (mut c, _) = open_editor("pipette_checkpoint_source");
     let zmap = c.held_checkpoints().last().unwrap().zmap.clone();
     let stored = read_whole_zmap(&zmap);
@@ -5346,16 +5346,8 @@ fn pipette_refuses_a_checkpoint_stroke() {
     alt_click(&mut c);
     assert_eq!(
         c.brush_source(),
-        Some(held),
-        "the pick over a checkpoint stroke fails instead of reading the stored map"
-    );
-
-    c.edit_session_mut().unwrap().undo();
-    alt_click(&mut c);
-    assert_eq!(
-        c.brush_source(),
         Some(under),
-        "without the stroke the same pick reads the stored map"
+        "the pick reads the stored map beneath a checkpoint stroke it has no colour for"
     );
 }
 

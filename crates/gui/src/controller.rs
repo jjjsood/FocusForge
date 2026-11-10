@@ -4141,7 +4141,11 @@ impl AppController {
         } else {
             job::ModeConditions::default()
         };
-        Ok(job::top_source(&ops, info, x, y, &conditions)?.or_else(|| edit.stored_source(x, y)))
+        let top = match job::top_source(&ops, info, x, y, &conditions, &|_| None) {
+            Some(job::StrokeSource::Frame(n)) => Some(*n),
+            Some(job::StrokeSource::Checkpoint(_)) | None => None,
+        };
+        Ok(top.or_else(|| edit.stored_source(x, y)))
     }
 
     /// `Alt + click`, or the armed pipette's `Start`: reads the frame the

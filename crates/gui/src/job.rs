@@ -2966,7 +2966,7 @@ mod placed_stroke_tests {
     }
 
     #[test]
-    fn the_overlay_keeps_the_stored_colours_under_a_checkpoint_stroke() {
+    fn the_overlay_skips_a_checkpoint_stroke_it_has_no_colour_for() {
         let whole = Rect {
             x: 0,
             y: 0,
@@ -2980,16 +2980,18 @@ mod placed_stroke_tests {
             draw.colors(info(), whole, NonZeroU32::MIN, &indices)
         };
         let stored = colors(Vec::new());
-        assert_ne!(
-            colors(vec![frame_stroke(4, 8)]),
-            stored,
-            "a frame stroke recolours the overlay"
-        );
+        let framed = colors(vec![frame_stroke(4, 8)]);
+        assert_ne!(framed, stored, "a frame stroke recolours the overlay");
         assert_eq!(colors(vec![checkpoint_stroke(8)]), stored);
-        assert_eq!(
-            colors(vec![frame_stroke(4, 8), checkpoint_stroke(30)]),
-            stored,
-            "one checkpoint stroke leaves the whole overlay stored"
-        );
+        for ops in [
+            vec![frame_stroke(4, 8), checkpoint_stroke(30)],
+            vec![checkpoint_stroke(30), frame_stroke(4, 8)],
+        ] {
+            assert_eq!(
+                colors(ops),
+                framed,
+                "the checkpoint stroke is skipped, the frame stroke beside it still recolours"
+            );
+        }
     }
 }

@@ -86,10 +86,10 @@ fn opacity_endpoints_are_exact() {
         std::num::NonZeroU32::MIN,
         &crate::retouch::ModeConditions::default(),
         &table,
+        &|_| None,
         &indices,
         &mut colors,
-    )
-    .unwrap();
+    );
 
     // Opacity 0 leaves tonemap_cpu's own composite output untouched.
     let mut expected = vec![0u8; n * 4];
