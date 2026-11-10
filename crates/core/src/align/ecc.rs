@@ -1984,15 +1984,20 @@ mod tests {
     /// The cap of the flat-floor solves below.
     const FLAT_FLOOR_CAP: u32 = 150;
 
+    /// The `STALL_WINDOW` steps that precede index `n`.
+    fn window_before(steps: &[f64], n: usize) -> &[f64; STALL_WINDOW] {
+        steps[n - STALL_WINDOW..n]
+            .try_into()
+            .expect("a window of STALL_WINDOW steps")
+    }
+
     /// Iteration indices `k` whose last ten steps (ending at `k`) are
     /// stall-shaped and lie within a factor of 1.9 of the smallest step seen
     /// up to `k`, paired with that smallest step.
     fn flat_floor_candidates(steps: &[f64]) -> Vec<(usize, f64)> {
         (STALL_WINDOW - 1..steps.len())
             .filter_map(|k| {
-                let window: &[f64; STALL_WINDOW] = steps[k + 1 - STALL_WINDOW..=k]
-                    .try_into()
-                    .expect("a window of STALL_WINDOW steps");
+                let window = window_before(steps, k + 1);
                 let smallest = steps[..=k].iter().copied().fold(f64::INFINITY, f64::min);
                 let peak = window.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                 (peak < 1.9 * smallest && is_stalled(window)).then_some((k, smallest))
@@ -2073,11 +2078,6 @@ mod tests {
     /// below twice its own value, and with no earlier window below that floor.
     #[test]
     fn a_converging_step_wins_over_a_stall_eligible_window() {
-        let window_at = |steps: &[f64], k: usize| -> [f64; STALL_WINDOW] {
-            steps[k + 1 - STALL_WINDOW..=k]
-                .try_into()
-                .expect("a window of STALL_WINDOW steps")
-        };
         let (amplitude, k, epsilon) = amplitudes()
             .find_map(|amplitude| {
                 let (_, trace) = speckle_solve(amplitude, 1e-300, FLAT_FLOOR_CAP);
@@ -2085,8 +2085,9 @@ mod tests {
                 (STALL_WINDOW - 1..steps.len()).find_map(|k| {
                     let epsilon = steps[k] * 1.000_000_1;
                     let params = params_with(u32::MAX, epsilon);
-                    let stops_at =
-                        |j: usize| stops_stalled(&window_at(&steps, j), j as u32 + 1, &params);
+                    let stops_at = |j: usize| {
+                        stops_stalled(window_before(&steps, j + 1), j as u32 + 1, &params)
+                    };
                     (steps[..k].iter().all(|&s| s >= epsilon)
                         && (STALL_WINDOW - 1..k).all(|j| !stops_at(j))
                         && stops_at(k))
@@ -2154,19 +2155,13 @@ mod tests {
                 } else {
                     level.steps.len()
                 };
-                let first_stop = (STALL_WINDOW..=judged).find(|&n| {
-                    let window: &[f64; STALL_WINDOW] = level.steps[n - STALL_WINDOW..n]
-                        .try_into()
-                        .expect("a window of STALL_WINDOW steps");
-                    stops_stalled(window, n as u32, &params)
-                });
+                let first_stop = (STALL_WINDOW..=judged)
+                    .find(|&n| stops_stalled(window_before(&level.steps, n), n as u32, &params));
                 if level.converged {
                     converging += 1;
                     assert_eq!(first_stop, None, "a converging level would stop as stalled");
                     for n in STALL_WINDOW..=judged {
-                        let window: &[f64; STALL_WINDOW] = level.steps[n - STALL_WINDOW..n]
-                            .try_into()
-                            .expect("a window of STALL_WINDOW steps");
+                        let window = window_before(&level.steps, n);
                         if is_stalled(window) {
                             let peak = window.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                             nearest = nearest.min(peak / level.epsilon);

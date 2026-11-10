@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Records the per-level step series of the chain hops of the reference stack
-//! on the GPU backend, for the replay in `crates/core/src/align/ecc.rs`. Reads
-//! the stack named by `FOCUSFORGE_REFERENCE_STACK` and writes
-//! `crates/core/tests/data/gpu-ecc-step-series-<stack directory name>.txt`.
+//! Records the GPU per-level ECC step series of the stack named by
+//! `FOCUSFORGE_REFERENCE_STACK` into `crates/core/tests/data/`.
 //!
-//! The solver's stall exit truncates the series it would be judged on, so the
-//! data is only valid when recorded with that exit disabled.
+//! The data is only valid when recorded with the solver's stall exit disabled:
+//! that exit truncates the series the replay judges.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
