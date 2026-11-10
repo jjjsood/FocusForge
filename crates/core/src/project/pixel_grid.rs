@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Whether two fused states share one pixel grid.
-//!
-//! A checkpoint can serve as a brush source for another only when its pixels
-//! line up one-to-one with the edited state's. That holds when both fuses
-//! used the same source frames, the same alignment, the same crop and
-//! produced the same dimensions. [`PixelGrid::mismatch`] names the first
-//! attribute that differs, in that order. Brightness gains are not part of
-//! the grid.
+//! Whether two fused states share one pixel grid: the same source frames, the
+//! same alignment, the same crop and the same dimensions.
+//! [`PixelGrid::mismatch`] names the first attribute that differs, in that
+//! order. Brightness gains are not part of the grid.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -69,8 +65,9 @@ impl<'a> PixelGrid<'a> {
 
     /// Why `other` does not share this grid, `None` when it does. Source
     /// frames compare by content hash when both sides carry one, otherwise
-    /// by path; a crop of `None` equals a full-frame rectangle of its own extent; transforms
-    /// compare bit for bit with missing entries read as identity.
+    /// by path; a crop of `None` equals a full-frame rectangle of its own
+    /// extent; transforms compare bit for bit with missing entries read as
+    /// identity.
     pub fn mismatch(&self, other: &PixelGrid<'_>) -> Option<GridMismatch> {
         let same_frames = match (&self.hashes, &other.hashes) {
             (Some(a), Some(b)) => a == b,
@@ -198,14 +195,13 @@ mod tests {
         let a = reg(vec![], Some(rect(0, 0, 32, 24)));
         let b = reg(vec![], Some(rect(0, 0, 40, 24)));
         let moved = reg(vec![], Some(rect(8, 4, 32, 24)));
-        let cropped = reg(vec![], Some(rect(0, 0, 32, 24)));
         both_ways(
             &grid(&["a"], &a, 32, 24),
             &grid(&["a"], &b, 32, 24),
             Some(GridMismatch::Crop),
         );
         both_ways(
-            &grid(&["a"], &cropped, 32, 24),
+            &grid(&["a"], &a, 32, 24),
             &grid(&["a"], &moved, 32, 24),
             Some(GridMismatch::Crop),
         );
