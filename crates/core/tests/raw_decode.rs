@@ -1775,8 +1775,8 @@ fn fused_probe_pixel(reader: &dyn TileReader, label: &str) -> Vec<u16> {
 }
 
 /// The scheduler's initial in-flight limit, its band width and the samples of
-/// `rect` in the weighted-average fusion of the `frame_count` square frames `reader`
-/// serves, with `facts` as the host the scheduler probes when given.
+/// `rect` in the weighted-average fusion of the `frame_count` square frames
+/// `reader` serves, with `facts` as the host the scheduler probes when given.
 fn fused_rect(
     reader: &dyn TileReader,
     frame_count: usize,
