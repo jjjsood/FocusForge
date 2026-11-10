@@ -186,7 +186,7 @@ impl CheckpointImage {
                 if let Some(reason) = unpaintable_reason(project, id, reference)? {
                     return Err(refused(project.path(), index, reference, reason));
                 }
-                Self::prepare_reference(project, project.path(), index, reference, format)
+                Self::prepare(project, reference)
             })
         })?;
         Ok(Self::shaped(
