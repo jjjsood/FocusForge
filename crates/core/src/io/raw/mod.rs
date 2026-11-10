@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
+use half::slice::HalfFloatSliceExt;
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
 use rawler::imgop::xyz::Illuminant;
@@ -23,6 +24,7 @@ use crate::tile::{HostBudget, MemoryBound, Rect, Sample, SampleFormat, ScratchDi
 
 mod look;
 pub use look::LookTransform;
+use look::encode_f32;
 
 /// Default bound for one developed RAW frame and its decode reservation.
 pub const DEFAULT_RAW_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -335,16 +337,17 @@ fn read_buffer_bytes(width: usize, height: usize) -> usize {
     SCRATCH_BLOCK.min(width) * SCRATCH_BLOCK.min(height) * PIXEL_BYTES
 }
 
-/// The `[f32; 3]` pixels stored as native-endian half-precision bytes.
-fn decode_pixels(bytes: &[u8]) -> impl Iterator<Item = [f32; 3]> + '_ {
-    bytes.chunks_exact(PIXEL_BYTES).map(|pixel| {
-        std::array::from_fn(|channel| {
-            let bytes = pixel[channel * 2..(channel + 1) * 2]
-                .try_into()
-                .expect("a channel is two bytes");
-            half::f16::from_ne_bytes(bytes).to_f32()
-        })
-    })
+/// Widens native-endian half-precision `bytes` into `out`, one `f32` per
+/// value. `halves` is scratch, reused across calls.
+fn decode_pixels(bytes: &[u8], halves: &mut Vec<half::f16>, out: &mut Vec<f32>) {
+    halves.clear();
+    halves.extend(
+        bytes
+            .chunks_exact(2)
+            .map(|pair| half::f16::from_ne_bytes([pair[0], pair[1]])),
+    );
+    out.resize(halves.len(), 0.0);
+    halves.convert_to_f32_slice(out);
 }
 
 /// Fills `buf` from `file` at `offset`; a file that ends first is
@@ -823,27 +826,43 @@ impl RawStack {
         let row_len = width * 3;
         match &developed {
             Developed::Cached(frame) => {
+                let mut linear = Vec::new();
                 for (row, source_y) in (rect.y..rect.y + rect.height).enumerate() {
                     let source = source_y as usize * stride + rect.x as usize;
                     let destination = &mut out[row * row_len..(row + 1) * row_len];
                     look_row(
-                        frame.samples[source..source + width].iter().copied(),
+                        frame.samples[source..source + width].as_flattened(),
                         look,
                         scale,
+                        &mut linear,
                         destination,
                     );
                 }
             }
-            Developed::Stored(frame) => frame
-                .read_runs(rect, |row, column, bytes| {
-                    let target =
-                        &mut out[row * row_len + column * 3..][..bytes.len() / PIXEL_BYTES * 3];
-                    look_row(decode_pixels(bytes), look, scale, target);
-                })
-                .map_err(crate::io::FrameError::from)?,
+            Developed::Stored(frame) => {
+                look_stored(frame, rect, look, scale, out).map_err(crate::io::FrameError::from)?;
+            }
         }
         Ok(())
     }
+}
+
+/// [`RawStack::read_gained`] for a stored frame: each run is widened, then
+/// looked, through buffers reused across runs.
+fn look_stored<S: Sample>(
+    frame: &StoredFrame,
+    rect: Rect,
+    look: &LookTransform,
+    scale: f32,
+    out: &mut [S],
+) -> Result<(), RawError> {
+    let row_len = rect.width as usize * 3;
+    let (mut halves, mut widened, mut linear) = (Vec::new(), Vec::new(), Vec::new());
+    frame.read_runs(rect, |row, column, bytes| {
+        let target = &mut out[row * row_len + column * 3..][..bytes.len() / PIXEL_BYTES * 3];
+        decode_pixels(bytes, &mut halves, &mut widened);
+        look_row(&widened, look, scale, &mut linear, target);
+    })
 }
 
 /// The runs of `count` pixels from column `x` that each stay inside one
@@ -860,18 +879,23 @@ fn block_segments(x: usize, count: usize) -> impl Iterator<Item = (usize, usize)
     })
 }
 
-/// Applies `scale`, then the look, to `pixels`, narrowing into `target`.
+/// Applies `scale`, then the look, to `pixels` (three values each),
+/// narrowing into `target`. The matrix pass fills `linear`, the encode pass
+/// reads it back.
 fn look_row<S: Sample>(
-    pixels: impl Iterator<Item = [f32; 3]>,
+    pixels: &[f32],
     look: &LookTransform,
     scale: f32,
+    linear: &mut Vec<f32>,
     target: &mut [S],
 ) {
-    for (pixel, target) in pixels.zip(target.chunks_exact_mut(3)) {
-        let looked = look.forward_f32(pixel.map(|value| value * scale));
-        for (sample, value) in target.iter_mut().zip(looked) {
-            *sample = S::narrow(value * WHITE);
-        }
+    linear.resize(pixels.len(), 0.0);
+    for (mixed, pixel) in linear.chunks_exact_mut(3).zip(pixels.chunks_exact(3)) {
+        let scaled = [pixel[0] * scale, pixel[1] * scale, pixel[2] * scale];
+        mixed.copy_from_slice(&look.linear_f32(scaled));
+    }
+    for (sample, value) in target.iter_mut().zip(linear.iter()) {
+        *sample = S::narrow(encode_f32(*value) * WHITE);
     }
 }
 
@@ -1667,10 +1691,12 @@ fn seam<T>(path: &Path, operation: impl FnOnce() -> rawler::Result<T>) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        FrameBytes, PIXEL_BYTES, RawError, SCRATCH_BLOCK, StoredFrame, decode_pixels,
-        panic_boundary, scratch_bytes, write_samples,
+        FrameBytes, IDENTITY_MATRIX, LookTransform, PIXEL_BYTES, RawError, SCRATCH_BLOCK,
+        StoredFrame, WHITE, decode_pixels, look_stored, panic_boundary, scratch_bytes,
+        write_samples,
     };
-    use crate::tile::Rect;
+    use crate::equalize::UNIT_GAIN;
+    use crate::tile::{Rect, Sample};
     use std::path::Path;
 
     /// A frame whose sample at (x, y) is `[x, y, x + y]`, exact in half precision.
@@ -1681,13 +1707,17 @@ mod tests {
     }
 
     /// The same frame twice: in a scratch file under `dir`, and in memory.
-    fn stored_frames(dir: &Path, width: usize, height: usize) -> (StoredFrame, StoredFrame) {
-        let samples = coordinate_samples(width, height);
+    fn stored_frames(
+        dir: &Path,
+        width: usize,
+        height: usize,
+        samples: &[[f32; 3]],
+    ) -> (StoredFrame, StoredFrame) {
         let path = dir.join("frame.f16");
         let mut file = std::fs::File::create(&path).expect("scratch file");
-        write_samples(&mut file, &samples, width).expect("scratch writes");
+        write_samples(&mut file, samples, width).expect("scratch writes");
         let mut memory = Vec::new();
-        write_samples(&mut memory, &samples, width).expect("vector writes");
+        write_samples(&mut memory, samples, width).expect("vector writes");
         let frame = |bytes| StoredFrame {
             bytes,
             width,
@@ -1704,24 +1734,182 @@ mod tests {
     fn read_rect(frame: &StoredFrame, rect: Rect) -> Vec<[f32; 3]> {
         let columns = rect.width as usize;
         let mut pixels = vec![[f32::NAN; 3]; columns * rect.height as usize];
+        let (mut halves, mut decoded) = (Vec::new(), Vec::new());
         frame
             .read_runs(rect, |row, column, bytes| {
+                decode_pixels(bytes, &mut halves, &mut decoded);
                 for (slot, pixel) in pixels[row * columns + column..]
                     .iter_mut()
-                    .zip(decode_pixels(bytes))
+                    .zip(decoded.chunks_exact(3))
                 {
-                    *slot = pixel;
+                    *slot = [pixel[0], pixel[1], pixel[2]];
                 }
             })
             .expect("the frame reads");
         pixels
     }
 
+    /// Scalar oracle: one `to_f32` per channel.
+    fn reference_decode(bytes: &[u8]) -> impl Iterator<Item = [f32; 3]> + '_ {
+        bytes.chunks_exact(PIXEL_BYTES).map(|pixel| {
+            std::array::from_fn(|channel| {
+                let bytes = pixel[channel * 2..(channel + 1) * 2]
+                    .try_into()
+                    .expect("a channel is two bytes");
+                half::f16::from_ne_bytes(bytes).to_f32()
+            })
+        })
+    }
+
+    /// Per-pixel scalar oracle for `look_row`.
+    fn reference_look_row<S: Sample>(
+        pixels: impl Iterator<Item = [f32; 3]>,
+        look: &LookTransform,
+        scale: f32,
+        target: &mut [S],
+    ) {
+        for (pixel, target) in pixels.zip(target.chunks_exact_mut(3)) {
+            let looked = look.forward_f32(pixel.map(|value| value * scale));
+            for (sample, value) in target.iter_mut().zip(looked) {
+                *sample = S::narrow(value * WHITE);
+            }
+        }
+    }
+
+    fn reference_stored<S: Sample>(
+        frame: &StoredFrame,
+        rect: Rect,
+        look: &LookTransform,
+        scale: f32,
+        out: &mut [S],
+    ) {
+        let row_len = rect.width as usize * 3;
+        frame
+            .read_runs(rect, |row, column, bytes| {
+                let target =
+                    &mut out[row * row_len + column * 3..][..bytes.len() / PIXEL_BYTES * 3];
+                reference_look_row(reference_decode(bytes), look, scale, target);
+            })
+            .expect("the frame reads");
+    }
+
+    #[test]
+    fn f16_widening_matches_half_for_every_pattern() {
+        // Two extra values make the count a multiple of three; the slice
+        // starts at an odd address.
+        let patterns: Vec<u16> = (0..=u16::MAX).chain([0x7e01, 0xfc01]).collect();
+        let mut backing = vec![0u8; patterns.len() * 2 + 1];
+        for (slot, bits) in backing[1..].chunks_exact_mut(2).zip(&patterns) {
+            slot.copy_from_slice(&half::f16::from_bits(*bits).to_ne_bytes());
+        }
+        let (mut halves, mut widened) = (Vec::new(), Vec::new());
+        decode_pixels(&backing[1..], &mut halves, &mut widened);
+        assert_eq!(widened.len(), patterns.len());
+        for (bits, got) in patterns.iter().zip(&widened) {
+            let want = half::f16::from_bits(*bits).to_f32();
+            assert_eq!(got.to_bits(), want.to_bits(), "pattern {bits:#06x}");
+        }
+    }
+
+    /// Frame samples that carry every f16 pattern in every channel (the
+    /// strides are odd, so each channel is a permutation of the patterns).
+    fn pattern_samples(width: usize, height: usize) -> Vec<[f32; 3]> {
+        (0..width * height)
+            .map(|pixel| {
+                [20_001usize, 30_011, 40_013]
+                    .map(|stride| half::f16::from_bits((pixel * stride % 65_536) as u16).to_f32())
+            })
+            .collect()
+    }
+
+    fn assert_same_bits<S: Sample>(got: &[S], want: &[S], message: &str) {
+        assert_eq!(got.len(), want.len(), "{message}");
+        if let Some(at) = got
+            .iter()
+            .zip(want)
+            .position(|(g, w)| g.widen().to_bits() != w.widen().to_bits())
+        {
+            panic!(
+                "{message}: sample {at} is {} want {}",
+                got[at].widen(),
+                want[at].widen()
+            );
+        }
+    }
+
+    fn check_look_stored<S: Sample>(
+        frame: &StoredFrame,
+        rect: Rect,
+        look: &LookTransform,
+        scale: f32,
+        message: &str,
+    ) {
+        let len = rect.width as usize * rect.height as usize * 3;
+        let mut got = vec![S::default(); len];
+        look_stored(frame, rect, look, scale, &mut got).expect("the frame reads");
+        let mut want = vec![S::default(); len];
+        reference_stored(frame, rect, look, scale, &mut want);
+        assert_same_bits(&got, &want, message);
+    }
+
+    #[test]
+    fn raw_look_row_matches_reference() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let camera = LookTransform::new(
+            [2.1, 1.0, 1.5, f32::NAN],
+            [[0.9, -0.2, 0.1], [-0.3, 1.1, 0.2], [0.05, 0.1, 0.8]],
+        );
+        let grey = LookTransform::new([f32::NAN; 4], IDENTITY_MATRIX);
+        let looks = [("camera", &camera), ("grey", &grey)];
+        let gains = [0, UNIT_GAIN / 3, UNIT_GAIN, UNIT_GAIN * 3 / 2, u32::MAX];
+        for (width, height) in [(300usize, 260usize), (70, 45)] {
+            let stores = stored_frames(dir.path(), width, height, &pattern_samples(width, height));
+            let (w, h) = (width as u32, height as u32);
+            let rects = [
+                (0, 0, 64, 40),
+                (0, 0, w, h),
+                (17, 3, 40, 30),
+                (60, 10, 10, 30),
+                (3, 60, 20, 10),
+                (w - 1, h - 1, 1, 1),
+                (w - 33, h - 20, 33, 20),
+            ]
+            .into_iter()
+            .filter(|&(x, y, width, height)| x + width <= w && y + height <= h)
+            .collect::<Vec<_>>();
+            for (store, frame) in [("file", &stores.0), ("memory", &stores.1)] {
+                for (name, look) in looks {
+                    for gain in gains {
+                        let scale = gain as f32 / UNIT_GAIN as f32;
+                        for &(x, y, width, height) in &rects {
+                            let rect = Rect {
+                                x,
+                                y,
+                                width,
+                                height,
+                            };
+                            let message = format!(
+                                "{w}x{h} {store} {name} gain {gain} rect ({x},{y}) {width}x{height}"
+                            );
+                            check_look_stored::<u16>(frame, rect, look, scale, &message);
+                            check_look_stored::<f32>(frame, rect, look, scale, &message);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn scratch_file_is_block_major() {
         let dir = tempfile::tempdir().expect("temp dir");
         for (width, height) in [(128, 64), (130, 64), (150, 70), (129, 131), (40, 30)] {
-            let (on_disk, in_memory) = stored_frames(dir.path(), width, height);
+            let (on_disk, in_memory) = stored_frames(
+                dir.path(),
+                width,
+                height,
+                &coordinate_samples(width, height),
+            );
             let (FrameBytes::File(path), FrameBytes::Memory(memory)) =
                 (&on_disk.bytes, &in_memory.bytes)
             else {
@@ -1753,7 +1941,12 @@ mod tests {
         let starts = [0usize, 1, 17, 63, 64, 65, 127];
         let lengths = [1usize, 2, 64, 65, 130];
         for (width, height) in [(150, 70), (129, 131), (40, 30)] {
-            let (on_disk, in_memory) = stored_frames(dir.path(), width, height);
+            let (on_disk, in_memory) = stored_frames(
+                dir.path(),
+                width,
+                height,
+                &coordinate_samples(width, height),
+            );
             let reference = coordinate_samples(width, height);
             let mut rects = vec![(width - 1, height - 1, 1, 1)];
             for &y0 in &starts {

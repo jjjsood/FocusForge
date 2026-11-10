@@ -109,6 +109,14 @@ impl LookTransform {
         })
     }
 
+    /// [`Self::forward_f32`] before the transfer curve: white balance and
+    /// colour matrix in linear sRGB. Same operations, same order.
+    #[inline]
+    pub(super) fn linear_f32(&self, rgb: [f32; 3]) -> [f32; 3] {
+        self.balanced_to_srgb
+            .map(|row| row[0] * rgb[0] + row[1] * rgb[1] + row[2] * rgb[2])
+    }
+
     /// Look-space `rgb` back to camera-linear: the exact inverse of
     /// [`Self::forward`].
     pub fn inverse(&self, rgb: [f64; 3]) -> [f64; 3] {
@@ -140,7 +148,7 @@ fn encode(x: f64) -> f64 {
 
 /// [`encode`] in `f32`.
 #[inline]
-fn encode_f32(x: f32) -> f32 {
+pub(super) fn encode_f32(x: f32) -> f32 {
     let magnitude = x.abs();
     let encoded = if magnitude <= KNEE as f32 {
         12.92 * magnitude
