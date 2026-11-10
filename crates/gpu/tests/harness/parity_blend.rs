@@ -6,7 +6,7 @@
 
 use focusforge_core::algorithm::TileReader;
 use focusforge_core::io::TiffStack;
-use focusforge_core::project::{BrushMode, Op, Point};
+use focusforge_core::project::{BrushMode, Op, Point, StrokeSource};
 use focusforge_core::retouch::blend;
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::ZMapInfo;
@@ -32,14 +32,7 @@ fn pt(x: i32, y: i32) -> Point {
 }
 
 fn stroke(path: Vec<Point>, radius: f32, softness: f32) -> Op {
-    Op::BrushStroke {
-        source_id: SRC_FRAME as u16,
-        path,
-        radius,
-        softness,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }
+    Op::frame_stroke(SRC_FRAME as u16, path, radius, softness)
 }
 
 fn blender(shared: &SharedDevice) -> Blender {
@@ -351,7 +344,7 @@ fn blend_refuses_oversized_region() {
 
 fn styled(path: Vec<Point>, radius: f32, softness: f32, mode: BrushMode, opacity: f32) -> Op {
     Op::BrushStroke {
-        source_id: SRC_FRAME as u16,
+        source: StrokeSource::Frame(SRC_FRAME as u16),
         path,
         radius,
         softness,

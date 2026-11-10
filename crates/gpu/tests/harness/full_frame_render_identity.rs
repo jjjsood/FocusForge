@@ -18,8 +18,8 @@ use focusforge_core::io::{
 };
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
-    self, BrushMode, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Op, ParentRef, PendingState,
-    Point, Project,
+    self, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Op, ParentRef, PendingState, Point,
+    Project,
 };
 use focusforge_core::retouch::blend;
 use focusforge_core::tile::Rect;
@@ -42,15 +42,14 @@ const RENDER_BAND_BYTES: usize = 4 << 20;
 /// one reaches past the right edge.
 fn strokes(width: u32, height: u32) -> Vec<Op> {
     let (w, h) = (width as i32, height as i32);
-    let stroke =
-        |source_id: u16, radius: f32, softness: f32, path: &[(i32, i32)]| Op::BrushStroke {
+    let stroke = |source_id: u16, radius: f32, softness: f32, path: &[(i32, i32)]| {
+        Op::frame_stroke(
             source_id,
-            path: path.iter().map(|&(x, y)| Point { x, y }).collect(),
+            path.iter().map(|&(x, y)| Point { x, y }).collect(),
             radius,
             softness,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        };
+        )
+    };
     vec![
         stroke(
             0,
@@ -117,13 +116,11 @@ fn render_live(held: &HeldCheckpoint, ops: &[Op], blender: &Blender, out: &Path)
 
     let mut placed = Vec::new();
     for op in ops {
-        let Op::BrushStroke { source_id, .. } = op else {
-            panic!("the live leg blends brush strokes only");
-        };
+        let frame = blend::source_frame(op).expect("the live leg blends frame strokes only");
         if let Some(footprint) = blend::footprint(op, info).expect("the stroke must be valid") {
             placed.push(blend::PlacedStroke {
                 op,
-                frame: usize::from(*source_id),
+                frame: usize::from(frame),
                 footprint,
             });
         }

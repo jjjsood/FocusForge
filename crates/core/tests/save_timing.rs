@@ -15,8 +15,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use focusforge_core::io::frame_paths;
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
-    self, BrushMode, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Op, Opened,
-    ParentRef, Plane, Point, Project,
+    self, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Op, Opened, ParentRef,
+    Plane, Point, Project,
 };
 
 const WARM_RUNS: usize = 3;
@@ -195,20 +195,18 @@ fn run_scenarios(frames: &[PathBuf], method: &'static str, out: &Path) -> Vec<Fi
     );
 
     let (w, h) = (held.width as i32, held.height as i32);
-    let stroke = Op::BrushStroke {
-        source_id: 1,
-        path: vec![
+    let stroke = Op::frame_stroke(
+        1,
+        vec![
             Point { x: w / 4, y: h / 2 },
             Point {
                 x: 3 * w / 4,
                 y: h / 2,
             },
         ],
-        radius: w as f32 / 100.0,
-        softness: 0.5,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    };
+        w as f32 / 100.0,
+        0.5,
+    );
     let mut head_id = String::new();
     let save_after_retouch = measure(
         method,

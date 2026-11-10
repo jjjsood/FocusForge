@@ -19,8 +19,7 @@ use focusforge_core::project::export::{
     ExportFormat, ExportOptions, MetadataOptions, export_checkpoint,
 };
 use focusforge_core::project::{
-    BrushMode, Metrics, Op, Plane, Point, Project, SealRequest, append_ops_onto, materialize_plane,
-    seal_at,
+    Metrics, Op, Plane, Point, Project, SealRequest, append_ops_onto, materialize_plane, seal_at,
 };
 use focusforge_core::retouch::blend;
 use focusforge_core::zmap::ZMapInfo;
@@ -77,14 +76,7 @@ fn save_folder_receives_the_export_under_its_proposed_name() {
 }
 
 fn dab() -> Op {
-    Op::BrushStroke {
-        source_id: 0,
-        path: vec![Point { x: 1, y: 1 }],
-        radius: 0.5,
-        softness: 0.0,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }
+    Op::frame_stroke(0, vec![Point { x: 1, y: 1 }], 0.5, 0.0)
 }
 
 const MW: u32 = 5;
@@ -187,14 +179,7 @@ fn build_edited_with_samples(name: &str, samples_per_pixel: u32) -> Edited {
     let edited = append_ops_onto(
         &project,
         &root,
-        vec![Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 2, y: 1 }],
-            radius: 1.5,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }],
+        vec![Op::frame_stroke(1, vec![Point { x: 2, y: 1 }], 1.5, 0.0)],
         None,
         t0 + 60,
     )
@@ -528,14 +513,7 @@ fn live_export_writes_the_unsaved_state_and_changes_nothing() {
     let root_row = row_index(&controller, &edited.root);
     controller.select_checkpoint_row(root_row);
     common::enter_editor(&mut controller);
-    let first = Op::BrushStroke {
-        source_id: 1,
-        path: vec![Point { x: 1, y: 1 }],
-        radius: 0.5,
-        softness: 0.0,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    };
+    let first = Op::frame_stroke(1, vec![Point { x: 1, y: 1 }], 0.5, 0.0);
     controller
         .edit_session_mut()
         .unwrap()
@@ -549,14 +527,7 @@ fn live_export_writes_the_unsaved_state_and_changes_nothing() {
     controller.export_confirmed(move |_proposed| Some(picked.clone()));
     wait_export(&mut controller);
 
-    let repaint = Op::BrushStroke {
-        source_id: 2,
-        path: vec![Point { x: 1, y: 1 }],
-        radius: 0.5,
-        softness: 0.0,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    };
+    let repaint = Op::frame_stroke(2, vec![Point { x: 1, y: 1 }], 0.5, 0.0);
     controller
         .edit_session_mut()
         .unwrap()
@@ -658,14 +629,7 @@ fn live_export_writes_the_unsaved_state_and_changes_nothing() {
     controller
         .edit_session_mut()
         .unwrap()
-        .append(Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 30, y: 30 }],
-            radius: 8.0,
-            softness: 0.5,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        })
+        .append(Op::frame_stroke(1, vec![Point { x: 30, y: 30 }], 8.0, 0.5))
         .expect("the stroke inside the map applies");
     let before: std::collections::BTreeSet<PathBuf> = fs::read_dir(&frames)
         .unwrap()
@@ -1046,14 +1010,7 @@ fn build_raw_edited(name: &str) -> (Edited, Vec<tempfile::NamedTempFile>) {
     let edited = append_ops_onto(
         &project,
         &root,
-        vec![Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 20, y: 10 }],
-            radius: 4.0,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }],
+        vec![Op::frame_stroke(1, vec![Point { x: 20, y: 10 }], 4.0, 0.0)],
         None,
         t0 + 60,
     )

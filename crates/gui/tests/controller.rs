@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use focusforge_core::align::Registration;
 use focusforge_core::io::Rect;
-use focusforge_core::project::{self, BrushMode, Op, Point, Project};
+use focusforge_core::project::{self, BrushMode, Op, Point, Project, StrokeSource};
 use focusforge_core::zmap::ZMapReader;
 use focusforge_gpu::blend::Blender;
 use focusforge_gpu::device::SharedDevice;
@@ -577,14 +577,7 @@ fn read_whole_zmap(path: &Path) -> Vec<u16> {
 }
 
 fn one_dab(source_id: u16) -> Op {
-    Op::BrushStroke {
-        source_id,
-        path: vec![Point { x: 20, y: 20 }],
-        radius: 4.0,
-        softness: 0.0,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }
+    Op::frame_stroke(source_id, vec![Point { x: 20, y: 20 }], 4.0, 0.0)
 }
 
 /// `set_mode(Editor)` refused: `false`, nothing emitted, still stacking.
@@ -1734,14 +1727,7 @@ fn pressing_the_checkpoints_scrollbar_thumb_grabs_it_without_jumping() {
     )
     .unwrap();
     for i in 1..10i64 {
-        let op = Op::BrushStroke {
-            source_id: 0,
-            path: vec![Point { x: 1, y: 1 }],
-            radius: 0.5,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        };
+        let op = Op::frame_stroke(0, vec![Point { x: 1, y: 1 }], 0.5, 0.0);
         append_ops_at(&project_path, vec![op], None, noon + i * 60)
             .unwrap_or_else(|err| panic!("checkpoint {i} must append: {err}"));
     }
@@ -4083,10 +4069,8 @@ impl Sealed {
 
     /// `op` blended over `out`, a whole-map composite, from its frame.
     fn blend_over(&self, out: &mut [u16], op: &Op, info: ZMapInfo) {
-        let Op::BrushStroke { source_id, .. } = op else {
-            panic!("only brush strokes are blended");
-        };
-        let src = self.frame_view(usize::from(*source_id));
+        let frame = blend::source_frame(op).expect("only frame strokes are blended");
+        let src = self.frame_view(usize::from(frame));
         blend::apply(op, info, self.map, out, self.map, &src, 3).unwrap();
     }
 
@@ -4214,28 +4198,24 @@ fn drag_produces_one_brush_stroke() {
     drag(&mut c, &line);
     assert_eq!(
         ops(&c),
-        vec![Op::BrushStroke {
-            source_id: 2,
-            path: vec![Point { x: 10, y: 10 }, Point { x: 40, y: 30 }],
+        vec![Op::frame_stroke(
+            2,
+            vec![Point { x: 10, y: 10 }, Point { x: 40, y: 30 }],
             radius,
-            softness: 0.25,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }],
+            0.25
+        )],
         "one op, its straight path resampled down to its two ends"
     );
 
     drag(&mut c, &[(20.0, 21.0)]);
     assert_eq!(
         ops(&c).last(),
-        Some(&Op::BrushStroke {
-            source_id: 2,
-            path: vec![Point { x: 20, y: 21 }],
+        Some(&Op::frame_stroke(
+            2,
+            vec![Point { x: 20, y: 21 }],
             radius,
-            softness: 0.25,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }),
+            0.25
+        )),
         "a press-release with no motion is a one-point op"
     );
     assert_eq!(ops(&c).len(), 2);
@@ -4247,7 +4227,13 @@ fn drag_produces_one_brush_stroke() {
     common::settle_region_renders(&mut c);
     assert_eq!(ops(&c).len(), 3, "a drag starting on the left pane");
     assert!(
-        matches!(ops(&c).last(), Some(Op::BrushStroke { source_id: 2, .. })),
+        matches!(
+            ops(&c).last(),
+            Some(Op::BrushStroke {
+                source: StrokeSource::Frame(2),
+                ..
+            })
+        ),
         "it paints the selected source"
     );
     common::settle_region_renders(&mut c);
@@ -4411,14 +4397,12 @@ fn brush_controls_convert_to_storage_units() {
         drag(&mut c, &[press_at]);
         assert_eq!(
             ops(&c).last(),
-            Some(&Op::BrushStroke {
-                source_id: c.brush_source().unwrap(),
-                path: vec![Point { x: 17, y: 42 }],
-                radius: view.size / 2.0,
-                softness: view.soft / 100.0,
-                mode: BrushMode::Normal,
-                opacity: 1.0,
-            }),
+            Some(&Op::frame_stroke(
+                c.brush_source().unwrap(),
+                vec![Point { x: 17, y: 42 }],
+                view.size / 2.0,
+                view.soft / 100.0
+            )),
             "pressed at {press_at:?}"
         );
     }
@@ -5180,7 +5164,10 @@ fn pipette_reads_and_appends_nothing() {
     assert!(
         matches!(
             ops(&c)[..],
-            [Op::BrushStroke { source_id, .. }] if source_id == picked
+            [Op::BrushStroke {
+                source: StrokeSource::Frame(source_id),
+                ..
+            }] if source_id == picked
         ),
         "the next drag paints with the picked source: {:?}",
         ops(&c)
@@ -5223,14 +5210,7 @@ fn zmap_unreadable_leaves_the_image_working() {
     c.select_frame(1);
     common::paint(
         &mut c,
-        Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 20, y: 20 }],
-            radius: 4.0,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        },
+        Op::frame_stroke(1, vec![Point { x: 20, y: 20 }], 4.0, 0.0),
     );
     assert_eq!(ops(&c).len(), 1, "a stroke appends");
     let (sx, sy) = at(50.0, 50.0);
@@ -5266,7 +5246,10 @@ fn pipette_reads_the_overlay() {
     assert!(
         matches!(
             ops(&c)[..],
-            [Op::BrushStroke { source_id, .. }] if source_id == painter
+            [Op::BrushStroke {
+                source: StrokeSource::Frame(source_id),
+                ..
+            }] if source_id == painter
         ),
         "a stroke from another frame covers the pixel"
     );
@@ -5324,6 +5307,58 @@ fn pipette_reads_the_overlay() {
     assert_eq!(ops(&c).len(), 1, "picking appends nothing");
 }
 
+#[test]
+fn pipette_refuses_a_checkpoint_stroke() {
+    let (mut c, _) = open_editor("pipette_checkpoint_source");
+    let zmap = c.held_checkpoints().last().unwrap().zmap.clone();
+    let stored = read_whole_zmap(&zmap);
+    let info = ZMapReader::open(&zmap).unwrap().info();
+    let (x, y, under) = (8..info.height() - 8)
+        .flat_map(|y| (8..info.width() - 8).map(move |x| (x, y)))
+        .find_map(|(x, y)| {
+            let source = stored[(y * info.width() + x) as usize];
+            (source != NO_SOURCE).then_some((x, y, source))
+        })
+        .expect("the fused map names a source away from its edge");
+    let held = (under + 1) % 3;
+    let stroke = Op::BrushStroke {
+        source: StrokeSource::Checkpoint("0123456789abcdef0123456789abcdef".to_string()),
+        path: vec![Point {
+            x: x as i32,
+            y: y as i32,
+        }],
+        radius: 8.0,
+        softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
+    };
+    c.edit_session_mut()
+        .unwrap()
+        .append(stroke)
+        .expect("a checkpoint stroke records as geometry");
+
+    let alt_click = |c: &mut AppController| {
+        let (sx, sy) = at(x as f32, y as f32);
+        c.pointer(PointerKind::Down, Button::Left, sx, sy, ALT);
+        c.pointer(PointerKind::Up, Button::Left, sx, sy, ALT);
+    };
+    c.select_frame(usize::from(held));
+    alt_click(&mut c);
+    assert_eq!(
+        c.brush_source(),
+        Some(held),
+        "the pick over a checkpoint stroke fails instead of reading the stored map"
+    );
+
+    c.edit_session_mut().unwrap().undo();
+    alt_click(&mut c);
+    assert_eq!(
+        c.brush_source(),
+        Some(under),
+        "without the stroke the same pick reads the stored map"
+    );
+}
+
 /// The overlay's colour at every pixel of the map: the active tab's
 /// `overlay_draw()` over the stored indices at `zmap`.
 fn overlay_pixels(c: &AppController, zmap: &Path) -> Vec<[u8; 3]> {
@@ -5372,7 +5407,7 @@ fn frame_other_than(not: &[u16]) -> usize {
 /// A hard-edged single dab.
 fn dab(source_id: u16, centre: (u32, u32), radius: f32, mode: BrushMode, opacity: f32) -> Op {
     Op::BrushStroke {
-        source_id,
+        source: StrokeSource::Frame(source_id),
         path: vec![Point {
             x: centre.0 as i32,
             y: centre.1 as i32,
@@ -6105,7 +6140,9 @@ fn live_overlay_follows_the_drag() {
     assert!(ops(&c).is_empty(), "the stroke is not an op while held");
     let [
         Op::BrushStroke {
-            source_id, path, ..
+            source: StrokeSource::Frame(source_id),
+            path,
+            ..
         },
     ] = &held[..]
     else {
@@ -6861,14 +6898,7 @@ fn live_stroke_previews_each_new_segment() {
     let view = c.brush_toolbar_view();
     let (source, radius, softness) = (1u16, view.size / 2.0, view.soft / 100.0);
     let info = c.edit_session().unwrap().info();
-    let stroke = |path: Vec<Point>| Op::BrushStroke {
-        source_id: source,
-        path,
-        radius,
-        softness,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    };
+    let stroke = |path: Vec<Point>| Op::frame_stroke(source, path, radius, softness);
 
     // A quarter-pixel trace, some steps sub-pixel, wandering across tiles.
     let trace: Vec<(f32, f32)> = (0..45)
@@ -8053,14 +8083,12 @@ fn modal_opening_mid_stroke_leaves_no_live_drag() {
     release(&mut c, at(50.0, 40.0));
     assert_eq!(
         ops(&c),
-        vec![Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 10, y: 10 }, Point { x: 20, y: 15 }],
-            radius: c.brush_toolbar_view().size / 2.0,
-            softness: c.brush_toolbar_view().soft_fraction,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }],
+        vec![Op::frame_stroke(
+            1,
+            vec![Point { x: 10, y: 10 }, Point { x: 20, y: 15 }],
+            c.brush_toolbar_view().size / 2.0,
+            c.brush_toolbar_view().soft_fraction
+        )],
         "the stroke ends on the next pointer-up, with nothing added after the modal opened"
     );
 
@@ -8172,14 +8200,12 @@ fn paint(controller: &mut AppController, x: i32) {
         .stored_source(x as u32, 20)
         .expect("the column lies inside the map");
     session
-        .append(Op::BrushStroke {
-            source_id: u16::from(shown == 0),
-            path: vec![Point { x, y: 20 }],
-            radius: 4.0,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        })
+        .append(Op::frame_stroke(
+            u16::from(shown == 0),
+            vec![Point { x, y: 20 }],
+            4.0,
+            0.0,
+        ))
         .expect("a dab inside the map applies");
 }
 
@@ -9007,14 +9033,7 @@ fn live_soft_edge_is_a_blend_not_a_dither() {
     c.select_frame(1);
     let radius = c.brush_toolbar_view().size / 2.0;
     let softness = c.brush_toolbar_view().soft / 100.0;
-    let stroke = Op::BrushStroke {
-        source_id: 1,
-        path: rounded(&[(20.0, 30.0), (36.0, 30.0)]),
-        radius,
-        softness,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    };
+    let stroke = Op::frame_stroke(1, rounded(&[(20.0, 30.0), (36.0, 30.0)]), radius, softness);
     let source = sealed.frame_view(1);
 
     let check = |c: &AppController, case: &str| {
@@ -9086,14 +9105,7 @@ fn live_tick_reblends_only_its_footprint(name: &str, device: Option<&SharedDevic
     c.select_frame(2);
     let radius = c.brush_toolbar_view().size / 2.0;
     let softness = c.brush_toolbar_view().soft / 100.0;
-    let stroke = |path: Vec<Point>| Op::BrushStroke {
-        source_id: 2,
-        path,
-        radius,
-        softness,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    };
+    let stroke = |path: Vec<Point>| Op::frame_stroke(2, path, radius, softness);
 
     // Segments that double back over each other, so alpha would compound
     // were each segment blended on its own.
@@ -9261,22 +9273,18 @@ fn brush_stroke_appends_soft_op() {
     assert_eq!(
         ops(&c),
         vec![
-            Op::BrushStroke {
-                source_id: 2,
-                path: vec![Point { x: 12, y: 20 }, Point { x: 18, y: 30 }],
+            Op::frame_stroke(
+                2,
+                vec![Point { x: 12, y: 20 }, Point { x: 18, y: 30 }],
                 radius,
-                softness: 0.0,
-                mode: BrushMode::Normal,
-                opacity: 1.0,
-            },
-            Op::BrushStroke {
-                source_id: 2,
-                path: vec![Point { x: 36, y: 20 }, Point { x: 42, y: 30 }],
+                0.0
+            ),
+            Op::frame_stroke(
+                2,
+                vec![Point { x: 36, y: 20 }, Point { x: 42, y: 30 }],
                 radius,
-                softness: 1.0,
-                mode: BrushMode::Normal,
-                opacity: 1.0,
-            },
+                1.0
+            ),
         ]
     );
 }

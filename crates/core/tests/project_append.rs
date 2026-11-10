@@ -12,7 +12,7 @@ use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
-    self, AppendRequest, BrushMode, Metrics, Op, ParentRef, Point, Project, SealRequest,
+    self, AppendRequest, Metrics, Op, ParentRef, Point, Project, SealRequest,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
@@ -452,20 +452,18 @@ fn saved(id: &str) -> ParentRef {
 
 /// One brush stroke painting frame `source_id` from `(x, y)` down and right.
 fn stroke(source_id: u16, x: i32, y: i32) -> Op {
-    Op::BrushStroke {
+    Op::frame_stroke(
         source_id,
-        path: vec![
+        vec![
             Point { x, y },
             Point {
                 x: x + 12,
                 y: y + 8,
             },
         ],
-        radius: 5.0,
-        softness: 0.0,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }
+        5.0,
+        0.0,
+    )
 }
 
 /// `held` written as one linear chain: the first under the project's head

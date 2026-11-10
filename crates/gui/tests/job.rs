@@ -18,7 +18,7 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{self, FuseOutcome, FuseOutput, FuseRequest, StageObserver};
-use focusforge_core::project::{self, BrushMode, Op, Point, Project};
+use focusforge_core::project::{self, BrushMode, Op, Point, Project, StrokeSource};
 use focusforge_core::registry;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use focusforge_gui::canvas::CanvasFeed;
@@ -4273,14 +4273,7 @@ fn quit_and_close_questions_cannot_overlap() {
 
 /// A one-dab brush stroke of source 1 at `(x, 10)`.
 fn dab(x: i32) -> job::Op {
-    job::Op::BrushStroke {
-        source_id: 1,
-        path: vec![Point { x, y: 10 }],
-        radius: 0.5,
-        softness: 0.0,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }
+    job::Op::frame_stroke(1, vec![Point { x, y: 10 }], 0.5, 0.0)
 }
 
 /// Enters the editor on the active tab and paints `strokes` dabs.
@@ -8108,14 +8101,12 @@ fn raw_edit_session_below_the_cap_is_refused_naming_the_cap() {
 }
 
 fn raw_stroke() -> Op {
-    Op::BrushStroke {
-        source_id: 1,
-        path: vec![Point { x: 4, y: 11 }, Point { x: 32, y: 11 }],
-        radius: 40.0,
-        softness: 0.5,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }
+    Op::frame_stroke(
+        1,
+        vec![Point { x: 4, y: 11 }, Point { x: 32, y: 11 }],
+        40.0,
+        0.5,
+    )
 }
 
 /// `region` rendered from the base under `ops` into a fresh session's
@@ -8233,7 +8224,7 @@ fn raw_project_live_retouch_matches_saved_and_export() {
 
 fn raw_stroke_in(mode: BrushMode, source_id: u16, (x, y): (i32, i32), radius: f32) -> Op {
     Op::BrushStroke {
-        source_id,
+        source: StrokeSource::Frame(source_id),
         path: vec![Point { x, y }, Point { x: x + 3, y: y + 2 }],
         radius,
         softness: 0.3,

@@ -318,14 +318,7 @@ mod tests {
     }
 
     fn stroke_op(path: Vec<Point>) -> Op {
-        Op::BrushStroke {
-            source_id: 3,
-            path,
-            radius: 2.5,
-            softness: 0.4,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }
+        Op::frame_stroke(3, path, 2.5, 0.4)
     }
 
     /// `alpha` of `path` at every pixel of the test map.

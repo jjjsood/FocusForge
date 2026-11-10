@@ -18,7 +18,7 @@ use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
     self, BlobKind, BrushMode, Checkpoint, HASH_ALGORITHM, Metrics, Op, Plane, Point, Project,
-    SealRequest, SourceResolution, blob,
+    SealRequest, SourceResolution, StrokeSource, blob,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 
@@ -243,14 +243,7 @@ fn manifest_carries_no_format_version() {
 
     project::append_ops(
         &project_path,
-        vec![Op::BrushStroke {
-            source_id: 0,
-            path: vec![Point { x: 1, y: 1 }],
-            radius: 2.0,
-            softness: 0.5,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }],
+        vec![Op::frame_stroke(0, vec![Point { x: 1, y: 1 }], 2.0, 0.5)],
         None,
     )
     .unwrap();
@@ -343,14 +336,12 @@ fn checkpoint_serializes_every_field_with_no_parent_and_no_ops() {
 
 #[test]
 fn the_brush_stroke_round_trips() {
-    let ops = vec![Op::BrushStroke {
-        source_id: 7,
-        path: vec![Point { x: -3, y: 4 }, Point { x: 10, y: 20 }],
-        radius: 12.5,
-        softness: 0.25,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }];
+    let ops = vec![Op::frame_stroke(
+        7,
+        vec![Point { x: -3, y: 4 }, Point { x: 10, y: 20 }],
+        12.5,
+        0.25,
+    )];
     let text = serde_json::to_string(&ops).unwrap();
     let back: Vec<Op> = serde_json::from_str(&text).unwrap();
     assert_eq!(back, ops);
@@ -369,7 +360,7 @@ fn stroke_list_fixture() -> String {
 
 fn stroke(mode: BrushMode, opacity: f32) -> Op {
     Op::BrushStroke {
-        source_id: 3,
+        source: StrokeSource::Frame(3),
         path: vec![Point { x: -4, y: 9 }, Point { x: 30, y: -2 }],
         radius: 6.5,
         softness: 0.0,
@@ -540,6 +531,148 @@ fn brush_stroke_mode_opacity_default_keeps_its_bytes_and_id() {
         Checkpoint::derive_child_id("parent", "fingerprint", &blake3::hash(ops_json).to_hex(), 7)
     };
     assert_eq!(id(&bytes), id(without_fields.as_bytes()));
+}
+
+fn sourced_stroke(source: StrokeSource, points: usize, mode: BrushMode, opacity: f32) -> Op {
+    Op::BrushStroke {
+        source,
+        path: (0..points as i32)
+            .map(|i| Point { x: i * 3, y: -i })
+            .collect(),
+        radius: 4.0,
+        softness: 0.75,
+        mode,
+        opacity,
+    }
+}
+
+#[test]
+fn stroke_source_round_trips_both_variants() {
+    let sources = [
+        StrokeSource::Frame(0),
+        StrokeSource::Frame(u16::MAX),
+        StrokeSource::Checkpoint("0123456789abcdef0123456789abcdef".into()),
+        StrokeSource::Checkpoint(String::new()),
+    ];
+    for source in sources {
+        for points in [0, 1, 1000] {
+            for (mode, opacity) in [(BrushMode::Normal, 1.0), (BrushMode::Darken, 0.3)] {
+                let op = sourced_stroke(source.clone(), points, mode, opacity);
+                let text = serde_json::to_string(&op).unwrap();
+                assert_eq!(serde_json::from_str::<Op>(&text).unwrap(), op);
+
+                let value = serde_json::to_value(&op).unwrap();
+                let fields = value["brush-stroke"].as_object().unwrap();
+                match &source {
+                    StrokeSource::Frame(n) => {
+                        assert_eq!(fields["source_id"], serde_json::json!(n), "{op:?}");
+                        assert!(!fields.contains_key("source"), "{op:?}");
+                    }
+                    StrokeSource::Checkpoint(id) => {
+                        assert_eq!(
+                            fields["source"],
+                            serde_json::json!({ "checkpoint": id }),
+                            "{op:?}"
+                        );
+                        assert!(!fields.contains_key("source_id"), "{op:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn stroke_source_frame_keeps_its_bytes_and_id() {
+    let literal = r#"[{"brush-stroke":{"source_id":65535,"path":[{"x":-7,"y":0},{"x":0,"y":41},{"x":9,"y":9}],"radius":2.5,"softness":1.0}}]"#;
+    let ops: Vec<Op> = serde_json::from_str(literal).unwrap();
+    let bytes = serde_json::to_vec(&ops).unwrap();
+    assert_eq!(bytes, literal.as_bytes());
+    let id = |ops_json: &[u8]| {
+        Checkpoint::derive_child_id("parent", "fingerprint", &blake3::hash(ops_json).to_hex(), 7)
+    };
+    assert_eq!(id(&bytes), id(literal.as_bytes()));
+    assert_eq!(
+        serde_json::to_string(&Op::frame_stroke(2, vec![Point { x: 0, y: 0 }], 4.5, 0.25)).unwrap(),
+        r#"{"brush-stroke":{"source_id":2,"path":[{"x":0,"y":0}],"radius":4.5,"softness":0.25}}"#
+    );
+    assert_eq!(
+        ops,
+        vec![Op::frame_stroke(
+            u16::MAX,
+            vec![
+                Point { x: -7, y: 0 },
+                Point { x: 0, y: 41 },
+                Point { x: 9, y: 9 }
+            ],
+            2.5,
+            1.0
+        )]
+    );
+
+    let (_dir, path) = sealed("project_format_stroke_source_frame");
+    let frames = vec![
+        Op::frame_stroke(0, vec![Point { x: 1, y: 2 }], 3.0, 0.5),
+        sourced_stroke(StrokeSource::Frame(2), 2, BrushMode::Lighten, 0.5),
+    ];
+    let appended = project::append_ops(&path, frames.clone(), None).unwrap();
+    let entry = format!("checkpoints/{}.json", appended.checkpoint);
+    let raw: serde_json::Value = serde_json::from_slice(
+        &Index::read(&path)
+            .unwrap()
+            .read_entry(&path, &entry)
+            .unwrap(),
+    )
+    .unwrap();
+    for (i, expected) in [0, 2].into_iter().enumerate() {
+        let written = raw["ops"][i]["brush-stroke"].as_object().unwrap();
+        assert_eq!(written["source_id"], serde_json::json!(expected), "{raw}");
+        assert!(!written.contains_key("source"), "{raw}");
+    }
+    assert_eq!(Project::open(&path).unwrap().checkpoint().ops, frames);
+}
+
+fn stroke_with(source_fields: &str) -> String {
+    let comma = if source_fields.is_empty() { "" } else { "," };
+    format!(
+        r#"{{"brush-stroke":{{{source_fields}{comma}"path":[{{"x":2,"y":3}}],"radius":1.5,"softness":0.25}}}}"#
+    )
+}
+
+#[test]
+fn legacy_source_id_reads_as_a_frame() {
+    for n in [0u16, 1, 255, 256, 65535] {
+        for fields in [
+            format!(r#""source_id":{n}"#),
+            format!(r#""source":{{"frame":{n}}}"#),
+        ] {
+            let op: Op = serde_json::from_str(&stroke_with(&fields)).unwrap();
+            let Op::BrushStroke { source, .. } = op else {
+                panic!("not a brush stroke: {op:?}");
+            };
+            assert_eq!(source, StrokeSource::Frame(n), "{fields}");
+        }
+    }
+}
+
+#[test]
+fn legacy_source_id_with_source_is_refused() {
+    let both = stroke_with(r#""source_id":4,"source":{"frame":4}"#);
+    let message = serde_json::from_str::<Op>(&both).unwrap_err().to_string();
+    assert!(
+        message.contains("source_id") && message.contains("source"),
+        "{message}"
+    );
+    assert!(message.contains("both"), "{message}");
+
+    let neither = serde_json::from_str::<Op>(&stroke_with("")).unwrap_err();
+    assert!(
+        neither.to_string().contains("missing field `source_id`"),
+        "{neither}"
+    );
+
+    let unknown = serde_json::from_str::<Op>(&stroke_with(r#""source":{"layer":1}"#)).unwrap_err();
+    assert!(unknown.to_string().contains("unknown variant"), "{unknown}");
 }
 
 #[test]

@@ -51,12 +51,12 @@ pub use focusforge_core::align::{Registration, Transform};
 pub use focusforge_core::equalize::UNIT_GAIN;
 pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage, StageCacheError};
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
-pub use focusforge_core::project::{BrushMode, Op};
+pub use focusforge_core::project::{BrushMode, Op, StrokeSource};
 pub use focusforge_core::project::{
     HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, kept_entries, now_unix,
 };
 pub use focusforge_core::retouch::{
-    ModeConditions, RetouchError, footprint, needs_mode_conditions, top_source,
+    ModeConditions, RetouchError, footprint, needs_mode_conditions, source_frame, top_source,
 };
 pub use focusforge_core::update::{
     CheckFailure, HttpReleaseSource, ReleaseSource, UpdateCheck, check as check_for_update,
@@ -2017,13 +2017,11 @@ fn placed_strokes(
 ) -> Result<Vec<blend::PlacedStroke<'_>>, String> {
     let mut placed = Vec::new();
     for op in &job.ops {
-        let Op::BrushStroke { source_id, .. } = op else {
-            return Err(RetouchError::Unsupported.to_string());
-        };
+        let frame = blend::source_frame(op).map_err(|error| error.to_string())?;
         if let Some(footprint) = blend::footprint(op, info).map_err(|error| error.to_string())? {
             placed.push(blend::PlacedStroke {
                 op,
-                frame: usize::from(*source_id),
+                frame: usize::from(frame),
                 footprint,
             });
         }
@@ -2880,5 +2878,106 @@ mod export_refusal_tests {
         let panicked = export_outcome(Err(Box::new("boom"))).unwrap_err();
         assert!(!panicked.locate);
         assert_eq!(panicked.lines, vec!["Cannot export this position."]);
+    }
+}
+
+#[cfg(test)]
+mod placed_stroke_tests {
+    use super::*;
+    use crate::canvas::OverlayDraw;
+    use focusforge_core::project::Point;
+    use std::num::NonZeroU32;
+
+    const CHECKPOINT: &str = "feedfacecafebeef0123456789abcdef";
+
+    fn dab(x: i32) -> Vec<Point> {
+        vec![Point { x, y: 10 }]
+    }
+
+    fn frame_stroke(frame: u16, x: i32) -> Op {
+        Op::frame_stroke(frame, dab(x), 3.0, 0.5)
+    }
+
+    fn checkpoint_stroke(x: i32) -> Op {
+        Op::BrushStroke {
+            source: StrokeSource::Checkpoint(CHECKPOINT.to_string()),
+            path: dab(x),
+            radius: 3.0,
+            softness: 0.5,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
+        }
+    }
+
+    fn job_of(ops: Vec<Op>) -> RegionRender {
+        RegionRender {
+            region: Rect {
+                x: 0,
+                y: 0,
+                width: 48,
+                height: 32,
+            },
+            pre: PreImage::Base,
+            ops,
+            ends_drag: false,
+        }
+    }
+
+    fn info() -> ZMapInfo {
+        ZMapInfo::new(48, 32, 6).unwrap()
+    }
+
+    #[test]
+    fn a_frame_only_job_places_its_strokes_with_their_frames() {
+        let job = job_of(vec![frame_stroke(5, 8), frame_stroke(2, 30)]);
+        let placed = placed_strokes(info(), &job).unwrap();
+        let frames: Vec<usize> = placed.iter().map(|p| p.frame).collect();
+        assert_eq!(frames, [5, 2]);
+    }
+
+    #[test]
+    fn checkpoint_source_is_refused() {
+        let expected = RetouchError::CheckpointSource {
+            checkpoint: CHECKPOINT.to_string(),
+        }
+        .to_string();
+        for ops in [
+            vec![frame_stroke(3, 8), checkpoint_stroke(30)],
+            vec![checkpoint_stroke(30), frame_stroke(3, 8)],
+        ] {
+            let error = placed_strokes(info(), &job_of(ops))
+                .err()
+                .expect("a checkpoint source is refused");
+            assert_eq!(error, expected);
+            assert!(error.contains(CHECKPOINT), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_overlay_keeps_the_stored_colours_under_a_checkpoint_stroke() {
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            width: 48,
+            height: 32,
+        };
+        let indices = vec![1u16; 48 * 32];
+        let colors = |ops: Vec<Op>| {
+            let mut draw = OverlayDraw::for_opacity(6, 1.0);
+            draw.ops = ops.into();
+            draw.colors(info(), whole, NonZeroU32::MIN, &indices)
+        };
+        let stored = colors(Vec::new());
+        assert_ne!(
+            colors(vec![frame_stroke(4, 8)]),
+            stored,
+            "a frame stroke recolours the overlay"
+        );
+        assert_eq!(colors(vec![checkpoint_stroke(8)]), stored);
+        assert_eq!(
+            colors(vec![frame_stroke(4, 8), checkpoint_stroke(30)]),
+            stored,
+            "one checkpoint stroke leaves the whole overlay stored"
+        );
     }
 }

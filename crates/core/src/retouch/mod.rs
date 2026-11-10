@@ -9,7 +9,7 @@ use crate::zmap::ZMapError;
 
 pub use blend::{
     ModeConditions, footprint, needs_mode_conditions, overlay_colors, replay_mode_conditions,
-    top_source,
+    source_frame, top_source,
 };
 
 /// Failures validating a stroke against the fused map's extent and frame count.
@@ -36,6 +36,10 @@ pub enum RetouchError {
     /// A stroke's path holds no points.
     #[error("path is empty")]
     EmptyPath,
+
+    /// A stroke is painted from a checkpoint, which this path cannot read.
+    #[error("a stroke painted from checkpoint {checkpoint} cannot be rendered here")]
+    CheckpointSource { checkpoint: String },
 
     /// An op other than a brush stroke was handed to this apply path.
     #[error("this op is not supported here")]

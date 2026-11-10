@@ -1266,7 +1266,7 @@ impl ProjectTab {
         let mut ops = edit.drawn_ops();
         if let Some(stroke) = &edit.stroke {
             ops.push(job::Op::BrushStroke {
-                source_id: stroke.source(),
+                source: job::StrokeSource::Frame(stroke.source()),
                 path: stroke.path_so_far(),
                 radius: stroke.radius(),
                 softness: stroke.softness(),
@@ -4141,7 +4141,7 @@ impl AppController {
         } else {
             job::ModeConditions::default()
         };
-        Ok(job::top_source(&ops, info, x, y, &conditions).or_else(|| edit.stored_source(x, y)))
+        Ok(job::top_source(&ops, info, x, y, &conditions)?.or_else(|| edit.stored_source(x, y)))
     }
 
     /// `Alt + click`, or the armed pipette's `Start`: reads the frame the
@@ -4268,10 +4268,11 @@ impl AppController {
         let Some(segment) = stroke.take_segment() else {
             return;
         };
-        let (source_id, radius, softness) = (stroke.source(), stroke.radius(), stroke.softness());
+        let (radius, softness) = (stroke.radius(), stroke.softness());
+        let source = job::StrokeSource::Frame(stroke.source());
         let (mode, opacity) = (stroke.mode(), stroke.opacity());
         let op = job::Op::BrushStroke {
-            source_id,
+            source: source.clone(),
             path: segment,
             radius,
             softness,
@@ -4279,7 +4280,7 @@ impl AppController {
             opacity,
         };
         let so_far = job::Op::BrushStroke {
-            source_id,
+            source,
             path: stroke.path_so_far(),
             radius,
             softness,
@@ -4323,7 +4324,7 @@ impl AppController {
             return;
         };
         let op = job::Op::BrushStroke {
-            source_id: stroke.source(),
+            source: job::StrokeSource::Frame(stroke.source()),
             path: stroke.finish(),
             radius: stroke.radius(),
             softness: stroke.softness(),

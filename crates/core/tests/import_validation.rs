@@ -16,8 +16,8 @@ use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
-    self, AppendRequest, BlobKind, BrushMode, Metrics, Op, Opened, Plane, Point, Project,
-    ProjectError, SealRequest, blob,
+    self, AppendRequest, BlobKind, Metrics, Op, Opened, Plane, Point, Project, ProjectError,
+    SealRequest, blob,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
@@ -189,14 +189,7 @@ fn sealed_mantis(name: &str) -> (PathBuf, PathBuf) {
 }
 
 fn stroke(source_id: u16, x: i32, y: i32, radius: f32) -> Op {
-    Op::BrushStroke {
-        source_id,
-        path: vec![Point { x, y }],
-        radius,
-        softness: 0.0,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }
+    Op::frame_stroke(source_id, vec![Point { x, y }], radius, 0.0)
 }
 
 /// `result.unwrap_err()`, without requiring the `Ok` side to implement
@@ -377,18 +370,16 @@ fn verification_is_lazy_but_never_skipped() {
     })
     .expect("middle re-fuse must succeed");
 
-    let ops = vec![Op::BrushStroke {
-        source_id: 3,
-        path: vec![
+    let ops = vec![Op::frame_stroke(
+        3,
+        vec![
             Point { x: 200, y: 220 },
             Point { x: 230, y: 205 },
             Point { x: 260, y: 225 },
         ],
-        radius: 12.0,
-        softness: 0.3,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }];
+        12.0,
+        0.3,
+    )];
     let sealed_ops =
         project::append_ops_at(&project_path, ops, None, 1_000).expect("append must succeed");
     assert_eq!(sealed_ops.zmap.kind, BlobKind::Full);
@@ -1005,14 +996,7 @@ fn located_frames_are_checked_by_content() {
 /// state whose render reads source frames.
 fn append_stroke(project_path: &Path) {
     let head = Project::open(project_path).unwrap().checkpoint().id.clone();
-    let stroke = project::Op::BrushStroke {
-        source_id: 1,
-        path: vec![project::Point { x: 4, y: 4 }],
-        radius: 2.0,
-        softness: 0.0,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    };
+    let stroke = project::Op::frame_stroke(1, vec![project::Point { x: 4, y: 4 }], 2.0, 0.0);
     project::append_ops_onto(project_path, &head, vec![stroke], None, 1)
         .expect("the stroke must append");
 }

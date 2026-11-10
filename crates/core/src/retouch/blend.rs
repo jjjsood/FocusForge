@@ -12,7 +12,7 @@ use std::cmp::Ordering;
 use std::num::NonZeroU32;
 
 use crate::algorithm::TileReader;
-use crate::project::{BrushMode, Op, Point};
+use crate::project::{BrushMode, Op, Point, StrokeSource};
 use crate::tile::{Rect, Sample};
 use crate::zmap::ZMapInfo;
 
@@ -35,12 +35,31 @@ pub(super) struct Stroke<'a> {
     pub(super) opacity: f32,
 }
 
-/// Refuses, in order: an empty path; `source_id >= info.frame_count()`; a
-/// non-finite or non-positive radius; a softness outside `0.0..=1.0`; an
-/// opacity outside `0 < x <= 1`.
+/// The frame a stroke blends from; a checkpoint source is refused with
+/// [`RetouchError::CheckpointSource`]. Every consumer that reads pixels from a
+/// stroke's source goes through it.
+pub fn source_frame(op: &Op) -> Result<u16, RetouchError> {
+    let Op::BrushStroke { source, .. } = op;
+    match source {
+        StrokeSource::Frame(n) => Ok(*n),
+        StrokeSource::Checkpoint(checkpoint) => Err(RetouchError::CheckpointSource {
+            checkpoint: checkpoint.clone(),
+        }),
+    }
+}
+
+/// [`source_frame`] for an op the caller has already checked.
+fn checked_frame(op: &Op) -> u16 {
+    source_frame(op).expect("every source was checked to be a frame")
+}
+
+/// Refuses, in order: an empty path; a frame source with
+/// `source_id >= info.frame_count()` (a checkpoint source passes as
+/// geometry); a non-finite or non-positive radius; a softness outside
+/// `0.0..=1.0`; an opacity outside `0 < x <= 1`.
 pub(super) fn validate<'a>(op: &'a Op, info: ZMapInfo) -> Result<Stroke<'a>, RetouchError> {
     let Op::BrushStroke {
-        source_id,
+        source,
         path,
         radius,
         softness,
@@ -50,7 +69,9 @@ pub(super) fn validate<'a>(op: &'a Op, info: ZMapInfo) -> Result<Stroke<'a>, Ret
     if path.is_empty() {
         return Err(RetouchError::EmptyPath);
     }
-    if u32::from(*source_id) >= info.frame_count() {
+    if let StrokeSource::Frame(source_id) = source
+        && u32::from(*source_id) >= info.frame_count()
+    {
         return Err(RetouchError::SourceOutOfRange {
             source_id: *source_id,
             frame_count: info.frame_count(),
@@ -707,7 +728,9 @@ pub fn needs_mode_conditions(ops: &[Op], info: ZMapInfo, rect: Rect) -> bool {
 /// composite the ops apply to (frame 0, map coordinates), `frames` the source
 /// frames and `origin` the offset to frame coordinates, as in
 /// [`apply_strokes`]. Each Lighten or Darken stroke is decided on the result
-/// of the strokes before it. A failed read is returned, never a partial result.
+/// of the strokes before it. A failed read is returned, never a partial result,
+/// and a stroke painted from a checkpoint anywhere in `ops` is refused with
+/// [`RetouchError::CheckpointSource`].
 #[allow(clippy::too_many_arguments)]
 pub fn replay_mode_conditions<S: Blend>(
     ops: &[Op],
@@ -719,6 +742,9 @@ pub fn replay_mode_conditions<S: Blend>(
     origin: (u32, u32),
     spp: usize,
 ) -> Result<ModeConditions, RetouchError> {
+    for op in ops {
+        source_frame(op)?;
+    }
     let step = step.get();
     let samples = |r: Rect| r.width as usize * r.height as usize * spp;
     let mut held = Vec::new();
@@ -729,9 +755,8 @@ pub fn replay_mode_conditions<S: Blend>(
         let Some(reach) = light_dark_reach(op, info, rect) else {
             continue;
         };
-        let Op::BrushStroke {
-            source_id, mode, ..
-        } = op;
+        let Op::BrushStroke { mode, .. } = op;
+        let frame = checked_frame(op);
         // Lattice samples inside `reach`: sample `i` sits at `rect.x + i * step`.
         let first = |at: u32, from: u32| (from - at).div_ceil(step);
         let (i0, i1) = (first(rect.x, reach.x), first(rect.x, reach.x + reach.width));
@@ -752,11 +777,10 @@ pub fn replay_mode_conditions<S: Blend>(
         let placed: Vec<PlacedStroke> = ops[..op_index]
             .iter()
             .filter_map(|earlier| {
-                let Op::BrushStroke { source_id, .. } = earlier;
                 let footprint = footprint(earlier, info).ok().flatten()?;
                 Some(PlacedStroke {
                     op: earlier,
-                    frame: usize::from(*source_id),
+                    frame: usize::from(checked_frame(earlier)),
                     footprint,
                 })
             })
@@ -780,7 +804,7 @@ pub fn replay_mode_conditions<S: Blend>(
             y: lattice.y + origin.1,
             ..lattice
         };
-        S::read_tile(frames, usize::from(*source_id), at_frame, &mut source)?;
+        S::read_tile(frames, usize::from(frame), at_frame, &mut source)?;
         let pixel = |r: Rect, x: u32, y: u32| {
             ((y - r.y) as usize * r.width as usize + (x - r.x) as usize) * spp
         };
@@ -828,25 +852,25 @@ fn table_color(table: &[[u8; 3]], index: u16) -> [u8; 3] {
 
 /// The source of the latest valid stroke in `ops` that is the origin of
 /// `(x, y)`: its opacity-scaled alpha there exceeds half of full coverage and,
-/// for Lighten and Darken, `conditions` holds. `None` when no stroke is.
+/// for Lighten and Darken, `conditions` holds. `None` when no stroke is. A
+/// stroke painted from a checkpoint anywhere in `ops` is refused with
+/// [`RetouchError::CheckpointSource`].
 pub fn top_source(
     ops: &[Op],
     info: ZMapInfo,
     x: u32,
     y: u32,
     conditions: &ModeConditions,
-) -> Option<u16> {
-    ops.iter().enumerate().rev().find_map(|(k, op)| {
-        let Op::BrushStroke {
-            source_id,
-            mode,
-            opacity,
-            ..
-        } = op;
+) -> Result<Option<u16>, RetouchError> {
+    for op in ops {
+        source_frame(op)?;
+    }
+    Ok(ops.iter().enumerate().rev().find_map(|(k, op)| {
+        let Op::BrushStroke { mode, opacity, .. } = op;
         let mask = alpha(op, info, x, y).ok()?;
         shows_source(*mode, mask, opacity_q16(*opacity), conditions, (k, x, y))
-            .then_some(*source_id)
-    })
+            .then(|| checked_frame(op))
+    }))
 }
 
 /// Fills `out` with each sample's overlay colour over the `step`-th rows and
@@ -854,7 +878,8 @@ pub fn top_source(
 /// (clamped to the last entry), then, per valid stroke of `ops` in order, the
 /// stroke source's colour wherever the stroke is the origin (the rule of
 /// [`top_source`], with the same `conditions`). Cost follows the samples near
-/// each path.
+/// each path. A stroke painted from a checkpoint anywhere in `ops` is refused
+/// with [`RetouchError::CheckpointSource`], leaving `out` unwritten.
 #[allow(clippy::too_many_arguments)]
 pub fn overlay_colors(
     ops: &[Op],
@@ -865,7 +890,10 @@ pub fn overlay_colors(
     table: &[[u8; 3]],
     indices: &[u16],
     out: &mut [[u8; 3]],
-) {
+) -> Result<(), RetouchError> {
+    for op in ops {
+        source_frame(op)?;
+    }
     let step = step.get();
     let columns = rect.width.div_ceil(step) as usize;
     let rows = rect.height.div_ceil(step) as usize;
@@ -875,14 +903,13 @@ pub fn overlay_colors(
         *color = table_color(table, index);
     }
     for (k, op) in ops.iter().enumerate() {
-        let Op::BrushStroke { source_id, .. } = op;
         let Ok(stroke) = validate(op, info) else {
             continue;
         };
         let Some(active) = stroke_footprint(&stroke, info).and_then(|fp| rect.intersect(fp)) else {
             continue;
         };
-        let over = table_color(table, *source_id);
+        let over = table_color(table, checked_frame(op));
         let opacity = opacity_q16(stroke.opacity);
         let ramp = Ramp::new(&stroke);
         let grid = SegmentGrid::new(&stroke, active);
@@ -909,6 +936,7 @@ pub fn overlay_colors(
             }
         }
     }
+    Ok(())
 }
 
 /// Blends the stroke `op`'s source samples over `out`. `out` holds the
@@ -1047,14 +1075,7 @@ mod tests {
     }
 
     fn stroke_op(source_id: u16, path: Vec<Point>, radius: f32, softness: f32) -> Op {
-        Op::BrushStroke {
-            source_id,
-            path,
-            radius,
-            softness,
-            mode: crate::project::BrushMode::Normal,
-            opacity: 1.0,
-        }
+        Op::frame_stroke(source_id, path, radius, softness)
     }
 
     fn info(width: u32, height: u32) -> ZMapInfo {
@@ -1096,7 +1117,7 @@ mod tests {
             let src_f: Vec<f32> = src.iter().map(|&v| f32::from(v) - 0.5).collect();
             for opacity in [0.01f32, 0.5, 1.0] {
                 let op = Op::BrushStroke {
-                    source_id: 2,
+                    source: StrokeSource::Frame(2),
                     path: vec![pt(10, 10), pt(25, 15)],
                     radius: 8.0,
                     softness: 0.5,
@@ -1147,7 +1168,7 @@ mod tests {
     /// over `out` in `mode` at full opacity.
     fn one_pixel<S: Blend>(mode: BrushMode, out: &[S], src: &[S]) -> Vec<S> {
         let op = Op::BrushStroke {
-            source_id: 0,
+            source: StrokeSource::Frame(0),
             path: vec![pt(0, 0)],
             radius: 2.0,
             softness: 0.0,
@@ -1268,7 +1289,7 @@ mod tests {
 
     fn mode_stroke(mode: BrushMode, opacity: f32) -> Op {
         Op::BrushStroke {
-            source_id: 2,
+            source: StrokeSource::Frame(2),
             path: vec![pt(10, 10), pt(25, 15)],
             radius: 8.0,
             softness: 0.5,
@@ -1488,7 +1509,7 @@ mod tests {
         let info = info(40, 30);
         let whole = rect(0, 0, 40, 30);
         let op = Op::BrushStroke {
-            source_id: 0,
+            source: StrokeSource::Frame(0),
             path: vec![pt(20, 15)],
             radius: 8.0,
             softness: 0.0,
@@ -1496,7 +1517,7 @@ mod tests {
             opacity: 1.0,
         };
         let normal = Op::BrushStroke {
-            source_id: 0,
+            source: StrokeSource::Frame(0),
             path: vec![pt(20, 15)],
             radius: 8.0,
             softness: 0.0,
@@ -1725,7 +1746,7 @@ mod tests {
     fn detail_pass_radius_and_margin_follow_the_radius() {
         let map = info(64, 64);
         let detail = |radius| Op::BrushStroke {
-            source_id: 0,
+            source: StrokeSource::Frame(0),
             path: vec![pt(5, 5)],
             radius,
             softness: 0.5,
@@ -1749,7 +1770,7 @@ mod tests {
         }
         for mode in [BrushMode::Normal, BrushMode::Lighten, BrushMode::Darken] {
             let op = Op::BrushStroke {
-                source_id: 0,
+                source: StrokeSource::Frame(0),
                 path: vec![pt(5, 5)],
                 radius: 100.0,
                 softness: 0.5,
@@ -1767,20 +1788,17 @@ mod tests {
 
     fn place<'a>(info: ZMapInfo, ops: &'a [Op]) -> Vec<PlacedStroke<'a>> {
         ops.iter()
-            .map(|op| {
-                let Op::BrushStroke { source_id, .. } = op;
-                PlacedStroke {
-                    op,
-                    frame: usize::from(*source_id),
-                    footprint: footprint(op, info).unwrap().unwrap(),
-                }
+            .map(|op| PlacedStroke {
+                op,
+                frame: usize::from(source_frame(op).unwrap()),
+                footprint: footprint(op, info).unwrap().unwrap(),
             })
             .collect()
     }
 
     fn mode_at(mode: BrushMode, x: i32, y: i32) -> Op {
         Op::BrushStroke {
-            source_id: 0,
+            source: StrokeSource::Frame(0),
             path: vec![pt(x, y)],
             radius: 7.5,
             softness: 0.5,
@@ -1905,7 +1923,7 @@ mod tests {
         ];
         for (x, y) in edges {
             let op = Op::BrushStroke {
-                source_id: 1,
+                source: StrokeSource::Frame(1),
                 path: vec![pt(x, y)],
                 radius: 7.5,
                 softness: 0.5,
@@ -1944,7 +1962,7 @@ mod tests {
 
     fn stroke_with(mode: BrushMode, opacity: f32) -> Op {
         Op::BrushStroke {
-            source_id: 0,
+            source: StrokeSource::Frame(0),
             path: vec![pt(1, 1)],
             radius: 3.0,
             softness: 0.0,
@@ -1995,7 +2013,7 @@ mod tests {
         }
         // The earlier checks keep their place in the order.
         let bad = |path: Vec<Point>, source_id, radius, softness| Op::BrushStroke {
-            source_id,
+            source: StrokeSource::Frame(source_id),
             path,
             radius,
             softness,
@@ -2509,10 +2527,7 @@ mod tests {
             .iter()
             .map(|op| PlacedStroke {
                 op,
-                frame: {
-                    let Op::BrushStroke { source_id, .. } = op;
-                    usize::from(*source_id)
-                },
+                frame: usize::from(source_frame(op).unwrap()),
                 footprint: footprint(op, info).unwrap().unwrap(),
             })
             .collect();
@@ -2648,7 +2663,8 @@ mod tests {
             &palette(),
             indices,
             &mut out,
-        );
+        )
+        .unwrap();
         out
     }
 
@@ -2681,8 +2697,7 @@ mod tests {
                         continue;
                     };
                     if a > 32768 {
-                        let Op::BrushStroke { source_id, .. } = op;
-                        expected = table[usize::from(*source_id).min(last)];
+                        expected = table[usize::from(source_frame(op).unwrap()).min(last)];
                         painted += 1;
                     }
                 }
@@ -2746,13 +2761,17 @@ mod tests {
             .expect("the edge falls to half");
         for x in 10..flip {
             assert_eq!(
-                top_source(&one, map, x, 15, &none),
+                top_source(&one, map, x, 15, &none).unwrap(),
                 Some(1),
                 "inside at {x}"
             );
         }
         for x in flip..40 {
-            assert_eq!(top_source(&one, map, x, 15, &none), None, "outside at {x}");
+            assert_eq!(
+                top_source(&one, map, x, 15, &none).unwrap(),
+                None,
+                "outside at {x}"
+            );
         }
 
         let two = [
@@ -2762,28 +2781,28 @@ mod tests {
         // The later stroke wins where it covers more than half, the earlier
         // one where only it does.
         assert_eq!(
-            top_source(&two, map, 13, 15, &none),
+            top_source(&two, map, 13, 15, &none).unwrap(),
             Some(3),
             "both over half"
         );
         assert_eq!(
-            top_source(&two, map, 11, 15, &none),
+            top_source(&two, map, 11, 15, &none).unwrap(),
             Some(1),
             "only the earlier"
         );
         assert_eq!(
-            top_source(&two, map, 20, 15, &none),
+            top_source(&two, map, 20, 15, &none).unwrap(),
             Some(3),
             "only the later"
         );
-        assert_eq!(top_source(&two, map, 21, 15, &none), None);
+        assert_eq!(top_source(&two, map, 21, 15, &none).unwrap(), None);
 
         let refused = [
             stroke_op(1, vec![pt(10, 15)], 10.0, 1.0),
             stroke_op(9, vec![pt(10, 15)], 10.0, 1.0),
         ];
         assert_eq!(
-            top_source(&refused, map, 10, 15, &none),
+            top_source(&refused, map, 10, 15, &none).unwrap(),
             Some(1),
             "refused op skipped"
         );
@@ -2801,13 +2820,14 @@ mod tests {
             let out = colors_over(&ops, map, rect, step, &indices);
             let mut shown = 0;
             for (at, x, y) in lattice(rect, step) {
-                let expected = match top_source(&ops, map, x, y, &ModeConditions::default()) {
-                    Some(source) => {
-                        shown += 1;
-                        table[usize::from(source).min(last)]
-                    }
-                    None => table[usize::from(indices[at]).min(last)],
-                };
+                let expected =
+                    match top_source(&ops, map, x, y, &ModeConditions::default()).unwrap() {
+                        Some(source) => {
+                            shown += 1;
+                            table[usize::from(source).min(last)]
+                        }
+                        None => table[usize::from(indices[at]).min(last)],
+                    };
                 assert_eq!(out[at], expected, "step {step} at ({x}, {y})");
             }
             assert!(shown > 20, "the strokes cover samples at step {step}");
@@ -2825,7 +2845,7 @@ mod tests {
         softness: f32,
     ) -> Op {
         Op::BrushStroke {
-            source_id,
+            source: StrokeSource::Frame(source_id),
             path,
             radius,
             softness,
@@ -3005,17 +3025,13 @@ mod tests {
         let sum = |pixel: &[S]| pixel.iter().map(|s| f64::from(s.widen())).sum::<f64>();
         let mut acts = Vec::new();
         for op in ops {
-            let Op::BrushStroke {
-                source_id,
-                mode,
-                opacity,
-                ..
-            } = op;
+            let Op::BrushStroke { mode, opacity, .. } = op;
             let mut hit = vec![false; (w * h) as usize];
             if validate(op, scene.map).is_ok() {
                 let mut src = vec![S::default(); result.len()];
                 let at_frame = rect(ORIGIN.0, ORIGIN.1, w, h);
-                S::read_tile(&scene.frames, usize::from(*source_id), at_frame, &mut src).unwrap();
+                let frame = usize::from(source_frame(op).unwrap());
+                S::read_tile(&scene.frames, frame, at_frame, &mut src).unwrap();
                 let q = u64::from(super::opacity_q16(*opacity));
                 for y in 0..h {
                     for x in 0..w {
@@ -3076,11 +3092,9 @@ mod tests {
                 let pixel = (y * 48 + x) as usize;
                 let mut expected = table[usize::from(indices[at]).min(last)];
                 for (op, hit) in ops.iter().zip(&acts) {
-                    let Op::BrushStroke {
-                        source_id, mode, ..
-                    } = op;
+                    let Op::BrushStroke { mode, .. } = op;
                     if hit[pixel] {
-                        expected = table[usize::from(*source_id).min(last)];
+                        expected = table[usize::from(source_frame(op).unwrap()).min(last)];
                     } else if step == 1
                         && matches!(mode, BrushMode::Lighten | BrushMode::Darken)
                         && alpha(op, scene.map, x, y).is_ok_and(|a| a == OPAQUE)
@@ -3115,7 +3129,7 @@ mod tests {
                 let mut origins = 0;
                 for x in 0..45 {
                     let product = f64::from(alpha(&op, map, x, 15).unwrap()) * f64::from(opacity);
-                    let got = top_source(ops, map, x, 15, &none);
+                    let got = top_source(ops, map, x, 15, &none).unwrap();
                     if product >= 32769.0 {
                         assert_eq!(got, Some(2), "{mode:?} {opacity} at {x}");
                     } else if product <= 32767.0 {
@@ -3129,7 +3143,7 @@ mod tests {
                     assert!(origins > 0, "{mode:?} at {opacity} is an origin somewhere");
                 }
                 if opacity == 0.6 {
-                    let full = top_source(ops, map, 10, 15, &none);
+                    let full = top_source(ops, map, 10, 15, &none).unwrap();
                     assert_eq!(full, Some(2), "full mask times 0.6 is above half");
                     assert!(origins < 20, "but only where the mask is above 5/6");
                 }
@@ -3206,11 +3220,19 @@ mod tests {
             let underneath = if ops.len() == 2 { Some(1) } else { None };
             for (x, want) in expected.iter().enumerate() {
                 let x = x as u32;
-                assert_eq!(top_source(&ops, map, x, 0, &conditions), *want, "x {x}");
+                assert_eq!(
+                    top_source(&ops, map, x, 0, &conditions).unwrap(),
+                    *want,
+                    "x {x}"
+                );
                 assert_eq!(out[x as usize], table[usize::from(want.unwrap_or(0))]);
                 // With nothing replayed the Lighten or Darken stroke is never an origin.
                 let none = ModeConditions::default();
-                assert_eq!(top_source(&ops, map, x, 0, &none), underneath, "x {x}");
+                assert_eq!(
+                    top_source(&ops, map, x, 0, &none).unwrap(),
+                    underneath,
+                    "x {x}"
+                );
                 assert_eq!(
                     unreplayed[x as usize],
                     table[usize::from(underneath.unwrap_or(0))]
@@ -3276,14 +3298,18 @@ mod tests {
                 let mut top = None;
                 for op in &ops {
                     if alpha(op, map, x, y).is_ok_and(|a| a > 32768) {
-                        let Op::BrushStroke { source_id, .. } = op;
-                        expected = table[usize::from(*source_id).min(last)];
-                        top = Some(*source_id);
+                        let source_id = source_frame(op).unwrap();
+                        expected = table[usize::from(source_id).min(last)];
+                        top = Some(source_id);
                         painted += 1;
                     }
                 }
                 assert_eq!(out[at], expected, "step {step} at ({x}, {y})");
-                assert_eq!(top_source(&ops, map, x, y, &none), top, "({x}, {y})");
+                assert_eq!(
+                    top_source(&ops, map, x, y, &none).unwrap(),
+                    top,
+                    "({x}, {y})"
+                );
             }
         }
         assert!(painted > 40);
@@ -3358,6 +3384,116 @@ mod tests {
         }
     }
 
+    fn checkpoint_stroke(path: Vec<Point>, radius: f32, softness: f32) -> Op {
+        Op::BrushStroke {
+            source: StrokeSource::Checkpoint("c0ffee".to_string()),
+            path,
+            radius,
+            softness,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_checkpoint_source_as_geometry() {
+        let map = ZMapInfo::new(40, 30, 1).unwrap();
+        let path = vec![pt(5, 5), pt(20, 10)];
+        let frame = stroke_op(0, path.clone(), 6.0, 0.5);
+        let checkpoint = checkpoint_stroke(path, 6.0, 0.5);
+        let expected = footprint(&frame, map).unwrap();
+        assert!(expected.is_some());
+        assert_eq!(footprint(&checkpoint, map).unwrap(), expected);
+
+        assert!(matches!(
+            footprint(&checkpoint_stroke(Vec::new(), 6.0, 0.5), map),
+            Err(RetouchError::EmptyPath)
+        ));
+        assert!(matches!(
+            footprint(&checkpoint_stroke(vec![pt(1, 1)], 0.0, 0.5), map),
+            Err(RetouchError::InvalidRadius { .. })
+        ));
+        assert!(matches!(
+            footprint(&checkpoint_stroke(vec![pt(1, 1)], 6.0, 2.0), map),
+            Err(RetouchError::InvalidSoftness { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_refuses_an_out_of_range_frame() {
+        for frame_count in [1u32, 7] {
+            let map = ZMapInfo::new(40, 30, frame_count).unwrap();
+            let last = u16::try_from(frame_count - 1).unwrap();
+            assert!(footprint(&stroke_op(last, vec![pt(5, 5)], 6.0, 0.5), map).is_ok());
+            let err = footprint(&stroke_op(last + 1, vec![pt(5, 5)], 6.0, 0.5), map).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    RetouchError::SourceOutOfRange { source_id, frame_count: n }
+                        if source_id == last + 1 && n == frame_count
+                ),
+                "{err:?}"
+            );
+            assert!(err.to_string().contains("source_id"), "{err}");
+        }
+    }
+
+    #[test]
+    fn checkpoint_source_is_refused_by_every_consumer() {
+        let map = info(40, 30);
+        let none = ModeConditions::default();
+        let area = rect(0, 0, 40, 30);
+        let frame = stroke_op(1, vec![pt(10, 10)], 6.0, 0.5);
+        let planes = Planes {
+            width: 40,
+            spp: 1,
+            planes: vec![vec![7.0; 40 * 30]; 4],
+        };
+        let refused = |err: RetouchError| {
+            assert!(
+                matches!(&err, RetouchError::CheckpointSource { checkpoint } if checkpoint == "c0ffee"),
+                "{err:?}"
+            );
+        };
+        for at in [pt(10, 10), pt(35, 25)] {
+            let checkpoint = checkpoint_stroke(vec![at], 4.0, 0.5);
+            for ops in [
+                vec![checkpoint.clone(), frame.clone()],
+                vec![frame.clone(), checkpoint.clone()],
+            ] {
+                refused(top_source(&ops, map, 10, 10, &none).unwrap_err());
+
+                let sentinel = [9u8, 8, 7];
+                let mut out = vec![sentinel; 40 * 30];
+                let indices = vec![0u16; 40 * 30];
+                let result = overlay_colors(
+                    &ops,
+                    map,
+                    area,
+                    NonZeroU32::MIN,
+                    &none,
+                    &palette(),
+                    &indices,
+                    &mut out,
+                );
+                refused(result.unwrap_err());
+                assert!(out.iter().all(|&c| c == sentinel), "out stays unwritten");
+
+                let replay = replay_mode_conditions::<f32>(
+                    &ops,
+                    map,
+                    area,
+                    NonZeroU32::MIN,
+                    &planes,
+                    &planes,
+                    (0, 0),
+                    1,
+                );
+                refused(replay.unwrap_err());
+            }
+        }
+    }
+
     /// For mixed-mode ops, `top_source` with the one-pixel replay of each
     /// lattice sample names the frame the lattice overlay paints there.
     fn top_source_follows_replayed_overlay<S: Blend>(wide: bool) {
@@ -3373,7 +3509,7 @@ mod tests {
             let mut shown = 0;
             for (at, x, y) in lattice(area, step) {
                 let one = replay_for::<S>(&ops, &scene, rect(x, y, 1, 1), 1).unwrap();
-                let expected = match top_source(&ops, scene.map, x, y, &one) {
+                let expected = match top_source(&ops, scene.map, x, y, &one).unwrap() {
                     Some(source) => {
                         shown += 1;
                         table[usize::from(source).min(last)]

@@ -14,9 +14,9 @@ use focusforge_core::params::ParamValues;
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
     self, BlobKind, BrushMode, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind,
-    Metrics, Op, Plane, Point, Project, ProjectError, SealRequest,
+    Metrics, Op, Plane, Point, Project, ProjectError, SealRequest, StrokeSource,
 };
-use focusforge_core::retouch::blend;
+use focusforge_core::retouch::{RetouchError, blend};
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
 fn tmp_dir(name: &str) -> PathBuf {
@@ -179,9 +179,9 @@ fn build(name: &str) -> Built {
     let edited = project::append_ops_onto(
         &project_path,
         &sealed.checkpoint,
-        vec![Op::BrushStroke {
-            source_id: 1,
-            path: vec![
+        vec![Op::frame_stroke(
+            1,
+            vec![
                 Point {
                     x: 350,
                     y: BAND_ROWS as i32 - 2,
@@ -191,11 +191,9 @@ fn build(name: &str) -> Built {
                     y: BAND_ROWS as i32 + 2,
                 },
             ],
-            radius: 40.0,
-            softness: 0.5,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }],
+            40.0,
+            0.5,
+        )],
         None,
         1,
     )
@@ -404,14 +402,12 @@ const PENDING_CROP: Rect = Rect {
 };
 
 fn pending_stroke(source_id: u16, path: &[(i32, i32)], radius: f32, softness: f32) -> Op {
-    Op::BrushStroke {
+    Op::frame_stroke(
         source_id,
-        path: path.iter().map(|&(x, y)| Point { x, y }).collect(),
+        path.iter().map(|&(x, y)| Point { x, y }).collect(),
         radius,
         softness,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }
+    )
 }
 
 #[test]
@@ -562,6 +558,72 @@ fn pending_state_export_equals_the_saved_export() {
     assert!(!refused.exists(), "a refused export leaves no file");
 }
 
+#[test]
+fn checkpoint_source_is_refused() {
+    let dir = tmp_dir("render_state_checkpoint_source");
+    let sources: Vec<PathBuf> = (0..2u32)
+        .map(|i| {
+            let path = dir.join(format!("frame-{i}.tif"));
+            write_tiff(&path, PENDING_FRAME_W, PENDING_FRAME_H, 1, |s| {
+                (s as u32 + i * 1000) as u16
+            });
+            path
+        })
+        .collect();
+    let composite = dir.join("composite.tif");
+    write_tiff(&composite, PENDING_FRAME_W, PENDING_FRAME_H, 1, |s| {
+        500 + s as u16
+    });
+    let frame_stroke = pending_stroke(1, &[(1, 1), (6, 4)], 2.0, 0.5);
+    let checkpoint_stroke = Op::BrushStroke {
+        source: StrokeSource::Checkpoint("c0ffee".to_string()),
+        path: vec![Point { x: 3, y: 3 }],
+        radius: 2.0,
+        softness: 0.5,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
+    };
+    let state = project::PendingState {
+        composite,
+        ops: vec![frame_stroke.clone()],
+        sources,
+        registration: Registration::default(),
+        reference: 0,
+        description: "staged composite".to_string(),
+    };
+
+    let rendered = dir.join("rendered.tif");
+    project::export_pending(
+        &state,
+        &rendered,
+        &ExportOptions::default(),
+        &MetadataOptions::default(),
+    )
+    .expect("a frame-sourced state renders");
+
+    let mixed = project::PendingState {
+        ops: vec![frame_stroke, checkpoint_stroke],
+        ..state
+    };
+    let refused = dir.join("refused.tif");
+    let err = project::export_pending(
+        &mixed,
+        &refused,
+        &ExportOptions::default(),
+        &MetadataOptions::default(),
+    )
+    .expect_err("a checkpoint-sourced stroke is refused");
+    let ProjectError::Op { index, source } = err else {
+        panic!("expected ProjectError::Op, got {err}");
+    };
+    assert_eq!(index, 1, "the index of the checkpoint stroke");
+    assert!(
+        matches!(*source, RetouchError::CheckpointSource { ref checkpoint } if checkpoint == "c0ffee"),
+        "{source}"
+    );
+    assert!(!refused.exists(), "a refused export leaves no file");
+}
+
 /// `image` rendered in `f32` over `tile`, laid out as the tile's own rows.
 fn render_tile_f32(image: &CheckpointImage, project: Option<&mut Project>, tile: Rect) -> Vec<f32> {
     let spp = image.samples_per_pixel as usize;
@@ -659,14 +721,12 @@ fn f32_held_saved_and_pending_render_agree() {
     })
     .expect("a float staged composite must seal")
     .checkpoint;
-    let stroke = Op::BrushStroke {
-        source_id: 1,
-        path: vec![Point { x: 6, y: 11 }, Point { x: 30, y: 11 }],
-        radius: 6.0,
-        softness: 0.5,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    };
+    let stroke = Op::frame_stroke(
+        1,
+        vec![Point { x: 6, y: 11 }, Point { x: 30, y: 11 }],
+        6.0,
+        0.5,
+    );
     let edited = project::append_ops_onto(&project_path, &root, vec![stroke.clone()], None, 1)
         .expect("the stroke must append")
         .checkpoint;

@@ -7,7 +7,7 @@
 
 use focusforge_core::display::{overlay_cpu, tonemap_cpu, zmap_index_scale};
 use focusforge_core::io::TiffStack;
-use focusforge_core::project::{BrushMode, Op, Point};
+use focusforge_core::project::{Op, Point};
 use focusforge_core::retouch::{ModeConditions, overlay_colors};
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{NO_SOURCE, ZMapReader, overlay_table};
@@ -315,14 +315,12 @@ fn overlay_parity_matches_cpu() {
     indices[5] = NO_SOURCE;
 
     let sources = zmap.frame_count();
-    let stroke = Op::BrushStroke {
-        source_id: 2,
-        path: vec![Point { x: 0, y: 12 }, Point { x: 30, y: 20 }],
-        radius: 9.0,
-        softness: 0.6,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    };
+    let stroke = Op::frame_stroke(
+        2,
+        vec![Point { x: 0, y: 12 }, Point { x: 30, y: 20 }],
+        9.0,
+        0.6,
+    );
     for alpha in [0u8, 166, 255] {
         for solo in [None, Some(3u16)] {
             let table = overlay_table(sources, solo);
@@ -336,7 +334,8 @@ fn overlay_parity_matches_cpu() {
                 &table,
                 &indices,
                 &mut colors,
-            );
+            )
+            .expect("a frame stroke has a colour");
 
             let target = DisplayTexture::new(shared.device(), crop.width, crop.height);
             render_overlay(

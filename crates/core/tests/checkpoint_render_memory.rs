@@ -18,7 +18,7 @@ use focusforge_core::project::export::{
     TiffCompression,
 };
 use focusforge_core::project::{
-    self, BrushMode, CheckpointImage, Metrics, Op, Point, Project, ProjectError, SealRequest,
+    self, CheckpointImage, Metrics, Op, Point, Project, ProjectError, SealRequest,
 };
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
@@ -180,14 +180,7 @@ fn seal_op_bearing(name: &str, height: u32) -> (PathBuf, String, String) {
     let child = project::append_ops_onto(
         &project_path,
         &sealed.checkpoint,
-        vec![Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 4, y: 4 }],
-            radius: 6.0,
-            softness: 0.5,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }],
+        vec![Op::frame_stroke(1, vec![Point { x: 4, y: 4 }], 6.0, 0.5)],
         None,
         1,
     )

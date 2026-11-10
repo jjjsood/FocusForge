@@ -111,23 +111,67 @@ pub struct Point {
     pub y: i32,
 }
 
+/// Where a brush stroke blends its pixels from: a frame of the stack or a
+/// checkpoint's result. Serialized as `{"frame": n}` or `{"checkpoint": "<id>"}`;
+/// inside a stroke a frame is written as the plain `source_id: n` and a
+/// checkpoint as `source: {"checkpoint": "<id>"}`; a stroke record holding both
+/// fields, or neither, is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StrokeSource {
+    Frame(u16),
+    Checkpoint(String),
+}
+
 /// One edit in a checkpoint's op log. **Externally tagged** -- the serde
 /// default, stated here because it is frozen: an untagged enum would make
 /// deserialization buffered and slow (serde-rs/serde#2101).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(try_from = "OpRepr", into = "OpRepr")]
 #[non_exhaustive]
 pub enum Op {
-    /// Blend frame `source_id` into the result along `path` through a soft
-    /// round mask of `radius` pixels and `softness` in `0.0..=1.0`. Strokes
-    /// apply in list order; the result image is the document.
+    /// Blend `source` into the result along `path` through a soft round mask
+    /// of `radius` pixels and `softness` in `0.0..=1.0`. Strokes apply in
+    /// list order; the result image is the document.
     ///
     /// `mode` and `opacity` read as [`BrushMode::Normal`] and `1.0` when
-    /// absent, and each is left out of the serialized stroke while it holds
-    /// that default, so a default stroke keeps its bytes (and the id hashed
-    /// from them). `opacity` scales the stroke's coverage.
+    /// absent and are left out of the serialized stroke while they hold that
+    /// default, so a default stroke keeps its bytes (and the id hashed from
+    /// them). `opacity` scales the stroke's coverage.
     BrushStroke {
-        source_id: u16,
+        source: StrokeSource,
+        path: Vec<Point>,
+        radius: f32,
+        softness: f32,
+        mode: BrushMode,
+        opacity: f32,
+    },
+}
+
+impl Op {
+    /// A [`BrushMode::Normal`] stroke at full opacity painted from frame `frame`.
+    pub fn frame_stroke(frame: u16, path: Vec<Point>, radius: f32, softness: f32) -> Op {
+        Op::BrushStroke {
+            source: StrokeSource::Frame(frame),
+            path,
+            radius,
+            softness,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
+        }
+    }
+}
+
+/// The stored shape of [`Op`]: a stroke's source is two optional fields so
+/// that the `source_id` and the `source` record both read.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum OpRepr {
+    BrushStroke {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<StrokeSource>,
         path: Vec<Point>,
         radius: f32,
         softness: f32,
@@ -136,6 +180,62 @@ pub enum Op {
         #[serde(default = "full_opacity", skip_serializing_if = "is_full_opacity")]
         opacity: f32,
     },
+}
+
+impl From<Op> for OpRepr {
+    fn from(op: Op) -> OpRepr {
+        let Op::BrushStroke {
+            source,
+            path,
+            radius,
+            softness,
+            mode,
+            opacity,
+        } = op;
+        let (source_id, source) = match source {
+            StrokeSource::Frame(n) => (Some(n), None),
+            checkpoint => (None, Some(checkpoint)),
+        };
+        OpRepr::BrushStroke {
+            source_id,
+            source,
+            path,
+            radius,
+            softness,
+            mode,
+            opacity,
+        }
+    }
+}
+
+impl TryFrom<OpRepr> for Op {
+    type Error = &'static str;
+
+    fn try_from(repr: OpRepr) -> Result<Op, Self::Error> {
+        let OpRepr::BrushStroke {
+            source_id,
+            source,
+            path,
+            radius,
+            softness,
+            mode,
+            opacity,
+        } = repr;
+        let source = match (source_id, source) {
+            (Some(n), None) => StrokeSource::Frame(n),
+            (None, Some(source)) => source,
+            (Some(_), Some(_)) => return Err("a brush stroke names both `source_id` and `source`"),
+            (None, None) => return Err("missing field `source_id` (or `source`)"),
+        };
+        Ok(Op::BrushStroke {
+            source,
+            path,
+            radius,
+            softness,
+            mode,
+            opacity,
+        })
+    }
 }
 
 /// The blend mode a stroke records. `Detail` keeps the result's own

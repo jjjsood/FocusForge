@@ -479,11 +479,14 @@ fn place_strokes<'a>(
             index,
             source: Box::new(err),
         })?;
-        let Op::BrushStroke { source_id, .. } = op;
+        let frame = blend::source_frame(op).map_err(|err| ProjectError::Op {
+            index,
+            source: Box::new(err),
+        })?;
         if let Some(footprint) = footprint {
             strokes.push(PlacedStroke {
                 op: op.clone(),
-                source: usize::from(*source_id),
+                source: usize::from(frame),
                 footprint,
             });
         }

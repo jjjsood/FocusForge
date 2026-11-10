@@ -357,7 +357,6 @@ pub fn build_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use focusforge_core::project::BrushMode;
 
     fn checkpoint(id: &str, created_at: i64) -> Checkpoint {
         Checkpoint {
@@ -623,14 +622,12 @@ mod tests {
     }
 
     fn stroke(x: i32) -> Op {
-        Op::BrushStroke {
-            source_id: 0,
-            path: vec![focusforge_core::project::Point { x, y: 0 }],
-            radius: 1.0,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }
+        Op::frame_stroke(
+            0,
+            vec![focusforge_core::project::Point { x, y: 0 }],
+            1.0,
+            0.0,
+        )
     }
 
     #[test]

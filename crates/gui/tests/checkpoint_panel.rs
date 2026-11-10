@@ -16,8 +16,8 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::{
-    BrushMode, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, Point, Project,
-    ProjectError, SealRequest, append_ops_at, append_ops_onto, render_checkpoint, seal_at,
+    HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, Point, Project, ProjectError,
+    SealRequest, append_ops_at, append_ops_onto, render_checkpoint, seal_at,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use focusforge_gui::bridge::Canvas;
@@ -144,14 +144,7 @@ fn write_chain(project_path: &Path, times: &[i64]) {
     .expect("root checkpoint must seal");
 
     for (i, &at) in times.iter().enumerate().skip(1) {
-        let op = Op::BrushStroke {
-            source_id: 0,
-            path: vec![Point { x: 1, y: 1 }],
-            radius: 0.5,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        };
+        let op = Op::frame_stroke(0, vec![Point { x: 1, y: 1 }], 0.5, 0.0);
         append_ops_at(project_path, vec![op], None, at)
             .unwrap_or_else(|err| panic!("checkpoint {i} must append: {err}"));
     }
@@ -175,14 +168,7 @@ fn rows_match_the_core_listing() {
     let project_path = edited.project.clone();
     let t0 = 1_756_468_800;
     for (parent, x) in [(&edited.edited, 4), (&edited.root, 0)] {
-        let op = Op::BrushStroke {
-            source_id: 2,
-            path: vec![Point { x, y: 0 }],
-            radius: 0.5,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        };
+        let op = Op::frame_stroke(2, vec![Point { x, y: 0 }], 0.5, 0.0);
         append_ops_onto(&project_path, parent, vec![op], None, t0 + 60).unwrap();
     }
 
@@ -347,14 +333,7 @@ fn build_edited(name: &str) -> Edited {
     let edited = append_ops_onto(
         &project,
         &root,
-        vec![Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 2, y: 1 }],
-            radius: 1.5,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }],
+        vec![Op::frame_stroke(1, vec![Point { x: 2, y: 1 }], 1.5, 0.0)],
         None,
         t0 + 60,
     )
@@ -509,14 +488,7 @@ fn selecting_a_row_materializes_and_marks_it() {
 /// A stroke painting `source_id` at `(x, y)`; the map is 5 x 3 with source
 /// `(y * 5 + x) % 3` at each pixel.
 fn stroke(x: i32, y: i32, source_id: u16) -> Op {
-    Op::BrushStroke {
-        source_id,
-        path: vec![Point { x, y }],
-        radius: 0.5,
-        softness: 0.0,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }
+    Op::frame_stroke(source_id, vec![Point { x, y }], 0.5, 0.0)
 }
 
 /// Every op the live image shows over its base, oldest first.

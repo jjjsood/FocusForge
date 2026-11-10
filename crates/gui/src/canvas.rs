@@ -1043,8 +1043,9 @@ impl OverlayDraw {
 
     /// The colour of each texel of the `step` lattice of `rect`, from its
     /// stored Z-Map index in `indices`. A Lighten or Darken stroke shows its
-    /// source only where the readers say it acts; without them, or when a read
-    /// fails, the stored colour stays.
+    /// source only where the readers say it acts; without them, when a read
+    /// fails, or when a stroke is painted from a checkpoint, the stored colour
+    /// stays.
     pub fn colors(
         &self,
         info: ZMapInfo,
@@ -1067,16 +1068,22 @@ impl OverlayDraw {
             })
             .unwrap_or_default();
         let mut colors = vec![[0u8; 3]; indices.len()];
-        overlay_colors(
-            &self.ops,
-            info,
-            rect,
-            step,
-            &conditions,
-            &self.table,
-            indices,
-            &mut colors,
-        );
+        let mut paint = |ops: &[Op]| {
+            overlay_colors(
+                ops,
+                info,
+                rect,
+                step,
+                &conditions,
+                &self.table,
+                indices,
+                &mut colors,
+            )
+        };
+        if let Err(error) = paint(&self.ops) {
+            tracing::warn!(%error, "the overlay could not draw a stroke; the stored colours stay");
+            paint(&[]).expect("no stroke is left to refuse");
+        }
         colors
     }
 }

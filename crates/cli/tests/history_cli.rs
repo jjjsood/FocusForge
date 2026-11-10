@@ -17,9 +17,7 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::{TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
-use focusforge_core::project::{
-    self, BrushMode, Checkpoint, Metrics, Op, Point, Project, SealRequest,
-};
+use focusforge_core::project::{self, Checkpoint, Metrics, Op, Point, Project, SealRequest};
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use serde_json::Value;
@@ -109,14 +107,12 @@ fn write_op_file(dir: &Path, name: &str, body: &Value) -> PathBuf {
 /// A brush stroke well inside a 512x512, 8-frame map -- [`shared_stack`]'s
 /// own geometry.
 fn one_stroke() -> Vec<Op> {
-    vec![Op::BrushStroke {
-        source_id: 1,
-        path: vec![Point { x: 20, y: 20 }, Point { x: 24, y: 24 }],
-        radius: 3.0,
-        softness: 0.0,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }]
+    vec![Op::frame_stroke(
+        1,
+        vec![Point { x: 20, y: 20 }, Point { x: 24, y: 24 }],
+        3.0,
+        0.0,
+    )]
 }
 
 #[test]
@@ -200,14 +196,12 @@ fn exported_zmap_matches_core_replay() {
     let ops_b = write_op_file(
         &dir,
         "ops-b.json",
-        &serde_json::to_value(vec![Op::BrushStroke {
-            source_id: 3,
-            path: vec![Point { x: 200, y: 200 }],
-            radius: 2.0,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }])
+        &serde_json::to_value(vec![Op::frame_stroke(
+            3,
+            vec![Point { x: 200, y: 200 }],
+            2.0,
+            0.0,
+        )])
         .unwrap(),
     );
     let output = run(
@@ -284,14 +278,12 @@ fn sealing_from_an_older_checkpoint_branches() {
     let ops_b = write_op_file(
         &dir,
         "ops-b.json",
-        &serde_json::to_value(vec![Op::BrushStroke {
-            source_id: 4,
-            path: vec![Point { x: 300, y: 300 }],
-            radius: 2.0,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }])
+        &serde_json::to_value(vec![Op::frame_stroke(
+            4,
+            vec![Point { x: 300, y: 300 }],
+            2.0,
+            0.0,
+        )])
         .unwrap(),
     );
 
@@ -747,14 +739,12 @@ fn output_does_not_reveal_storage_kind() {
     let ops = write_op_file(
         &dir,
         "ops.json",
-        &serde_json::to_value(vec![Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 5, y: 5 }],
-            radius: 1.0,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }])
+        &serde_json::to_value(vec![Op::frame_stroke(
+            1,
+            vec![Point { x: 5, y: 5 }],
+            1.0,
+            0.0,
+        )])
         .unwrap(),
     );
     let output = run(
@@ -1299,14 +1289,12 @@ fn validation_states_are_reported() {
     let ops = write_op_file(
         &ops_dir,
         "orphan-ops.json",
-        &serde_json::to_value(vec![Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 2, y: 2 }],
-            radius: 1.0,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }])
+        &serde_json::to_value(vec![Op::frame_stroke(
+            1,
+            vec![Point { x: 2, y: 2 }],
+            1.0,
+            0.0,
+        )])
         .unwrap(),
     );
     let output = run(
@@ -1384,14 +1372,12 @@ fn accept_changed_sources_list_and_delete_changed_project() {
     let child = retouch(
         &dir,
         &project,
-        &[Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 5, y: 5 }, Point { x: 7, y: 7 }],
-            radius: 1.0,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }],
+        &[Op::frame_stroke(
+            1,
+            vec![Point { x: 5, y: 5 }, Point { x: 7, y: 7 }],
+            1.0,
+            0.0,
+        )],
         None,
     )
     .remove(0);

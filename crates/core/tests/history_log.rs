@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 use focusforge_core::align::{Registration, Transform};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
-use focusforge_core::project::{
-    self, AlignRecord, BrushMode, Metrics, Op, Point, Project, SealRequest,
-};
+use focusforge_core::project::{self, AlignRecord, Metrics, Op, Point, Project, SealRequest};
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::ZMapInfo;
 
@@ -215,22 +213,13 @@ fn inject_unknown_field(path: &Path, entry_name: &str) {
 
 fn two_strokes() -> Vec<Op> {
     vec![
-        Op::BrushStroke {
-            source_id: 2,
-            path: vec![Point { x: 3, y: 4 }, Point { x: 10, y: 12 }],
-            radius: 3.5,
-            softness: 0.25,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        },
-        Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 5, y: 2 }],
-            radius: 2.0,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        },
+        Op::frame_stroke(
+            2,
+            vec![Point { x: 3, y: 4 }, Point { x: 10, y: 12 }],
+            3.5,
+            0.25,
+        ),
+        Op::frame_stroke(1, vec![Point { x: 5, y: 2 }], 2.0, 0.0),
     ]
 }
 

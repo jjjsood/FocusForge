@@ -20,7 +20,7 @@ use focusforge_core::project::container::Index;
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
     self, BrushMode, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics,
-    Op, Point, Project, ProjectError, SealRequest, partial_path,
+    Op, Point, Project, ProjectError, SealRequest, StrokeSource, partial_path,
 };
 use focusforge_core::retouch::blend::{self, Blend};
 use focusforge_core::tile::{HostBudget, Sample};
@@ -73,14 +73,12 @@ fn write_tiff(path: &Path, width: u32, height: u32, spp: u32, samples: &[u16]) {
 }
 
 fn stroke(source_id: u16, path: &[(i32, i32)], radius: f32, softness: f32) -> Op {
-    Op::BrushStroke {
+    Op::frame_stroke(
         source_id,
-        path: path.iter().map(|&(x, y)| Point { x, y }).collect(),
+        path.iter().map(|&(x, y)| Point { x, y }).collect(),
         radius,
         softness,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }
+    )
 }
 
 /// `image` rendered over `tile`, laid out as the tile's own rows.
@@ -145,16 +143,14 @@ fn reference_blend<S: Blend>(
     let mut out = composite.to_vec();
     let mut frame = vec![S::default(); out.len()];
     for op in ops {
-        let Op::BrushStroke { source_id, .. } = op else {
-            panic!("only strokes are blended");
-        };
+        let frame_index = blend::source_frame(op).unwrap();
         let at = Rect {
             x: origin.0,
             y: origin.1,
             width,
             height,
         };
-        S::read_tile(frames, usize::from(*source_id), at, &mut frame).unwrap();
+        S::read_tile(frames, usize::from(frame_index), at, &mut frame).unwrap();
         for y in 0..height {
             for x in 0..width {
                 let a = blend::alpha(op, info, x, y).unwrap();
@@ -723,7 +719,7 @@ fn append_refuses_bad_ops_and_writes_nothing() {
 fn q16_zero_opacity_changes_nothing() {
     let (_, project_path, root, _) = gained_pair("retouch_ops_q16_zero");
     let faint = Op::BrushStroke {
-        source_id: 1,
+        source: StrokeSource::Frame(1),
         path: vec![Point { x: 10, y: 10 }, Point { x: 30, y: 20 }],
         radius: 9.0,
         softness: 0.0,
@@ -813,7 +809,7 @@ fn stroke_in(
     opacity: f32,
 ) -> Op {
     Op::BrushStroke {
-        source_id,
+        source: StrokeSource::Frame(source_id),
         path: path.iter().map(|&(x, y)| Point { x, y }).collect(),
         radius,
         softness: 0.3,
@@ -836,14 +832,12 @@ fn reference_whole<S: Blend>(
     let placed: Vec<blend::PlacedStroke> = ops
         .iter()
         .filter_map(|op| {
-            let Op::BrushStroke { source_id, .. } = op else {
-                panic!("only strokes are blended");
-            };
+            let frame = blend::source_frame(op).unwrap();
             blend::footprint(op, info)
                 .unwrap()
                 .map(|footprint| blend::PlacedStroke {
                     op,
-                    frame: usize::from(*source_id),
+                    frame: usize::from(frame),
                     footprint,
                 })
         })
