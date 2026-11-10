@@ -3692,7 +3692,6 @@ mod tests {
         let table = palette();
         let none = ModeConditions::default();
         let area = rect(0, 0, 60, 30);
-        let at = |op: Op| vec![op];
         let from = |mode, opacity| {
             source_stroke(
                 StrokeSource::Checkpoint("amber".to_string()),
@@ -3716,7 +3715,7 @@ mod tests {
         }
         for mode in [BrushMode::Normal, BrushMode::Detail] {
             for opacity in [1.0f32, 0.5] {
-                let ops = at(from(mode, opacity));
+                let ops = vec![from(mode, opacity)];
                 let mut origins = 0;
                 for x in 0..45 {
                     let product =
