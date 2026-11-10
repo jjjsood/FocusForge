@@ -88,14 +88,15 @@ pub struct AlignReport {
     /// no `--no-align`. Present so `align --json` and `stack --json` report
     /// their `align` stage the same way.
     pub align_source: String,
-    /// The anchor arm's worker bound and the peak it reached: always `Some`
-    /// here. `Option` so the key has one type in `align --json` and
-    /// `stack --json`.
+    /// The worker bound of the alignment (anchor registrations or chain hops)
+    /// and the peak it reached: always `Some` here. `Option` so the key has
+    /// one type in `align --json` and `stack --json`.
     pub align_workers: Option<usize>,
     pub peak_align_workers: Option<usize>,
-    /// The bytes the alignment accounted for: the shared reference data plus
-    /// one registration per worker. An explicit budget below one
-    /// registration still runs one worker, so this can exceed the budget.
+    /// The bytes the alignment accounted for: for an anchor run the shared
+    /// reference data plus one registration per worker, for a chain run one
+    /// hop per worker. An explicit budget below one registration or hop still
+    /// runs one worker, so this can exceed the budget.
     pub align_accounted_bytes: u64,
     /// `"cpu"`, or the adapter's display when at least one alignment level
     /// ran on it.

@@ -514,8 +514,8 @@ pub fn read_tile_step_into<R: TileReader + ?Sized>(
 
 /// What an [`AlignAlgorithm::align_frame`] call sees: the facts about the
 /// stack, which frame is the alignment reference, a handle onto real pixels
-/// through a [`TileReader`], and (in the anchor arm only) a driver-prepared
-/// value from [`AlignAlgorithm::prepare_run`].
+/// through a [`TileReader`], and a driver-prepared value from
+/// [`AlignAlgorithm::prepare_run`].
 ///
 /// `Send + Sync` on [`TileReader`] is what keeps `AlignContext<'_>` `Sync`,
 /// which is what lets `align_frame` run across frames under rayon. `Send +
@@ -806,12 +806,12 @@ pub trait AlignAlgorithm: Send + Sync + 'static {
         false
     }
 
-    /// Called **at most once per run**, by the driver, **only in the anchor
-    /// arm**, before any [`align_frame`](Self::align_frame) call of that
-    /// run -- with the same fully resolved `cfg` every `align_frame` call of
-    /// that run will receive. The returned value is opaque to the driver,
-    /// which only owns it and hands it back to every `align_frame` call
-    /// through [`AlignContext::prepared`]; nothing here interprets it.
+    /// Called **at most once per run**, by the driver, in the anchor and the
+    /// chain arm alike, before any [`align_frame`](Self::align_frame) call of
+    /// that run -- with the same fully resolved `cfg` every call will receive.
+    /// The returned value is opaque to the driver, which owns it and hands it
+    /// back to every `align_frame` call through [`AlignContext::prepared`]; in
+    /// a chain run those calls share it concurrently.
     ///
     /// `Ok(None)` is always a correct implementation -- it costs only the
     /// rebuild it declines to avoid -- which is why every implementor except

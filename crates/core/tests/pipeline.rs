@@ -551,7 +551,10 @@ fn cancel_during_alignment_stops_at_a_frame_boundary() {
     let frame_count = CANCEL_ON + workers + 8;
     let frames = mantis_64_frames(frame_count);
 
-    for (policy, bound) in [("anchor", CANCEL_ON + workers - 1), ("chain", CANCEL_ON)] {
+    for (policy, bound) in [
+        ("anchor", CANCEL_ON + workers - 1),
+        ("chain", CANCEL_ON + workers - 1),
+    ] {
         let control = JobControl::new();
         let algorithm: &'static CancellingAlign = Box::leak(Box::new(CancellingAlign {
             control: Arc::clone(&control),
@@ -724,8 +727,11 @@ fn pause_during_alignment_stops_registering_frames() {
     let frames = mantis_64_frames(frame_count);
 
     // The pausing call itself, plus at most one in-flight registration per
-    // other worker; the chain arm registers on one thread.
-    for (policy, bound) in [("anchor", PAUSE_ON + workers - 1), ("chain", PAUSE_ON)] {
+    // other worker, in either arm.
+    for (policy, bound) in [
+        ("anchor", PAUSE_ON + workers - 1),
+        ("chain", PAUSE_ON + workers - 1),
+    ] {
         let control = JobControl::new();
         let calls = Arc::new(AtomicUsize::new(0));
         let algorithm: &'static PausingAlign = Box::leak(Box::new(PausingAlign {
@@ -780,7 +786,10 @@ fn cancel_during_alignment_stops_at_a_frame_boundary_from_a_held_pause() {
     let frame_count = PAUSE_ON + workers + 8;
     let frames = mantis_64_frames(frame_count);
 
-    for (policy, bound) in [("anchor", PAUSE_ON + workers - 1), ("chain", PAUSE_ON)] {
+    for (policy, bound) in [
+        ("anchor", PAUSE_ON + workers - 1),
+        ("chain", PAUSE_ON + workers - 1),
+    ] {
         let control = JobControl::new();
         let calls = Arc::new(AtomicUsize::new(0));
         let algorithm: &'static PausingAlign = Box::leak(Box::new(PausingAlign {
@@ -1071,9 +1080,10 @@ fn align_progress_carries_an_eta() {
 fn align_eta_excludes_a_pause() {
     let control = JobControl::new();
     let observer = AlignEtaLog::default();
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
     let request = timed_align_request(
         "align_eta_pause",
-        8,
+        2 + workers + 8,
         &control,
         2,
         Duration::from_millis(20),
