@@ -53,8 +53,7 @@ pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage, 
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
 pub use focusforge_core::project::{BrushMode, Op, StrokeSource};
 pub use focusforge_core::project::{
-    GONE_KEY, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, entry_colour_index,
-    held_index, held_key, kept_entries, now_unix, stroke_chain,
+    GONE_KEY, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, kept_entries, now_unix,
 };
 pub use focusforge_core::retouch::{
     ModeConditions, RetouchError, footprint, needs_mode_conditions, source_frame, top_source,
