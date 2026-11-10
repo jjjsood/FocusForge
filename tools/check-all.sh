@@ -48,6 +48,7 @@ set -uo pipefail  # deliberately not -e: every gate runs, then the summary
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
+ARGS=("$@")
 STATIC_ONLY=0
 QUICK=0
 VERBOSE=0
@@ -75,6 +76,26 @@ done
 case "$TAIL_LINES" in
   ''|*[!0-9]*) usage ;;
 esac
+
+# On a Linux desktop the test stages briefly saturate every core and push
+# memory into swap, which freezes the session. A building run therefore
+# re-executes itself in a transient systemd user scope: above MemoryHigh the
+# kernel reclaims from the gate instead of from the desktop, and CPUWeight
+# only matters under contention, so an idle machine still runs at full speed.
+# A caller already inside a scope with a memory.high keeps that limit, since
+# the new scope is a sibling and would otherwise escape it.
+# FF_GATE_MEMORY_HIGH / FF_GATE_WEIGHT (CPU and IO) tune it; FF_GATE_SCOPE=0 or CI
+# turns it off; without a reachable user manager the run goes on unscoped.
+if [ "$STATIC_ONLY" -eq 0 ] && [ -z "${CI:-}" ] && [ "${FF_GATE_SCOPE:-1}" != 0 ] \
+   && [ "$(uname -s)" = Linux ] && command -v systemd-run >/dev/null 2>&1 \
+   && systemctl --user show -p Version >/dev/null 2>&1; then
+  mem_high="${FF_GATE_MEMORY_HIGH:-85%}"
+  outer="$(cat "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.high" 2>/dev/null)"
+  [ -z "${FF_GATE_MEMORY_HIGH:-}" ] && [ -n "$outer" ] && [ "$outer" != max ] && mem_high="$outer"
+  exec env FF_GATE_SCOPE=0 systemd-run --user --scope --quiet --collect --unit "check-all-$$-$RANDOM" \
+    -p MemoryHigh="$mem_high" -p CPUWeight="${FF_GATE_WEIGHT:-50}" -p IOWeight="${FF_GATE_WEIGHT:-50}" \
+    "$BASH" "$REPO/tools/check-all.sh" ${ARGS+"${ARGS[@]}"}
+fi
 
 [ -f Cargo.toml ] || {
   echo "SKIP check-all: no Cargo.toml"
