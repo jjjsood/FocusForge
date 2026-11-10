@@ -137,9 +137,9 @@ pub struct StackReport {
     /// `None` unless the alignment was computed this run.
     pub align_workers: Option<usize>,
     pub peak_align_workers: Option<usize>,
-    /// The bytes the alignment accounted for (shared reference data plus one
-    /// registration per worker) -- `None` unless the alignment was computed
-    /// this run.
+    /// The bytes the alignment accounted for: for an anchor run the shared
+    /// reference data plus one registration per worker, for a chain run one
+    /// hop per worker -- `None` unless the alignment was computed this run.
     pub align_accounted_bytes: Option<u64>,
     /// `"cpu"`, or the adapter's display when at least one alignment level
     /// ran on it -- `null` unless the alignment was computed this run.
