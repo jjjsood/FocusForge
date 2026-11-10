@@ -763,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_fallback_line_names_a_software_adapter() {
+    fn software_adapter_line_names_the_adapter() {
         for name in [
             "Microsoft Basic Render Driver",
             "llvmpipe (LLVM 19.1.7, 256 bits)",
