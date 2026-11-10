@@ -2050,102 +2050,132 @@ fn assert_scratch_u16_reads(want: &[u16], got: &[u16], what: &str) {
 
 #[test]
 fn raw_develop_pass_reads_match_cached_reads() {
-    const SIDE: (u32, u32) = (40, 30);
-    let files: Vec<_> = (0..3)
-        .map(|i| gradient_dng(SIDE.0, SIDE.1, i * 700))
-        .collect();
-    let paths: Vec<PathBuf> = files.iter().map(|f| PathBuf::from(f.path())).collect();
-    let cached = RawStack::open_files(&paths).expect("DNG stack opens");
-    let developed = RawStack::open_files(&paths).expect("DNG stack opens");
-    let root = target_tmp();
-    developed
-        .develop_once(
-            root.path(),
-            HostBudget::explicit(u64::MAX),
-            2,
-            &|| false,
-            &AtomicUsize::new(0),
-        )
-        .expect("the pass develops every frame");
-    assert_eq!(developed.develop_counts(), Some(vec![1; 3]));
-    let rects = [
-        Rect {
-            x: 0,
-            y: 0,
-            width: SIDE.0,
-            height: SIDE.1,
-        },
-        Rect {
-            x: SIDE.0 - 5,
-            y: SIDE.1 - 3,
-            width: 5,
-            height: 3,
-        },
-        Rect {
-            x: SIDE.0 - 1,
-            y: SIDE.1 - 1,
-            width: 1,
-            height: 1,
-        },
-    ];
-    for frame in 0..3 {
-        for rect in rects {
-            let samples = rect.width as usize * rect.height as usize * 3;
-            for gain in [UNIT_GAIN, UNIT_GAIN * 3 / 2, UNIT_GAIN / 3] {
+    for side in [(40u32, 30u32), (150, 70)] {
+        let files: Vec<_> = (0..3)
+            .map(|i| gradient_dng(side.0, side.1, i * 700))
+            .collect();
+        let paths: Vec<PathBuf> = files.iter().map(|f| PathBuf::from(f.path())).collect();
+        let cached = RawStack::open_files(&paths).expect("DNG stack opens");
+        let developed = RawStack::open_files(&paths).expect("DNG stack opens");
+        let root = target_tmp();
+        developed
+            .develop_once(
+                root.path(),
+                HostBudget::explicit(u64::MAX),
+                2,
+                &|| false,
+                &AtomicUsize::new(0),
+            )
+            .expect("the pass develops every frame");
+        assert_eq!(developed.develop_counts(), Some(vec![1; 3]));
+        let rects = [
+            Rect {
+                x: 0,
+                y: 0,
+                width: side.0,
+                height: side.1,
+            },
+            Rect {
+                x: side.0 - 5,
+                y: side.1 - 3,
+                width: 5,
+                height: 3,
+            },
+            Rect {
+                x: side.0 - 1,
+                y: side.1 - 1,
+                width: 1,
+                height: 1,
+            },
+        ];
+        // Rects across 64 px block boundaries, on and off the 32 px grid.
+        let straddling = [
+            Rect {
+                x: 60,
+                y: 60,
+                width: 8,
+                height: 8,
+            },
+            Rect {
+                x: 33,
+                y: 1,
+                width: 100,
+                height: 69,
+            },
+            Rect {
+                x: 63,
+                y: 0,
+                width: 2,
+                height: 70,
+            },
+        ];
+        let rects: Vec<Rect> = rects
+            .into_iter()
+            .chain(
+                straddling
+                    .into_iter()
+                    .filter(|r| r.x + r.width <= side.0 && r.y + r.height <= side.1),
+            )
+            .collect();
+        for frame in 0..3 {
+            for &rect in &rects {
+                let samples = rect.width as usize * rect.height as usize * 3;
+                for gain in [UNIT_GAIN, UNIT_GAIN * 3 / 2, UNIT_GAIN / 3] {
+                    let (mut want, mut got) = (vec![0u16; samples], vec![0u16; samples]);
+                    cached
+                        .read_tile_gained_into(frame, rect, gain, &mut want)
+                        .expect("cached read");
+                    developed
+                        .read_tile_gained_into(frame, rect, gain, &mut got)
+                        .expect("mapped read");
+                    assert_scratch_u16_reads(
+                        &want,
+                        &got,
+                        &format!("u16 frame {frame} {rect:?} gain {gain}"),
+                    );
+
+                    let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
+                    cached
+                        .read_tile_gained_f32_into(frame, rect, gain, &mut want)
+                        .expect("cached read");
+                    developed
+                        .read_tile_gained_f32_into(frame, rect, gain, &mut got)
+                        .expect("mapped read");
+                    assert_scratch_f32_reads(
+                        &want,
+                        &got,
+                        &format!("f32 frame {frame} {rect:?} gain {gain}"),
+                    );
+                }
                 let (mut want, mut got) = (vec![0u16; samples], vec![0u16; samples]);
                 cached
-                    .read_tile_gained_into(frame, rect, gain, &mut want)
+                    .read_tile_into(frame, rect, &mut want)
                     .expect("cached read");
                 developed
-                    .read_tile_gained_into(frame, rect, gain, &mut got)
+                    .read_tile_into(frame, rect, &mut got)
                     .expect("mapped read");
-                assert_scratch_u16_reads(
-                    &want,
-                    &got,
-                    &format!("u16 frame {frame} {rect:?} gain {gain}"),
-                );
-
+                assert_scratch_u16_reads(&want, &got, &format!("unit gain frame {frame} {rect:?}"));
                 let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
                 cached
-                    .read_tile_gained_f32_into(frame, rect, gain, &mut want)
+                    .read_tile_f32_into(frame, rect, &mut want)
                     .expect("cached read");
                 developed
-                    .read_tile_gained_f32_into(frame, rect, gain, &mut got)
+                    .read_tile_f32_into(frame, rect, &mut got)
                     .expect("mapped read");
                 assert_scratch_f32_reads(
                     &want,
                     &got,
-                    &format!("f32 frame {frame} {rect:?} gain {gain}"),
+                    &format!("unit gain f32 frame {frame} {rect:?}"),
                 );
             }
-            let (mut want, mut got) = (vec![0u16; samples], vec![0u16; samples]);
-            cached
-                .read_tile_into(frame, rect, &mut want)
-                .expect("cached read");
-            developed
-                .read_tile_into(frame, rect, &mut got)
-                .expect("mapped read");
-            assert_scratch_u16_reads(&want, &got, &format!("unit gain frame {frame} {rect:?}"));
-            let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
-            cached
-                .read_tile_f32_into(frame, rect, &mut want)
-                .expect("cached read");
-            developed
-                .read_tile_f32_into(frame, rect, &mut got)
-                .expect("mapped read");
-            assert_scratch_f32_reads(
-                &want,
-                &got,
-                &format!("unit gain f32 frame {frame} {rect:?}"),
+            assert_eq!(
+                cached.linear_means(frame).expect("cached means"),
+                developed.linear_means(frame).expect("mapped means"),
+                "means of frame {frame}"
             );
         }
-        assert_eq!(
-            cached.linear_means(frame).expect("cached means"),
-            developed.linear_means(frame).expect("mapped means"),
-            "means of frame {frame}"
-        );
+        assert_eq!(developed.develop_counts(), Some(vec![1; 3]));
     }
-    assert_eq!(developed.develop_counts(), Some(vec![1; 3]));
 }
 
 fn scratch_files(root: &Path) -> Vec<PathBuf> {
@@ -2166,28 +2196,31 @@ fn scratch_files(root: &Path) -> Vec<PathBuf> {
 
 #[test]
 fn raw_scratch_file_size_matches_encoding() {
-    let dng = gradient_dng(48, 20, 0);
-    let root = target_tmp();
-    let paths = copies_of(&dng, 8, root.path());
-    let stack = RawStack::open_files(&paths).expect("DNG stack opens");
-    let scratch = root.path().join("scratch");
-    std::fs::create_dir(&scratch).expect("scratch root");
-    stack
-        .develop_once(
-            &scratch,
-            HostBudget::explicit(u64::MAX),
-            2,
-            &|| false,
-            &AtomicUsize::new(0),
-        )
-        .expect("the pass develops every frame");
-    let frame_bytes = stack.scratch_frame_bytes().expect("frame bytes fit");
-    assert_eq!(frame_bytes, 48 * 20 * 6);
-    let files = scratch_files(&scratch);
-    assert_eq!(files.len(), 8, "{files:?}");
-    for file in files {
-        let length = std::fs::metadata(&file).expect("scratch file").len();
-        assert_eq!(length, frame_bytes, "{}", file.display());
+    // One block, and ragged on both axes across several blocks.
+    for (width, height) in [(48u32, 20u32), (130, 70)] {
+        let dng = gradient_dng(width, height, 0);
+        let root = target_tmp();
+        let paths = copies_of(&dng, 8, root.path());
+        let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).expect("scratch root");
+        stack
+            .develop_once(
+                &scratch,
+                HostBudget::explicit(u64::MAX),
+                2,
+                &|| false,
+                &AtomicUsize::new(0),
+            )
+            .expect("the pass develops every frame");
+        let frame_bytes = stack.scratch_frame_bytes().expect("frame bytes fit");
+        assert_eq!(frame_bytes, u64::from(width * height * 6));
+        let files = scratch_files(&scratch);
+        assert_eq!(files.len(), 8, "{files:?}");
+        for file in files {
+            let length = std::fs::metadata(&file).expect("scratch file").len();
+            assert_eq!(length, frame_bytes, "{}", file.display());
+        }
     }
 }
 

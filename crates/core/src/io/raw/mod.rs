@@ -245,15 +245,23 @@ impl CachedFrame for LinearFrame {
 /// channels.
 const PIXEL_BYTES: usize = std::mem::size_of::<[half::f16; 3]>();
 
+/// Side of the square pixel blocks a developed frame is stored in.
+const SCRATCH_BLOCK: usize = 64;
+
 /// Pixels per `write` call when a developed frame goes to scratch.
 const WRITE_PIXELS: usize = 1 << 16;
 
 /// A frame developed into a scratch file and mapped read-only: its
 /// `width * height` samples as native-endian half-precision `[f16; 3]`, no
-/// header.
+/// header, in `SCRATCH_BLOCK`-square blocks. Blocks follow in row-major order;
+/// inside a block the samples are row-major. Blocks at the right and bottom
+/// edges are ragged, so a block `bw` wide and `bh` high holds `bw * bh`
+/// pixels.
 #[derive(Debug)]
 struct MappedFrame {
     map: Mmap,
+    width: usize,
+    height: usize,
     /// Each channel's mean over the frame.
     means: [f64; 3],
     /// Grey replicated to three channels, so no colour transform applies.
@@ -261,8 +269,22 @@ struct MappedFrame {
 }
 
 impl MappedFrame {
-    /// `count` pixels starting at pixel `first`.
-    fn pixels(&self, first: usize, count: usize) -> impl Iterator<Item = [f32; 3]> + '_ {
+    /// `count` pixels of row `y` starting at column `x`, all inside one block.
+    fn pixels(&self, x: usize, y: usize, count: usize) -> impl Iterator<Item = [f32; 3]> + '_ {
+        let (block_x, block_y) = (
+            x / SCRATCH_BLOCK * SCRATCH_BLOCK,
+            y / SCRATCH_BLOCK * SCRATCH_BLOCK,
+        );
+        let block_width = SCRATCH_BLOCK.min(self.width - block_x);
+        let block_height = SCRATCH_BLOCK.min(self.height - block_y);
+        assert!(
+            x - block_x + count <= block_width,
+            "a read stays inside one scratch block"
+        );
+        let first = block_y * self.width
+            + block_x * block_height
+            + (y - block_y) * block_width
+            + (x - block_x);
         self.map[first * PIXEL_BYTES..(first + count) * PIXEL_BYTES]
             .chunks_exact(PIXEL_BYTES)
             .map(|pixel| {
@@ -482,31 +504,46 @@ impl RawStack {
             path: path.clone(),
             source,
         };
-        write_samples(&path, &developed.samples).map_err(fault)?;
+        let (width, height) = {
+            let desc = &self.frames[index].desc;
+            (desc.width as usize, desc.height as usize)
+        };
+        write_samples(&path, &developed.samples, width).map_err(fault)?;
         Ok(MappedFrame {
             map: map_read_only(&path).map_err(fault)?,
+            width,
+            height,
             means: developed.means,
             monochrome: developed.monochrome,
         })
     }
 }
 
-/// Writes `samples` to a new file at `path` as native-endian `f16`s, each
-/// rounded to nearest.
-fn write_samples(path: &Path, samples: &[[f32; 3]]) -> std::io::Result<()> {
+/// Writes `samples`, `width` pixels per row, to a new file at `path` as
+/// native-endian `f16`s, each rounded to nearest, in `SCRATCH_BLOCK`-square
+/// blocks: block rows top to bottom, blocks left to right, each block's rows
+/// in order. Blocks at the right and bottom edges are ragged, not padded.
+fn write_samples(path: &Path, samples: &[[f32; 3]], width: usize) -> std::io::Result<()> {
     let mut file = std::fs::File::create(path)?;
     let mut chunk = Vec::with_capacity(WRITE_PIXELS * PIXEL_BYTES);
-    for pixels in samples.chunks(WRITE_PIXELS) {
-        chunk.clear();
-        chunk.extend(
-            pixels
-                .iter()
-                .flatten()
-                .flat_map(|value| half::f16::from_f32(*value).to_ne_bytes()),
-        );
-        file.write_all(&chunk)?;
+    for band in samples.chunks(width * SCRATCH_BLOCK) {
+        for first in (0..width).step_by(SCRATCH_BLOCK) {
+            let last = (first + SCRATCH_BLOCK).min(width);
+            for row in band.chunks_exact(width) {
+                chunk.extend(
+                    row[first..last]
+                        .iter()
+                        .flatten()
+                        .flat_map(|value| half::f16::from_f32(*value).to_ne_bytes()),
+                );
+                if chunk.len() >= WRITE_PIXELS * PIXEL_BYTES {
+                    file.write_all(&chunk)?;
+                    chunk.clear();
+                }
+            }
+        }
     }
-    Ok(())
+    file.write_all(&chunk)
 }
 
 impl FrameReader for RawStack {
@@ -679,12 +716,29 @@ impl RawStack {
                     destination,
                 ),
                 Developed::Mapped(frame) => {
-                    look_row(frame.pixels(source, width), look, scale, destination);
+                    for (x, len) in block_segments(rect.x as usize, width) {
+                        let target = &mut destination[(x - rect.x as usize) * 3..][..len * 3];
+                        look_row(frame.pixels(x, source_y as usize, len), look, scale, target);
+                    }
                 }
             }
         }
         Ok(())
     }
+}
+
+/// The runs of `count` pixels from column `x` that each stay inside one
+/// scratch block column, as `(first column, length)`.
+fn block_segments(x: usize, count: usize) -> impl Iterator<Item = (usize, usize)> {
+    let end = x + count;
+    std::iter::successors(Some(x), |&start| {
+        Some((start / SCRATCH_BLOCK + 1) * SCRATCH_BLOCK)
+    })
+    .take_while(move |&start| start < end)
+    .map(move |start| {
+        let stop = ((start / SCRATCH_BLOCK + 1) * SCRATCH_BLOCK).min(end);
+        (start, stop - start)
+    })
 }
 
 /// Applies `scale`, then the look, to `pixels`, narrowing into `target`.
@@ -1448,8 +1502,102 @@ fn seam<T>(path: &Path, operation: impl FnOnce() -> rawler::Result<T>) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{RawError, panic_boundary, scratch_bytes};
+    use super::{
+        MappedFrame, PIXEL_BYTES, RawError, SCRATCH_BLOCK, block_segments, map_read_only,
+        panic_boundary, scratch_bytes, write_samples,
+    };
     use std::path::Path;
+
+    /// A frame whose sample at (x, y) is `[x, y, x + y]`, exact in half precision.
+    fn coordinate_samples(width: usize, height: usize) -> Vec<[f32; 3]> {
+        (0..height)
+            .flat_map(|y| (0..width).map(move |x| [x as f32, y as f32, (x + y) as f32]))
+            .collect()
+    }
+
+    fn scratch_frame(dir: &Path, width: usize, height: usize) -> MappedFrame {
+        let path = dir.join("frame.f16");
+        write_samples(&path, &coordinate_samples(width, height), width).expect("scratch writes");
+        MappedFrame {
+            map: map_read_only(&path).expect("scratch maps"),
+            width,
+            height,
+            means: [0.0; 3],
+            monochrome: false,
+        }
+    }
+
+    #[test]
+    fn scratch_file_is_block_major() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for (width, height) in [(128, 64), (130, 64), (150, 70), (129, 131), (40, 30)] {
+            let frame = scratch_frame(dir.path(), width, height);
+            assert_eq!(
+                frame.map.len(),
+                width * height * PIXEL_BYTES,
+                "{width}x{height}"
+            );
+            // Blocks in row-major block order, rows then columns inside a block.
+            let mut order: Vec<(usize, usize)> = (0..height)
+                .flat_map(|y| (0..width).map(move |x| (x, y)))
+                .collect();
+            order.sort_by_key(|&(x, y)| (y / SCRATCH_BLOCK, x / SCRATCH_BLOCK, y, x));
+            let expected: Vec<u8> = order
+                .iter()
+                .flat_map(|&(x, y)| {
+                    [x as f32, y as f32, (x + y) as f32]
+                        .into_iter()
+                        .flat_map(|value| half::f16::from_f32(value).to_ne_bytes())
+                })
+                .collect();
+            assert!(
+                frame.map[..] == expected[..],
+                "{width}x{height} layout differs"
+            );
+        }
+    }
+
+    #[test]
+    fn block_major_reads_match_row_major() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let starts = [0usize, 1, 17, 63, 64, 65, 127];
+        let lengths = [1usize, 2, 64, 65, 130];
+        for (width, height) in [(150, 70), (129, 131), (40, 30)] {
+            let frame = scratch_frame(dir.path(), width, height);
+            let reference = coordinate_samples(width, height);
+            for &y0 in &starts {
+                for &x0 in &starts {
+                    for &rows in &lengths {
+                        for &columns in &lengths {
+                            if x0 + columns > width || y0 + rows > height {
+                                continue;
+                            }
+                            let mut got = Vec::new();
+                            for y in y0..y0 + rows {
+                                for (x, len) in block_segments(x0, columns) {
+                                    got.extend(frame.pixels(x, y, len));
+                                }
+                            }
+                            let want: Vec<[f32; 3]> = (y0..y0 + rows)
+                                .flat_map(|y| {
+                                    reference[y * width + x0..y * width + x0 + columns]
+                                        .iter()
+                                        .map(|pixel| pixel.map(|v| half::f16::from_f32(v).to_f32()))
+                                })
+                                .collect();
+                            assert!(
+                                got == want,
+                                "{width}x{height} rect at ({x0},{y0}) {columns}x{rows}"
+                            );
+                        }
+                    }
+                }
+            }
+            let (x, y) = (width - 1, height - 1);
+            let got: Vec<_> = frame.pixels(x, y, 1).collect();
+            assert_eq!(got, vec![[x as f32, y as f32, (x + y) as f32]]);
+        }
+    }
 
     #[test]
     fn scratch_space_needed_overflow_is_an_error() {
