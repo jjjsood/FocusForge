@@ -362,3 +362,226 @@ fn stdout_json_is_one_document() {
     assert_eq!(report["checkpoints"].as_array().unwrap().len(), 3);
     assert_eq!(report["project"], arg(&project));
 }
+
+/// A brush stroke named by a `source` record, `{"frame": n}` or
+/// `{"checkpoint": "<id prefix>"}`.
+fn with_source(source: Value, radius: f64, softness: f64, path: &[(i32, i32)]) -> Value {
+    let mut op = stroke(0, radius, softness, path);
+    let body = op["brush-stroke"].as_object_mut().unwrap();
+    body.remove("source_id");
+    body.insert("source".into(), source);
+    op
+}
+
+fn visible_ids(project: &Path) -> Vec<String> {
+    let open = Project::open(project).unwrap();
+    let ids = open.history().visible();
+    ids.into_iter().map(|c| c.id.clone()).collect()
+}
+
+/// The shortest prefix of `id`, at least 4 characters, that no other visible
+/// id shares.
+fn shortest_unique_prefix(project: &Path, id: &str) -> String {
+    let visible = visible_ids(project);
+    (4..=id.len())
+        .map(|n| &id[..n])
+        .find(|prefix| visible.iter().filter(|v| v.starts_with(prefix)).count() == 1)
+        .expect("a full id is unique")
+        .to_string()
+}
+
+/// The checkpoint source of the one stroke of state `id`.
+fn stored_source(project: &Path, id: &str) -> Option<String> {
+    let open = Project::open(project).unwrap();
+    let checkpoint = open.history().get(id).unwrap();
+    assert_eq!(checkpoint.ops.len(), 1);
+    checkpoint.ops[0].checkpoint_source().map(str::to_string)
+}
+
+#[test]
+fn retouch_checkpoint_sources() {
+    let (dir, project) = fresh_project("retouch_checkpoint_sources");
+    let root = root_id(&project);
+    let at = [(100, 100)];
+    let frame = |n: u32| with_source(serde_json::json!({ "frame": n }), 20.0, 0.0, &at);
+    let from_checkpoint =
+        |prefix: &str| with_source(serde_json::json!({ "checkpoint": prefix }), 30.0, 0.0, &at);
+
+    // Painting from the base at full strength restores the area bit-identically.
+    let root_prefix = shortest_unique_prefix(&project, &root);
+    let restore = write_json(
+        &dir,
+        "restore.json",
+        &Value::Array(vec![frame(1), from_checkpoint(&root_prefix)]),
+    );
+    let painted = retouch_ok(&dir, &project, &restore, &[]);
+    assert_eq!(painted.len(), 2, "restore: one state per op");
+    let base = exported(&dir, &project, &root);
+    assert_ne!(
+        exported(&dir, &project, &painted[0]),
+        base,
+        "restore: the frame stroke changes the image"
+    );
+    assert_eq!(
+        exported(&dir, &project, &painted[1]),
+        base,
+        "restore: painting from the base restores it"
+    );
+    assert_eq!(
+        stored_source(&project, &painted[1]).as_deref(),
+        Some(root.as_str())
+    );
+
+    // A mixed list: a legacy frame stroke, the full id, the shortest unique
+    // prefix and a `frame` record; each stored reference is the full id.
+    let painted_from = painted[0].clone();
+    let short = shortest_unique_prefix(&project, &painted_from);
+    assert!(
+        short.len() >= 4 && short.len() <= painted_from.len(),
+        "{short}"
+    );
+    let mixed = write_json(
+        &dir,
+        "mixed.json",
+        &Value::Array(vec![
+            stroke(1, 20.0, 0.0, &at),
+            from_checkpoint(&painted_from),
+            from_checkpoint(&short),
+            frame(2),
+        ]),
+    );
+    let chain = retouch_ok(&dir, &project, &mixed, &["--from", &root]);
+    assert_eq!(chain.len(), 4, "mixed: one state per op");
+    let sources: Vec<Option<String>> = chain.iter().map(|id| stored_source(&project, id)).collect();
+    assert_eq!(
+        sources,
+        [
+            None,
+            Some(painted_from.clone()),
+            Some(painted_from.clone()),
+            None
+        ],
+        "mixed: stored references are full ids"
+    );
+    let open = Project::open(&project).unwrap();
+    assert_eq!(
+        open.history().get(&chain[0]).unwrap().ops,
+        open.history().get(&painted[0]).unwrap().ops,
+        "mixed: source_id n is the frame n record"
+    );
+    drop(open);
+
+    // `--from` and a checkpoint source resolve one prefix the same way.
+    let one_frame = write_json(&dir, "one-frame.json", &Value::Array(vec![frame(1)]));
+    let unique = shortest_unique_prefix(&project, &root);
+    let via_from = retouch_ok(&dir, &project, &one_frame, &["--from", &unique]);
+    let parent = Project::open(&project)
+        .unwrap()
+        .history()
+        .get(&via_from[0])
+        .unwrap()
+        .parent
+        .clone();
+    assert_eq!(parent.as_deref(), Some(root.as_str()), "--from resolves it");
+    let one_source = write_json(
+        &dir,
+        "one-source.json",
+        &Value::Array(vec![from_checkpoint(&unique)]),
+    );
+    let via_source = retouch_ok(&dir, &project, &one_source, &[]);
+    assert_eq!(
+        stored_source(&project, &via_source[0]).as_deref(),
+        Some(root.as_str()),
+        "a source resolves the same prefix to the same checkpoint"
+    );
+
+    // A deleted checkpoint that strokes still paint from stays stored, hidden.
+    let output = run(
+        &dir,
+        &[
+            "history",
+            "delete",
+            arg(&project),
+            "--checkpoint",
+            &painted_from,
+        ],
+    );
+    assert!(output.success, "history delete: {}", output.stderr);
+    let hidden = Project::open(&project)
+        .unwrap()
+        .history()
+        .get(&painted_from)
+        .unwrap()
+        .hidden;
+    assert!(hidden, "the deleted checkpoint is kept, hidden");
+
+    let visible = visible_ids(&project);
+    let count = format!("matches {} checkpoints", visible.len());
+    let mut ambiguous = vec![count.as_str()];
+    ambiguous.extend(visible.iter().map(String::as_str));
+    let named = format!("no checkpoint named {painted_from}");
+    let cases: [(&str, &str, Vec<&str>); 3] = [
+        ("unknown", "zz", vec!["no checkpoint named zz"]),
+        ("ambiguous", "", ambiguous),
+        ("hidden", &painted_from, vec![named.as_str()]),
+    ];
+    for (name, prefix, parts) in cases {
+        for position in [0usize, 2] {
+            let mut list = vec![frame(1); 3];
+            list[position] = from_checkpoint(prefix);
+            let file = format!("{name}-{position}.json");
+            let stderr = refuse(&dir, &project, &file, &Value::Array(list));
+            let lead = format!("op #{position}: ");
+            assert!(stderr.contains(&lead), "{name} at {position}: {stderr}");
+            for part in &parts {
+                assert!(stderr.contains(part), "{name} at {position}: {stderr}");
+            }
+        }
+    }
+    for prefix in ["zz", ""] {
+        let args = [
+            "retouch",
+            arg(&project),
+            "--ops",
+            arg(&one_frame),
+            "--from",
+            prefix,
+        ];
+        let from = run(&dir, &args);
+        let ops = write_json(
+            &dir,
+            "bad-source.json",
+            &Value::Array(vec![from_checkpoint(prefix)]),
+        );
+        let source = run(&dir, &["retouch", arg(&project), "--ops", arg(&ops)]);
+        assert!(!from.success && !source.success, "{prefix:?}");
+        let (_, after) = source
+            .stderr
+            .split_once("op #0: ")
+            .expect("the op position leads");
+        assert_eq!(
+            from.stderr.trim_start_matches("error: ").trim_end(),
+            after.trim_end(),
+            "{prefix:?}: --from and a source say the same"
+        );
+    }
+}
+
+#[test]
+fn retouch_help_names_both_sources() {
+    let dir = common::tmp_dir("retouch_help_sources");
+    let output = run(&dir, &["retouch", "--help"]);
+    assert!(output.success, "{}", output.stderr);
+    for part in [
+        r#"{"frame": n}"#,
+        r#"{"checkpoint": "<id prefix>"}"#,
+        r#""source_id": n` reads as frame n"#,
+        "unique prefix",
+    ] {
+        assert!(
+            output.stdout.contains(part),
+            "`{part}` missing: {}",
+            output.stdout
+        );
+    }
+}

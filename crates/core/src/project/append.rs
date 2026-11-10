@@ -20,6 +20,7 @@ use super::error::ProjectError;
 use super::manifest::{
     AlignRecord, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
 };
+use super::render::unpaintable_reason;
 use super::seal::{composite_blob, now_unix, record, source_ref};
 use super::{HASH_ALGORITHM, Op, Project, SealedProject, full_blob, fused_extent};
 use crate::align::Registration;
@@ -266,7 +267,9 @@ fn write_fused(
 /// Records `ops` as a new checkpoint onto `project_path`'s head, stamping the
 /// current wall clock. Refuses an empty list ([`ProjectError::EmptyOpList`])
 /// and a list holding anything but a valid brush stroke
-/// ([`ProjectError::Op`], naming the first bad op) before writing. Sources are
+/// ([`ProjectError::Op`], naming the first bad op, or
+/// [`ProjectError::CheckpointSourceRefused`] for a stroke painted from a
+/// checkpoint it cannot be rendered with) before writing. Sources are
 /// never opened or rehashed: the new checkpoint's `stack_fingerprint`,
 /// `algorithm` and `params` are carried forward from the head unchanged, and
 /// its `zmap_blob` and the manifest's planes name the fused ancestor's. The
@@ -323,8 +326,10 @@ fn append_ops_saved(
 /// child, the first under `parent` (`None` is the head), and commits once.
 /// The ids come back in order and `label` names the last state only. Every op
 /// is checked before anything is written: the first invalid one is
-/// [`ProjectError::Op`] with its position and the file is left as it was; an
-/// empty list is [`ProjectError::EmptyOpList`].
+/// [`ProjectError::Op`] with its position, or
+/// [`ProjectError::CheckpointSourceRefused`] when it paints from a checkpoint
+/// that is unknown, deleted or cannot render under `parent`, and the file is
+/// left as it was; an empty list is [`ProjectError::EmptyOpList`].
 pub fn append_op_chain(
     project_path: &Path,
     parent: Option<&str>,
@@ -440,7 +445,10 @@ pub(super) fn append_ops_on(
 
 /// `parent`'s checkpoint, once every op of `ops` is valid against the Z-Map
 /// geometry of `parent`'s fused ancestor: the first op that is not is
-/// [`ProjectError::Op`] with its position.
+/// [`ProjectError::Op`] with its position. A stroke painted from a checkpoint
+/// that is not in the project, was deleted, or cannot be rendered under
+/// `parent` (another pixel grid or sample type) is
+/// [`ProjectError::CheckpointSourceRefused`] with its position.
 fn checked_parent(project: &Project, parent: &str, ops: &[Op]) -> Result<Checkpoint, ProjectError> {
     let head = project.history().get(parent)?.clone();
     let (width, height, frame_count) = fused_extent(project, parent)?;
@@ -451,6 +459,21 @@ fn checked_parent(project: &Project, parent: &str, ops: &[Op]) -> Result<Checkpo
             index,
             source: Box::new(source),
         })?;
+        if let Some(reference) = op.checkpoint_source() {
+            let reason = match project.history().get(reference) {
+                Err(_) => Some("is not in this project".to_string()),
+                Ok(named) if named.hidden => Some("was deleted".to_string()),
+                Ok(_) => unpaintable_reason(project, parent, reference)?,
+            };
+            if let Some(reason) = reason {
+                return Err(ProjectError::CheckpointSourceRefused {
+                    path: project.path().to_path_buf(),
+                    index,
+                    checkpoint: reference.to_string(),
+                    reason,
+                });
+            }
+        }
     }
     Ok(head)
 }

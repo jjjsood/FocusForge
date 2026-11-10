@@ -183,13 +183,8 @@ impl CheckpointImage {
         let mut references = References::default();
         let strokes = place_strokes(ops.into_iter(), info, &mut |index, reference| {
             references.slot(reference, || {
-                if let Some(mismatch) = project.grid_mismatch(id, reference)? {
-                    return Err(refused(
-                        project.path(),
-                        index,
-                        reference,
-                        format!("has {mismatch}"),
-                    ));
+                if let Some(reason) = unpaintable_reason(project, id, reference)? {
+                    return Err(refused(project.path(), index, reference, reason));
                 }
                 Self::prepare_reference(project, project.path(), index, reference, format)
             })
@@ -217,22 +212,11 @@ impl CheckpointImage {
     ) -> Result<Self, ProjectError> {
         let image = Self::prepare(project, reference)?;
         if image.sample_format != format {
-            let name = |f: SampleFormat| {
-                if f == SampleFormat::U16 {
-                    "16-bit"
-                } else {
-                    "f32"
-                }
-            };
             return Err(refused(
                 path,
                 index,
                 reference,
-                format!(
-                    "holds {} samples, not {}",
-                    name(image.sample_format),
-                    name(format)
-                ),
+                sample_mismatch(image.sample_format, format),
             ));
         }
         Ok(image)
@@ -616,6 +600,35 @@ impl References {
         self.ids.push(id.to_string());
         Ok(self.images.len() - 1)
     }
+}
+
+/// Why a checkpoint holding `held` samples cannot be painted onto an image of
+/// `wanted` samples.
+fn sample_mismatch(held: SampleFormat, wanted: SampleFormat) -> String {
+    let name = |f: SampleFormat| {
+        if f == SampleFormat::U16 {
+            "16-bit"
+        } else {
+            "f32"
+        }
+    };
+    format!("holds {} samples, not {}", name(held), name(wanted))
+}
+
+/// Why checkpoint `reference` cannot be painted from while `edited` is being
+/// edited, `None` when it can: another pixel grid, or other samples than
+/// `edited`'s composite.
+pub(super) fn unpaintable_reason(
+    project: &Project,
+    edited: &str,
+    reference: &str,
+) -> Result<Option<String>, ProjectError> {
+    if let Some(mismatch) = project.grid_mismatch(edited, reference)? {
+        return Ok(Some(format!("has {mismatch}")));
+    }
+    let format_of = |id: &str| project.plane_format(&project.fuse_state(id)?.composite);
+    let (held, wanted) = (format_of(reference)?, format_of(edited)?);
+    Ok((held != wanted).then(|| sample_mismatch(held, wanted)))
 }
 
 fn refused(path: &Path, index: usize, checkpoint: &str, reason: impl Into<String>) -> ProjectError {

@@ -1166,7 +1166,8 @@ fn dangling_stroke_source_is_refused() {
     // A save naming a missing checkpoint fails and leaves the file as it was.
     let err = project::append_ops(&path, vec![checkpoint_stroke(ghost)], None).unwrap_err();
     assert!(
-        matches!(&err, project::ProjectError::DanglingStrokeSource { referenced, .. } if referenced == ghost),
+        matches!(&err, project::ProjectError::CheckpointSourceRefused { index: 0, checkpoint, reason, .. }
+            if checkpoint == ghost && reason == "is not in this project"),
         "{err:?}"
     );
     assert_eq!(head_id(&path), root);

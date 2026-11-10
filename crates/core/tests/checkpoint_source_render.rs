@@ -698,9 +698,19 @@ fn refusal(err: ProjectError) -> (usize, String, String) {
     }
 }
 
+/// Three strokes with `bad` at `position` and valid frame strokes elsewhere.
+fn three_strokes(position: usize, bad: &str) -> Vec<Op> {
+    (0..3)
+        .map(|at: usize| {
+            let source = if at == position { from(bad) } else { frame(1) };
+            stroke(source, &[(10 + at as i32, 12)], 3.0, BrushMode::Normal, 1.0)
+        })
+        .collect()
+}
+
 #[test]
-fn refuses_unrenderable_checkpoint_source() {
-    let p = build::<u16>("cs_refused", 3);
+fn append_refuses_bad_checkpoint_source() {
+    let p = build::<u16>("cs_append_refused", 3);
     let other_dir = p.dir.join("other-content");
     std::fs::create_dir_all(&other_dir).unwrap();
     let other_sources = write_sources(&other_dir, 3, 1);
@@ -713,36 +723,111 @@ fn refuses_unrenderable_checkpoint_source() {
     );
     let other = append_fuse(&p, "frames", &other_sources, cropped(CROP), false);
     let wide = append_fuse(&p, "wide", &p.sources, cropped(CROP), true);
+    let deleted = append_ops(
+        &p,
+        &p.root,
+        vec![stroke(frame(0), &[(5, 5)], 3.0, BrushMode::Normal, 1.0)],
+    );
+    // A stroke painting from it keeps the deleted checkpoint stored.
+    append_ops(
+        &p,
+        &p.root,
+        vec![stroke(
+            from(&deleted),
+            &[(9, 9)],
+            3.0,
+            BrushMode::Normal,
+            1.0,
+        )],
+    );
+    project::seal_in_memory(
+        &p.path,
+        &[],
+        &[ParentRef::Saved(deleted.clone())],
+        None,
+        true,
+    )
+    .unwrap();
+    let unknown = "0".repeat(32);
 
-    for (reference, reason) in [
+    let cases = [
+        (&unknown, "is not in this project"),
+        (&deleted, "was deleted"),
         (&shifted, "has different crop"),
         (&other, "has different source frames"),
         (&wide, "holds f32 samples, not 16-bit"),
-    ] {
-        let bad = append_ops(
-            &p,
-            &p.root,
-            vec![
-                stroke(frame(0), &[(5, 5)], 3.0, BrushMode::Normal, 1.0),
-                stroke(from(reference), &[(20, 20)], 4.0, BrushMode::Normal, 1.0),
-            ],
-        );
-        let mut project = Project::open(&p.path).unwrap();
-        let out = p.dir.join("refused.tif");
-        let err = project::render_checkpoint(&mut project, &bad, &out, None).unwrap_err();
-        assert_eq!(refusal(err), (1, reference.clone(), reason.to_string()));
-        assert!(!out.exists() && !partial_path(&out).exists(), "{reason}");
-        let err = project::export_checkpoint(
-            &mut project,
-            &bad,
-            &out,
-            &ExportOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .unwrap_err();
-        assert_eq!(refusal(err).2, reason);
-        assert!(!out.exists() && !partial_path(&out).exists(), "{reason}");
+    ];
+    for (reference, reason) in cases {
+        for position in [0, 2] {
+            let before = std::fs::read(&p.path).unwrap();
+            let at = CLOCK.fetch_add(1, Ordering::SeqCst);
+            let ops = three_strokes(position, reference);
+
+            let err = project::append_op_chain(&p.path, Some(&p.root), ops.clone(), None, at)
+                .unwrap_err();
+            assert_eq!(
+                refusal(err),
+                (position, reference.clone(), reason.to_string()),
+                "append_op_chain, {reason} at {position}"
+            );
+            assert_eq!(std::fs::read(&p.path).unwrap(), before, "{reason}");
+
+            let err = project::append_ops_onto(&p.path, &p.root, ops, None, at).unwrap_err();
+            assert_eq!(
+                refusal(err),
+                (position, reference.clone(), reason.to_string()),
+                "append_ops_onto, {reason} at {position}"
+            );
+            assert_eq!(std::fs::read(&p.path).unwrap(), before, "{reason}");
+        }
     }
+}
+
+#[test]
+fn append_accepts_descendant_checkpoint_source() {
+    let p = build::<u16>("cs_append_descendant", 3);
+    let a = append_ops(
+        &p,
+        &p.root,
+        vec![stroke(frame(1), &[(20, 20)], 5.0, BrushMode::Normal, 1.0)],
+    );
+    let b = append_ops(
+        &p,
+        &a,
+        vec![stroke(frame(2), &[(30, 25)], 5.0, BrushMode::Normal, 1.0)],
+    );
+    let newer = append_ops(
+        &p,
+        &p.root,
+        vec![stroke(from(&b), &[(25, 22)], 6.0, BrushMode::Normal, 1.0)],
+    );
+    let older = append_ops(
+        &p,
+        &b,
+        vec![stroke(
+            from(&p.root),
+            &[(25, 22)],
+            6.0,
+            BrushMode::Normal,
+            1.0,
+        )],
+    );
+
+    let project = Project::open(&p.path).unwrap();
+    for (id, source) in [(&newer, &b), (&older, &p.root)] {
+        let ops = project.history().op_chain(id).unwrap();
+        assert_eq!(
+            ops.last().unwrap().checkpoint_source(),
+            Some(source.as_str())
+        );
+    }
+    assert_eq!(project.manifest().format_version, Some(2));
+}
+
+#[test]
+fn refuses_unrenderable_checkpoint_source() {
+    let p = build::<u16>("cs_refused", 3);
+    let wide = append_fuse(&p, "wide", &p.sources, cropped(CROP), true);
 
     let project = Project::open(&p.path).unwrap();
     let pending = |ops: Vec<Op>, registration: Registration| PendingState {
