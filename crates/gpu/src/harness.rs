@@ -550,12 +550,12 @@ pub fn backend_for(
     if no_gpu {
         return (None, "--cpu given: forcing the CPU path".to_string());
     }
-    match gpu_backend_capped(max_vram) {
+    match compute_backend(max_vram) {
         Ok(backend) => (
             Some(backend),
             format!("adapter selected: {}; using the GPU path", backend.info()),
         ),
-        Err(err) => (None, cpu_fallback_line(err)),
+        Err(line) => (None, line),
     }
 }
 
@@ -588,7 +588,7 @@ impl LazyAlignBackend {
     /// `announce` once, as one line.
     fn resolve(&self) -> Option<&'static GpuBackend> {
         *self.selected.get_or_init(|| {
-            let (backend, line) = match gpu_backend_capped(self.max_vram) {
+            let (backend, line) = match compute_backend(self.max_vram) {
                 Ok(backend) => (
                     Some(backend),
                     format!(
@@ -597,7 +597,7 @@ impl LazyAlignBackend {
                         backend.device_budget().bytes()
                     ),
                 ),
-                Err(err) => (None, cpu_fallback_line(err)),
+                Err(line) => (None, line),
             };
             if let Some(backend) = backend {
                 let _ = self.adapter.set(backend.info().to_string());
@@ -651,6 +651,37 @@ pub fn align_backend_for(
     (Some(lazy), String::new())
 }
 
+/// The backend a stack run computes on, or the one-line reason it computes on
+/// the CPU. An adapter of device type `Cpu` is refused before the VRAM probe,
+/// which would otherwise allocate system RAM on it. [`gpu_backend_capped`]
+/// itself still serves a software adapter to tests.
+fn compute_backend(max_vram: Option<u64>) -> Result<&'static GpuBackend, String> {
+    let device = shared_device().map_err(cpu_fallback_line)?;
+    if !compute_adapter_usable(device.adapter().get_info().device_type) {
+        return Err(software_adapter_line(&device.info().name));
+    }
+    gpu_backend_capped(max_vram).map_err(cpu_fallback_line)
+}
+
+/// Whether an adapter of this type may run fusion and alignment: a software
+/// rasterizer is slower than the CPU path.
+fn compute_adapter_usable(device_type: wgpu::DeviceType) -> bool {
+    match device_type {
+        wgpu::DeviceType::Cpu => false,
+        wgpu::DeviceType::DiscreteGpu
+        | wgpu::DeviceType::IntegratedGpu
+        | wgpu::DeviceType::VirtualGpu
+        | wgpu::DeviceType::Other => true,
+    }
+}
+
+/// The one-line fallback message for an adapter [`compute_adapter_usable`]
+/// refuses.
+fn software_adapter_line(adapter: &str) -> String {
+    tracing::info!(adapter, "software adapter refused for compute");
+    format!("only a software adapter ({adapter}) is available; continuing on the CPU path")
+}
+
 /// One short stderr line naming the reason class only: a missing adapter and
 /// [`GpuError::VramExhausted`] (an adapter that cannot serve the minimum
 /// budget) fall back alike. The driver's full text goes to the log, and to
@@ -675,8 +706,8 @@ fn cpu_fallback_line(reason: &GpuError) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        LazyAlignBackend, align_backend_for, backend_for, cpu_fallback_line, settled_backend,
-        vram_cap_settled,
+        LazyAlignBackend, align_backend_for, backend_for, compute_adapter_usable,
+        cpu_fallback_line, settled_backend, software_adapter_line, vram_cap_settled,
     };
     use crate::device::GpuError;
     use focusforge_core::algorithm::{AlignAlgorithm, StackAlgorithm};
@@ -720,6 +751,32 @@ mod tests {
         let line = cpu_fallback_line(&GpuError::NoAdapter { reason });
         assert_eq!(line, "no usable GPU adapter; continuing on the CPU path");
         assert!(!line.contains('\n') && line.len() <= 120, "{line}");
+    }
+
+    #[test]
+    fn compute_adapter_refuses_only_cpu() {
+        use wgpu::DeviceType::{Cpu, DiscreteGpu, IntegratedGpu, Other, VirtualGpu};
+        assert!(!compute_adapter_usable(Cpu));
+        for hardware in [DiscreteGpu, IntegratedGpu, VirtualGpu, Other] {
+            assert!(compute_adapter_usable(hardware), "{hardware:?}");
+        }
+    }
+
+    #[test]
+    fn software_adapter_line_names_the_adapter() {
+        for name in [
+            "Microsoft Basic Render Driver",
+            "llvmpipe (LLVM 19.1.7, 256 bits)",
+        ] {
+            let line = software_adapter_line(name);
+            assert_eq!(
+                line,
+                format!(
+                    "only a software adapter ({name}) is available; continuing on the CPU path"
+                )
+            );
+            assert!(!line.contains('\n') && line.len() <= 120, "{line}");
+        }
     }
 
     #[test]
