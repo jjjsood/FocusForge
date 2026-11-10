@@ -98,6 +98,8 @@ path.
 `focusforge-gui` tries GPU-backed graphics adapters first and falls back to a
 software adapter (for example in a virtual machine or a Remote Desktop
 session), logging a warning that names it. It runs there at software speed.
+`focusforge-cli stack` and the stacking in the window never compute on a software
+adapter: fusion and alignment run on the CPU, and the log names the adapter.
 When no adapter works at all it exits with an error; on Windows, started from
 the Start menu, it shows that error in a message box.
 

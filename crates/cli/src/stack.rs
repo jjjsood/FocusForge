@@ -150,13 +150,13 @@ pub struct StackReport {
     /// -- so this field, not that one, is what a later run compares before
     /// reading a stage number as a real cost.
     pub align_source: String,
-    /// The anchor arm's worker bound and the peak it actually reached --
+    /// The alignment worker bound and the peak it actually reached --
     /// `None` unless the alignment was computed this run.
     pub align_workers: Option<usize>,
     pub peak_align_workers: Option<usize>,
-    /// The bytes the alignment accounted for (shared reference data plus one
-    /// registration per worker) -- `None` unless the alignment was computed
-    /// this run.
+    /// The bytes the alignment accounted for: for an anchor run the shared
+    /// reference data plus one registration per worker, for a chain run one
+    /// hop per worker -- `None` unless the alignment was computed this run.
     pub align_accounted_bytes: Option<u64>,
     /// `"cpu"`, or the adapter's display when at least one alignment level
     /// ran on it -- `null` unless the alignment was computed this run.
