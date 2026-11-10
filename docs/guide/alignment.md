@@ -85,8 +85,9 @@ choose an entry.
 - **Chain** (default) compares each frame with its neighbour, step by step
   towards the reference frame. Neighbouring frames look alike, so this holds
   up even when the first and last frames of a long stack look very different
-  (one sharp at the front, the other at the back). Frames are solved one
-  after the other.
+  (one sharp at the front, the other at the back). On a machine with several
+  processor cores, several steps are solved at the same time, as far as the
+  memory limit allows.
 - **Anchor** compares every frame directly with the reference frame, all at
   the same time. It is much faster on a machine with many processor cores:
   on a 61-frame stack of 44.8-megapixel frames, about 6 seconds instead of
