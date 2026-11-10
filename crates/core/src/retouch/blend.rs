@@ -780,7 +780,7 @@ pub fn replay_mode_conditions<S: Blend>(
                 let footprint = footprint(earlier, info).ok().flatten()?;
                 Some(PlacedStroke {
                     op: earlier,
-                    frame: usize::from(checked_frame(earlier)),
+                    source: PlacedSource::Frame(usize::from(checked_frame(earlier))),
                     footprint,
                 })
             })
@@ -796,6 +796,7 @@ pub fn replay_mode_conditions<S: Blend>(
             frames,
             origin,
             spp,
+            &[],
             apply::<S>,
         )?;
         let mut source = vec![S::default(); samples(lattice)];
@@ -1012,24 +1013,31 @@ pub fn apply<S: Blend>(
     Ok(())
 }
 
-/// One stroke of [`apply_strokes`]: the op, the frame it blends from and the
+/// Where a placed stroke's source samples come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacedSource {
+    /// A frame of the `frames` reader handed to [`apply_strokes`].
+    Frame(usize),
+    /// Entry `k` of the `rendered` buffers handed to [`apply_strokes`].
+    Rendered(usize),
+}
+
+/// One stroke of [`apply_strokes`]: the op, where it blends from and the
 /// part of the map it can change ([`footprint`]).
 #[derive(Clone, Copy)]
 pub struct PlacedStroke<'a> {
     pub op: &'a Op,
-    pub frame: usize,
+    pub source: PlacedSource,
     pub footprint: Rect,
 }
 
 /// Blends each of `strokes`, in order, over `out`, the samples of `out_rect`
-/// (row-major, `spp` samples a pixel). A stroke reads its frame from `frames`
-/// over the part of `out_rect` its footprint meets, widened by
-/// [`read_margin`] for a Detail stroke, shifted by `origin` (the crop offset
-/// between map and frame coordinates); a stroke whose footprint is clear of
-/// `out_rect` reads nothing. A failed frame read is [`RetouchError::Source`]
-/// and leaves `out` as the strokes before it made it. Each stroke is blended
-/// by `blend`, called as [`apply`] is: [`apply`] itself, or a blend with the
-/// same result.
+/// (`spp` samples a pixel). A stroke reads its source over the part of
+/// `out_rect` its footprint meets, widened by [`read_margin`] for Detail: a
+/// [`PlacedSource::Frame`] from `frames` shifted by `origin`, a
+/// [`PlacedSource::Rendered`] from `rendered` (map coordinates, covering that
+/// part). A failed frame read is [`RetouchError::Source`]; `blend` is called
+/// as [`apply`] is.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_strokes<S: Sample>(
     info: ZMapInfo,
@@ -1039,9 +1047,10 @@ pub fn apply_strokes<S: Sample>(
     frames: &dyn TileReader,
     origin: (u32, u32),
     spp: usize,
+    rendered: &[(Rect, Vec<S>)],
     mut blend: impl FnMut(&Op, ZMapInfo, Rect, &mut [S], Rect, &[S], usize) -> Result<(), RetouchError>,
 ) -> Result<(), RetouchError> {
-    let mut frame: Vec<S> = Vec::new();
+    let mut source: Vec<S> = Vec::new();
     for stroke in strokes {
         if stroke.footprint.intersect(out_rect).is_none() {
             continue;
@@ -1050,17 +1059,35 @@ pub fn apply_strokes<S: Sample>(
         let region = grow(stroke.footprint, margin, info)
             .intersect(out_rect)
             .expect("the footprint meets out_rect");
-        frame.resize(
+        source.resize(
             region.width as usize * region.height as usize * spp,
             S::default(),
         );
-        let at_frame = Rect {
-            x: region.x + origin.0,
-            y: region.y + origin.1,
-            ..region
-        };
-        S::read_tile(frames, stroke.frame, at_frame, &mut frame)?;
-        blend(stroke.op, info, out_rect, out, region, &frame, spp)?;
+        match stroke.source {
+            PlacedSource::Frame(frame) => {
+                let at_frame = Rect {
+                    x: region.x + origin.0,
+                    y: region.y + origin.1,
+                    ..region
+                };
+                S::read_tile(frames, frame, at_frame, &mut source)?;
+            }
+            PlacedSource::Rendered(k) => {
+                let (area, samples) = &rendered[k];
+                assert_eq!(
+                    area.intersect(region),
+                    Some(region),
+                    "a rendered source covers the part its stroke reads"
+                );
+                let row = region.width as usize * spp;
+                for (r, line) in source.chunks_exact_mut(row).enumerate() {
+                    let at = ((region.y - area.y) as usize + r) * area.width as usize
+                        + (region.x - area.x) as usize;
+                    line.copy_from_slice(&samples[at * spp..at * spp + row]);
+                }
+            }
+        }
+        blend(stroke.op, info, out_rect, out, region, &source, spp)?;
     }
     Ok(())
 }
@@ -1790,7 +1817,7 @@ mod tests {
         ops.iter()
             .map(|op| PlacedStroke {
                 op,
-                frame: usize::from(source_frame(op).unwrap()),
+                source: PlacedSource::Frame(usize::from(source_frame(op).unwrap())),
                 footprint: footprint(op, info).unwrap().unwrap(),
             })
             .collect()
@@ -1953,6 +1980,7 @@ mod tests {
                 &frames,
                 origin,
                 1,
+                &[],
                 apply,
             )
             .unwrap_or_else(|e| panic!("stroke at ({x}, {y}): {e}"));
@@ -2451,7 +2479,7 @@ mod tests {
             .zip([0, 2])
             .map(|(op, frame)| PlacedStroke {
                 op,
-                frame,
+                source: PlacedSource::Frame(frame),
                 footprint: footprint(op, info).unwrap().unwrap(),
             })
             .collect();
@@ -2465,6 +2493,7 @@ mod tests {
             &frames,
             (0, 0),
             1,
+            &[],
             |op, _, _, out, region, src, spp| {
                 calls.push((op.clone(), region, src.len(), spp));
                 out.fill(1);
@@ -2527,7 +2556,7 @@ mod tests {
             .iter()
             .map(|op| PlacedStroke {
                 op,
-                frame: usize::from(source_frame(op).unwrap()),
+                source: PlacedSource::Frame(usize::from(source_frame(op).unwrap())),
                 footprint: footprint(op, info).unwrap().unwrap(),
             })
             .collect();
@@ -2545,7 +2574,7 @@ mod tests {
             );
             crate::algorithm::TileReader::read_tile_into(
                 &frames,
-                stroke.frame,
+                usize::from(source_frame(stroke.op).unwrap()),
                 at_frame,
                 &mut frame,
             )
@@ -2555,13 +2584,24 @@ mod tests {
         assert_ne!(expected, base, "the strokes must blend something");
 
         let mut out = base.clone();
-        apply_strokes(info, out_rect, &mut out, &placed, &frames, origin, 1, apply).unwrap();
+        apply_strokes(
+            info,
+            out_rect,
+            &mut out,
+            &placed,
+            &frames,
+            origin,
+            1,
+            &[],
+            apply,
+        )
+        .unwrap();
         assert_eq!(out, expected);
 
         let mut untouched = base.clone();
         let far = [PlacedStroke {
             op: &ops[0],
-            frame: 0,
+            source: PlacedSource::Frame(0),
             footprint: rect(0, 0, 3, 3),
         }];
         apply_strokes(
@@ -2572,10 +2612,83 @@ mod tests {
             &frames,
             origin,
             1,
+            &[],
             apply,
         )
         .unwrap();
         assert_eq!(untouched, base, "a stroke off the rect writes nothing");
+    }
+
+    #[test]
+    fn a_rendered_source_blends_like_the_frame_it_copies() {
+        let info = info(40, 30);
+        let out_rect = rect(5, 4, 30, 20);
+        let frames = Ramps {
+            width: 64,
+            frames: 3,
+        };
+        let origin = (7, 3);
+        let ops = [
+            stroke_op(2, vec![pt(12, 10), pt(24, 14)], 6.0, 0.5),
+            stroke_op(1, vec![pt(20, 8), pt(14, 18)], 5.0, 1.0),
+        ];
+        let place = |sources: [PlacedSource; 2]| -> Vec<PlacedStroke> {
+            ops.iter()
+                .zip(sources)
+                .map(|(op, source)| PlacedStroke {
+                    op,
+                    source,
+                    footprint: footprint(op, info).unwrap().unwrap(),
+                })
+                .collect()
+        };
+        let base: Vec<u16> = (0..30 * 20).map(|i| (i * 37 % 65536) as u16).collect();
+
+        let by_frame = place([PlacedSource::Frame(2), PlacedSource::Frame(1)]);
+        let mut expected = base.clone();
+        apply_strokes(
+            info,
+            out_rect,
+            &mut expected,
+            &by_frame,
+            &frames,
+            origin,
+            1,
+            &[],
+            apply,
+        )
+        .unwrap();
+        assert_ne!(expected, base, "the strokes must blend something");
+
+        // Buffers in map coordinates, wider than the region each stroke reads.
+        let rendered: Vec<(Rect, Vec<u16>)> = [2, 1]
+            .into_iter()
+            .map(|frame| {
+                let area = rect(3, 2, 36, 26);
+                let at_frame = rect(
+                    area.x + origin.0,
+                    area.y + origin.1,
+                    area.width,
+                    area.height,
+                );
+                let mut samples = vec![0u16; (area.width * area.height) as usize];
+                crate::algorithm::TileReader::read_tile_into(
+                    &frames,
+                    frame,
+                    at_frame,
+                    &mut samples,
+                )
+                .unwrap();
+                (area, samples)
+            })
+            .collect();
+        let by_render = place([PlacedSource::Rendered(0), PlacedSource::Rendered(1)]);
+        let mut out = base.clone();
+        apply_strokes(
+            info, out_rect, &mut out, &by_render, &frames, origin, 1, &rendered, apply,
+        )
+        .unwrap();
+        assert_eq!(out, expected);
     }
 
     #[test]
@@ -2589,12 +2702,22 @@ mod tests {
         let op = stroke_op(2, vec![pt(10, 10)], 4.0, 0.0);
         let placed = [PlacedStroke {
             op: &op,
-            frame: 2,
+            source: PlacedSource::Frame(2),
             footprint: footprint(&op, info).unwrap().unwrap(),
         }];
         let mut out = vec![5u16; 40 * 30];
-        let err = apply_strokes(info, out_rect, &mut out, &placed, &frames, (0, 0), 1, apply)
-            .unwrap_err();
+        let err = apply_strokes(
+            info,
+            out_rect,
+            &mut out,
+            &placed,
+            &frames,
+            (0, 0),
+            1,
+            &[],
+            apply,
+        )
+        .unwrap_err();
         assert!(matches!(err, RetouchError::Source(_)), "{err:?}");
         assert!(out.iter().all(|&s| s == 5), "a failed read writes nothing");
     }

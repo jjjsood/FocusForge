@@ -21,10 +21,11 @@ use crate::retouch::blend::{self, Blend};
 use crate::tile::{HostBudget, Rect, Sample, SampleFormat};
 use crate::zmap::ZMapInfo;
 
-use super::checkpoint::{Checkpoint, FuseRecord, Op};
+use super::checkpoint::{Checkpoint, FuseRecord, Op, StrokeSource};
 use super::container::partial_path;
 use super::error::ProjectError;
 use super::manifest::PlaneRef;
+use super::pixel_grid::PixelGrid;
 use super::seal::HeldCheckpoint;
 use super::validate::check_sources;
 use super::{LeSample, Project, READ_BAND_BYTES};
@@ -46,6 +47,9 @@ pub struct CheckpointImage {
     /// Ceiling on the memory the source frame set may take when a stroke
     /// opens it; `None` takes the host-derived budget.
     memory_cap: Option<u64>,
+    /// Most bytes of checkpoint-sourced stroke samples a render holds at
+    /// once; see [`Self::with_source_bytes`].
+    source_bytes: u64,
 }
 
 enum Body {
@@ -58,6 +62,8 @@ enum Body {
         checkpoint: Box<Checkpoint>,
         ancestor: Box<FuseRecord>,
         strokes: Vec<PlacedStroke>,
+        /// The images the checkpoint-sourced `strokes` blend from.
+        checkpoints: Vec<CheckpointImage>,
     },
     /// Streams a held result's composite TIFF; no project is read.
     Held(PathBuf),
@@ -69,15 +75,34 @@ enum Body {
         registration: Registration,
         info: ZMapInfo,
         strokes: Vec<PlacedStroke>,
+        /// The images the checkpoint-sourced `strokes` blend from.
+        checkpoints: Vec<CheckpointImage>,
     },
 }
 
-/// A brush stroke with the frame it blends and the part of the image it can
-/// change.
+/// A brush stroke with where it blends from and the part of the image it can
+/// change. The source is a frame, or a slot in the body's `checkpoints`
+/// ([`blend::PlacedSource::Rendered`]).
 struct PlacedStroke {
     op: Op,
-    source: usize,
+    source: blend::PlacedSource,
     footprint: Rect,
+}
+
+/// The default for [`CheckpointImage::with_source_bytes`]: a tile whose
+/// checkpoint-sourced strokes need more is rendered as row halves, and each
+/// half streams the referenced plane again.
+// ponytail: on a synthetic 8192x5464x3 u16 project (release) one 200 px stroke
+// renders in 1.51 s from a frame and 1.65 s from the fused base; a chunk
+// cache across halves is the upgrade if a large stroke makes that ratio grow.
+const CHECKPOINT_SOURCE_BYTES: u64 = 64 << 20;
+
+/// What a render may use: the frame-set memory ceiling and the byte budget of
+/// checkpoint-sourced samples held at once.
+#[derive(Clone, Copy)]
+struct Limits {
+    memory_cap: Option<u64>,
+    source_bytes: u64,
 }
 
 /// An image not yet saved: the TIFF at `composite` with the brush strokes
@@ -120,15 +145,18 @@ impl CheckpointImage {
             sample_format,
             body,
             memory_cap: None,
+            source_bytes: CHECKPOINT_SOURCE_BYTES,
         }
     }
 
     /// The render of a saved checkpoint. Resolves `id` against `project`,
     /// refusing an unknown id ([`ProjectError::UnknownCheckpoint`]). A fused
     /// checkpoint needs no source frames; an op-bearing one is also refused
-    /// for unrecorded alignment ([`ProjectError::RenderAlignmentUnrecorded`])
-    /// or an op that is no valid brush stroke ([`ProjectError::Op`]), and
-    /// its render for sources missing or changed on disk
+    /// for unrecorded alignment ([`ProjectError::RenderAlignmentUnrecorded`]),
+    /// an op that is no valid brush stroke ([`ProjectError::Op`]) and a stroke
+    /// painted from a checkpoint that cannot be rendered under it
+    /// ([`ProjectError::CheckpointSourceRefused`]: another pixel grid or
+    /// sample type), and its render for sources missing or changed on disk
     /// ([`ProjectError::RenderSourcesUnavailable`]) when a stroke meets the
     /// tile.
     pub fn prepare(project: &Project, id: &str) -> Result<Self, ProjectError> {
@@ -153,7 +181,20 @@ impl CheckpointImage {
             record.sources.len() as u32,
         )
         .map_err(|err| ProjectError::container(project.path(), err))?;
-        let strokes = place_strokes(ops.into_iter(), info)?;
+        let mut references = References::default();
+        let strokes = place_strokes(ops.into_iter(), info, &mut |index, reference| {
+            references.slot(reference, || {
+                if let Some(mismatch) = project.grid_mismatch(id, reference)? {
+                    return Err(refused(
+                        project.path(),
+                        index,
+                        reference,
+                        format!("has {mismatch}"),
+                    ));
+                }
+                Self::prepare_reference(project, project.path(), index, reference, format)
+            })
+        })?;
         Ok(Self::shaped(
             &composite,
             format,
@@ -161,8 +202,41 @@ impl CheckpointImage {
                 checkpoint: Box::new(checkpoint),
                 ancestor: Box::new(record),
                 strokes,
+                checkpoints: references.images,
             },
         ))
+    }
+
+    /// The render of checkpoint `reference` for the stroke at op `index`,
+    /// refused when it holds other samples than `format`.
+    fn prepare_reference(
+        project: &Project,
+        path: &Path,
+        index: usize,
+        reference: &str,
+        format: SampleFormat,
+    ) -> Result<Self, ProjectError> {
+        let image = Self::prepare(project, reference)?;
+        if image.sample_format != format {
+            let name = |f: SampleFormat| {
+                if f == SampleFormat::U16 {
+                    "16-bit"
+                } else {
+                    "f32"
+                }
+            };
+            return Err(refused(
+                path,
+                index,
+                reference,
+                format!(
+                    "holds {} samples, not {}",
+                    name(image.sample_format),
+                    name(format)
+                ),
+            ));
+        }
+        Ok(image)
     }
 
     /// The render of a held result: its composite TIFF, with no project and
@@ -188,6 +262,7 @@ impl CheckpointImage {
             sample_format: stack.sample_format(),
             body: Body::Held(held.composite.clone()),
             memory_cap: None,
+            source_bytes: CHECKPOINT_SOURCE_BYTES,
         })
     }
 
@@ -196,8 +271,15 @@ impl CheckpointImage {
     /// ([`ProjectError::Op`]), a missing source
     /// ([`ProjectError::ExportSourcesUnavailable`]) and a composite or source
     /// that cannot be read. A source has no stored fingerprint to check
-    /// against, so a changed file is not detected.
-    pub fn prepare_pending(state: &PendingState) -> Result<Self, ProjectError> {
+    /// against, so a changed file is not detected. A stroke painted from a
+    /// checkpoint needs `project` to read it from; it is refused with
+    /// [`ProjectError::CheckpointSourceRefused`] when there is none, when the
+    /// project has no such checkpoint, when that checkpoint is on another
+    /// pixel grid or holds other samples than the composite.
+    pub fn prepare_pending(
+        state: &PendingState,
+        project: Option<&Project>,
+    ) -> Result<Self, ProjectError> {
         let composite = &state.composite;
         let stack = TiffStack::open_staged(composite)
             .map_err(|err| ProjectError::container(composite, err))?;
@@ -207,7 +289,29 @@ impl CheckpointImage {
         open_pending_sources(&state.sources, composite, samples_per_pixel)?;
         let info = ZMapInfo::new(width, height, state.sources.len() as u32)
             .map_err(|err| ProjectError::container(composite, err))?;
-        let strokes = place_strokes(state.ops.iter(), info)?;
+        let format = stack.sample_format();
+        let mut references = References::default();
+        let strokes = place_strokes(state.ops.iter(), info, &mut |index, reference| {
+            let refuse = |reason: &str| refused(composite, index, reference, reason);
+            let project = project.ok_or_else(|| refuse("needs its project, and none is open"))?;
+            references.slot(reference, || {
+                if project.history().get(reference).is_err() {
+                    return Err(refuse("is not in this project"));
+                }
+                let grid = PixelGrid {
+                    hashes: None,
+                    paths: state.sources.clone(),
+                    registration: &state.registration,
+                    width,
+                    height,
+                };
+                let fuse = project.fuse_state(reference)?;
+                if let Some(mismatch) = grid.mismatch(&project.pixel_grid(&fuse)) {
+                    return Err(refuse(&format!("has {mismatch}")));
+                }
+                Self::prepare_reference(project, composite, index, reference, format)
+            })
+        })?;
         Ok(CheckpointImage {
             width,
             height,
@@ -220,8 +324,10 @@ impl CheckpointImage {
                 registration: state.registration.clone(),
                 info,
                 strokes,
+                checkpoints: references.images,
             },
             memory_cap: None,
+            source_bytes: CHECKPOINT_SOURCE_BYTES,
         })
     }
 
@@ -249,10 +355,10 @@ impl CheckpointImage {
         sink: &mut RenderSink<'_>,
     ) -> Result<(), ProjectError> {
         match self.sample_format {
-            SampleFormat::U16 => self.render_as::<u16>(project, tile, sink),
+            SampleFormat::U16 => self.render_as::<u16>(project, tile, self.limits(), sink),
             SampleFormat::F32 => {
                 let mut narrowed: Vec<u16> = Vec::new();
-                self.render_as::<f32>(project, tile, &mut |band, rect| {
+                self.render_as::<f32>(project, tile, self.limits(), &mut |band, rect| {
                     narrowed.clear();
                     narrowed.extend(band.iter().map(|&v| u16::narrow(v)));
                     sink(&narrowed, rect)
@@ -282,13 +388,32 @@ impl CheckpointImage {
                 "the image holds 16-bit samples, not f32",
             ));
         }
-        self.render_as::<f32>(project, tile, sink)
+        self.render_as::<f32>(project, tile, self.limits(), sink)
     }
 
+    /// Renders with at most `bytes` of checkpoint-sourced stroke samples held
+    /// at once (the default is 64 MiB): a tile whose strokes need more is
+    /// rendered as row halves, down to single rows. The samples are the same
+    /// for any budget.
+    pub fn with_source_bytes(mut self, bytes: u64) -> Self {
+        self.source_bytes = bytes;
+        self
+    }
+
+    fn limits(&self) -> Limits {
+        Limits {
+            memory_cap: self.memory_cap,
+            source_bytes: self.source_bytes,
+        }
+    }
+
+    /// [`Self::render`] in the image's own sample type; `limits` bound every
+    /// source frame set the render opens and every checkpoint it blends from.
     fn render_as<S: DocumentSample>(
         &self,
         project: Option<&mut Project>,
         tile: Rect,
+        limits: Limits,
         sink: &mut RenderSink<'_, S>,
     ) -> Result<(), ProjectError> {
         assert_eq!(
@@ -311,14 +436,15 @@ impl CheckpointImage {
                 checkpoint,
                 ancestor,
                 strokes,
+                checkpoints,
             } => {
                 let project = project.expect("a saved checkpoint renders against its project");
                 render_ops(
                     project,
                     (checkpoint, ancestor),
-                    strokes,
+                    (strokes, checkpoints),
                     tile,
-                    self.memory_cap,
+                    limits,
                     sink,
                 )
             }
@@ -329,12 +455,13 @@ impl CheckpointImage {
                 registration,
                 info,
                 strokes,
+                checkpoints,
             } => render_pending(
-                composite,
-                sources,
-                registration,
+                (composite, sources, registration),
                 (*info, spp),
-                strokes,
+                (strokes, checkpoints),
+                project,
+                limits,
                 tile,
                 sink,
             ),
@@ -467,11 +594,47 @@ fn open_pending_sources(
     Ok(set)
 }
 
+/// The checkpoint images a render blends from, one per distinct id, in the
+/// order their ids were first met.
+#[derive(Default)]
+struct References {
+    ids: Vec<String>,
+    images: Vec<CheckpointImage>,
+}
+
+impl References {
+    /// The slot of `id`'s image, prepared by `prepare` the first time `id` is
+    /// met.
+    fn slot(
+        &mut self,
+        id: &str,
+        prepare: impl FnOnce() -> Result<CheckpointImage, ProjectError>,
+    ) -> Result<usize, ProjectError> {
+        if let Some(slot) = self.ids.iter().position(|known| known == id) {
+            return Ok(slot);
+        }
+        self.images.push(prepare()?);
+        self.ids.push(id.to_string());
+        Ok(self.images.len() - 1)
+    }
+}
+
+fn refused(path: &Path, index: usize, checkpoint: &str, reason: impl Into<String>) -> ProjectError {
+    ProjectError::CheckpointSourceRefused {
+        path: path.to_path_buf(),
+        index,
+        checkpoint: checkpoint.to_string(),
+        reason: reason.into(),
+    }
+}
+
 /// Validates each of `ops` over `info`'s map and places those that change
-/// something, in log order.
+/// something, in log order. `resolve` maps (op index, checkpoint id) of a
+/// checkpoint-sourced stroke to its image's slot.
 fn place_strokes<'a>(
     ops: impl Iterator<Item = &'a Op>,
     info: ZMapInfo,
+    resolve: &mut dyn FnMut(usize, &str) -> Result<usize, ProjectError>,
 ) -> Result<Vec<PlacedStroke>, ProjectError> {
     let mut strokes = Vec::new();
     for (index, op) in ops.enumerate() {
@@ -479,17 +642,21 @@ fn place_strokes<'a>(
             index,
             source: Box::new(err),
         })?;
-        let frame = blend::source_frame(op).map_err(|err| ProjectError::Op {
-            index,
-            source: Box::new(err),
-        })?;
-        if let Some(footprint) = footprint {
-            strokes.push(PlacedStroke {
-                op: op.clone(),
-                source: usize::from(frame),
-                footprint,
-            });
-        }
+        let Some(footprint) = footprint else {
+            continue;
+        };
+        let Op::BrushStroke { source, .. } = op;
+        let source = match source {
+            StrokeSource::Frame(frame) => blend::PlacedSource::Frame(usize::from(*frame)),
+            StrokeSource::Checkpoint(id) => {
+                blend::PlacedSource::Rendered(resolve(index, id.as_str())?)
+            }
+        };
+        strokes.push(PlacedStroke {
+            op: op.clone(),
+            source,
+            footprint,
+        });
     }
     Ok(strokes)
 }
@@ -594,36 +761,123 @@ fn stream_plane_to_sink<S: DocumentSample>(
     }
 }
 
+/// What a render of one tile reads: its extent, the strokes meeting it and
+/// the part of each referenced checkpoint its checkpoint-sourced strokes
+/// blend.
+struct Plan<'a> {
+    extent: Rect,
+    touching: Vec<blend::PlacedStroke<'a>>,
+    /// (checkpoint slot, area to render), where entry `k` feeds the stroke
+    /// placed as [`blend::PlacedSource::Rendered`]`(k)`.
+    areas: Vec<(usize, Rect)>,
+}
+
+impl Plan<'_> {
+    /// Bytes of the checkpoint-sourced samples, in `S`, of `spp` samples a pixel.
+    fn source_bytes<S: DocumentSample>(&self, spp: u32) -> u64 {
+        self.areas
+            .iter()
+            .map(|(_, a)| {
+                u64::from(a.width) * u64::from(a.height) * u64::from(spp) * S::FORMAT.bytes()
+            })
+            .sum()
+    }
+}
+
 /// The extent a render of `tile` reads, and the strokes meeting it, ready for
 /// [`blend_bands`]. No stroke meeting it means `tile` itself and an empty list.
-fn plan<'a>(
-    info: ZMapInfo,
-    strokes: &'a [PlacedStroke],
-    tile: Rect,
-) -> (Rect, Vec<blend::PlacedStroke<'a>>) {
+fn plan<'a>(info: ZMapInfo, strokes: &'a [PlacedStroke], tile: Rect) -> Plan<'a> {
     let placed: Vec<blend::PlacedStroke> = strokes
         .iter()
         .map(|stroke| blend::PlacedStroke {
             op: &stroke.op,
-            frame: stroke.source,
+            source: stroke.source,
             footprint: stroke.footprint,
         })
         .collect();
     let extent = blend::read_extent(info, &placed, tile);
+    let mut areas = Vec::new();
     let touching = placed
         .into_iter()
         .filter(|stroke| stroke.footprint.intersect(extent).is_some())
+        .map(|mut stroke| {
+            if let blend::PlacedSource::Rendered(slot) = stroke.source {
+                let margin = blend::read_margin(stroke.op, info).expect("a placed stroke is valid");
+                let area = blend::grow(stroke.footprint, margin, info)
+                    .intersect(extent)
+                    .expect("the footprint meets the extent");
+                stroke.source = blend::PlacedSource::Rendered(areas.len());
+                areas.push((slot, area));
+            }
+            stroke
+        })
         .collect();
-    (extent, touching)
+    Plan {
+        extent,
+        touching,
+        areas,
+    }
+}
+
+/// `tile` as row chunks, top to bottom, each costing at most `budget` by
+/// `cost`: halved until it fits or is one row.
+fn fit_rows(tile: Rect, budget: u64, cost: &dyn Fn(Rect) -> u64) -> Vec<Rect> {
+    if tile.height <= 1 || cost(tile) <= budget {
+        return vec![tile];
+    }
+    let top = Rect {
+        height: tile.height / 2,
+        ..tile
+    };
+    let bottom = Rect {
+        y: tile.y + top.height,
+        height: tile.height - top.height,
+        ..tile
+    };
+    let mut chunks = fit_rows(top, budget, cost);
+    chunks.extend(fit_rows(bottom, budget, cost));
+    chunks
+}
+
+/// Renders each of `areas` from its referenced checkpoint, in `S`.
+fn render_areas<S: DocumentSample>(
+    mut project: Option<&mut Project>,
+    checkpoints: &[CheckpointImage],
+    areas: &[(usize, Rect)],
+    spp: u32,
+    limits: Limits,
+) -> Result<Vec<(Rect, Vec<S>)>, ProjectError> {
+    let spp = spp as usize;
+    areas
+        .iter()
+        .map(|&(slot, area)| {
+            let mut samples = vec![S::default(); area.width as usize * area.height as usize * spp];
+            let project = project
+                .as_deref_mut()
+                .expect("a stroke painted from a checkpoint renders against the project");
+            checkpoints[slot].render_as::<S>(Some(project), area, limits, &mut |band, rect| {
+                let len = rect.width as usize * spp;
+                for (r, line) in band.chunks_exact(len).enumerate() {
+                    let at = ((rect.y - area.y) as usize + r) * area.width as usize
+                        + (rect.x - area.x) as usize;
+                    samples[at * spp..at * spp + len].copy_from_slice(line);
+                }
+                Ok(())
+            })?;
+            Ok((area, samples))
+        })
+        .collect()
 }
 
 /// A sink for the rows of `extent` that blends `strokes` over `tile` in log
-/// order, frames read through `warping` at `origin`, and hands `sink` the
+/// order, frames read through `warping` at `origin` and checkpoint areas taken
+/// from `rendered`, and hands `sink` the
 /// tile's bands. A band waits for the rows its [`blend::read_extent`] needs;
 /// rows no later band needs are dropped. `context` names a failed frame read.
 #[allow(clippy::too_many_arguments)]
 fn blend_bands<'a, 'b, S: DocumentSample>(
     strokes: &'a [blend::PlacedStroke<'a>],
+    rendered: &'a [(Rect, Vec<S>)],
     info: ZMapInfo,
     warping: &'a WarpingReader<'a>,
     origin: (u32, u32),
@@ -664,6 +918,7 @@ fn blend_bands<'a, 'b, S: DocumentSample>(
                 warping,
                 origin,
                 spp,
+                rendered,
                 blend::apply::<S>,
             )
             .map_err(|err| ProjectError::container(context, err))?;
@@ -690,45 +945,60 @@ fn blend_bands<'a, 'b, S: DocumentSample>(
 /// `tile` of the TIFF at `composite` (`info` its map's shape, `spp` its samples
 /// per pixel), each of `strokes` the tile meets blended in over it in log
 /// order from its frame, read through the gains and alignment of
-/// `registration`.
+/// `registration`, or from its referenced image in `checkpoints`, read from
+/// `project`.
+#[allow(clippy::too_many_arguments)]
 fn render_pending<S: DocumentSample>(
-    composite: &Path,
-    sources: &[PathBuf],
-    registration: &Registration,
+    (composite, sources, registration): (&Path, &[PathBuf], &Registration),
     (info, spp): (ZMapInfo, u32),
-    strokes: &[PlacedStroke],
+    (strokes, checkpoints): (&[PlacedStroke], &[CheckpointImage]),
+    mut project: Option<&mut Project>,
+    limits: Limits,
     tile: Rect,
     sink: &mut RenderSink<'_, S>,
 ) -> Result<(), ProjectError> {
-    let (extent, touching) = plan(info, strokes, tile);
-    if touching.is_empty() {
-        return render_held(composite, spp, tile, sink);
+    let cost = |r: Rect| plan(info, strokes, r).source_bytes::<S>(spp);
+    for chunk in fit_rows(tile, limits.source_bytes, &cost) {
+        let Plan {
+            extent,
+            touching,
+            areas,
+        } = plan(info, strokes, chunk);
+        if touching.is_empty() {
+            render_held(composite, spp, chunk, sink)?;
+            continue;
+        }
+        let rendered = render_areas::<S>(project.as_deref_mut(), checkpoints, &areas, spp, limits)?;
+        let set = open_pending_sources(sources, composite, spp)?;
+        let gained = GainReader::new(&*set.reader, registration.gains());
+        let warping = warp(&set, &gained, registration, sources.len(), spp);
+        let mut blend = blend_bands(
+            &touching,
+            &rendered,
+            info,
+            &warping,
+            registration.origin(),
+            spp as usize,
+            composite,
+            (extent, chunk),
+            &mut *sink,
+        );
+        render_held(composite, spp, extent, &mut blend)?;
     }
-    let set = open_pending_sources(sources, composite, spp)?;
-    let gained = GainReader::new(&*set.reader, registration.gains());
-    let warping = warp(&set, &gained, registration, sources.len(), spp);
-    let mut blend = blend_bands(
-        &touching,
-        info,
-        &warping,
-        registration.origin(),
-        spp as usize,
-        composite,
-        (extent, tile),
-        sink,
-    );
-    render_held(composite, spp, extent, &mut blend)
+    Ok(())
 }
 
 /// `ancestor`'s stored composite over `tile`, each stroke the tile meets
 /// blended in over it in log order from its frame, read through the gains and
-/// alignment the fusion used.
+/// alignment the fusion used, or from its referenced image in `checkpoints`.
+/// Every area of a referenced checkpoint is rendered, under its own frame set,
+/// before this render opens its set, so one set is open at a time.
 fn render_ops<S: DocumentSample>(
     project: &mut Project,
     (checkpoint, ancestor): (&Checkpoint, &FuseRecord),
-    strokes: &[PlacedStroke],
+    (strokes, checkpoints): (&[PlacedStroke], &[CheckpointImage]),
     tile: Rect,
-    memory_cap: Option<u64>,
+    limits: Limits,
     sink: &mut RenderSink<'_, S>,
 ) -> Result<(), ProjectError> {
     let spp = ancestor.composite.samples_per_pixel;
@@ -738,40 +1008,52 @@ fn render_ops<S: DocumentSample>(
         ancestor.sources.len() as u32,
     )
     .expect("prepare built the same extent");
-    let (extent, touching) = plan(info, strokes, tile);
-    if touching.is_empty() {
-        return stream_plane_to_sink(
+    let cost = |r: Rect| plan(info, strokes, r).source_bytes::<S>(spp);
+    for chunk in fit_rows(tile, limits.source_bytes, &cost) {
+        let Plan {
+            extent,
+            touching,
+            areas,
+        } = plan(info, strokes, chunk);
+        if touching.is_empty() {
+            stream_plane_to_sink(
+                project,
+                &ancestor.composite,
+                &mut crop_bands(chunk, spp, &mut *sink),
+            )?;
+            continue;
+        }
+        let rendered = render_areas::<S>(Some(&mut *project), checkpoints, &areas, spp, limits)?;
+
+        check_sources_available(project, checkpoint, ancestor)?;
+        let paths: Vec<PathBuf> = ancestor
+            .sources
+            .iter()
+            .map(|s| project.source_path(s))
+            .collect();
+        let set =
+            open_checkpoint_sources(project, checkpoint, &paths, ancestor, limits.memory_cap)?;
+        let gained = GainReader::new(&*set.reader, ancestor.registration.gains());
+        let warping = warp(&set, &gained, &ancestor.registration, paths.len(), spp);
+        let project_path = project.path().to_path_buf();
+        let mut blend = blend_bands(
+            &touching,
+            &rendered,
+            info,
+            &warping,
+            ancestor.registration.origin(),
+            spp as usize,
+            &project_path,
+            (extent, chunk),
+            &mut *sink,
+        );
+        stream_plane_to_sink(
             project,
             &ancestor.composite,
-            &mut crop_bands(tile, spp, sink),
-        );
+            &mut crop_bands(extent, spp, &mut blend),
+        )?;
     }
-
-    check_sources_available(project, checkpoint, ancestor)?;
-    let paths: Vec<PathBuf> = ancestor
-        .sources
-        .iter()
-        .map(|s| project.source_path(s))
-        .collect();
-    let set = open_checkpoint_sources(project, checkpoint, &paths, ancestor, memory_cap)?;
-    let gained = GainReader::new(&*set.reader, ancestor.registration.gains());
-    let warping = warp(&set, &gained, &ancestor.registration, paths.len(), spp);
-    let project_path = project.path().to_path_buf();
-    let mut blend = blend_bands(
-        &touching,
-        info,
-        &warping,
-        ancestor.registration.origin(),
-        spp as usize,
-        &project_path,
-        (extent, tile),
-        sink,
-    );
-    stream_plane_to_sink(
-        project,
-        &ancestor.composite,
-        &mut crop_bands(extent, spp, &mut blend),
-    )
+    Ok(())
 }
 
 /// A saved checkpoint's image as a TIFF holding the image's own samples: a
@@ -890,4 +1172,56 @@ pub(super) fn write_via_partial(
             source: Box::new(err),
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tile(y: u32, height: u32) -> Rect {
+        Rect {
+            x: 5,
+            y,
+            width: 13,
+            height,
+        }
+    }
+
+    /// Four bytes a pixel.
+    fn cost(r: Rect) -> u64 {
+        u64::from(r.width) * u64::from(r.height) * 4
+    }
+
+    fn assert_covers(chunks: &[Rect], whole: Rect) {
+        let mut y = whole.y;
+        for chunk in chunks {
+            assert_eq!((chunk.x, chunk.width, chunk.y), (whole.x, whole.width, y));
+            assert!(chunk.height > 0);
+            y += chunk.height;
+        }
+        assert_eq!(y, whole.y + whole.height, "the chunks reach the tile's end");
+    }
+
+    #[test]
+    fn source_budget_halves_tile_rows() {
+        let whole = tile(3, 47);
+        let row = cost(tile(0, 1));
+
+        assert_eq!(fit_rows(whole, cost(whole), &cost), vec![whole]);
+
+        let chunks = fit_rows(whole, row * 10, &cost);
+        assert_covers(&chunks, whole);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|c| cost(*c) <= row * 10), "{chunks:?}");
+        assert!(
+            chunks.iter().any(|c| c.height > 5),
+            "a tile is halved only as far as it must be: {chunks:?}"
+        );
+
+        let chunks = fit_rows(whole, row - 1, &cost);
+        assert_covers(&chunks, whole);
+        assert_eq!(chunks.len(), 47, "below one row, one row each");
+
+        assert_eq!(fit_rows(tile(9, 1), 0, &cost), vec![tile(9, 1)]);
+    }
 }

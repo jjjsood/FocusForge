@@ -8137,7 +8137,7 @@ fn raw_pending(files: &RawFiles, ops: Vec<Op>) -> project::PendingState {
 }
 
 fn pending_f32(state: &project::PendingState) -> Vec<f32> {
-    let image = project::CheckpointImage::prepare_pending(state).unwrap();
+    let image = project::CheckpointImage::prepare_pending(state, None).unwrap();
     let mut out = vec![0f32; (RAW_W * RAW_H * 3) as usize];
     image
         .render_f32(None, raw_whole(), &mut |band, rect| {
@@ -8214,7 +8214,7 @@ fn raw_project_live_retouch_matches_saved_and_export() {
         xmp: false,
         iptc: false,
     };
-    project::export_pending(&stroked, &out, &ExportOptions::default(), &metadata).unwrap();
+    project::export_pending(&stroked, None, &out, &ExportOptions::default(), &metadata).unwrap();
     let exported = focusforge_core::io::TiffStack::open_files(std::slice::from_ref(&out)).unwrap();
     let mut got = vec![0u16; live.len()];
     exported.read_tile_into(0, whole, &mut got).unwrap();

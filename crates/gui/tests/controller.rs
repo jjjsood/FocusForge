@@ -9461,7 +9461,8 @@ fn pending_render(composite: &Path, root: &Path, sealed: &Sealed, ops: Vec<Op>) 
         reference: 0,
         description: String::new(),
     };
-    let image = project::CheckpointImage::prepare_pending(&state).expect("the state prepares");
+    let image =
+        project::CheckpointImage::prepare_pending(&state, None).expect("the state prepares");
     let full = image.full();
     let mut out = vec![0u16; (full.width * full.height * 3) as usize];
     image

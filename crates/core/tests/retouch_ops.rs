@@ -837,7 +837,7 @@ fn reference_whole<S: Blend>(
                 .unwrap()
                 .map(|footprint| blend::PlacedStroke {
                     op,
-                    frame: usize::from(frame),
+                    source: blend::PlacedSource::Frame(usize::from(frame)),
                     footprint,
                 })
         })
@@ -851,6 +851,7 @@ fn reference_whole<S: Blend>(
         frames,
         origin,
         spp as usize,
+        &[],
         blend::apply::<S>,
     )
     .unwrap();
@@ -1040,7 +1041,7 @@ fn detail_bands_below_the_margin_equal_untiled_u16() {
     let mut project = Project::open(&project_path).unwrap();
     let saved = CheckpointImage::prepare(&project, &edited).unwrap();
     let state = pending(&dir, &sources, &ops);
-    let live = CheckpointImage::prepare_pending(&state).unwrap();
+    let live = CheckpointImage::prepare_pending(&state, None).unwrap();
     for tile in [full(width, height), inner] {
         let want = cut(&expected, width, SPP, tile);
         let from_saved = collect(SPP, tile, |sink| {
@@ -1113,7 +1114,7 @@ fn detail_bands_below_the_margin_equal_untiled_f32() {
     let mut project = Project::open(&project_path).unwrap();
     let saved = CheckpointImage::prepare(&project, &edited).unwrap();
     let state = pending(&dir, &sources, &ops);
-    let live = CheckpointImage::prepare_pending(&state).unwrap();
+    let live = CheckpointImage::prepare_pending(&state, None).unwrap();
     let bits = |plane: &[f32]| plane.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
     for tile in [full(width, height), inner] {
         let want = bits(&cut(&expected, width, spp, tile));
@@ -1265,7 +1266,7 @@ fn detail_margin_reference_stack() {
         .iter()
         .map(|op| blend::PlacedStroke {
             op,
-            frame: 1,
+            source: blend::PlacedSource::Frame(1),
             footprint: blend::footprint(op, full_info).unwrap().unwrap(),
         })
         .collect();

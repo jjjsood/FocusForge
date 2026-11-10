@@ -1652,9 +1652,13 @@ pub enum ExportSource {
     /// reference frame is read only for its metadata.
     Held(HeldCheckpoint),
     /// The active tab's strokes not yet saved, over its current row's
-    /// composite: exported through [`project::export_pending`], with no
-    /// project.
-    Pending(project::PendingState),
+    /// composite: exported through [`project::export_pending`]. A stroke
+    /// painted from a checkpoint reads it from the project at `project_path`;
+    /// `None` opens none.
+    Pending {
+        state: project::PendingState,
+        project_path: Option<PathBuf>,
+    },
 }
 
 /// [`export_position`]'s own error: a project or render failure.
@@ -1683,8 +1687,12 @@ pub fn export_position(
         ExportSource::Held(held) => {
             project::export_held(&held, path, options, metadata)?;
         }
-        ExportSource::Pending(state) => {
-            project::export_pending(&state, path, options, metadata)?;
+        ExportSource::Pending {
+            state,
+            project_path,
+        } => {
+            let mut project = project_path.as_deref().map(Project::open).transpose()?;
+            project::export_pending(&state, project.as_mut(), path, options, metadata)?;
         }
     }
     Ok(())
@@ -2021,7 +2029,7 @@ fn placed_strokes(
         if let Some(footprint) = blend::footprint(op, info).map_err(|error| error.to_string())? {
             placed.push(blend::PlacedStroke {
                 op,
-                frame: usize::from(frame),
+                source: blend::PlacedSource::Frame(usize::from(frame)),
                 footprint,
             });
         }
@@ -2077,6 +2085,7 @@ fn blend_region<S: Blend>(
             reader,
             origin,
             spp,
+            &[],
             &mut blend_stroke,
         )
     })
@@ -2931,8 +2940,11 @@ mod placed_stroke_tests {
     fn a_frame_only_job_places_its_strokes_with_their_frames() {
         let job = job_of(vec![frame_stroke(5, 8), frame_stroke(2, 30)]);
         let placed = placed_strokes(info(), &job).unwrap();
-        let frames: Vec<usize> = placed.iter().map(|p| p.frame).collect();
-        assert_eq!(frames, [5, 2]);
+        let sources: Vec<blend::PlacedSource> = placed.iter().map(|p| p.source).collect();
+        assert_eq!(
+            sources,
+            [blend::PlacedSource::Frame(5), blend::PlacedSource::Frame(2)]
+        );
     }
 
     #[test]

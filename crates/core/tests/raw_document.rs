@@ -369,13 +369,13 @@ fn raw_exports_clip_once() {
 
     let pending = raw.pending.clone();
     let wide = render_f32(
-        &CheckpointImage::prepare_pending(&pending).unwrap(),
+        &CheckpointImage::prepare_pending(&pending, None).unwrap(),
         None,
         full(size.0, size.1),
     );
     assert_eq!(bits(&wide), bits(&raw.edited_f32), "pending equals saved");
     check_exports(&dir, "pending", &wide, size, &mut |path, options| {
-        project::export_pending(&pending, path, options, &meta).unwrap();
+        project::export_pending(&pending, None, path, options, &meta).unwrap();
     });
 
     let wide = raw.edited_f32.clone();
@@ -497,8 +497,8 @@ fn one_render_for_held_saved_and_pending() {
         ..pending.clone()
     };
     let held_image = CheckpointImage::prepare_held(&held).unwrap();
-    let pending_image = CheckpointImage::prepare_pending(&pending).unwrap();
-    let pending_stroked_image = CheckpointImage::prepare_pending(&pending_stroked).unwrap();
+    let pending_image = CheckpointImage::prepare_pending(&pending, None).unwrap();
+    let pending_stroked_image = CheckpointImage::prepare_pending(&pending_stroked, None).unwrap();
     let root_image = CheckpointImage::prepare(&project, &root).unwrap();
     let edited_image = CheckpointImage::prepare(&project, &edited).unwrap();
 
@@ -1032,9 +1032,16 @@ fn dng_same_document_as_render() {
     assert_within(&held, &camera_16bit(&look, &staged), 1, "held");
 
     let pending_path = dir.join("pending.dng");
-    project::export_pending(&raw.pending, &pending_path, &ExportOptions::Dng, &meta).unwrap();
+    project::export_pending(
+        &raw.pending,
+        None,
+        &pending_path,
+        &ExportOptions::Dng,
+        &meta,
+    )
+    .unwrap();
     let pending_wide = render_f32(
-        &CheckpointImage::prepare_pending(&raw.pending).unwrap(),
+        &CheckpointImage::prepare_pending(&raw.pending, None).unwrap(),
         None,
         size,
     );

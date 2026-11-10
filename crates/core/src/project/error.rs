@@ -49,6 +49,17 @@ pub enum ProjectError {
         source: Box<crate::retouch::RetouchError>,
     },
 
+    /// The stroke at op `index` is painted from `checkpoint`, which cannot
+    /// be rendered under the checkpoint being rendered; `reason` finishes the
+    /// sentence ("has different alignment", "is not in this project", ...).
+    #[error("op #{index} is painted from checkpoint {checkpoint}, which {reason}")]
+    CheckpointSourceRefused {
+        path: PathBuf,
+        index: usize,
+        checkpoint: String,
+        reason: String,
+    },
+
     /// [`super::append::append_ops`] was handed an empty op list -- a
     /// checkpoint sealing nothing is not a real record.
     #[error("{}: an empty op list cannot be sealed", path.display())]

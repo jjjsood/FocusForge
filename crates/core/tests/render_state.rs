@@ -13,10 +13,10 @@ use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter, frame_paths};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
-    self, BlobKind, BrushMode, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind,
-    Metrics, Op, Plane, Point, Project, ProjectError, SealRequest, StrokeSource,
+    self, BlobKind, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op,
+    Plane, Point, Project, ProjectError, SealRequest,
 };
-use focusforge_core::retouch::{RetouchError, blend};
+use focusforge_core::retouch::blend;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
 fn tmp_dir(name: &str) -> PathBuf {
@@ -503,6 +503,7 @@ fn pending_state_export_equals_the_saved_export() {
     let pending_out = dir.join("pending.tif");
     project::export_pending(
         &state,
+        None,
         &pending_out,
         &ExportOptions::default(),
         &MetadataOptions::default(),
@@ -542,6 +543,7 @@ fn pending_state_export_equals_the_saved_export() {
     let refused = dir.join("refused.tif");
     let err = project::export_pending(
         &state,
+        None,
         &refused,
         &ExportOptions::default(),
         &MetadataOptions::default(),
@@ -554,72 +556,6 @@ fn pending_state_export_equals_the_saved_export() {
         detail,
         format!("missing: {}", sources[1].display()),
         "one line per missing source"
-    );
-    assert!(!refused.exists(), "a refused export leaves no file");
-}
-
-#[test]
-fn checkpoint_source_is_refused() {
-    let dir = tmp_dir("render_state_checkpoint_source");
-    let sources: Vec<PathBuf> = (0..2u32)
-        .map(|i| {
-            let path = dir.join(format!("frame-{i}.tif"));
-            write_tiff(&path, PENDING_FRAME_W, PENDING_FRAME_H, 1, |s| {
-                (s as u32 + i * 1000) as u16
-            });
-            path
-        })
-        .collect();
-    let composite = dir.join("composite.tif");
-    write_tiff(&composite, PENDING_FRAME_W, PENDING_FRAME_H, 1, |s| {
-        500 + s as u16
-    });
-    let frame_stroke = pending_stroke(1, &[(1, 1), (6, 4)], 2.0, 0.5);
-    let checkpoint_stroke = Op::BrushStroke {
-        source: StrokeSource::Checkpoint("c0ffee".to_string()),
-        path: vec![Point { x: 3, y: 3 }],
-        radius: 2.0,
-        softness: 0.5,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    };
-    let state = project::PendingState {
-        composite,
-        ops: vec![frame_stroke.clone()],
-        sources,
-        registration: Registration::default(),
-        reference: 0,
-        description: "staged composite".to_string(),
-    };
-
-    let rendered = dir.join("rendered.tif");
-    project::export_pending(
-        &state,
-        &rendered,
-        &ExportOptions::default(),
-        &MetadataOptions::default(),
-    )
-    .expect("a frame-sourced state renders");
-
-    let mixed = project::PendingState {
-        ops: vec![frame_stroke, checkpoint_stroke],
-        ..state
-    };
-    let refused = dir.join("refused.tif");
-    let err = project::export_pending(
-        &mixed,
-        &refused,
-        &ExportOptions::default(),
-        &MetadataOptions::default(),
-    )
-    .expect_err("a checkpoint-sourced stroke is refused");
-    let ProjectError::Op { index, source } = err else {
-        panic!("expected ProjectError::Op, got {err}");
-    };
-    assert_eq!(index, 1, "the index of the checkpoint stroke");
-    assert!(
-        matches!(*source, RetouchError::CheckpointSource { ref checkpoint } if checkpoint == "c0ffee"),
-        "{source}"
     );
     assert!(!refused.exists(), "a refused export leaves no file");
 }
@@ -775,8 +711,8 @@ fn f32_held_saved_and_pending_render_agree() {
         ..pending.clone()
     };
     let held_image = CheckpointImage::prepare_held(&held).unwrap();
-    let pending_image = CheckpointImage::prepare_pending(&pending).unwrap();
-    let pending_stroked_image = CheckpointImage::prepare_pending(&pending_stroked).unwrap();
+    let pending_image = CheckpointImage::prepare_pending(&pending, None).unwrap();
+    let pending_stroked_image = CheckpointImage::prepare_pending(&pending_stroked, None).unwrap();
     let root_image = CheckpointImage::prepare(&project, &root).unwrap();
     let edited_image = CheckpointImage::prepare(&project, &edited).unwrap();
 

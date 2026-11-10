@@ -11526,14 +11526,31 @@ fn export_source_for(tab: &ProjectTab) -> Option<job::ExportSource> {
         .filter(|edit| edit.op_count() > 0 || info.live)
     {
         let (sources, registration) = tab.fused()?;
-        return Some(job::ExportSource::Pending(job::PendingState {
-            composite: edit.composite.clone(),
-            ops: edit.stack_ops(),
-            sources,
-            registration,
-            reference: info.reference,
-            description: info.description,
-        }));
+        let ops = edit.stack_ops();
+        let names_checkpoint = ops.iter().any(|op| {
+            matches!(
+                op,
+                job::Op::BrushStroke {
+                    source: job::StrokeSource::Checkpoint(_),
+                    ..
+                }
+            )
+        });
+        let project_path = match &tab.project {
+            GuiProject::Opened(project) if names_checkpoint => Some(project.path().to_path_buf()),
+            _ => None,
+        };
+        return Some(job::ExportSource::Pending {
+            state: job::PendingState {
+                composite: edit.composite.clone(),
+                ops,
+                sources,
+                registration,
+                reference: info.reference,
+                description: info.description,
+            },
+            project_path,
+        });
     }
     if info.live {
         return None;

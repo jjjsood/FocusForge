@@ -120,7 +120,7 @@ fn render_live(held: &HeldCheckpoint, ops: &[Op], blender: &Blender, out: &Path)
         if let Some(footprint) = blend::footprint(op, info).expect("the stroke must be valid") {
             placed.push(blend::PlacedStroke {
                 op,
-                frame: usize::from(frame),
+                source: blend::PlacedSource::Frame(usize::from(frame)),
                 footprint,
             });
         }
@@ -171,6 +171,7 @@ fn render_live(held: &HeldCheckpoint, ops: &[Op], blender: &Blender, out: &Path)
                 &warped,
                 origin,
                 spp,
+                &[],
                 |op, info, out_rect, out, region, src, spp| {
                     blender
                         .apply(op, info, out_rect, out, region, src, spp)
@@ -316,7 +317,7 @@ fn every_render_path_agrees_on_the_reference_stack() {
                     reference,
                     description: held.composite_description.clone(),
                 };
-                project::export_pending(&pending, &display, &options.0, &options.1)
+                project::export_pending(&pending, None, &display, &options.0, &options.1)
             }
             .expect("the unsaved state must export");
 
