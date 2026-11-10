@@ -16,8 +16,8 @@
 //! so a newer manifest whose other fields changed still gets the version
 //! message. The field is written only as 2, when the history holds a stroke
 //! painted from a checkpoint or with a non-default mode or opacity
-//! ([`required_format_version`]); a project
-//! without one carries no field, and a stored version is never lowered.
+//! ([`required_format_version`]); a project without one carries no field, and
+//! a stored version is never lowered.
 
 use serde::{Deserialize, Serialize};
 
