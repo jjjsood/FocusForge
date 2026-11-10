@@ -91,10 +91,9 @@ struct PlacedStroke {
 
 /// The default for [`CheckpointImage::with_source_bytes`]: a tile whose
 /// checkpoint-sourced strokes need more is rendered as row halves, and each
-/// half streams the referenced plane again.
-// ponytail: on a synthetic 8192x5464x3 u16 project (release) one 200 px stroke
-// renders in 1.51 s from a frame and 1.65 s from the fused base; a chunk
-// cache across halves is the upgrade if a large stroke makes that ratio grow.
+/// half streams the referenced plane again. On a synthetic 8192x5464x3 u16
+/// project (release) one 200 px stroke renders in 1.51 s from a frame and
+/// 1.65 s from the fused base.
 const CHECKPOINT_SOURCE_BYTES: u64 = 64 << 20;
 
 /// What a render may use: the frame-set memory ceiling and the byte budget of
