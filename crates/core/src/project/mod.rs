@@ -85,8 +85,9 @@ pub use pixel_grid::{GridMismatch, PixelGrid};
 pub use render::{CheckpointImage, PendingState, render_checkpoint};
 pub use review::ReviewMetrics;
 pub use seal::{
-    HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, SealRequest, SealedProject,
-    kept_entries, now_unix, seal, seal_at, seal_in_memory,
+    GONE_KEY, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, SealRequest,
+    SealedProject, entry_colour_index, held_index, held_key, kept_entries, now_unix, seal, seal_at,
+    seal_in_memory, stroke_chain,
 };
 pub use validate::{
     FingerprintMismatch, Opened, PendingProject, SourceCheck, Validation, check_sources,

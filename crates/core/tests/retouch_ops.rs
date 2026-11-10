@@ -997,6 +997,7 @@ fn wide_u16_project(
 
 fn pending(dir: &Path, sources: &[PathBuf], ops: &[Op]) -> project::PendingState {
     project::PendingState {
+        held: Vec::new(),
         composite: dir.join("composite.tif"),
         ops: ops.to_vec(),
         sources: sources.to_vec(),

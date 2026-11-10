@@ -581,6 +581,7 @@ fn tiled_render_equals_full_render() {
 
 fn pending_over(p: &Project1, ops: Vec<Op>) -> PendingState {
     PendingState {
+        held: Vec::new(),
         composite: p.composite.clone(),
         ops,
         sources: p.sources.clone(),

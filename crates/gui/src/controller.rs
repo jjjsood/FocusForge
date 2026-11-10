@@ -1202,6 +1202,9 @@ impl ProjectTab {
         };
         // `ids` holds one id per written entry.
         let kept = job::kept_entries(&self.held, &self.pending_deletes, keep);
+        if !kept.get(entry).copied().unwrap_or(false) {
+            return None;
+        }
         ids.get(kept[..entry].iter().filter(|written| **written).count())
             .cloned()
     }
@@ -10478,6 +10481,20 @@ impl AppController {
             tab.row_planes = None;
             tab.project = GuiProject::Opened(Box::new(project));
             tab.title = entry::tab_title(&tab.project);
+            let saved: Vec<Option<String>> = (0..tab.held.len())
+                .map(|entry| tab.saved_row_key(&checkpoints::held_key(entry), &ids, keep.as_ref()))
+                .collect();
+            if let Some(edit) = tab.edit.as_mut() {
+                edit.rewrite_checkpoint_sources(|source| {
+                    let written = saved.get(checkpoints::held_index(source)?);
+                    Some(
+                        written
+                            .cloned()
+                            .flatten()
+                            .unwrap_or_else(|| job::GONE_KEY.to_string()),
+                    )
+                });
+            }
             remove_in_memory(&tab.held);
             tab.held.clear();
             tab.compressing.clear();
@@ -11552,6 +11569,7 @@ fn export_source_for(tab: &ProjectTab) -> Option<job::ExportSource> {
                 registration,
                 reference: info.reference,
                 description: info.description,
+                held: tab.held.clone(),
             },
             project_path,
         });

@@ -60,7 +60,7 @@ pub fn append_at(
     created_at: i64,
 ) -> Result<SealedProject, ProjectError> {
     let mut project = Project::open(request.project_path)?;
-    let sealed = append_onto(&mut project, &request, None, created_at, None)?;
+    let sealed = append_onto(&mut project, &request, None, created_at, None, None)?;
     project.commit()?;
     Ok(sealed)
 }
@@ -68,13 +68,15 @@ pub fn append_at(
 /// [`append_at`] onto an open project, under an explicit `parent` checkpoint
 /// instead of the project's head; `None` is the head. The caller has checked
 /// that `parent` exists and commits the project. A `composite` blob already
-/// staged is written as it is and stays where it is.
+/// staged is written as it is and stays where it is. `colour_index` is the
+/// checkpoint's colour number; `None` is the next free one.
 pub(super) fn append_onto(
     project: &mut Project,
     request: &AppendRequest<'_>,
     parent: Option<&str>,
     created_at: i64,
     composite: Option<&StagedBlob>,
+    colour_index: Option<u32>,
 ) -> Result<SealedProject, ProjectError> {
     let staging = request
         .staged_composite
@@ -89,6 +91,7 @@ pub(super) fn append_onto(
         parent,
         created_at,
         composite,
+        colour_index,
         &staging,
         &mut staged,
     );
@@ -98,12 +101,14 @@ pub(super) fn append_onto(
     result
 }
 
+#[allow(clippy::too_many_arguments)] // the staging directory and its blob list travel with the request's own inputs
 fn append_staged(
     project: &mut Project,
     request: &AppendRequest<'_>,
     parent: Option<&str>,
     created_at: i64,
     composite: Option<&StagedBlob>,
+    colour_index: Option<u32>,
     staging: &Path,
     staged: &mut Vec<StagedBlob>,
 ) -> Result<SealedProject, ProjectError> {
@@ -139,6 +144,7 @@ fn append_staged(
             label: request.label.clone(),
             metrics: request.metrics,
             created_at,
+            colour_index,
         },
     )
 }
@@ -160,6 +166,8 @@ struct FusedWrite<'a> {
     label: Option<String>,
     metrics: Metrics,
     created_at: i64,
+    /// `None` is the next free colour number.
+    colour_index: Option<u32>,
 }
 
 fn write_fused(
@@ -180,6 +188,7 @@ fn write_fused(
         label,
         metrics,
         created_at,
+        colour_index,
     } = write;
     let stack_fingerprint = blob::stack_fingerprint(&sources);
     let composite_record = record(composite);
@@ -248,7 +257,7 @@ fn write_fused(
             metrics: manifest.metrics,
         }),
         hidden: false,
-        colour_index: Some(project.history().next_colour_index()),
+        colour_index: Some(colour_index.unwrap_or_else(|| project.history().next_colour_index())),
     };
 
     project.put_blob(composite)?;
@@ -317,7 +326,7 @@ fn append_ops_saved(
 ) -> Result<SealedProject, ProjectError> {
     let mut project = Project::open(project_path)?;
     let parent = parent.map_or_else(|| project.checkpoint().id.clone(), str::to_string);
-    let sealed = append_ops_on(&mut project, &parent, ops, label, created_at)?;
+    let sealed = append_ops_on(&mut project, &parent, ops, label, created_at, None)?;
     project.commit()?;
     Ok(sealed)
 }
@@ -349,7 +358,7 @@ pub fn append_op_chain(
     let mut ids = Vec::with_capacity(ops.len());
     for (index, op) in ops.into_iter().enumerate() {
         let label = if index == last { label.clone() } else { None };
-        let sealed = append_ops_on(&mut project, &parent, vec![op], label, created_at)?;
+        let sealed = append_ops_on(&mut project, &parent, vec![op], label, created_at, None)?;
         parent.clone_from(&sealed.checkpoint);
         ids.push(sealed.checkpoint);
     }
@@ -358,12 +367,15 @@ pub fn append_op_chain(
 }
 
 /// [`append_ops_onto`] on an open project, left for the caller to commit.
+/// `colour_index` is the checkpoint's colour number; `None` is the next free
+/// one.
 pub(super) fn append_ops_on(
     project: &mut Project,
     parent: &str,
     ops: Vec<Op>,
     label: Option<String>,
     created_at: i64,
+    colour_index: Option<u32>,
 ) -> Result<SealedProject, ProjectError> {
     if ops.is_empty() {
         return Err(ProjectError::EmptyOpList {
@@ -430,7 +442,7 @@ pub(super) fn append_ops_on(
         label,
         fuse: None,
         hidden: false,
-        colour_index: Some(project.history().next_colour_index()),
+        colour_index: Some(colour_index.unwrap_or_else(|| project.history().next_colour_index())),
     };
     project.put_checkpoint(&checkpoint)?;
     project.set_manifest(new_manifest)?;

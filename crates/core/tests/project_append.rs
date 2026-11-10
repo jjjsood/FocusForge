@@ -1408,3 +1408,571 @@ fn pixel_grid_held_fuse_matches_saved_by_resolved_path() {
         Some(GridMismatch::SourceFrames)
     );
 }
+
+// ---------------------------------------------------------------------
+// Unsaved checkpoints as stroke sources: a stroke names entry `j` of the
+// list as `held_key(j)`, renders from it before the save and is written
+// with the id the entry gets.
+// ---------------------------------------------------------------------
+
+use focusforge_core::io::TiffStack;
+use focusforge_core::project::export::{ExportOptions, MetadataOptions};
+use focusforge_core::project::{
+    CheckpointImage, PendingState, entry_colour_index, held_key, stroke_chain,
+};
+
+/// A 100 % normal stroke painting from entry `j` of the unsaved list, from
+/// `(x, y)` down and right.
+fn held_stroke(j: usize, x: i32, y: i32) -> Op {
+    Op::BrushStroke {
+        source: StrokeSource::Checkpoint(held_key(j)),
+        path: vec![
+            Point { x, y },
+            Point {
+                x: x + 11,
+                y: y + 5,
+            },
+        ],
+        radius: 5.0,
+        softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
+    }
+}
+
+/// Every sample of `image`, rendered against `project` when it needs one.
+fn render_image(image: &CheckpointImage, project: Option<&mut Project>) -> Vec<u16> {
+    let mut samples = vec![0u16; (W * H * SPP) as usize];
+    image
+        .render(project, image.full(), &mut |band, rect| {
+            let row = rect.width as usize * SPP as usize;
+            for (r, line) in band.chunks_exact(row).enumerate() {
+                let at = ((rect.y as usize + r) * W as usize + rect.x as usize) * SPP as usize;
+                samples[at..at + row].copy_from_slice(line);
+            }
+            Ok(())
+        })
+        .unwrap();
+    samples
+}
+
+fn read_tiff(path: &Path) -> Vec<u16> {
+    let stack = TiffStack::open_files(&[path.to_path_buf()]).unwrap();
+    let mut samples = vec![0u16; (W * H * SPP) as usize];
+    stack.read_tile_into(0, full(W, H), &mut samples).unwrap();
+    samples
+}
+
+fn pixel(samples: &[u16], x: u32, y: u32) -> &[u16] {
+    let at = (y * W + x) as usize * SPP as usize;
+    &samples[at..at + SPP as usize]
+}
+
+/// The composite of the fuse entry `i` of `entries` is recorded on: the
+/// nearest fused entry up its parents, else `saved_base`.
+fn base_composite(entries: &[project::InMemoryCheckpoint], i: usize, saved_base: &Path) -> PathBuf {
+    let mut at = i;
+    loop {
+        match (&entries[at].kind, &entries[at].parent) {
+            (project::InMemoryKind::Fused(held), _) => return held.composite.clone(),
+            (_, Some(ParentRef::Entry(j))) => at = *j,
+            _ => return saved_base.to_path_buf(),
+        }
+    }
+}
+
+fn pending_state(
+    composite: PathBuf,
+    sources: &[PathBuf],
+    ops: Vec<Op>,
+    held: Vec<project::InMemoryCheckpoint>,
+) -> PendingState {
+    PendingState {
+        composite,
+        ops,
+        sources: sources.to_vec(),
+        registration: focusforge_core::align::Registration::default(),
+        reference: 0,
+        description: "staged composite".to_string(),
+        held,
+    }
+}
+
+/// Entry `i` of `entries` as the unsaved state renders it: a held fuse's
+/// composite, or its taken ops over the fuse they are recorded on. `saved_base`
+/// is the composite of the saved checkpoint an entry hangs from.
+fn entry_render(
+    entries: &[project::InMemoryCheckpoint],
+    i: usize,
+    sources: &[PathBuf],
+    saved_base: &Path,
+    project: Option<&mut Project>,
+) -> Vec<u16> {
+    let image = match &entries[i].kind {
+        project::InMemoryKind::Fused(held) => CheckpointImage::prepare_held(held).unwrap(),
+        project::InMemoryKind::Ops { .. } => {
+            let state = pending_state(
+                base_composite(entries, i, saved_base),
+                sources,
+                stroke_chain(entries, i).unwrap(),
+                entries[..i].to_vec(),
+            );
+            CheckpointImage::prepare_pending(&state, project.as_deref()).unwrap()
+        }
+    };
+    render_image(&image, project)
+}
+
+/// The unsaved list the render tests paint from, on a project saved as
+/// `root`: a held fuse, ops over it, and ops over the saved root whose second
+/// stroke paints from the held fuse.
+fn source_entries(dir: &Path, sources: &[PathBuf], root: &str) -> Vec<project::InMemoryCheckpoint> {
+    vec![
+        fused_entry(held_checkpoint(dir, sources, 1, 1_000), Some(saved(root))),
+        ops_entry(vec![stroke(1, 20, 12)], 1_100, ParentRef::Entry(0)),
+        ops_entry(
+            vec![stroke(2, 40, 30), held_stroke(0, 6, 36)],
+            1_200,
+            saved(root),
+        ),
+    ]
+}
+
+/// The checkpoint and reason of a refused `prepare_pending`.
+fn refusal(result: Result<CheckpointImage, project::ProjectError>) -> (String, String) {
+    match result {
+        Err(project::ProjectError::CheckpointSourceRefused {
+            checkpoint, reason, ..
+        }) => (checkpoint, reason),
+        Err(other) => panic!("a different error: {other}"),
+        Ok(_) => panic!("the render was not refused"),
+    }
+}
+
+#[test]
+fn in_memory_source_renders() {
+    let (dir, path, sources) = sealed("in_memory_source_renders");
+    let root = head_of(&path);
+    let entries = source_entries(&dir, &sources, &root);
+    let staging = dir.join("pending-base");
+    std::fs::create_dir_all(&staging).unwrap();
+    let (base, _) = stage_planes(&staging, 0, 0);
+    let mut project = Project::open(&path).unwrap();
+
+    // One stroke per entry, each in its own part of the image, the last
+    // reaching off the canvas.
+    let strokes = [
+        held_stroke(0, 4, 4),
+        held_stroke(1, 24, 20),
+        held_stroke(2, 46, 36),
+        held_stroke(0, -3, -2),
+    ];
+    let state = pending_state(base.clone(), &sources, strokes.to_vec(), entries.clone());
+    let image = CheckpointImage::prepare_pending(&state, Some(&project)).unwrap();
+    let untouched = composite_samples(0);
+    let view = render_image(&image, Some(&mut project));
+
+    let expected: Vec<Vec<u16>> = (0..3)
+        .map(|i| entry_render(&entries, i, &sources, &base, Some(&mut project)))
+        .collect();
+    assert_eq!(
+        expected[0],
+        composite_samples(1),
+        "a held fuse is its composite"
+    );
+    for (entry, points) in [
+        (0, [(4, 4), (15, 9)]),
+        (1, [(24, 20), (35, 25)]),
+        (2, [(46, 36), (57, 41)]),
+        (0, [(0, 0), (8, 3)]),
+    ] {
+        for (x, y) in points {
+            assert_eq!(
+                pixel(&view, x, y),
+                pixel(&expected[entry], x, y),
+                "entry {entry} reproduced at ({x}, {y})"
+            );
+        }
+    }
+    for (entry, x, y) in [(1, 24, 20), (2, 46, 36)] {
+        assert_ne!(
+            pixel(&expected[entry], x, y),
+            pixel(&untouched, x, y),
+            "entry {entry} differs from the base at ({x}, {y})"
+        );
+    }
+    for (x, y) in [(60, 2), (30, 44), (62, 22)] {
+        assert_eq!(
+            pixel(&view, x, y),
+            pixel(&untouched, x, y),
+            "({x}, {y}) is outside every footprint"
+        );
+    }
+
+    // The pending export is the render, and a source budget below one stroke
+    // area changes no sample.
+    let out = dir.join("pending.tif");
+    project::export_pending(
+        &state,
+        Some(&mut project),
+        &out,
+        &ExportOptions::default(),
+        &MetadataOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(read_tiff(&out), view, "export equals render");
+    let squeezed = CheckpointImage::prepare_pending(&state, Some(&project))
+        .unwrap()
+        .with_source_bytes(1);
+    assert_eq!(render_image(&squeezed, Some(&mut project)), view, "budget");
+
+    // A never-saved list renders with no project.
+    let never = vec![
+        fused_entry(held_checkpoint(&dir, &sources, 2, 2_000), None),
+        ops_entry(vec![stroke(1, 20, 12)], 2_100, ParentRef::Entry(0)),
+    ];
+    let state = pending_state(
+        base.clone(),
+        &sources,
+        vec![held_stroke(0, 4, 4), held_stroke(1, 30, 20)],
+        never.clone(),
+    );
+    let image = CheckpointImage::prepare_pending(&state, None).unwrap();
+    let view = render_image(&image, None);
+    let first = entry_render(&never, 0, &sources, &base, None);
+    let second = entry_render(&never, 1, &sources, &base, None);
+    assert_eq!(pixel(&view, 4, 4), pixel(&first, 4, 4));
+    assert_eq!(pixel(&view, 30, 20), pixel(&second, 30, 20));
+
+    // Refusals: past the list, and an entry painting from itself or later.
+    let past = pending_state(
+        base.clone(),
+        &sources,
+        vec![held_stroke(3, 4, 4)],
+        entries.clone(),
+    );
+    assert_eq!(
+        refusal(CheckpointImage::prepare_pending(&past, Some(&project))),
+        (held_key(3), "is not in this project".to_string())
+    );
+    for (name, bad) in [("itself", 1), ("a later entry", 2)] {
+        let list = vec![
+            fused_entry(
+                held_checkpoint(&dir, &sources, 3, 3_000),
+                Some(saved(&root)),
+            ),
+            ops_entry(vec![held_stroke(bad, 4, 4)], 3_100, ParentRef::Entry(0)),
+            ops_entry(vec![stroke(1, 2, 2)], 3_200, ParentRef::Entry(1)),
+        ];
+        let state = pending_state(base.clone(), &sources, vec![held_stroke(1, 20, 20)], list);
+        assert_eq!(
+            refusal(CheckpointImage::prepare_pending(&state, Some(&project))),
+            (
+                held_key(bad),
+                "is not before the checkpoint painting from it".to_string()
+            ),
+            "an entry painting from {name}"
+        );
+    }
+}
+
+/// The checkpoint ids the stored strokes of `path` paint from, sorted.
+fn stored_sources(path: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = stored_strokes(path)
+        .iter()
+        .filter_map(|stroke| stroke["source"]["checkpoint"].as_str().map(str::to_string))
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn in_memory_source_rewritten_on_save() {
+    for onto_existing in [true, false] {
+        let (dir, path, sources) = sealed(&format!("in_memory_source_rewritten_{onto_existing}"));
+        let root = head_of(&path);
+        let staging = dir.join("pending-base");
+        std::fs::create_dir_all(&staging).unwrap();
+        let (base, _) = stage_planes(&staging, 0, 0);
+        let fuse_parent = onto_existing.then(|| saved(&root));
+        // e1 paints from its parent e0; e2 paints from e0 and from e1, which
+        // is never its parent.
+        let entries = vec![
+            fused_entry(held_checkpoint(&dir, &sources, 1, 1_000), fuse_parent),
+            ops_entry(
+                vec![stroke(1, 20, 12), held_stroke(0, 6, 6)],
+                1_100,
+                ParentRef::Entry(0),
+            ),
+            ops_entry(
+                vec![held_stroke(0, 40, 30), held_stroke(1, 6, 36)],
+                1_200,
+                if onto_existing {
+                    saved(&root)
+                } else {
+                    ParentRef::Entry(0)
+                },
+            ),
+        ];
+        let target = if onto_existing {
+            path.clone()
+        } else {
+            dir.join(format!("fresh.{}", project::PROJECT_EXTENSION))
+        };
+        let mut opened = onto_existing.then(|| Project::open(&path).unwrap());
+        let before: Vec<Vec<u16>> = (0..entries.len())
+            .map(|i| entry_render(&entries, i, &sources, &base, opened.as_mut()))
+            .collect();
+        drop(opened);
+        assert_ne!(before[1], before[0], "the stroke of entry 1 changes it");
+
+        let ids = project::seal_in_memory(&target, &entries, &[], None, onto_existing).unwrap();
+
+        assert_eq!(ids.len(), 3);
+        let mut expected = vec![ids[0].clone(), ids[0].clone(), ids[1].clone()];
+        expected.sort();
+        assert_eq!(
+            stored_sources(&target),
+            expected,
+            "onto_existing {onto_existing}"
+        );
+        for stroke in stored_strokes(&target) {
+            assert!(
+                !stroke.to_string().contains("held:"),
+                "an entry index reached the file: {stroke}"
+            );
+        }
+        let mut reopened = Project::open(&target).unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            let image = CheckpointImage::prepare(&reopened, id).unwrap();
+            assert_eq!(
+                render_image(&image, Some(&mut reopened)),
+                before[i],
+                "entry {i} renders as it did unsaved, onto_existing {onto_existing}"
+            );
+        }
+    }
+}
+
+#[test]
+fn in_memory_source_refused() {
+    for onto_existing in [true, false] {
+        let (dir, path, sources) = sealed(&format!("in_memory_source_refused_{onto_existing}"));
+        let root = head_of(&path);
+        let target = if onto_existing {
+            path.clone()
+        } else {
+            dir.join(format!("fresh.{}", project::PROJECT_EXTENSION))
+        };
+        let before = onto_existing.then(|| std::fs::read(&target).unwrap());
+        let first = || {
+            fused_entry(
+                held_checkpoint(&dir, &sources, 1, 1_000),
+                onto_existing.then(|| saved(&root)),
+            )
+        };
+        let refused = [
+            (
+                "out of range at op 0",
+                vec![
+                    first(),
+                    ops_entry(vec![held_stroke(5, 6, 6)], 1_100, ParentRef::Entry(0)),
+                ],
+                "checkpoint 1 paints from checkpoint 5, which is not before it",
+            ),
+            (
+                "itself at op 0",
+                vec![
+                    first(),
+                    ops_entry(vec![held_stroke(1, 6, 6)], 1_100, ParentRef::Entry(0)),
+                ],
+                "checkpoint 1 paints from checkpoint 1, which is not before it",
+            ),
+            (
+                "a later entry at op 1",
+                vec![
+                    first(),
+                    ops_entry(
+                        vec![stroke(1, 2, 2), held_stroke(2, 6, 6)],
+                        1_100,
+                        ParentRef::Entry(0),
+                    ),
+                    ops_entry(vec![stroke(2, 9, 9)], 1_200, ParentRef::Entry(1)),
+                ],
+                "checkpoint 1 paints from checkpoint 2, which is not before it",
+            ),
+            (
+                "the entry itself at op 1 of a later entry",
+                vec![
+                    first(),
+                    ops_entry(vec![stroke(1, 2, 2)], 1_100, ParentRef::Entry(0)),
+                    ops_entry(
+                        vec![stroke(2, 9, 9), held_stroke(2, 6, 6)],
+                        1_200,
+                        ParentRef::Entry(1),
+                    ),
+                ],
+                "checkpoint 2 paints from checkpoint 2, which is not before it",
+            ),
+        ];
+        for (what, entries, message) in refused {
+            let err = project::seal_in_memory(&target, &entries, &[], None, onto_existing)
+                .expect_err(what);
+            assert!(
+                err.to_string().contains(message),
+                "{what}: `{err}` does not say `{message}`"
+            );
+            match &before {
+                Some(bytes) => assert_eq!(&std::fs::read(&target).unwrap(), bytes, "{what}"),
+                None => assert!(!target.exists(), "{what} created the project"),
+            }
+            assert!(leftover_temporaries(&dir).is_empty(), "{what}");
+        }
+    }
+}
+
+fn gone_stroke() -> Op {
+    Op::BrushStroke {
+        source: StrokeSource::Checkpoint(project::GONE_KEY.to_string()),
+        path: vec![Point { x: 4, y: 4 }],
+        radius: 5.0,
+        softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
+    }
+}
+
+#[test]
+fn gone_source_names_no_checkpoint() {
+    let (dir, path, sources) = sealed("gone_source_names_no_checkpoint");
+    let root = head_of(&path);
+    let staging = dir.join("pending-base");
+    std::fs::create_dir_all(&staging).unwrap();
+    let (base, _) = stage_planes(&staging, 0, 0);
+    let project = Project::open(&path).unwrap();
+    assert_eq!(project::held_index(project::GONE_KEY), None);
+    let entries = vec![fused_entry(
+        held_checkpoint(&dir, &sources, 1, 1_000),
+        Some(saved(&root)),
+    )];
+
+    // The unsaved view refuses it, however many entries it holds.
+    let state = pending_state(base, &sources, vec![gone_stroke()], entries.clone());
+    assert_eq!(
+        refusal(CheckpointImage::prepare_pending(&state, Some(&project))),
+        (
+            project::GONE_KEY.to_string(),
+            "is not in this project".to_string()
+        )
+    );
+
+    // A save refuses it and writes nothing.
+    drop(project);
+    let before = std::fs::read(&path).unwrap();
+    let list = vec![
+        entries[0].clone(),
+        ops_entry(vec![gone_stroke()], 1_100, ParentRef::Entry(0)),
+    ];
+    let err = project::seal_in_memory(&path, &list, &[], None, true)
+        .expect_err("a stroke painting from a checkpoint that was never written");
+    assert!(err.to_string().contains(project::GONE_KEY), "{err}");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(leftover_temporaries(&dir).is_empty());
+}
+
+#[test]
+fn in_memory_source_kept() {
+    let (dir, path, sources) = sealed("in_memory_source_kept");
+    let root = head_of(&path);
+    let fuse = || {
+        fused_entry(
+            held_checkpoint(&dir, &sources, 1, 1_000),
+            Some(saved(&root)),
+        )
+    };
+    let used = vec![
+        fuse(),
+        ops_entry(vec![held_stroke(0, 6, 6)], 1_100, saved(&root)),
+    ];
+    let unused = vec![
+        fuse(),
+        ops_entry(vec![stroke(1, 6, 6)], 1_100, saved(&root)),
+    ];
+    let source_deleted = [ParentRef::Entry(0)];
+    assert_eq!(
+        project::kept_entries(&used, &source_deleted, None),
+        [true, true],
+        "a deleted entry a written stroke paints from is kept"
+    );
+    assert_eq!(
+        project::kept_entries(&unused, &source_deleted, None),
+        [false, true],
+        "unused by any entry, it is dropped"
+    );
+    assert_eq!(
+        project::kept_entries(&used, &[ParentRef::Entry(0), ParentRef::Entry(1)], None),
+        [false, false],
+        "an unwritten entry's stroke keeps nothing"
+    );
+
+    let ids = project::seal_in_memory(&path, &used, &source_deleted, None, true).unwrap();
+    assert_eq!(ids.len(), 2);
+    assert!(is_hidden(&path, &ids[0]), "written, then hidden");
+    assert_eq!(stored_sources(&path), [ids[0].clone()]);
+    let mut project = Project::open(&path).unwrap();
+    let image = CheckpointImage::prepare(&project, &ids[1]).unwrap();
+    let samples = render_image(&image, Some(&mut project));
+    assert_eq!(pixel(&samples, 6, 6), pixel(&composite_samples(1), 6, 6));
+}
+
+#[test]
+fn in_memory_entries_keep_their_colour() {
+    for onto_existing in [true, false] {
+        let (dir, path, sources) = sealed(&format!("in_memory_entries_colour_{onto_existing}"));
+        let target = if onto_existing {
+            path.clone()
+        } else {
+            dir.join(format!("fresh.{}", project::PROJECT_EXTENSION))
+        };
+        let mut first_parent = None;
+        if onto_existing {
+            let at = Project::open(&path).unwrap().checkpoint().created_at;
+            project::append_ops_at(&path, vec![stroke(1, 1, 1)], None, at + 10).unwrap();
+            first_parent = Some(saved(&head_of(&path)));
+        }
+        let base = if onto_existing {
+            Project::open(&path).unwrap().history().next_colour_index()
+        } else {
+            0
+        };
+        // Entry 1 is deleted and never written; the ones after it keep their numbers.
+        let entries = vec![
+            fused_entry(held_checkpoint(&dir, &sources, 1, 5_000), first_parent),
+            ops_entry(vec![stroke(1, 2, 2)], 5_100, ParentRef::Entry(0)),
+            ops_entry(vec![stroke(2, 3, 3)], 5_200, ParentRef::Entry(0)),
+            fused_entry(
+                held_checkpoint(&dir, &sources, 2, 5_300),
+                Some(ParentRef::Entry(2)),
+            ),
+        ];
+        let ids = project::seal_in_memory(
+            &target,
+            &entries,
+            &[ParentRef::Entry(1)],
+            None,
+            onto_existing,
+        )
+        .unwrap();
+        assert_eq!(ids.len(), 3, "entry 1 is not written");
+        for (id, entry) in ids.iter().zip([0, 2, 3]) {
+            let number = entry_colour_index(base, entry);
+            assert_eq!(number, base + entry as u32);
+            assert_eq!(
+                stored_colour_of(&target, id),
+                Some(u64::from(number)),
+                "stored, entry {entry}, onto_existing {onto_existing}"
+            );
+            assert_eq!(colour_of(&target, id), number, "read, entry {entry}");
+        }
+    }
+}

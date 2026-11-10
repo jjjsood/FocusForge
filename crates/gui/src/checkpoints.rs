@@ -44,34 +44,7 @@ pub struct CheckpointEntry {
     pub fresh: Option<u64>,
 }
 
-/// A held row's own key into `ProjectTab::held`, stable until a save.
-pub(crate) fn held_key(index: usize) -> String {
-    format!("held:{index}")
-}
-
-/// [`held_key`]'s index back; `None` for a saved checkpoint's id.
-pub(crate) fn held_index(key: &str) -> Option<usize> {
-    key.strip_prefix("held:")?.parse().ok()
-}
-
-/// The ops of in-memory entry `index` and of the op-bearing entries it
-/// descends from, oldest first, up to the first fused entry or saved
-/// checkpoint. `None` when `index` is not an op-bearing entry.
-pub(crate) fn stroke_chain(held: &[InMemoryCheckpoint], index: usize) -> Option<Vec<Op>> {
-    let mut levels = Vec::new();
-    let mut entry = held.get(index)?;
-    while let InMemoryKind::Ops { ops, .. } = &entry.kind {
-        levels.push(ops);
-        match &entry.parent {
-            Some(ParentRef::Entry(parent)) => entry = held.get(*parent)?,
-            _ => break,
-        }
-    }
-    if levels.is_empty() {
-        return None;
-    }
-    Some(levels.into_iter().rev().flatten().cloned().collect())
-}
+pub(crate) use focusforge_core::project::{held_index, held_key, stroke_chain};
 
 /// Op kinds in the order a summary lists them; the last catches any op kind
 /// the list does not name.

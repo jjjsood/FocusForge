@@ -217,6 +217,7 @@ fn stroked_raw(name: &str) -> StrokedRaw {
         .checkpoint;
     let mut project = Project::open(&project_path).unwrap();
     let pending = PendingState {
+        held: Vec::new(),
         composite: held.composite.clone(),
         ops: vec![stroke],
         sources: held.sources.clone(),
@@ -485,6 +486,7 @@ fn one_render_for_held_saved_and_pending() {
     let mut project = Project::open(&project_path).unwrap();
 
     let pending = PendingState {
+        held: Vec::new(),
         composite: held.composite.clone(),
         ops: Vec::new(),
         sources: held.sources.clone(),
@@ -493,6 +495,7 @@ fn one_render_for_held_saved_and_pending() {
         description: held.composite_description.clone(),
     };
     let pending_stroked = PendingState {
+        held: Vec::new(),
         ops: vec![stroke],
         ..pending.clone()
     };

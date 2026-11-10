@@ -8127,6 +8127,7 @@ fn live_region(session: &mut job::EditState, region: Rect, ops: Vec<Op>) -> Vec<
 
 fn raw_pending(files: &RawFiles, ops: Vec<Op>) -> project::PendingState {
     project::PendingState {
+        held: Vec::new(),
         composite: files.composite.clone(),
         ops,
         sources: files.sources.clone(),
@@ -8393,4 +8394,138 @@ fn raw_session_blends_on_the_cpu() {
         "samples above white survive"
     );
     assert_eq!(bits(&with_device), bits(&plain));
+}
+
+/// A stroke painted from unsaved checkpoint `entry`.
+fn held_dab(entry: usize, x: i32) -> job::Op {
+    job::Op::BrushStroke {
+        source: job::StrokeSource::Checkpoint(format!("held:{entry}")),
+        path: vec![Point { x, y: 10 }],
+        radius: 0.5,
+        softness: 0.0,
+        mode: job::BrushMode::Normal,
+        opacity: 1.0,
+    }
+}
+
+/// The checkpoint every op paints from, `None` for a frame stroke.
+fn painted_from(ops: &[job::Op]) -> Vec<Option<&str>> {
+    ops.iter().map(job::Op::checkpoint_source).collect()
+}
+
+/// The panel index of the row with `id`.
+fn row_of(controller: &AppController, id: &str) -> usize {
+    controller
+        .checkpoints_panel()
+        .entries
+        .iter()
+        .position(|entry| entry.id.as_deref() == Some(id))
+        .unwrap_or_else(|| panic!("no row for {id}"))
+}
+
+#[test]
+fn held_source_files_kept() {
+    for uses_source in [false, true] {
+        let (mut c, path) = two_saved(&format!("held_source_files_{uses_source}"));
+        let root = saved_rows(&path)[0].0.clone();
+        // Held 0 hangs from the head, held 1 from the root: neither is the
+        // other's parent.
+        fuse_and_settle(&mut c);
+        c.select_checkpoint_row(row_of(&c, &root));
+        fuse_and_settle(&mut c);
+        assert_eq!(c.held_checkpoints().len(), 2);
+        common::enter_editor(&mut c);
+        common::paint(
+            &mut c,
+            if uses_source {
+                held_dab(0, 12)
+            } else {
+                dab(12)
+            },
+        );
+        assert!(c.save_checkpoint(), "the stroke becomes an entry");
+
+        let first = c.held_checkpoints()[0].composite.clone();
+        assert!(first.is_file());
+        c.request_checkpoint_delete(row_of(&c, "held:0"));
+        c.confirm_checkpoint_delete();
+        assert_eq!(
+            first.is_file(),
+            uses_source,
+            "a deleted fuse a stroke paints from keeps its files, any other loses them"
+        );
+    }
+}
+
+#[test]
+fn held_source_rewritten_after_save() {
+    let mut c = painted_tab("held_source_rewritten", 2, 0);
+    common::enter_editor(&mut c);
+    common::paint(&mut c, held_dab(0, 12));
+    let sources = |c: &AppController| {
+        painted_from(&c.edit_session().unwrap().stack_ops())
+            .into_iter()
+            .map(|id| id.map(str::to_string))
+            .collect::<Vec<_>>()
+    };
+
+    // A failed save changes no reference.
+    let held_before = held_paths(&c);
+    let blocked = unwritable_target("held_source_rewritten_blocked");
+    assert!(!common::save_and_settle(&mut c, |_| Some(blocked.clone())));
+    assert_eq!(sources(&c), [Some("held:0".to_string())]);
+    assert_eq!(held_paths(&c), held_before);
+
+    // A successful one names the saved id in the chain, in a stroke drawn
+    // while it ran and in one undone meanwhile.
+    let target = common::tree("held_source_rewritten_target").join("saved.ffp");
+    assert!(c.start_save_active_project(|_| Some(target.clone())));
+    common::paint(&mut c, held_dab(0, 20));
+    common::paint(&mut c, held_dab(0, 28));
+    c.edit_session_mut()
+        .unwrap()
+        .undo()
+        .expect("a stroke to undo");
+    c.join_save();
+    assert_eq!(c.settle_save(), Some(true));
+
+    let root = saved_rows(&target)
+        .into_iter()
+        .find(|row| row.3)
+        .expect("the fuse is saved")
+        .0;
+    assert_eq!(sources(&c), vec![Some(root.clone()); 2]);
+    c.edit_session_mut()
+        .unwrap()
+        .redo()
+        .expect("a stroke to redo");
+    assert_eq!(sources(&c), vec![Some(root); 3]);
+}
+
+#[test]
+fn held_source_not_written_cannot_alias_a_new_entry() {
+    let (mut c, path) = two_saved("held_source_gone");
+    let root = saved_rows(&path)[0].0.clone();
+    fuse_and_settle(&mut c);
+    c.select_checkpoint_row(row_of(&c, &root));
+    fuse_and_settle(&mut c);
+    common::enter_editor(&mut c);
+    // An undone stroke is no entry's, so nothing written paints from held 0.
+    common::paint(&mut c, held_dab(0, 12));
+    c.edit_session_mut()
+        .unwrap()
+        .undo()
+        .expect("a stroke to undo");
+    c.request_checkpoint_delete(row_of(&c, "held:0"));
+    c.confirm_checkpoint_delete();
+    assert!(c.save_active_project(|_| panic!("a saved tab never asks where")));
+
+    // Held 0 is a new entry's name from here on; the undone stroke is not its.
+    assert!(c.held_checkpoints().is_empty());
+    c.edit_session_mut()
+        .unwrap()
+        .redo()
+        .expect("a stroke to redo");
+    let ops = c.edit_session().unwrap().stack_ops();
+    assert_eq!(painted_from(&ops), [Some(job::GONE_KEY)]);
 }

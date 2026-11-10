@@ -9446,6 +9446,7 @@ fn mode_list_closes_on_choice_field_escape_and_canvas_press() {
 /// same function an export of unsaved strokes goes through.
 fn pending_render(composite: &Path, root: &Path, sealed: &Sealed, ops: Vec<Op>) -> Vec<u16> {
     let state = project::PendingState {
+        held: Vec::new(),
         composite: composite.to_path_buf(),
         ops,
         sources: (0..3).map(|i| root.join(format!("{i:02}.tif"))).collect(),

@@ -265,10 +265,6 @@ fn branched_and_deleted_with(
         .boxed()
 }
 
-fn branched_and_deleted(g: Geometry) -> BoxedStrategy<Vec<Action>> {
-    branched_and_deleted_with(g, seal_action)
-}
-
 fn branched_and_deleted_from_checkpoints(g: Geometry) -> BoxedStrategy<Vec<Action>> {
     branched_and_deleted_with(g, sourced_seal_action)
 }
@@ -435,6 +431,18 @@ fn fail(what: &str, err: impl std::fmt::Display) -> TestCaseError {
     TestCaseError::fail(format!("{what}: {err}"))
 }
 
+/// A stroke painting from checkpoint `source`.
+fn checkpoint_stroke(source: String) -> Op {
+    Op::BrushStroke {
+        source: StrokeSource::Checkpoint(source),
+        path: vec![Point { x: 1, y: 1 }],
+        radius: 2.0,
+        softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
+    }
+}
+
 /// One `append_ops_onto` / `delete_checkpoint` call per step: the core
 /// calls behind the GUI's save and `history delete`.
 fn write_per_checkpoint(path: &Path, model: &mut Model) -> Result<(), TestCaseError> {
@@ -447,14 +455,11 @@ fn write_per_checkpoint(path: &Path, model: &mut Model) -> Result<(), TestCaseEr
                 sources,
                 created_at,
             } => {
-                ops.extend(sources.iter().map(|&source| Op::BrushStroke {
-                    source: StrokeSource::Checkpoint(model.nodes[source].id.clone()),
-                    path: vec![Point { x: 1, y: 1 }],
-                    radius: 2.0,
-                    softness: 0.0,
-                    mode: BrushMode::Normal,
-                    opacity: 1.0,
-                }));
+                ops.extend(
+                    sources
+                        .iter()
+                        .map(|&source| checkpoint_stroke(model.nodes[source].id.clone())),
+                );
                 let sealed =
                     project::append_ops_onto(path, &model.nodes[parent].id, ops, None, created_at)
                         .map_err(|e| fail(&format!("seal node {node} under node {parent}"), e))?;
@@ -484,6 +489,10 @@ fn write_in_memory(path: &Path, model: &mut Model) -> Result<(), TestCaseError> 
         0 => ParentRef::Saved(root.clone()),
         n => ParentRef::Entry(n - 1),
     };
+    let source = |node: usize| match node {
+        0 => root.clone(),
+        n => project::held_key(n - 1),
+    };
     let mut entries = Vec::new();
     let mut deletes = Vec::new();
     for step in &model.steps {
@@ -495,13 +504,11 @@ fn write_in_memory(path: &Path, model: &mut Model) -> Result<(), TestCaseError> 
                 created_at,
                 ..
             } => {
-                assert!(
-                    sources.is_empty(),
-                    "an unsaved entry cannot name another entry as a stroke source"
-                );
+                let mut ops = ops.clone();
+                ops.extend(sources.iter().map(|&node| checkpoint_stroke(source(node))));
                 entries.push(InMemoryCheckpoint {
                     kind: InMemoryKind::Ops {
-                        ops: ops.clone(),
+                        ops,
                         created_at: *created_at,
                     },
                     parent: Some(reference(*parent)),
@@ -621,7 +628,7 @@ proptest! {
     }
 
     #[test]
-    fn in_memory_save_round_trips((g, salt, actions) in case(branched_and_deleted)) {
+    fn in_memory_save_round_trips((g, salt, actions) in case(branched_and_deleted_from_checkpoints)) {
         let (dir, path, mut model) = start("in_memory", g, salt);
         model.play(&actions);
         prop_assert!(model.has_branch(), "the case has no branch");

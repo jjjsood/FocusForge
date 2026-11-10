@@ -310,6 +310,7 @@ fn every_render_path_agrees_on_the_reference_stack() {
             } else {
                 let reference = held.align.as_ref().map_or(0, |a| a.reference);
                 let pending = PendingState {
+                    held: Vec::new(),
                     composite: held.composite.clone(),
                     ops: ops.to_vec(),
                     sources: held.sources.clone(),

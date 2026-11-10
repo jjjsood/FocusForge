@@ -26,7 +26,9 @@ use super::container::partial_path;
 use super::error::ProjectError;
 use super::manifest::PlaneRef;
 use super::pixel_grid::PixelGrid;
-use super::seal::HeldCheckpoint;
+use super::seal::{
+    HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, held_index, stroke_chain,
+};
 use super::validate::check_sources;
 use super::{LeSample, Project, READ_BAND_BYTES};
 
@@ -119,6 +121,9 @@ pub struct PendingState {
     /// The exact `ImageDescription` the export's TIFF IFD (or another
     /// format's equivalent field) carries.
     pub description: String,
+    /// The unsaved checkpoints a stroke may paint from, as
+    /// `StrokeSource::Checkpoint(held_key(i))` for entry `i`.
+    pub held: Vec<InMemoryCheckpoint>,
 }
 
 /// The band sink every render path hands its bands to: samples plus the
@@ -159,12 +164,24 @@ impl CheckpointImage {
     /// ([`ProjectError::RenderSourcesUnavailable`]) when a stroke meets the
     /// tile.
     pub fn prepare(project: &Project, id: &str) -> Result<Self, ProjectError> {
+        Self::prepare_with(project, id, Vec::new(), Held::NONE)
+    }
+
+    /// [`Self::prepare`] of checkpoint `id` with `extra` ops applied after its
+    /// own, `held` resolving the unsaved entries they paint from.
+    fn prepare_with(
+        project: &Project,
+        id: &str,
+        extra: Vec<Op>,
+        held: Held<'_>,
+    ) -> Result<Self, ProjectError> {
         let checkpoint = project.history().get(id)?.clone();
         let record = project.fuse_state(id)?;
 
         let composite = record.composite.clone();
         let format = project.plane_format(&composite)?;
-        let ops = project.history().op_chain(id)?;
+        let mut ops = project.history().op_chain(id)?;
+        ops.extend(&extra);
         if ops.is_empty() {
             return Ok(Self::shaped(
                 &composite,
@@ -180,9 +197,20 @@ impl CheckpointImage {
             record.sources.len() as u32,
         )
         .map_err(|err| ProjectError::container(project.path(), err))?;
+        let edited = project.pixel_grid(&record);
         let mut references = References::default();
         let strokes = place_strokes(ops.into_iter(), info, &mut |index, reference| {
             references.slot(reference, || {
+                if let Some(j) = held_index(reference) {
+                    let at = (project.path(), index, reference);
+                    return Self::prepare_held_source(
+                        held,
+                        j,
+                        Some(project),
+                        at,
+                        (&edited, format),
+                    );
+                }
                 if let Some(reason) = unpaintable_reason(project, id, reference)? {
                     return Err(refused(project.path(), index, reference, reason));
                 }
@@ -220,6 +248,92 @@ impl CheckpointImage {
             ));
         }
         Ok(image)
+    }
+
+    /// The render of unsaved entry `j` for the stroke at op `index` of the
+    /// render of `path` (`at`), refused when `j` is not an earlier entry of
+    /// `held`, is on another pixel grid than `edited` or holds other samples
+    /// than `format`.
+    fn prepare_held_source(
+        held: Held<'_>,
+        j: usize,
+        project: Option<&Project>,
+        (path, index, reference): (&Path, usize, &str),
+        (edited, format): (&PixelGrid<'_>, SampleFormat),
+    ) -> Result<Self, ProjectError> {
+        let refuse = |reason: &str| refused(path, index, reference, reason);
+        if j >= held.entries.len() {
+            return Err(refuse("is not in this project"));
+        }
+        if j >= held.painting {
+            return Err(refuse("is not before the checkpoint painting from it"));
+        }
+        let mismatch = match base_of(held.entries, j) {
+            Some(Base::Fuse(fuse)) => edited.mismatch(&PixelGrid::held(fuse)),
+            Some(Base::Saved(id)) => {
+                let project =
+                    project.ok_or_else(|| refuse("needs its project, and none is open"))?;
+                let fuse = project.fuse_state(id)?;
+                edited.mismatch(&project.pixel_grid(&fuse))
+            }
+            None => None,
+        };
+        if let Some(mismatch) = mismatch {
+            return Err(refuse(&format!("has {mismatch}")));
+        }
+        let image = Self::prepare_entry(held.entries, j, project, path)?;
+        if image.sample_format != format {
+            return Err(refuse(&sample_mismatch(image.sample_format, format)));
+        }
+        Ok(image)
+    }
+
+    /// The render of unsaved entry `j`: a held fuse's composite, or its own
+    /// ops and those of the op-bearing entries it descends from over the
+    /// fuse they are recorded on, never the strokes of the session. Strokes
+    /// of those ops paint from the entries before `j`.
+    fn prepare_entry(
+        entries: &[InMemoryCheckpoint],
+        j: usize,
+        project: Option<&Project>,
+        path: &Path,
+    ) -> Result<Self, ProjectError> {
+        let no_fuse =
+            || ProjectError::container(path, format!("checkpoint {j} has no fuse to render over"));
+        let Some(chain) = stroke_chain(entries, j) else {
+            let InMemoryKind::Fused(fuse) = &entries[j].kind else {
+                return Err(no_fuse());
+            };
+            return Self::prepare_held(fuse);
+        };
+        let held = Held {
+            entries,
+            painting: j,
+        };
+        match base_of(entries, j) {
+            Some(Base::Fuse(fuse)) => {
+                let state = PendingState {
+                    composite: fuse.composite.clone(),
+                    ops: chain,
+                    sources: fuse.sources.clone(),
+                    registration: fuse.registration.clone(),
+                    reference: 0,
+                    description: fuse.composite_description.clone(),
+                    held: Vec::new(),
+                };
+                Self::prepare_pending_in(&state, project, held)
+            }
+            Some(Base::Saved(id)) => {
+                let project = project.ok_or_else(|| {
+                    ProjectError::container(
+                        path,
+                        format!("checkpoint {j} is recorded on a saved checkpoint, and no project is open"),
+                    )
+                })?;
+                Self::prepare_with(project, id, chain, held)
+            }
+            None => Err(no_fuse()),
+        }
     }
 
     /// The render of a held result: its composite TIFF, with no project and
@@ -263,6 +377,20 @@ impl CheckpointImage {
         state: &PendingState,
         project: Option<&Project>,
     ) -> Result<Self, ProjectError> {
+        let held = Held {
+            entries: &state.held,
+            painting: state.held.len(),
+        };
+        Self::prepare_pending_in(state, project, held)
+    }
+
+    /// [`Self::prepare_pending`] with `held` resolving the unsaved entries
+    /// its strokes paint from.
+    fn prepare_pending_in(
+        state: &PendingState,
+        project: Option<&Project>,
+        held: Held<'_>,
+    ) -> Result<Self, ProjectError> {
         let composite = &state.composite;
         let stack = TiffStack::open_staged(composite)
             .map_err(|err| ProjectError::container(composite, err))?;
@@ -273,21 +401,27 @@ impl CheckpointImage {
         let info = ZMapInfo::new(width, height, state.sources.len() as u32)
             .map_err(|err| ProjectError::container(composite, err))?;
         let format = stack.sample_format();
+        let grid = PixelGrid {
+            hashes: None,
+            paths: state.sources.clone(),
+            registration: &state.registration,
+            width,
+            height,
+        };
         let mut references = References::default();
         let strokes = place_strokes(state.ops.iter(), info, &mut |index, reference| {
+            if let Some(j) = held_index(reference) {
+                return references.slot(reference, || {
+                    let at = (composite.as_path(), index, reference);
+                    Self::prepare_held_source(held, j, project, at, (&grid, format))
+                });
+            }
             let refuse = |reason: &str| refused(composite, index, reference, reason);
             let project = project.ok_or_else(|| refuse("needs its project, and none is open"))?;
             references.slot(reference, || {
                 if project.history().get(reference).is_err() {
                     return Err(refuse("is not in this project"));
                 }
-                let grid = PixelGrid {
-                    hashes: None,
-                    paths: state.sources.clone(),
-                    registration: &state.registration,
-                    width,
-                    height,
-                };
                 let fuse = project.fuse_state(reference)?;
                 if let Some(mismatch) = grid.mismatch(&project.pixel_grid(&fuse)) {
                     return Err(refuse(&format!("has {mismatch}")));
@@ -577,6 +711,42 @@ fn open_pending_sources(
     Ok(set)
 }
 
+/// The unsaved entries a render resolves a `held_key` source against, and the
+/// index of the entry whose strokes are being resolved: a stroke may only
+/// paint from an entry before it.
+#[derive(Clone, Copy)]
+struct Held<'a> {
+    entries: &'a [InMemoryCheckpoint],
+    painting: usize,
+}
+
+impl Held<'static> {
+    const NONE: Held<'static> = Held {
+        entries: &[],
+        painting: 0,
+    };
+}
+
+/// What an unsaved op-bearing entry is recorded over.
+enum Base<'a> {
+    Fuse(&'a HeldCheckpoint),
+    Saved(&'a str),
+}
+
+/// What entry `at` of `entries` renders over: its own fuse, or the one of the
+/// nearest fused or saved ancestor. `None` for a chain that ends in no fuse.
+fn base_of(entries: &[InMemoryCheckpoint], mut at: usize) -> Option<Base<'_>> {
+    loop {
+        let entry = entries.get(at)?;
+        match (&entry.kind, &entry.parent) {
+            (InMemoryKind::Fused(fuse), _) => return Some(Base::Fuse(fuse)),
+            (_, Some(ParentRef::Saved(id))) => return Some(Base::Saved(id)),
+            (_, Some(ParentRef::Entry(parent))) if *parent < at => at = *parent,
+            _ => return None,
+        }
+    }
+}
+
 /// The checkpoint images a render blends from, one per distinct id, in the
 /// order their ids were first met.
 #[derive(Default)]
@@ -864,18 +1034,20 @@ fn render_areas<S: DocumentSample>(
         .iter()
         .map(|&(slot, area)| {
             let mut samples = vec![S::default(); area.width as usize * area.height as usize * spp];
-            let project = project
-                .as_deref_mut()
-                .expect("a stroke painted from a checkpoint renders against the project");
-            checkpoints[slot].render_as::<S>(Some(project), area, limits, &mut |band, rect| {
-                let len = rect.width as usize * spp;
-                for (r, line) in band.chunks_exact(len).enumerate() {
-                    let at = ((rect.y - area.y) as usize + r) * area.width as usize
-                        + (rect.x - area.x) as usize;
-                    samples[at * spp..at * spp + len].copy_from_slice(line);
-                }
-                Ok(())
-            })?;
+            checkpoints[slot].render_as::<S>(
+                project.as_deref_mut(),
+                area,
+                limits,
+                &mut |band, rect| {
+                    let len = rect.width as usize * spp;
+                    for (r, line) in band.chunks_exact(len).enumerate() {
+                        let at = ((rect.y - area.y) as usize + r) * area.width as usize
+                            + (rect.x - area.x) as usize;
+                        samples[at * spp..at * spp + len].copy_from_slice(line);
+                    }
+                    Ok(())
+                },
+            )?;
             Ok((area, samples))
         })
         .collect()

@@ -491,6 +491,7 @@ fn pending_state_export_equals_the_saved_export() {
         pending_stroke(0, &[(3, 0), (3, 4)], 2.0, 0.0),
     ];
     let state = project::PendingState {
+        held: Vec::new(),
         composite: base.clone(),
         ops: pending_ops.clone(),
         sources: sources.clone(),
@@ -699,6 +700,7 @@ fn f32_held_saved_and_pending_render_agree() {
         compressed_composite: None,
     };
     let pending = project::PendingState {
+        held: Vec::new(),
         composite: composite.clone(),
         ops: Vec::new(),
         sources: sources.clone(),
@@ -707,6 +709,7 @@ fn f32_held_saved_and_pending_render_agree() {
         description: "staged composite".to_string(),
     };
     let pending_stroked = project::PendingState {
+        held: Vec::new(),
         ops: vec![stroke.clone()],
         ..pending.clone()
     };

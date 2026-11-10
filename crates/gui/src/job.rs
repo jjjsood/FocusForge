@@ -53,7 +53,8 @@ pub use focusforge_core::job::{ControlState, JobControl, JobProgress, JobStage, 
 pub use focusforge_core::pipeline::{FuseOutcome, PipelineError};
 pub use focusforge_core::project::{BrushMode, Op, StrokeSource};
 pub use focusforge_core::project::{
-    HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, kept_entries, now_unix,
+    GONE_KEY, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, entry_colour_index,
+    held_index, held_key, kept_entries, now_unix, stroke_chain,
 };
 pub use focusforge_core::retouch::{
     ModeConditions, RetouchError, footprint, needs_mode_conditions, source_frame, top_source,
@@ -2221,6 +2222,26 @@ impl EditState {
     pub fn rebase(&mut self) {
         self.chain.append(&mut self.pending);
         self.undone.clear();
+    }
+
+    /// Renames the checkpoint every stroke of `chain`, `pending` and `undone`
+    /// paints from: `to` maps a source id to its new id, `None` leaves it.
+    pub fn rewrite_checkpoint_sources(&mut self, to: impl Fn(&str) -> Option<String>) {
+        let ops = self
+            .chain
+            .iter_mut()
+            .chain(&mut self.pending)
+            .chain(&mut self.undone);
+        for op in ops {
+            if let Op::BrushStroke {
+                source: StrokeSource::Checkpoint(id),
+                ..
+            } = op
+                && let Some(renamed) = to(id)
+            {
+                *id = renamed;
+            }
+        }
     }
 
     /// Renders `job` on the calling thread straight into the resident tiles.

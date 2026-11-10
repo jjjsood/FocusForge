@@ -19,7 +19,8 @@ use focusforge_core::project::export::{
     ExportFormat, ExportOptions, MetadataOptions, export_checkpoint,
 };
 use focusforge_core::project::{
-    Metrics, Op, Plane, Point, Project, SealRequest, append_ops_onto, materialize_plane, seal_at,
+    BrushMode, Metrics, Op, Plane, Point, Project, SealRequest, StrokeSource, append_ops_onto,
+    materialize_plane, seal_at,
 };
 use focusforge_core::retouch::blend;
 use focusforge_core::zmap::ZMapInfo;
@@ -1502,4 +1503,84 @@ fn stale_dialog_answer_is_dropped_for_export() {
     assert_eq!(controller.export_stage(), "ready");
     assert!(!controller.take_export_started());
     assert!(controller.export_destination_request().is_some());
+}
+
+#[test]
+fn pending_strokes_are_no_source() {
+    let mut controller = scratch_controller("export_pending_no_source");
+    open_fused_tab(&mut controller, "export_pending_no_source", 2);
+    common::enter_editor(&mut controller);
+    let brush = |source: StrokeSource| Op::BrushStroke {
+        source,
+        path: vec![Point { x: 20, y: 20 }],
+        radius: 6.0,
+        softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
+    };
+    let paint = |controller: &mut AppController, op: Op| {
+        controller
+            .edit_session_mut()
+            .unwrap()
+            .append(op)
+            .expect("the stroke inside the map applies");
+    };
+
+    // Entry 1 holds one stroke from frame 0; the session then paints frame 1
+    // and, over the same spot, entry 1.
+    paint(&mut controller, brush(StrokeSource::Frame(0)));
+    assert!(controller.save_checkpoint(), "the stroke becomes an entry");
+    paint(&mut controller, brush(StrokeSource::Frame(1)));
+    paint(
+        &mut controller,
+        brush(StrokeSource::Checkpoint("held:1".to_string())),
+    );
+
+    let dir = common::tree("export_pending_no_source_out");
+    controller.checkpoint_export_requested();
+    let pending = dir.join("pending.tif");
+    let picked = pending.clone();
+    controller.export_confirmed(move |_| Some(picked.clone()));
+    wait_export(&mut controller);
+
+    // Once saved, the entry's own render and the whole unsaved state are
+    // checkpoints to export.
+    let saved = save_to_proposed(&mut controller);
+    let mut project = Project::open(&saved).unwrap();
+    let rows: Vec<focusforge_core::project::Checkpoint> =
+        project.history().all().into_iter().cloned().collect();
+    let entry = rows.iter().find(|c| c.ops.len() == 1).unwrap().id.clone();
+    let session = rows.iter().find(|c| c.ops.len() == 2).unwrap().clone();
+    assert_eq!(
+        session.ops[1].checkpoint_source(),
+        Some(entry.as_str()),
+        "the reference is written with the entry's id"
+    );
+    let export = |project: &mut Project, id: &str, name: &str| {
+        let out = dir.join(name);
+        export_checkpoint(
+            project,
+            id,
+            &out,
+            &ExportOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .unwrap();
+        samples(&out)
+    };
+    let entry_render = export(&mut project, &entry, "entry.tif");
+    let whole = export(&mut project, &session.id, "session.tif");
+    let exported = samples(&pending);
+    assert_eq!(exported, whole, "the unsaved export is the saved one");
+    let (width, _) = TiffStack::open_files(std::slice::from_ref(&pending))
+        .unwrap()
+        .dimensions();
+    for (x, y) in [(20, 20), (17, 20), (23, 21), (20, 24)] {
+        let at = ((y * width + x) * 3) as usize;
+        assert_eq!(
+            exported[at..at + 3],
+            entry_render[at..at + 3],
+            "({x}, {y}) shows the entry as it was taken, not the session's frame 1 stroke"
+        );
+    }
 }
