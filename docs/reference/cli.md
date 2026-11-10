@@ -459,7 +459,7 @@ was produced — `"computed"` (a real solve), `"cached"` (a stage-cache hit),
 `"resumed"` (a `--resume` ledger peek) or `"skipped"` (`--no-align`) — because
 a cache hit or a resume enters the stage and reports a small real number that
 is not "alignment took 10ms". The `align_workers` and `peak_align_workers`
-fields give the anchor arm's worker bound and the peak it actually reached -- numbers only
+fields give the worker bound and the peak it actually reached -- numbers only
 when `align_source == "computed"`, `null` otherwise. A `"cached"`, `"resumed"`
 or `"skipped"` run never runs the alignment driver itself, so it has no
 worker count of its own; reporting one from a previous run's cache entry
@@ -616,9 +616,11 @@ timing relationship `stack --json` documents. The `align_source` field is always
 `"computed"` for `align` (no `--resume`, no stage cache, no `--no-align`
 here), carried so a consumer reading both reports' `align` stage does not
 need to know which command produced it. The `align_workers` and
-`peak_align_workers` fields give the anchor arm's worker bound and the peak
-it actually reached (chain mode always reports `1`/`1` -- it is serial
-by construction) -- always numbers here, since every `align` run computes.
+`peak_align_workers` fields give the worker bound and the peak it actually
+reached -- always numbers here, since every `align` run computes. Both policies
+solve several registrations at the same time on one worker pool; the bound is
+the available cores limited by the host memory budget, and each frame's
+alignment pyramid is built once and shared by the registrations that use it.
 
 ```json
 {
@@ -671,8 +673,9 @@ diverged frame carries `reason`: `singular-hessian`, `lemma-one-region`,
 transform leaves a large residual at patches away from the fit region) or
 `weak-match` (the final correlation is below 0.2, the floor a correct
 registration reaches; the fit is kept).
-`stalled` means the iteration cap was reached with flat or oscillating steps
-and the best-correlation transform is kept, or that a middle pyramid level
+`stalled` means the level's last ten steps are flat or oscillating and either
+the iteration cap was reached or every one of them is below twice the level's
+`epsilon_px`; the best-correlation transform is kept. It also means that a middle pyramid level
 lost correlation and handed its best fit to the next finer level; only `diverged` counts as a
 failure, so a `stalled` frame neither fails a strict run nor adds to
 `failure_count`. In the text report a diverged row
