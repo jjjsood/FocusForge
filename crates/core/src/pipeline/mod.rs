@@ -33,8 +33,8 @@ use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
 use crate::gpu::{AlignBackend, TileBackend};
 use crate::io::tiff::writer::file_len;
 use crate::io::{
-    COMPOSITE_FILENAME, FrameDesc, FrameReader, ReaderKind, Rect, TiffStack, ZMAP_FILENAME,
-    open_frame_set,
+    COMPOSITE_FILENAME, DevelopStore, FrameDesc, FrameReader, ReaderKind, Rect, TiffStack,
+    ZMAP_FILENAME, open_frame_set,
 };
 use crate::job::{
     AlignIdentity, ControlState, FrameFingerprint, Job, JobControl, JobOutcome, JobProgress,
@@ -45,6 +45,7 @@ use crate::params::{self, ParamValue, ParamValues, Provenance, ResolvedParams};
 use crate::project::{
     self, AlignRecord, AppendRequest, HeldCheckpoint, Metrics, SealRequest, SealedProject,
 };
+use crate::tile::scheduler::pool_threads;
 use crate::tile::{
     NoopPreprocess, SampleFormat, TileConsumer, TileError, TilePlan, TileScheduler,
     TileSchedulerOptions,
@@ -194,6 +195,9 @@ pub struct FuseReport {
     /// in; `None` when they were admitted in plan order.
     pub band_columns: Option<usize>,
     pub max_bytes_in_flight: u64,
+    /// Where the developed frames were kept; `None` for a reader that
+    /// develops nothing.
+    pub developed_store: Option<DevelopStore>,
     /// The bytes the scheduler accounted for at its in-flight limit:
     /// `in_flight_limit` tiles, each counted with the method's working bytes
     /// and reader scratch.
@@ -500,6 +504,30 @@ struct RunShape {
     fingerprint_len: u64,
 }
 
+/// Bytes of tile scheduling a run can hold at once over `frame`-sized frames
+/// read through `reader`: one accounted tile per pool thread. A run that
+/// aligns on the host (`aligned` without `gpu`) also schedules through the
+/// warping reader, so each tile carries the scratch of an identity warp: the
+/// warped samples with coverage and a source read as large as the
+/// destination.
+pub fn develop_tile_share(
+    options: &TileSchedulerOptions,
+    reader: &dyn TileReader,
+    frame: (u32, u32),
+    samples_per_pixel: u32,
+    aligned: bool,
+    gpu: bool,
+) -> u64 {
+    let mut tile = options.tile_bytes(reader, frame, samples_per_pixel);
+    if aligned && !gpu {
+        let (width, height) = options.read_extent(frame);
+        let destination = u64::from(width) * u64::from(height);
+        let sample_bytes = u64::from(samples_per_pixel) * reader.sample_format().bytes();
+        tile += destination * (sample_bytes + 1) + destination * sample_bytes;
+    }
+    tile.saturating_mul(pool_threads() as u64)
+}
+
 /// The bytes a run writes, split by where they land. `output` is `Some` when
 /// a project is written beside the output path.
 #[derive(Debug)]
@@ -662,6 +690,22 @@ pub fn run(
         .min(control.admission_cap())
         .max(1);
     let cancel_requested = || control.state() == ControlState::CancelRequested;
+    let developed_store = frame_reader.develop_store(
+        develop_budget,
+        workers,
+        develop_tile_share(
+            &options,
+            frame_reader,
+            (width, height),
+            spp,
+            request.align.is_some(),
+            request.backend.is_some() && cap_fallback.is_none(),
+        ),
+    )?;
+    // Frames kept in memory are no longer available to the tiles.
+    if developed_store == Some(DevelopStore::Memory) {
+        options.budget = develop_budget.reduced_by(scratch_needed);
+    }
     {
         let (sealed, output_dir) = match &request.output {
             FuseOutput::Seal(path) | FuseOutput::Append(path) => (
@@ -689,9 +733,13 @@ pub fn run(
             },
             sealed,
         )?;
+        let developed_on_disk = match developed_store {
+            Some(DevelopStore::ScratchFile) => scratch_needed,
+            _ => 0,
+        };
         let scratch_total = space
             .scratch
-            .checked_add(scratch_needed)
+            .checked_add(developed_on_disk)
             .ok_or_else(size_overflow)?;
         let mut destinations = vec![(request.scratch_root.as_path(), scratch_total)];
         if let (Some(dir), Some(bytes)) = (output_dir, space.output) {
@@ -700,7 +748,7 @@ pub fn run(
         check_disk_space(request, &destinations)?;
     }
     // A RAW stack develops every frame here, once, so no later read does.
-    if scratch_needed > 0 {
+    if let Some(store) = developed_store {
         timer.mark(Stage::Setup);
         timer.enter(Stage::Develop);
         let developed = control.begin_develop(frame_reader.len());
@@ -711,6 +759,7 @@ pub fn run(
         let result = with_progress_ticks(observer, &control, request.poll, || {
             frame_reader.develop_once(
                 &request.scratch_root,
+                store,
                 develop_budget,
                 workers,
                 &cancel_requested,
@@ -1391,6 +1440,7 @@ pub fn run(
         in_flight_limit,
         band_columns,
         max_bytes_in_flight: scheduler.budget().bytes(),
+        developed_store,
         accounted_bytes_in_flight: in_flight_limit as u64 * scheduler.bytes_per_tile(),
         budget_provenance: scheduler.budget().provenance(),
         backed_off: scheduler.final_in_flight_limit() < in_flight_limit,
@@ -1871,6 +1921,31 @@ mod tests {
         (0..count)
             .filter_map(|i| lapvar(reader, i, rect, reader.spp))
             .fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.max(v))))
+    }
+
+    #[test]
+    fn develop_share_adds_the_identity_warp_scratch() {
+        let reader = Frames::graded(3, 3);
+        let mut options = TileSchedulerOptions::explicit_budget(".", 1 << 30);
+        options.tile_size = 160;
+        let frame = (300, 200);
+        let share = |aligned, gpu| develop_tile_share(&options, &reader, frame, 3, aligned, gpu);
+        let unwarped = share(false, false);
+        assert_eq!(
+            unwarped,
+            options.tile_bytes(&reader, frame, 3) * pool_threads() as u64
+        );
+        assert_eq!(share(false, true), unwarped, "no alignment, GPU run");
+        assert_eq!(share(true, true), unwarped, "aligned GPU run");
+        // u16 samples: the warped samples with coverage, and a source read
+        // as large as the destination.
+        let destination = 160 * 160;
+        let identity_warp = destination * (3 * 2 + 1) + destination * 3 * 2;
+        assert_eq!(
+            share(true, false),
+            unwarped + identity_warp * pool_threads() as u64,
+            "aligned CPU run"
+        );
     }
 
     #[test]

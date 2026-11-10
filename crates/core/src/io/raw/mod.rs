@@ -16,7 +16,8 @@ use rawler::rawsource::RawSource;
 use super::frame_cache::{CacheFault, CachedFrame, FrameCache, TileFault, check_tile};
 use super::grouping::parse_exif_datetime;
 use super::{
-    FrameDesc, FrameError, FrameReader, RawIdentity, cache_refusal_message, map_read_only,
+    DevelopStore, FrameDesc, FrameError, FrameReader, RawIdentity, cache_refusal_message,
+    map_read_only,
 };
 use crate::algorithm::{AlgorithmError, TileReader};
 use crate::equalize::UNIT_GAIN;
@@ -251,15 +252,34 @@ const SCRATCH_BLOCK: usize = 64;
 /// Pixels per `write` call when a developed frame goes to scratch.
 const WRITE_PIXELS: usize = 1 << 16;
 
-/// A frame developed into a scratch file and mapped read-only: its
-/// `width * height` samples as native-endian half-precision `[f16; 3]`, no
-/// header, in `SCRATCH_BLOCK`-square blocks. Blocks follow in row-major order;
-/// inside a block the samples are row-major. Blocks at the right and bottom
-/// edges are ragged, so a block `bw` wide and `bh` high holds `bw * bh`
-/// pixels.
+/// A developed frame's bytes: a read-only mapping of its scratch file, or an
+/// owned buffer.
 #[derive(Debug)]
-struct MappedFrame {
-    map: Mmap,
+enum FrameBytes {
+    Mapped(Mmap),
+    Memory(Box<[u8]>),
+}
+
+impl std::ops::Deref for FrameBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(map) => map,
+            Self::Memory(bytes) => bytes,
+        }
+    }
+}
+
+/// A developed frame: its `width * height` samples as native-endian
+/// half-precision `[f16; 3]`, no header, in `SCRATCH_BLOCK`-square blocks.
+/// Blocks follow in row-major order; inside a block the samples are
+/// row-major. Blocks at the right and bottom edges are ragged, so a block `bw`
+/// wide and `bh` high holds `bw * bh` pixels. The same bytes sit in the
+/// scratch file and in the in-memory buffer.
+#[derive(Debug)]
+struct StoredFrame {
+    bytes: FrameBytes,
     width: usize,
     height: usize,
     /// Each channel's mean over the frame.
@@ -268,7 +288,7 @@ struct MappedFrame {
     monochrome: bool,
 }
 
-impl MappedFrame {
+impl StoredFrame {
     /// `count` pixels of row `y` starting at column `x`, all inside one block.
     fn pixels(&self, x: usize, y: usize, count: usize) -> impl Iterator<Item = [f32; 3]> + '_ {
         let (block_x, block_y) = (
@@ -285,7 +305,7 @@ impl MappedFrame {
             + block_x * block_height
             + (y - block_y) * block_width
             + (x - block_x);
-        self.map[first * PIXEL_BYTES..(first + count) * PIXEL_BYTES]
+        self.bytes[first * PIXEL_BYTES..(first + count) * PIXEL_BYTES]
             .chunks_exact(PIXEL_BYTES)
             .map(|pixel| {
                 std::array::from_fn(|channel| {
@@ -298,32 +318,33 @@ impl MappedFrame {
     }
 }
 
-/// Every frame developed into scratch. The mappings drop before the
-/// directory that holds their files.
+/// Every frame developed once. The mappings drop before the directory that
+/// holds their files.
 #[derive(Debug)]
 struct DevelopedFrames {
-    frames: Vec<MappedFrame>,
-    _dir: ScratchDir,
+    frames: Vec<StoredFrame>,
+    /// The scratch directory; `None` when the frames are in memory.
+    dir: Option<ScratchDir>,
 }
 
 /// Where a frame's developed samples are read from.
 enum Developed<'a> {
     Cached(Arc<LinearFrame>),
-    Mapped(&'a MappedFrame),
+    Stored(&'a StoredFrame),
 }
 
 impl Developed<'_> {
     fn monochrome(&self) -> bool {
         match self {
             Self::Cached(frame) => frame.monochrome,
-            Self::Mapped(frame) => frame.monochrome,
+            Self::Stored(frame) => frame.monochrome,
         }
     }
 
     fn means(&self) -> [f64; 3] {
         match self {
             Self::Cached(frame) => frame.means,
-            Self::Mapped(frame) => frame.means,
+            Self::Stored(frame) => frame.means,
         }
     }
 }
@@ -478,15 +499,15 @@ impl RawStack {
         Ok(developed)
     }
 
-    /// Frame `index`'s developed samples: its mapped scratch file when the
-    /// pass has run, else the cache.
+    /// Frame `index`'s developed samples: its stored frame when the pass has
+    /// run, else the cache.
     fn developed(&self, index: usize) -> Result<Developed<'_>, RawError> {
         match self.scratch.get() {
             Some(scratch) => {
                 scratch
                     .frames
                     .get(index)
-                    .map(Developed::Mapped)
+                    .map(Developed::Stored)
                     .ok_or(RawError::FrameIndex {
                         index,
                         count: self.frames.len(),
@@ -496,21 +517,34 @@ impl RawStack {
         }
     }
 
-    /// Develops frame `index` into `<dir>/<index>.f16` and maps the file.
-    fn develop_to_scratch(&self, index: usize, dir: &Path) -> Result<MappedFrame, RawError> {
+    /// Develops frame `index` into `<dir>/<index>.f16` and maps the file, or
+    /// into an owned buffer when `dir` is `None`.
+    fn develop_to_store(&self, index: usize, dir: Option<&Path>) -> Result<StoredFrame, RawError> {
         let developed = self.develop_frame(index)?;
-        let path = dir.join(format!("{index}.f16"));
-        let fault = |source| RawError::Scratch {
-            path: path.clone(),
-            source,
-        };
         let (width, height) = {
             let desc = &self.frames[index].desc;
             (desc.width as usize, desc.height as usize)
         };
-        write_samples(&path, &developed.samples, width).map_err(fault)?;
-        Ok(MappedFrame {
-            map: map_read_only(&path).map_err(fault)?,
+        let bytes = match dir {
+            Some(dir) => {
+                let path = dir.join(format!("{index}.f16"));
+                let fault = |source| RawError::Scratch {
+                    path: path.clone(),
+                    source,
+                };
+                let mut file = std::fs::File::create(&path).map_err(fault)?;
+                write_samples(&mut file, &developed.samples, width).map_err(fault)?;
+                FrameBytes::Mapped(map_read_only(&path).map_err(fault)?)
+            }
+            None => {
+                let mut buffer = Vec::with_capacity(width * height * PIXEL_BYTES);
+                write_samples(&mut buffer, &developed.samples, width)
+                    .expect("writing to a vector cannot fail");
+                FrameBytes::Memory(buffer.into_boxed_slice())
+            }
+        };
+        Ok(StoredFrame {
+            bytes,
             width,
             height,
             means: developed.means,
@@ -519,12 +553,11 @@ impl RawStack {
     }
 }
 
-/// Writes `samples`, `width` pixels per row, to a new file at `path` as
-/// native-endian `f16`s, each rounded to nearest, in `SCRATCH_BLOCK`-square
-/// blocks: block rows top to bottom, blocks left to right, each block's rows
-/// in order. Blocks at the right and bottom edges are ragged, not padded.
-fn write_samples(path: &Path, samples: &[[f32; 3]], width: usize) -> std::io::Result<()> {
-    let mut file = std::fs::File::create(path)?;
+/// Writes `samples`, `width` pixels per row, to `out` as native-endian
+/// `f16`s, each rounded to nearest, in `SCRATCH_BLOCK`-square blocks: block
+/// rows top to bottom, blocks left to right, each block's rows in order.
+/// Blocks at the right and bottom edges are ragged, not padded.
+fn write_samples(out: &mut impl Write, samples: &[[f32; 3]], width: usize) -> std::io::Result<()> {
     let mut chunk = Vec::with_capacity(WRITE_PIXELS * PIXEL_BYTES);
     for band in samples.chunks(width * SCRATCH_BLOCK) {
         for first in (0..width).step_by(SCRATCH_BLOCK) {
@@ -537,13 +570,13 @@ fn write_samples(path: &Path, samples: &[[f32; 3]], width: usize) -> std::io::Re
                         .flat_map(|value| half::f16::from_f32(*value).to_ne_bytes()),
                 );
                 if chunk.len() >= WRITE_PIXELS * PIXEL_BYTES {
-                    file.write_all(&chunk)?;
+                    out.write_all(&chunk)?;
                     chunk.clear();
                 }
             }
         }
     }
-    file.write_all(&chunk)
+    out.write_all(&chunk)
 }
 
 impl FrameReader for RawStack {
@@ -565,6 +598,30 @@ impl FrameReader for RawStack {
             .map_err(FrameError::from)?)
     }
 
+    fn develop_store(
+        &self,
+        budget: HostBudget,
+        workers: usize,
+        tile_share: u64,
+    ) -> Result<Option<DevelopStore>, AlgorithmError> {
+        let (_, required) = largest_reservation(&self.frames).map_err(FrameError::from)?;
+        let threads = develop_threads(workers, budget.bytes(), required, self.frames.len());
+        let frames = self
+            .scratch_total(self.frames.len())
+            .map_err(FrameError::from)?;
+        let peak = (threads as u64).saturating_mul(required).max(tile_share);
+        Ok(Some(
+            if frames
+                .checked_add(peak)
+                .is_some_and(|needed| needed <= budget.bytes())
+            {
+                DevelopStore::Memory
+            } else {
+                DevelopStore::ScratchFile
+            },
+        ))
+    }
+
     fn develop_counts(&self) -> Option<Vec<u64>> {
         Some(
             self.develops
@@ -574,14 +631,15 @@ impl FrameReader for RawStack {
         )
     }
 
-    /// Develops every frame once, in parallel, into mapped scratch files in a
-    /// directory under `scratch_root` that lives as long as this reader. At
-    /// most `workers` develops overlap, and no more than `budget` holds
-    /// decode reservations for. `developed` gains one as each frame lands in
-    /// scratch.
+    /// Develops every frame once, in parallel, into `store`: mapped scratch
+    /// files in a directory under `scratch_root` that lives as long as this
+    /// reader, or buffers owned by it. At most `workers` develops overlap,
+    /// and no more than `budget` holds decode reservations for. `developed`
+    /// gains one as each frame lands in its store.
     fn develop_once(
         &self,
         scratch_root: &Path,
+        store: DevelopStore,
         budget: HostBudget,
         workers: usize,
         cancelled: &(dyn Fn() -> bool + Sync),
@@ -601,21 +659,23 @@ impl FrameReader for RawStack {
             })
             .into());
         }
-        let threads = workers
-            .min(usize::try_from(budget_bytes / required.max(1)).unwrap_or(usize::MAX))
-            .min(self.frames.len())
-            .max(1);
+        let threads = develop_threads(workers, budget_bytes, required, self.frames.len());
 
-        let dir = ScratchDir::create_in(scratch_root)
-            .map_err(|error| match error {
-                TileError::Scratch { path, source } => RawError::Scratch { path, source },
-                other => RawError::Scratch {
-                    path: scratch_root.to_path_buf(),
-                    source: std::io::Error::other(other),
-                },
-            })
-            .map_err(FrameError::from)?;
-        let slots: Vec<OnceLock<MappedFrame>> =
+        let dir = match store {
+            DevelopStore::Memory => None,
+            DevelopStore::ScratchFile => Some(
+                ScratchDir::create_in(scratch_root)
+                    .map_err(|error| match error {
+                        TileError::Scratch { path, source } => RawError::Scratch { path, source },
+                        other => RawError::Scratch {
+                            path: scratch_root.to_path_buf(),
+                            source: std::io::Error::other(other),
+                        },
+                    })
+                    .map_err(FrameError::from)?,
+            ),
+        };
+        let slots: Vec<OnceLock<StoredFrame>> =
             self.frames.iter().map(|_| OnceLock::new()).collect();
         let next = AtomicUsize::new(0);
         let failure = Mutex::new(None);
@@ -630,7 +690,7 @@ impl FrameReader for RawStack {
                         let mapped = if cancelled() {
                             Err(AlgorithmError::Cancelled)
                         } else {
-                            self.develop_to_scratch(index, dir.path())
+                            self.develop_to_store(index, dir.as_ref().map(ScratchDir::path))
                                 .map_err(|error| AlgorithmError::from(FrameError::from(error)))
                         };
                         match mapped {
@@ -660,8 +720,7 @@ impl FrameReader for RawStack {
             .into_iter()
             .map(|slot| slot.into_inner().expect("every frame developed"))
             .collect();
-        self.scratch
-            .get_or_init(|| DevelopedFrames { frames, _dir: dir });
+        self.scratch.get_or_init(|| DevelopedFrames { frames, dir });
         Ok(threads)
     }
 }
@@ -715,7 +774,7 @@ impl RawStack {
                     scale,
                     destination,
                 ),
-                Developed::Mapped(frame) => {
+                Developed::Stored(frame) => {
                     for (x, len) in block_segments(rect.x as usize, width) {
                         let target = &mut destination[(x - rect.x as usize) * 3..][..len * 3];
                         look_row(frame.pixels(x, source_y as usize, len), look, scale, target);
@@ -808,11 +867,28 @@ impl TileReader for RawStack {
     }
 
     /// Every scratch block a `width x height` read can touch at any origin,
-    /// clamped to the frame.
+    /// clamped to the frame; none when the frames are in memory.
     fn read_page_cache_bytes(&self, width: u32, height: u32) -> u64 {
+        if self
+            .scratch
+            .get()
+            .is_some_and(|frames| frames.dir.is_none())
+        {
+            return 0;
+        }
         let (frame_width, frame_height) = self.dimensions();
         block_span(width, frame_width) * block_span(height, frame_height) * PIXEL_BYTES as u64
     }
+}
+
+/// How many frames develop at once: `workers`, no more than `budget_bytes`
+/// holds `required`-byte decode reservations for, no more than `frames`, and
+/// at least one.
+fn develop_threads(workers: usize, budget_bytes: u64, required: u64, frames: usize) -> usize {
+    workers
+        .min(usize::try_from(budget_bytes / required.max(1)).unwrap_or(usize::MAX))
+        .min(frames)
+        .max(1)
 }
 
 /// The pixels along one axis of the scratch blocks a read of `n` pixels can
@@ -1517,8 +1593,8 @@ fn seam<T>(path: &Path, operation: impl FnOnce() -> rawler::Result<T>) -> Result
 #[cfg(test)]
 mod tests {
     use super::{
-        MappedFrame, PIXEL_BYTES, RawError, SCRATCH_BLOCK, block_segments, map_read_only,
-        panic_boundary, scratch_bytes, write_samples,
+        FrameBytes, PIXEL_BYTES, RawError, SCRATCH_BLOCK, StoredFrame, block_segments,
+        map_read_only, panic_boundary, scratch_bytes, write_samples,
     };
     use std::path::Path;
 
@@ -1529,11 +1605,13 @@ mod tests {
             .collect()
     }
 
-    fn scratch_frame(dir: &Path, width: usize, height: usize) -> MappedFrame {
+    fn scratch_frame(dir: &Path, width: usize, height: usize) -> StoredFrame {
         let path = dir.join("frame.f16");
-        write_samples(&path, &coordinate_samples(width, height), width).expect("scratch writes");
-        MappedFrame {
-            map: map_read_only(&path).expect("scratch maps"),
+        let mut file = std::fs::File::create(&path).expect("scratch file");
+        write_samples(&mut file, &coordinate_samples(width, height), width)
+            .expect("scratch writes");
+        StoredFrame {
+            bytes: FrameBytes::Mapped(map_read_only(&path).expect("scratch maps")),
             width,
             height,
             means: [0.0; 3],
@@ -1547,7 +1625,7 @@ mod tests {
         for (width, height) in [(128, 64), (130, 64), (150, 70), (129, 131), (40, 30)] {
             let frame = scratch_frame(dir.path(), width, height);
             assert_eq!(
-                frame.map.len(),
+                frame.bytes.len(),
                 width * height * PIXEL_BYTES,
                 "{width}x{height}"
             );
@@ -1565,7 +1643,7 @@ mod tests {
                 })
                 .collect();
             assert!(
-                frame.map[..] == expected[..],
+                frame.bytes[..] == expected[..],
                 "{width}x{height} layout differs"
             );
         }

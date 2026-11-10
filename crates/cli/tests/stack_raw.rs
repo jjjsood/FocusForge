@@ -900,3 +900,133 @@ fn corpus_frame_stacks_on_default_backend() {
         "{low_memory_stderr}"
     );
 }
+
+/// Three 256 x 256 RAW frames in `<cwd>/input`, with their decode reservation
+/// and the bytes they take developed.
+fn gradient_raw_stack(cwd: &std::path::Path) -> (std::path::PathBuf, u64, u64) {
+    let input = cwd.join("input");
+    std::fs::create_dir(&input).expect("input directory");
+    let mut spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], Vec::new());
+    spec.width = 256;
+    spec.height = 256;
+    spec.samples = (0..256u32 * 256)
+        .map(|i| (((i % 256) + (i / 256)) * 8 % 4000) as u16)
+        .collect();
+    let source = write_dng(&spec, false);
+    for index in 0..3 {
+        std::fs::copy(source.path(), input.join(format!("{index:02}.dng"))).expect("copy frame");
+    }
+    let raw = RawStack::open_files(&[input.join("00.dng")]).expect("source RAW");
+    let metadata = raw.metadata(0).expect("frame 0 metadata");
+    let reservation = u64::from(metadata.raw_width) * u64::from(metadata.raw_height) * 30
+        + std::fs::metadata(source.path()).expect("DNG size").len();
+    (input, reservation, 3 * 256 * 256 * 6)
+}
+
+const SMALL_TILES: [&str; 4] = ["--tile-size", "160", "--set", "levels=3"];
+
+fn json_of(output: &std::process::Output) -> serde_json::Value {
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("JSON document")
+}
+
+#[test]
+fn raw_in_ram_frames_narrow_the_scheduler_budget() {
+    let cwd = common::tmp_dir("stack_raw_in_ram_budget");
+    let (input, reservation, frames) = gradient_raw_stack(&cwd);
+    let ceiling = 1u64 << 30;
+    let roomy = ceiling.to_string();
+    // Room for a decode, not for the frames beside it.
+    let tight = (reservation + frames / 2).to_string();
+    let args = |output: &str, ceiling: &str, extra: &[&str]| {
+        let output = cwd.join(output);
+        std::fs::create_dir(&output).expect("output directory");
+        let mut args = vec!["--max-host-memory", ceiling];
+        args.extend(SMALL_TILES);
+        args.extend(extra);
+        stack_json_args(&input, &output, &args)
+    };
+
+    let stacked = json_of(&run(&cwd, &args("ram", &roomy, &[])));
+    let dry = json_of(&run(&cwd, &args("ram-dry", &roomy, &["--dry-run"])));
+    for (what, report) in [("run", &stacked), ("dry run", &dry)] {
+        assert_eq!(report["developed_store"], "memory", "{what}: {report}");
+        assert_eq!(
+            report["max_bytes_in_flight"],
+            ceiling - frames,
+            "{what}: {report}"
+        );
+    }
+    assert!(stacked["band_columns"].is_null(), "{stacked}");
+
+    let stacked = json_of(&run(&cwd, &args("disk", &tight, &[])));
+    let dry = json_of(&run(&cwd, &args("disk-dry", &tight, &["--dry-run"])));
+    for (what, report) in [("run", &stacked), ("dry run", &dry)] {
+        assert_eq!(
+            report["developed_store"], "scratch_file",
+            "{what}: {report}"
+        );
+        assert_eq!(
+            report["max_bytes_in_flight"],
+            reservation + frames / 2,
+            "{what}: {report}"
+        );
+    }
+
+    let tiff = cwd.join("tiff");
+    std::fs::create_dir(&tiff).expect("output directory");
+    let frames = common::fixtures_dir().join("mantis-64").join("frames");
+    let stacked = json_of(&run(&cwd, &stack_json_args(&frames, &tiff, &[])));
+    assert!(stacked["developed_store"].is_null(), "{stacked}");
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_stack_output_is_identical_in_ram_and_on_disk() {
+    let cwd = common::tmp_dir("stack_raw_in_ram_identical");
+    let (input, reservation, frames) = gradient_raw_stack(&cwd);
+    let tight = (reservation + frames / 2).to_string();
+    let mut composites = Vec::new();
+    for (name, ceiling) in [("ram", None), ("disk", Some(tight))] {
+        let output = cwd.join(name);
+        std::fs::create_dir(&output).expect("output directory");
+        let mut extra = SMALL_TILES.to_vec();
+        if let Some(ceiling) = &ceiling {
+            extra.extend(["--max-host-memory", ceiling]);
+        }
+        let report = json_of(&run(&cwd, &stack_json_args(&input, &output, &extra)));
+        let want = if ceiling.is_some() {
+            "scratch_file"
+        } else {
+            "memory"
+        };
+        assert_eq!(report["developed_store"], want, "{name}: {report}");
+        let composite = cwd.join(format!("{name}.tif"));
+        let exported = Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+            .current_dir(&*cwd)
+            .args([
+                "export",
+                output.join("input.ffp").to_str().expect("UTF-8 project"),
+                "-o",
+                composite.to_str().expect("UTF-8 composite"),
+            ])
+            .output()
+            .expect("run export");
+        assert!(
+            exported.status.success(),
+            "export stderr: {}",
+            String::from_utf8_lossy(&exported.stderr)
+        );
+        composites.push(without_date_time(
+            std::fs::read(composite).expect("exported composite"),
+        ));
+    }
+    assert!(
+        composites[0] == composites[1],
+        "the stores gave different composites"
+    );
+}

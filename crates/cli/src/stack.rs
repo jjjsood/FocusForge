@@ -16,9 +16,12 @@ use focusforge_core::algorithm::StackAlgorithm;
 use focusforge_core::align::ReferencePolicy;
 use focusforge_core::equalize::{EqualizationReport, EqualizeSettings};
 use focusforge_core::gpu::{AlignBackend, TileBackend};
-use focusforge_core::io::{FrameReader, Group, Proposal, Rect, open_frame_set, propose};
+use focusforge_core::io::{
+    DevelopStore, FrameReader, Group, Proposal, Rect, open_frame_set, propose,
+};
 use focusforge_core::job::{JobControl, StageCache};
 use focusforge_core::params::{self, ParamValue, ParamValues, Provenance};
+use focusforge_core::pipeline::develop_tile_share;
 use focusforge_core::project::{self, PROJECT_EXTENSION};
 use focusforge_core::registry;
 use focusforge_core::tile::{TileScheduler, TileSchedulerOptions};
@@ -66,6 +69,9 @@ pub struct StackReport {
     pub peak_in_flight: usize,
     /// The host in-flight-byte budget actually in force for this run.
     pub max_bytes_in_flight: u64,
+    /// Where the RAW frames were developed to: `memory` or `scratch_file`;
+    /// `null` for input that is not developed.
+    pub developed_store: Option<DevelopStore>,
     /// The bytes the scheduler accounted for at its in-flight limit
     /// (`in_flight_limit` tiles, reader scratch included): the figure
     /// compared with `max_bytes_in_flight`, never with resident memory.
@@ -267,8 +273,12 @@ pub struct DryRunPlan {
     pub margin: u32,
     pub tiles: usize,
     pub in_flight_limit: usize,
-    /// Host bytes available to the tile scheduler after input caching.
+    /// Host bytes available to the tile scheduler after input caching and any
+    /// frames kept in memory.
     pub max_bytes_in_flight: u64,
+    /// Where the RAW frames would be developed to: `memory` or `scratch_file`;
+    /// `null` for input that is not developed.
+    pub developed_store: Option<DevelopStore>,
     pub backend: String,
     /// The paths this invocation *would* write. None of them exists.
     pub would_write: Vec<String>,
@@ -1104,20 +1114,41 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     // created anywhere. `TileScheduler::new` is pure: it builds a `TilePlan`
     // and divides the byte budget, touching no file.
     if preset_opts.dry_run {
-        let support = algo.tile_support(&params::resolved_values(&resolved));
+        let values = params::resolved_values(&resolved);
+        let support = algo.tile_support(&values);
         let mut options = TileSchedulerOptions::new(".scratch");
         options.apply_support(support);
+        options.working_bytes_per_pixel =
+            algo.working_bytes_per_pixel(&values, spp, frame_reader.sample_format());
         if let Some(tile_size) = job_opts.tile_size {
             options.tile_size = tile_size;
         }
-        // A developed stack's scheduler keeps the whole budget, as in the run.
-        let scheduler_budget = if frame_reader
-            .develop_scratch_bytes()
-            .is_ok_and(|bytes| bytes > 0)
-        {
-            preflight_budget
-        } else {
-            opened.scheduler_budget
+        // A developed stack's scheduler keeps the whole budget less any frames
+        // held in memory, as in the run.
+        let developed_bytes = match frame_reader.develop_scratch_bytes() {
+            Ok(bytes) => bytes,
+            Err(err) => return failed(&status, start, err),
+        };
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .min(frame_reader.len())
+            .max(1);
+        let share = develop_tile_share(
+            &options,
+            frame_reader,
+            (width, height),
+            spp,
+            align_prepared.is_some(),
+            backend.is_some(),
+        );
+        let developed_store = match frame_reader.develop_store(preflight_budget, workers, share) {
+            Ok(store) => store,
+            Err(err) => return failed(&status, start, err),
+        };
+        let scheduler_budget = match developed_store {
+            Some(DevelopStore::Memory) => preflight_budget.reduced_by(developed_bytes),
+            Some(DevelopStore::ScratchFile) => preflight_budget,
+            None => opened.scheduler_budget,
         };
         options.budget = scheduler_budget;
         let scheduler = match TileScheduler::new(frame_reader, stack_ctx, spp, &options) {
@@ -1157,6 +1188,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
             tiles: geometry.tiles().len(),
             in_flight_limit: scheduler.in_flight_limit(),
             max_bytes_in_flight: scheduler_budget.bytes(),
+            developed_store,
             backend: backend
                 .map(|b| b.info().to_string())
                 .unwrap_or_else(|| "cpu".to_string()),
@@ -1488,6 +1520,7 @@ fn build_stack_report(
         // concurrency.
         peak_in_flight: report.in_flight_limit,
         max_bytes_in_flight: report.max_bytes_in_flight,
+        developed_store: report.developed_store,
         accounted_bytes_in_flight: report.accounted_bytes_in_flight,
         budget_provenance: report.budget_provenance,
         backed_off: report.backed_off,
@@ -1751,6 +1784,7 @@ mod tests {
             band_columns: Some(3),
             peak_in_flight: 4,
             max_bytes_in_flight: 1 << 30,
+            developed_store: None,
             accounted_bytes_in_flight: 1 << 29,
             budget_provenance: Provenance::Host,
             backed_off: false,

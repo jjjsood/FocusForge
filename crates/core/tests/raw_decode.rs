@@ -8,7 +8,9 @@ use focusforge_core::algorithm::{AlgorithmError, TileReader};
 use focusforge_core::equalize::{EqualizeSettings, UNIT_GAIN};
 use focusforge_core::host::HostFacts;
 use focusforge_core::io::Rect;
-use focusforge_core::io::{FrameError, FrameReader, RawError, RawStack, open_frame_set};
+use focusforge_core::io::{
+    DevelopStore, FrameError, FrameReader, RawError, RawStack, open_frame_set,
+};
 use focusforge_core::job::{JobControl, JobStage};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::pipeline::{
@@ -630,6 +632,7 @@ fn raw_scratch_error_on_corpus_frames() {
         developed
             .develop_once(
                 root.path(),
+                DevelopStore::ScratchFile,
                 HostBudget::explicit(u64::MAX),
                 1,
                 &|| false,
@@ -2086,6 +2089,7 @@ fn raw_develop_pass_reads_match_cached_reads() {
         developed
             .develop_once(
                 root.path(),
+                DevelopStore::ScratchFile,
                 HostBudget::explicit(u64::MAX),
                 2,
                 &|| false,
@@ -2232,6 +2236,7 @@ fn raw_scratch_file_size_matches_encoding() {
         stack
             .develop_once(
                 &scratch,
+                DevelopStore::ScratchFile,
                 HostBudget::explicit(u64::MAX),
                 2,
                 &|| false,
@@ -2258,6 +2263,7 @@ fn raw_scratch_keeps_values_above_white() {
     developed
         .develop_once(
             root.path(),
+            DevelopStore::ScratchFile,
             HostBudget::explicit(u64::MAX),
             2,
             &|| false,
@@ -2321,7 +2327,14 @@ fn cache_refusal_message_names_the_file_in_mb_at_both_sites() {
     let stack = RawStack::open_files(std::slice::from_ref(&path)).expect("DNG stack opens");
     let develop = |budget: HostBudget| {
         stack
-            .develop_once(root.path(), budget, 1, &|| false, &AtomicUsize::new(0))
+            .develop_once(
+                root.path(),
+                DevelopStore::ScratchFile,
+                budget,
+                1,
+                &|| false,
+                &AtomicUsize::new(0),
+            )
             .expect_err("a budget below one reservation refuses")
             .to_string()
     };
@@ -2421,6 +2434,7 @@ fn raw_develops_overlap() {
         developed.store(0, Ordering::SeqCst);
         let result = stack.develop_once(
             root.path(),
+            DevelopStore::ScratchFile,
             HostBudget::explicit(budget),
             workers,
             &|| false,
@@ -2669,6 +2683,7 @@ fn raw_scratch_unwritable_is_a_named_error() {
     let error = stack
         .develop_once(
             blocker.path(),
+            DevelopStore::ScratchFile,
             HostBudget::explicit(u64::MAX),
             2,
             &|| false,
@@ -2754,6 +2769,7 @@ fn scratch_space_needed_matches_written_scratch() {
         stack
             .develop_once(
                 &scratch,
+                DevelopStore::ScratchFile,
                 HostBudget::explicit(u64::MAX),
                 2,
                 &|| false,
@@ -2781,7 +2797,9 @@ fn raw_run_space_staged_bytes_cover_written_staging() {
     let develop = 4 * 64 * 48 * 6;
     let root = target_tmp();
     let frames = copies_of(&dng, 4, root.path());
-    let needed = single_shortfall(&mut hold_request(frames.clone(), root.path()), 0).needed;
+    let mut capped = hold_request(frames.clone(), root.path());
+    capped.max_host_memory = Some(on_disk_budget(&dng));
+    let needed = single_shortfall(&mut capped, 0).needed;
     let written = held_len(&hold_request(frames, root.path()));
     let staged = needed - develop;
     assert!(
@@ -2799,13 +2817,15 @@ fn raw_run_space_includes_developed_scratch() {
     let staged = held_len(&hold_request(frames.clone(), root.path()));
     let probe_root = target_tmp();
     let probe_frames = copies_of(&dng, 4, probe_root.path());
-    let needed = single_shortfall(&mut hold_request(probe_frames, probe_root.path()), 0).needed;
+    let mut probe = hold_request(probe_frames, probe_root.path());
+    probe.max_host_memory = Some(on_disk_budget(&dng));
+    let needed = single_shortfall(&mut probe, 0).needed;
     // The sealed result adds its temporary compressed planes to the scratch
     // volume and the project itself to the output volume.
     for free in [develop - 1, 0] {
         let root = target_tmp();
         let frames = copies_of(&dng, 4, root.path());
-        let mut request = raw_request(frames, root.path(), None, None);
+        let mut request = raw_request(frames, root.path(), None, Some(on_disk_budget(&dng)));
         let shortfall = single_shortfall(&mut request, free);
         assert_eq!(shortfall.free, free);
         assert!(
@@ -2924,6 +2944,7 @@ fn page_cache_working_set_is_the_block_span_before_and_after_develop() {
     stack
         .develop_once(
             &scratch,
+            DevelopStore::ScratchFile,
             HostBudget::explicit(u64::MAX),
             2,
             &|| false,
@@ -2945,6 +2966,7 @@ fn page_cache_bands_output_identical() {
     stack
         .develop_once(
             root.path(),
+            DevelopStore::ScratchFile,
             HostBudget::explicit(u64::MAX),
             2,
             &|| false,
@@ -2986,4 +3008,278 @@ fn page_cache_bands_output_identical() {
         in_bands == in_plan_order,
         "the band order changed the composite"
     );
+}
+
+/// Develops `stack` into `store` under `root` with room for any pass.
+fn develop_into(stack: &RawStack, root: &Path, store: DevelopStore) {
+    stack
+        .develop_once(
+            root,
+            store,
+            HostBudget::explicit(u64::MAX),
+            2,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
+        .expect("the pass develops every frame");
+}
+
+/// Bytes one decode reserves for the stack's frames: raw pixels at 30 bytes
+/// each plus the file.
+fn decode_reservation(stack: &RawStack) -> u64 {
+    let raw = stack.metadata(0).expect("frame 0 has metadata");
+    u64::from(raw.raw_width) * u64::from(raw.raw_height) * 30
+        + stack.frame(0).expect("frame 0").file_size
+}
+
+/// A host memory ceiling that holds one decode of `dng` but not the developed
+/// frames beside it, so a run with it develops to scratch files.
+fn on_disk_budget(dng: &tempfile::NamedTempFile) -> u64 {
+    decode_reservation(&RawStack::open_files(&[PathBuf::from(dng.path())]).expect("DNG opens")) + 1
+}
+
+#[test]
+fn raw_in_ram_reads_match_scratch_reads() {
+    // One ragged block, and ragged on both axes across several blocks.
+    for side in [(40u32, 30u32), (150, 70)] {
+        let files: Vec<_> = (0..3)
+            .map(|i| gradient_dng(side.0, side.1, i * 700))
+            .collect();
+        let paths: Vec<PathBuf> = files.iter().map(|f| PathBuf::from(f.path())).collect();
+        let on_disk = RawStack::open_files(&paths).expect("DNG stack opens");
+        let in_ram = RawStack::open_files(&paths).expect("DNG stack opens");
+        let disk_root = target_tmp();
+        let ram_root = target_tmp();
+        develop_into(&on_disk, disk_root.path(), DevelopStore::ScratchFile);
+        develop_into(&in_ram, ram_root.path(), DevelopStore::Memory);
+        assert_scratch_empty(ram_root.path());
+        assert_eq!(scratch_files(disk_root.path()).len(), 3);
+        assert_eq!(in_ram.develop_counts(), Some(vec![1; 3]));
+
+        let rect = |x, y, width, height| Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let rects: Vec<Rect> = [
+            // The whole frame, the far corner, and a single pixel.
+            rect(0, 0, side.0, side.1),
+            rect(side.0 - 5, side.1 - 3, 5, 3),
+            rect(side.0 - 1, side.1 - 1, 1, 1),
+            // Across block edges, on and off the 32 px grid.
+            rect(60, 60, 8, 8),
+            rect(33, 1, 100, 69),
+            rect(63, 0, 2, 70),
+            rect(64, 64, 6, 6),
+        ]
+        .into_iter()
+        .filter(|r| r.x + r.width <= side.0 && r.y + r.height <= side.1)
+        .collect();
+        for frame in 0..3 {
+            for &rect in &rects {
+                let samples = rect.width as usize * rect.height as usize * 3;
+                for gain in [UNIT_GAIN, UNIT_GAIN * 3 / 2, UNIT_GAIN / 3] {
+                    let (mut want, mut got) = (vec![0u16; samples], vec![0u16; samples]);
+                    on_disk
+                        .read_tile_gained_into(frame, rect, gain, &mut want)
+                        .expect("scratch read");
+                    in_ram
+                        .read_tile_gained_into(frame, rect, gain, &mut got)
+                        .expect("in-memory read");
+                    assert_eq!(want, got, "u16 frame {frame} {rect:?} gain {gain}");
+
+                    let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
+                    on_disk
+                        .read_tile_gained_f32_into(frame, rect, gain, &mut want)
+                        .expect("scratch read");
+                    in_ram
+                        .read_tile_gained_f32_into(frame, rect, gain, &mut got)
+                        .expect("in-memory read");
+                    assert_eq!(want, got, "f32 frame {frame} {rect:?} gain {gain}");
+                }
+                let (mut want, mut got) = (vec![0u16; samples], vec![0u16; samples]);
+                on_disk
+                    .read_tile_into(frame, rect, &mut want)
+                    .expect("scratch read");
+                in_ram
+                    .read_tile_into(frame, rect, &mut got)
+                    .expect("in-memory read");
+                assert_eq!(want, got, "unit gain u16 frame {frame} {rect:?}");
+                let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
+                on_disk
+                    .read_tile_f32_into(frame, rect, &mut want)
+                    .expect("scratch read");
+                in_ram
+                    .read_tile_f32_into(frame, rect, &mut got)
+                    .expect("in-memory read");
+                assert_eq!(want, got, "unit gain f32 frame {frame} {rect:?}");
+            }
+            assert_eq!(
+                on_disk.linear_means(frame).expect("scratch means"),
+                in_ram.linear_means(frame).expect("in-memory means"),
+                "means of frame {frame}"
+            );
+        }
+        assert_eq!(in_ram.develop_counts(), Some(vec![1; 3]));
+    }
+}
+
+#[test]
+fn raw_store_choice_flips_at_the_in_ram_requirement() {
+    let dng = gradient_dng(130, 70, 0);
+    let root = target_tmp();
+    let paths = copies_of(&dng, 4, root.path());
+    let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+    let frames = stack.develop_scratch_bytes().expect("the figure fits");
+    assert_eq!(frames, 4 * 130 * 70 * 6);
+    let reservation = decode_reservation(&stack);
+    let workers = 2;
+    let choose = |budget: u64, share: u64| {
+        stack
+            .develop_store(HostBudget::explicit(budget), workers, share)
+            .expect("the choice is made")
+    };
+    // The share below the two reservations, at them, and above them.
+    for share in [0, 2 * reservation, 10 * reservation] {
+        let required = frames + (workers as u64 * reservation).max(share);
+        assert_eq!(
+            choose(required - 1, share),
+            Some(DevelopStore::ScratchFile),
+            "share {share}, one byte short"
+        );
+        assert_eq!(
+            choose(required, share),
+            Some(DevelopStore::Memory),
+            "share {share}, exactly enough"
+        );
+    }
+
+    // Room for both decodes but not for the frames: the pass writes the
+    // frames to scratch and keeps nothing in memory.
+    let budget = 2 * reservation;
+    assert_eq!(choose(budget, 0), Some(DevelopStore::ScratchFile));
+    let on_disk = RawStack::open_files(&paths).expect("DNG stack opens");
+    let disk_root = target_tmp();
+    on_disk
+        .develop_once(
+            disk_root.path(),
+            DevelopStore::ScratchFile,
+            HostBudget::explicit(budget),
+            workers,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
+        .expect("the pass develops every frame");
+    let written: u64 = scratch_files(disk_root.path())
+        .iter()
+        .map(|file| std::fs::metadata(file).expect("scratch file").len())
+        .sum();
+    assert_eq!(written, frames);
+    assert!(on_disk.read_page_cache_bytes(64, 64) > 0);
+
+    let in_ram = RawStack::open_files(&paths).expect("DNG stack opens");
+    let ram_root = target_tmp();
+    develop_into(&in_ram, ram_root.path(), DevelopStore::Memory);
+    assert_scratch_empty(ram_root.path());
+    assert_eq!(in_ram.read_page_cache_bytes(64, 64), 0);
+}
+
+#[test]
+fn raw_in_ram_failure_and_cancel_leave_nothing() {
+    let good = gradient_dng(256, 256, 0);
+    let withheld = write_dng(
+        &tinted_spec(vec![64; 256 * 256], 256, 256, [0, 1, 1, 2]),
+        true,
+    );
+    let frames = vec![
+        PathBuf::from(good.path()),
+        PathBuf::from(withheld.path()),
+        PathBuf::from(good.path()),
+    ];
+    let pass = |stack: &RawStack, root: &Path, store, cancel_after: usize| {
+        let polls = AtomicUsize::new(0);
+        stack.develop_once(
+            root,
+            store,
+            HostBudget::explicit(u64::MAX),
+            1,
+            &|| polls.fetch_add(1, Ordering::SeqCst) >= cancel_after,
+            &AtomicUsize::new(0),
+        )
+    };
+
+    // The pass keeps its frames in memory when nothing goes wrong.
+    let control =
+        RawStack::open_files(&[frames[0].clone(), frames[2].clone()]).expect("DNG stack opens");
+    let root = target_tmp();
+    pass(&control, root.path(), DevelopStore::Memory, usize::MAX).expect("the pass completes");
+    assert_eq!(control.read_page_cache_bytes(64, 64), 0);
+
+    // A header-only frame ends the pass with the same error in both stores.
+    let mut errors = Vec::new();
+    for store in [DevelopStore::ScratchFile, DevelopStore::Memory] {
+        let stack = RawStack::open_files(&frames).expect("DNG stack opens");
+        let root = target_tmp();
+        let error = pass(&stack, root.path(), store, usize::MAX)
+            .expect_err("a frame without pixels must end the pass");
+        assert!(
+            error
+                .to_string()
+                .contains(&withheld.path().display().to_string()),
+            "{store:?}: {error}"
+        );
+        assert_scratch_empty(root.path());
+        assert!(stack.read_page_cache_bytes(64, 64) > 0, "{store:?}");
+        errors.push(error.to_string());
+    }
+    assert_eq!(errors[0], errors[1]);
+
+    // A cancel after the second frame starts leaves nothing either, and the
+    // reader can run the pass again.
+    let stack = RawStack::open_files(&[frames[0].clone(), frames[2].clone(), frames[0].clone()])
+        .expect("DNG stack opens");
+    let root = target_tmp();
+    let cancelled = pass(&stack, root.path(), DevelopStore::Memory, 2);
+    assert!(
+        matches!(cancelled, Err(AlgorithmError::Cancelled)),
+        "{cancelled:?}"
+    );
+    assert_scratch_empty(root.path());
+    assert!(stack.read_page_cache_bytes(64, 64) > 0);
+    pass(&stack, root.path(), DevelopStore::Memory, usize::MAX)
+        .expect("a failed pass retained nothing, so the next one runs");
+    assert_eq!(stack.read_page_cache_bytes(64, 64), 0);
+}
+
+#[test]
+fn raw_in_ram_run_needs_no_scratch_space() {
+    let dng = gradient_dng(64, 48, 0);
+    let develop = 4 * 64 * 48 * 6;
+    let capped = Some(on_disk_budget(&dng));
+    let request = |max_host_memory, free: u64| {
+        let root = target_tmp();
+        let frames = copies_of(&dng, 4, root.path());
+        let mut request = raw_request(frames, root.path(), None, max_host_memory);
+        request.free_space = Some(recording_probe(move |_| volume("only", free)).0);
+        (request, root)
+    };
+    let shortfall = |max_host_memory| {
+        let (mut request, _root) = request(max_host_memory, 0);
+        single_shortfall(&mut request, 0).needed
+    };
+    let on_disk = shortfall(capped);
+    let in_ram = shortfall(None);
+    assert_eq!(in_ram + develop, on_disk, "only the frames differ");
+
+    // A volume that covers the rest but not the frames still runs the stack
+    // through memory and refuses the stack that needs the frames on disk.
+    let (held, _root) = request(None, in_ram);
+    let FuseOutcome::Completed(report) = run_raw(&held).expect("the RAW run completes") else {
+        panic!("expected a completed run");
+    };
+    assert_eq!(report.developed_store, Some(DevelopStore::Memory));
+    let (mut refused, _root) = request(capped, in_ram);
+    let shortfall = single_shortfall(&mut refused, in_ram);
+    assert_eq!((shortfall.needed, shortfall.free), (on_disk, in_ram));
 }

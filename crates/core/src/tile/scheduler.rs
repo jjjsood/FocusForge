@@ -216,6 +216,37 @@ impl TileSchedulerOptions {
             decimation_levels: self.levels,
         }
     }
+
+    /// The largest read rect a run plans over a `frame`-sized stack: the tile
+    /// size, never beyond the frame.
+    pub(crate) fn read_extent(&self, frame: (u32, u32)) -> (u32, u32) {
+        (self.tile_size.min(frame.0), self.tile_size.min(frame.1))
+    }
+
+    /// Bytes one in-flight tile is accounted at over `frame`-sized frames of
+    /// `samples_per_pixel` samples: the frame tile, its coverage mask, the
+    /// method's working bytes and `reader`'s per-read scratch.
+    pub fn tile_bytes(
+        &self,
+        reader: &dyn TileReader,
+        frame: (u32, u32),
+        samples_per_pixel: u32,
+    ) -> u64 {
+        let (width, height) = self.read_extent(frame);
+        bytes_per_tile(
+            width,
+            height,
+            samples_per_pixel,
+            reader.sample_format().bytes(),
+            self.working_bytes_per_pixel,
+        ) + reader.read_scratch_bytes(width, height)
+    }
+}
+
+/// The number of tiles the host's cores can work on at once, the cap on a
+/// run's in-flight limit.
+pub(crate) fn pool_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
 /// The order a run hands `tiles` to the pool. Without bands it is the order
@@ -389,19 +420,9 @@ impl<'a> TileScheduler<'a> {
             options.tile_size,
             options.support(),
         )?;
-        let pool_threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        // A read rect never exceeds the frame, whatever the tile size.
-        let read_width = options.tile_size.min(stack.width);
-        let read_height = options.tile_size.min(stack.height);
-        let bytes = bytes_per_tile(
-            read_width,
-            read_height,
-            samples_per_pixel,
-            reader.sample_format().bytes(),
-            options.working_bytes_per_pixel,
-        ) + reader.read_scratch_bytes(read_width, read_height);
+        let pool_threads = pool_threads();
+        let (read_width, read_height) = options.read_extent((stack.width, stack.height));
+        let bytes = options.tile_bytes(reader, (stack.width, stack.height), samples_per_pixel);
 
         if options.budget.refuses_below_one_tile() && bytes > 0 && options.budget.bytes() < bytes {
             return Err(TileError::HostMemoryTooSmall {
