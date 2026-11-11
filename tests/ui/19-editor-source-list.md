@@ -48,7 +48,7 @@ Use a fresh settings directory, where the source presentation is Image list. The
 19. Click the entry **List**, the first of the three (`FFMenuList::option-area` 0).
    Expect: the list is gone and the Presentation field reads "List".
 20. Click **Close settings** (`FFSettingsModal::close`).
-   Expect: the list shows "Results" with "2", then two one-line rows with a layers icon, "Details", a time and the pills (the first also "· 1 stroke"), then the line "1 hidden: different alignment", then "8 frames" and the frames 00.tif and below as compact lines; no preview pictures are drawn.
+   Expect: the list shows "Results" with "2", then two one-line rows with a layers icon, "Details", the start of a time and the pills; a row whose text does not fit ends in an ellipsis, so "· 1 stroke" may be cut off here (it is read in the Image list and Large previews steps); then the line "1 hidden: different alignment", then "8 frames" and the frames 00.tif and below as compact lines; no preview pictures are drawn.
 ## Image list
 21. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
    Expect: the Settings window opens.
