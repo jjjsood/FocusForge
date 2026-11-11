@@ -119,7 +119,7 @@ def release_components(root: Path) -> list[dict[str, object]]:
 
 
 def source_assets(root: Path) -> dict[str, str]:
-    about = (root / "crates/gui/ui/shell/settings_modal/about_tab.slint").read_text(encoding="utf-8")
+    about = (root / "crates/ui/ui/shell/settings_modal/about_tab.slint").read_text(encoding="utf-8")
     copyright_match = ABOUT_COPYRIGHT.search(about)
     if not copyright_match:
         raise ValueError("could not read FocusForge copyright from the About tab")

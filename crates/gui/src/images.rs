@@ -4,7 +4,7 @@
 //! colour, name and capture time, and the copy for the frame-set-change
 //! warnings. Plain Rust, no `use slint::` -- `crate::controller` builds
 //! `ImagesModel` from a tab's own frame list and exclusion mask and hands
-//! it to `ui/shell/dock/images_panel.slint`'s `for` loop; the schema/registry
+//! it to `crates/ui/ui/shell/dock/images_panel.slint`'s `for` loop; the schema/registry
 //! crate is named here so `crate::controller` never has to.
 
 use std::collections::HashMap;

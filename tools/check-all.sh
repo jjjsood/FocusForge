@@ -250,16 +250,17 @@ tool_selftest "manual coverage selftest" python3 tools/check-manual-coverage.py 
 if [ "$STATIC_ONLY" -eq 0 ]; then
   # Build-only: proves the no-GPU path still compiles, test targets included.
   # Must run BEFORE `build` -- see the header comment above for why the order
-  # is load-bearing. `--exclude focusforge-gui`: the GUI's Slint backend is
-  # wgpu-only by construction (crates/gui/Cargo.toml pins
+  # is load-bearing. `--exclude focusforge-gui --exclude focusforge-ui`: the
+  # Slint backend is wgpu-only by construction (crates/ui/Cargo.toml pins
   # `renderer-femtovg-wgpu` unconditionally, not behind the `gpu` feature),
-  # so it always compiles wgpu regardless of `--no-default-features` -- with
-  # it included this stage would still link wgpu and would prove nothing
-  # about the no-GPU path.
+  # so these two crates always compile wgpu regardless of
+  # `--no-default-features` -- with them included this stage would still link
+  # wgpu and would prove nothing about the no-GPU path.
   [ "$QUICK" -eq 1 ] || run_gate "build (no default features)" \
                              tools/with-lock.sh build -- \
                              cargo build --workspace --all-targets \
-                             --no-default-features --exclude focusforge-gui
+                             --no-default-features --exclude focusforge-gui \
+                             --exclude focusforge-ui
 
   # Must come first among the GPU-enabled stages: it produces the binary the
   # background stage runs, and it holds the target/ lock the cargo gates below
