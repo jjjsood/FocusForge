@@ -35,7 +35,8 @@
 - Flickering light or exposure drift between shots is evened out
 - Three methods to choose from: Details as the all-rounder, Soft transitions for gentler blends between frames, Focus map for the most coherent source map to pick from
 - Plan a bracket before shooting: the step calculator turns lens or objective, magnification, overlap and depth range into a focus step, frame count, duration and disk need, in the window or with `focusforge-cli step-plan`
-- See which frames hold the sharpest areas: the Analytics overlay and `focusforge-cli sharp-areas` count them per image
+- See which frames hold the sharpest areas: the Analytics overlay and `focusforge-cli sharp-areas` count them per image; the command also reports how far neighbouring frames overlap, so a gap between focus steps shows
+- Write a sharpness map per frame, and for a finished image, on one scale with `focusforge-cli sharpness-map`, to compare how sharp each is
 - Fast on a graphics card, the same result without one; the window also starts where only a software renderer is available
 - RAW stacks keep highlights above white until the final image is written
 
