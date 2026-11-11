@@ -18,6 +18,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
 use crate::algorithm::{AlgorithmError, AlignAlgorithm, StackAlgorithm, TileReader};
 use crate::align::{
     AlignDriverOptions, FailurePolicy, FrameAlignment, ReferencePolicy, Registration,
@@ -31,8 +33,8 @@ use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
 use crate::gpu::{AlignBackend, TileBackend};
 use crate::io::tiff::writer::file_len;
 use crate::io::{
-    COMPOSITE_FILENAME, FrameDesc, FrameReader, ReaderKind, Rect, TiffStack, ZMAP_FILENAME,
-    open_frame_set,
+    COMPOSITE_FILENAME, DevelopStore, FrameDesc, FrameReader, ReaderKind, Rect, TiffStack,
+    ZMAP_FILENAME, open_frame_set,
 };
 use crate::job::{
     AlignIdentity, ControlState, FrameFingerprint, Job, JobControl, JobOutcome, JobProgress,
@@ -43,8 +45,9 @@ use crate::params::{self, ParamValue, ParamValues, Provenance, ResolvedParams};
 use crate::project::{
     self, AlignRecord, AppendRequest, HeldCheckpoint, Metrics, SealRequest, SealedProject,
 };
+use crate::tile::scheduler::pool_threads;
 use crate::tile::{
-    NoopPreprocess, SampleFormat, TileConsumer, TileError, TilePlan, TileScheduler,
+    InFlightBound, NoopPreprocess, SampleFormat, TileConsumer, TileError, TilePlan, TileScheduler,
     TileSchedulerOptions,
 };
 use crate::timing::{Stage, StageTimer, StageTimings, equalize_scope};
@@ -188,7 +191,18 @@ pub struct FuseReport {
     pub tiles: usize,
     pub frame_tiles_read: usize,
     pub in_flight_limit: usize,
+    /// The term that set `in_flight_limit` before the floor of 1.
+    pub in_flight_bound: InFlightBound,
+    /// The width, in tile columns, of the vertical bands tiles were admitted
+    /// in; `None` when they were admitted in plan order.
+    pub band_columns: Option<usize>,
+    /// The file-cache bytes one tile's reads kept hot across all frames,
+    /// which sized `band_columns`; `None` when the reader reported none.
+    pub page_cache_bytes_per_tile: Option<u64>,
     pub max_bytes_in_flight: u64,
+    /// Where the developed frames were kept; `None` for a reader that
+    /// develops nothing.
+    pub developed_store: Option<DevelopStore>,
     /// The bytes the scheduler accounted for at its in-flight limit:
     /// `in_flight_limit` tiles, each counted with the method's working bytes
     /// and reader scratch.
@@ -495,6 +509,30 @@ struct RunShape {
     fingerprint_len: u64,
 }
 
+/// Bytes of tile scheduling a run can hold at once over `frame`-sized frames
+/// read through `reader`: one accounted tile per pool thread. A run that
+/// aligns on the host (`aligned` without `gpu`) also schedules through the
+/// warping reader, so each tile carries the scratch of an identity warp: the
+/// warped samples with coverage and a source read as large as the
+/// destination.
+pub fn develop_tile_share(
+    options: &TileSchedulerOptions,
+    reader: &dyn TileReader,
+    frame: (u32, u32),
+    samples_per_pixel: u32,
+    aligned: bool,
+    gpu: bool,
+) -> u64 {
+    let mut tile = options.tile_bytes(reader, frame, samples_per_pixel);
+    if aligned && !gpu {
+        let (width, height) = options.read_extent(frame);
+        let destination = u64::from(width) * u64::from(height);
+        let sample_bytes = u64::from(samples_per_pixel) * reader.sample_format().bytes();
+        tile += destination * (sample_bytes + 1) + destination * sample_bytes;
+    }
+    tile.saturating_mul(pool_threads() as u64)
+}
+
 /// The bytes a run writes, split by where they land. `output` is `Some` when
 /// a project is written beside the output path.
 #[derive(Debug)]
@@ -657,6 +695,22 @@ pub fn run(
         .min(control.admission_cap())
         .max(1);
     let cancel_requested = || control.state() == ControlState::CancelRequested;
+    let developed_store = frame_reader.develop_store(
+        develop_budget,
+        workers,
+        develop_tile_share(
+            &options,
+            frame_reader,
+            (width, height),
+            spp,
+            request.align.is_some(),
+            request.backend.is_some() && cap_fallback.is_none(),
+        ),
+    )?;
+    // Frames held in memory come off the tiles' budget.
+    if developed_store == Some(DevelopStore::Memory) {
+        options.budget = develop_budget.reduced_by(scratch_needed);
+    }
     {
         let (sealed, output_dir) = match &request.output {
             FuseOutput::Seal(path) | FuseOutput::Append(path) => (
@@ -684,9 +738,13 @@ pub fn run(
             },
             sealed,
         )?;
+        let developed_on_disk = match developed_store {
+            Some(DevelopStore::ScratchFile) => scratch_needed,
+            _ => 0,
+        };
         let scratch_total = space
             .scratch
-            .checked_add(scratch_needed)
+            .checked_add(developed_on_disk)
             .ok_or_else(size_overflow)?;
         let mut destinations = vec![(request.scratch_root.as_path(), scratch_total)];
         if let (Some(dir), Some(bytes)) = (output_dir, space.output) {
@@ -695,7 +753,7 @@ pub fn run(
         check_disk_space(request, &destinations)?;
     }
     // A RAW stack develops every frame here, once, so no later read does.
-    if scratch_needed > 0 {
+    if let Some(store) = developed_store {
         timer.mark(Stage::Setup);
         timer.enter(Stage::Develop);
         let developed = control.begin_develop(frame_reader.len());
@@ -706,6 +764,7 @@ pub fn run(
         let result = with_progress_ticks(observer, &control, request.poll, || {
             frame_reader.develop_once(
                 &request.scratch_root,
+                store,
                 develop_budget,
                 workers,
                 &cancel_requested,
@@ -1262,6 +1321,9 @@ pub fn run(
 
     let final_progress = control.progress();
     let in_flight_limit = scheduler.in_flight_limit();
+    let in_flight_bound = scheduler.in_flight_bound();
+    let band_columns = scheduler.band_columns();
+    let page_cache_bytes_per_tile = scheduler.page_cache_bytes_per_tile();
     let tiles = final_progress.unit_total;
     let frame_tiles_read = match &backend_consumer {
         Some(consumer) => consumer.fallback_tiles() * frame_reader.len(),
@@ -1276,7 +1338,7 @@ pub fn run(
 
     observer.stage(RunStage::Seal);
     let _ = source_hashes.join();
-    let metrics = measure_metrics(&staged_composite, frame_reader, &gain_reader);
+    let metrics = measure_metrics(&staged_composite, frame_reader, &gain_reader, workers);
     let align_record =
         alignment_result
             .as_ref()
@@ -1383,7 +1445,11 @@ pub fn run(
         tiles,
         frame_tiles_read,
         in_flight_limit,
+        in_flight_bound,
+        band_columns,
+        page_cache_bytes_per_tile,
         max_bytes_in_flight: scheduler.budget().bytes(),
+        developed_store,
         accounted_bytes_in_flight: in_flight_limit as u64 * scheduler.bytes_per_tile(),
         budget_provenance: scheduler.budget().provenance(),
         backed_off: scheduler.final_in_flight_limit() < in_flight_limit,
@@ -1631,6 +1697,7 @@ fn measure_metrics(
     composite: &Path,
     sources: &dyn FrameReader,
     gained: &dyn TileReader,
+    workers: usize,
 ) -> Metrics {
     let Ok(stack) = TiffStack::open_staged(composite) else {
         return Metrics::default();
@@ -1642,18 +1709,17 @@ fn measure_metrics(
     let window = centered(width, height, side_w, side_h);
     let composite_lapvar = lapvar(&stack, 0, window, spp);
 
-    let mut max_input_lapvar: Option<f64> = None;
-    for index in 0..sources.len() {
-        let (fw, fh) = sources.dimensions();
-        if fw < side_w || fh < side_h {
-            continue;
-        }
-        let fspp = sources.frame(index).samples_per_pixel;
-        let rect = centered(fw, fh, side_w, side_h);
-        if let Some(value) = lapvar(gained, index, rect, fspp) {
-            max_input_lapvar = Some(max_input_lapvar.map_or(value, |m: f64| m.max(value)));
-        }
-    }
+    let spps: Vec<u32> = (0..sources.len())
+        .map(|index| sources.frame(index).samples_per_pixel)
+        .collect();
+    let max_input_lapvar = max_input_lapvar(
+        gained,
+        sources.len(),
+        sources.dimensions(),
+        &spps,
+        (side_w, side_h),
+        workers,
+    );
 
     Metrics {
         composite_lapvar,
@@ -1673,13 +1739,69 @@ fn centered(width: u32, height: u32, side_w: u32, side_h: u32) -> Rect {
 
 fn lapvar(reader: &dyn TileReader, frame: usize, rect: Rect, spp: u32) -> Option<f64> {
     let mut samples = vec![0u16; rect.width as usize * rect.height as usize * spp as usize];
-    reader.read_tile_into(frame, rect, &mut samples).ok()?;
+    lapvar_into(reader, frame, rect, spp, &mut samples)
+}
+
+/// [`lapvar`] reading into the front of a caller-owned buffer of at least
+/// `rect.width * rect.height * spp` samples.
+fn lapvar_into(
+    reader: &dyn TileReader,
+    frame: usize,
+    rect: Rect,
+    spp: u32,
+    buf: &mut [u16],
+) -> Option<f64> {
+    let samples = &mut buf[..rect.width as usize * rect.height as usize * spp as usize];
+    reader.read_tile_into(frame, rect, samples).ok()?;
     Some(crate::fuse::metrics::laplacian_variance(
-        &samples,
+        samples,
         rect.width,
         rect.height,
         spp,
     ))
+}
+
+/// The largest [`lapvar_into`] over the central `side` window of every frame
+/// of `frame_count` frames of size `frame_dims`, measured on `workers`
+/// threads. Frames smaller than the window are not read; frames that fail to
+/// read are skipped. `None` when no frame was measured.
+fn max_input_lapvar(
+    gained: &dyn TileReader,
+    frame_count: usize,
+    frame_dims: (u32, u32),
+    spps: &[u32],
+    side: (u32, u32),
+    workers: usize,
+) -> Option<f64> {
+    let (fw, fh) = frame_dims;
+    if fw < side.0 || fh < side.1 {
+        return None;
+    }
+    let rect = centered(fw, fh, side.0, side.1);
+    let max_spp = spps.iter().copied().max().unwrap_or(0) as usize;
+    let buffer_len = side.0 as usize * side.1 as usize * max_spp;
+    let measure =
+        |buf: &mut Vec<u16>, index: usize| lapvar_into(gained, index, rect, spps[index], buf);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers.max(1))
+        .thread_name(|i| format!("focusforge-metrics-{i}"))
+        .panic_handler(crate::pool::log_worker_panic)
+        .build();
+    match pool {
+        Ok(pool) => pool.install(|| {
+            (0..frame_count)
+                .into_par_iter()
+                .map_init(|| vec![0u16; buffer_len], measure)
+                .flatten()
+                .reduce_with(f64::max)
+        }),
+        Err(_) => {
+            let mut buf = vec![0u16; buffer_len];
+            (0..frame_count)
+                .filter_map(|index| measure(&mut buf, index))
+                .reduce(f64::max)
+        }
+    }
 }
 
 /// Compare reader-provided layout fragments and report the outlier against
@@ -1747,6 +1869,133 @@ pub fn uniform_check(frames: &[(&str, &FrameDesc)]) -> (bool, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// In-memory frames whose checkerboard contrast is `amps[frame]`; reads of
+    /// the frames in `failing` error out and every read is counted.
+    struct Frames {
+        amps: Vec<u16>,
+        spp: u32,
+        failing: Vec<usize>,
+        reads: AtomicUsize,
+    }
+
+    impl Frames {
+        /// Contrast rises to the middle frame.
+        fn graded(count: usize, spp: u32) -> Self {
+            let amps = (0..count)
+                .map(|i| 500 * (1 + i.min(count - 1 - i) as u16))
+                .collect();
+            Frames {
+                amps,
+                spp,
+                failing: Vec::new(),
+                reads: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl TileReader for Frames {
+        fn read_tile_into(
+            &self,
+            frame: usize,
+            rect: Rect,
+            out: &mut [u16],
+        ) -> Result<(), AlgorithmError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.failing.contains(&frame) {
+                return Err(AlgorithmError::Failed {
+                    algorithm: "test".to_string(),
+                    detail: format!("frame {frame} unreadable"),
+                });
+            }
+            let spp = self.spp as usize;
+            assert_eq!(out.len(), (rect.width * rect.height) as usize * spp);
+            let mut at = 0;
+            for y in rect.y..rect.y + rect.height {
+                for x in rect.x..rect.x + rect.width {
+                    out[at..at + spp].fill(20_000 + self.amps[frame] * ((x + y) % 2) as u16);
+                    at += spp;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    const FRAME: (u32, u32) = (40, 24);
+    const SIDE: (u32, u32) = (16, 12);
+
+    fn serial_max(reader: &Frames, count: usize) -> Option<f64> {
+        let rect = centered(FRAME.0, FRAME.1, SIDE.0, SIDE.1);
+        (0..count)
+            .filter_map(|i| lapvar(reader, i, rect, reader.spp))
+            .fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.max(v))))
+    }
+
+    #[test]
+    fn develop_share_adds_the_identity_warp_scratch() {
+        let reader = Frames::graded(3, 3);
+        let mut options = TileSchedulerOptions::explicit_budget(".", 1 << 30);
+        options.tile_size = 160;
+        let frame = (300, 200);
+        let share = |aligned, gpu| develop_tile_share(&options, &reader, frame, 3, aligned, gpu);
+        let unwarped = share(false, false);
+        assert_eq!(
+            unwarped,
+            options.tile_bytes(&reader, frame, 3) * pool_threads() as u64
+        );
+        assert_eq!(share(false, true), unwarped, "no alignment, GPU run");
+        assert_eq!(share(true, true), unwarped, "aligned GPU run");
+        // u16 samples: the warped samples with coverage, and a source read
+        // as large as the destination.
+        let destination = 160 * 160;
+        let identity_warp = destination * (3 * 2 + 1) + destination * 3 * 2;
+        assert_eq!(
+            share(true, false),
+            unwarped + identity_warp * pool_threads() as u64,
+            "aligned CPU run"
+        );
+    }
+
+    #[test]
+    fn parallel_input_metrics_match_the_serial_loop() {
+        for count in [1usize, 5, 7] {
+            let reader = Frames::graded(count, 3);
+            let expected = serial_max(&reader, count).expect("frames measure");
+            for workers in [1usize, 4] {
+                let got = max_input_lapvar(&reader, count, FRAME, &vec![3; count], SIDE, workers)
+                    .expect("frames measure");
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "{count} frames, {workers} workers"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn input_metrics_skip_a_frame_that_fails_to_read() {
+        let mut reader = Frames::graded(5, 3);
+        let rect = centered(FRAME.0, FRAME.1, SIDE.0, SIDE.1);
+        let second_sharpest = lapvar(&reader, 1, rect, 3).expect("frame 1 measures");
+        reader.failing = vec![2];
+        for workers in [1usize, 4] {
+            let got = max_input_lapvar(&reader, 5, FRAME, &[3; 5], SIDE, workers);
+            assert_eq!(got.map(f64::to_bits), Some(second_sharpest.to_bits()));
+        }
+        reader.failing = (0..5).collect();
+        assert_eq!(max_input_lapvar(&reader, 5, FRAME, &[3; 5], SIDE, 4), None);
+    }
+
+    #[test]
+    fn input_metrics_skip_frames_smaller_than_the_window() {
+        for frame in [(SIDE.0 - 1, 24), (40, SIDE.1 - 1)] {
+            let reader = Frames::graded(3, 3);
+            assert_eq!(max_input_lapvar(&reader, 3, frame, &[3; 3], SIDE, 4), None);
+            assert_eq!(reader.reads.load(Ordering::SeqCst), 0, "{frame:?}");
+        }
+    }
 
     #[test]
     fn peek_resumable_alignment_skips_a_ledger_missing_raw_identity() {

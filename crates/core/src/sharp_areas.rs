@@ -193,7 +193,13 @@ pub fn count_sharp_areas_reporting(
         .panic_handler(crate::pool::log_worker_panic)
         .build()
         .map_err(|source| TileError::ThreadPool { source })?;
-    let gate = HostBudgetGate::new(HostBudget::explicit(0), 0, threads, HostSources::default());
+    let gate = HostBudgetGate::new(
+        HostBudget::explicit(0),
+        0,
+        0,
+        threads,
+        HostSources::default(),
+    );
     // A read or detail error wins over the stop the other workers then see.
     let first_error: Mutex<Option<SharpAreasError>> = Mutex::new(None);
     for tile in plan.tiles() {
