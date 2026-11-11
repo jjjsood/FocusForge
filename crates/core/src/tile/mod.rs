@@ -29,7 +29,9 @@ pub use error::TileError;
 pub use plan::{PlannedTile, TilePlan};
 pub use preprocess::{FramePreprocess, NoopPreprocess};
 pub use sample::{Sample, SampleFormat};
-pub use scheduler::{ControlledRun, TileRunReport, TileScheduler, TileSchedulerOptions};
+pub use scheduler::{
+    ControlledRun, InFlightBound, TileRunReport, TileScheduler, TileSchedulerOptions,
+};
 pub use scratch::ScratchDir;
 
 /// An axis-aligned rectangle in frame pixel coordinates, `u32` throughout.

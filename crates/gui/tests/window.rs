@@ -334,6 +334,70 @@ fn comparison_capture_requires_detached_pane() {
 }
 
 #[test]
+fn comparison_ready_watchdog_names_what_is_missing() {
+    if !has_display() {
+        println!("SKIP: window tests need DISPLAY or WAYLAND_DISPLAY");
+        return;
+    }
+    let capture = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("never-ready.png");
+    let _ = std::fs::remove_file(&capture);
+    let output = common::gui_bin("comparison_ready_watchdog")
+        .arg("--open")
+        .arg(common::fixture_frame("mantis-64", 0))
+        .args([
+            "--undock-pane",
+            "frame",
+            "--dock-after",
+            "100000",
+            "--screenshot-when-ready",
+            "--exit-after",
+            "1",
+            "--screenshot-window",
+            "comparison",
+            "--screenshot",
+        ])
+        .arg(&capture)
+        .output()
+        .expect("launch focusforge-gui");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("undock sequence has not finished"),
+        "{stderr}"
+    );
+    assert!(!capture.exists(), "the watchdog must not capture");
+}
+
+#[test]
+fn exit_after_with_an_undock_counts_from_the_undock() {
+    if !has_display() {
+        println!("SKIP: window tests need DISPLAY or WAYLAND_DISPLAY");
+        return;
+    }
+    let capture = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("after-undock.png");
+    let output = common::gui_bin("exit_after_undock")
+        .arg("--open")
+        .arg(common::fixture_frame("mantis-64", 0))
+        .args([
+            "--undock-pane",
+            "frame",
+            "--exit-after",
+            "1",
+            "--screenshot-window",
+            "comparison",
+            "--screenshot",
+        ])
+        .arg(&capture)
+        .output()
+        .expect("launch focusforge-gui");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("requires a detached pane"),
+        "the watchdog fired before the project loaded and the pane undocked: {stderr}"
+    );
+}
+
+#[test]
 fn refused_slow_down_values_are_logged_and_the_window_opens() {
     if !has_display() {
         println!("SKIP: window tests need DISPLAY or WAYLAND_DISPLAY");
@@ -435,7 +499,8 @@ fn both_sides_open_a_real_comparison_window() {
             command
                 .arg("--open")
                 .arg(common::fixture_frame("mantis-64", 0))
-                .args(["--undock-pane", side, "--exit-after", "8000"])
+                .args(["--undock-pane", side, "--exit-after", "60000"])
+                .arg("--screenshot-when-ready")
                 .args(["--screenshot-window", "comparison", "--screenshot"])
                 .arg(dir.join(format!("{side}.png")));
             command
@@ -452,7 +517,11 @@ fn both_sides_open_a_real_comparison_window() {
         let info = png::Decoder::new(std::io::Cursor::new(bytes))
             .read_info()
             .expect("valid detached PNG");
-        assert!(info.info().width >= 820 && info.info().height >= 600);
+        let (width, height) = (info.info().width, info.info().height);
+        assert!(
+            width >= 820 && height >= 600,
+            "{side} capture is {width}x{height}, below the preferred 820x600"
+        );
     }
 }
 
@@ -475,7 +544,8 @@ fn comparison_reopens_after_dock_and_main_close_exits() {
             "--reopen-after",
             "500",
             "--exit-after",
-            "8000",
+            "60000",
+            "--screenshot-when-ready",
             "--screenshot-window",
             "comparison",
             "--screenshot",
