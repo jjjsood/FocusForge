@@ -658,6 +658,13 @@ struct ProjectTab {
     /// tab is created, and kept in step by every edit that moves or shortens
     /// `frames`.
     selected: usize,
+    /// The checkpoint the brush paints from, by list id (`held:<n>` for an
+    /// unsaved one), while one is chosen in place of the frame at `selected`.
+    /// Counts only while the editor's Results group lists it.
+    source_checkpoint: Option<String>,
+    /// Whether the editor list's Results and Frames groups hide their rows.
+    results_collapsed: bool,
+    frames_collapsed: bool,
     /// The sort menu's own selection -- `None` is the dragged state, where
     /// neither `Name` nor `Capture time` is checked. Cleared by a manual
     /// drag.
@@ -964,6 +971,13 @@ fn fused_of(entry: &job::InMemoryCheckpoint) -> Option<&job::HeldCheckpoint> {
     }
 }
 
+/// How many brush strokes `ops` hold.
+fn stroke_count(ops: &[job::Op]) -> usize {
+    ops.iter()
+        .filter(|op| matches!(op, job::Op::BrushStroke { .. }))
+        .count()
+}
+
 /// A held checkpoint whose run diverged on `diverged`, by frame file name.
 struct ParkedRun {
     held: job::HeldCheckpoint,
@@ -1021,6 +1035,9 @@ impl ProjectTab {
             frames,
             excluded,
             selected,
+            source_checkpoint: None,
+            results_collapsed: false,
+            frames_collapsed: false,
             frame_sort: None,
             meta,
             thumbnail,
@@ -1207,6 +1224,179 @@ impl ProjectTab {
         }
         ids.get(kept[..entry].iter().filter(|written| **written).count())
             .cloned()
+    }
+
+    /// Runs `f` over the pixel grid of the fuse `base` names. `None` when
+    /// the fuse cannot be read.
+    fn with_grid<R>(&self, base: &RowBase, f: impl FnOnce(&job::PixelGrid<'_>) -> R) -> Option<R> {
+        match base {
+            RowBase::Held(index) => {
+                let held = fused_of(self.held.get(*index)?)?;
+                Some(f(&job::PixelGrid::held(held)))
+            }
+            RowBase::Saved(id) => {
+                let GuiProject::Opened(project) = &self.project else {
+                    return None;
+                };
+                let record = project.fuse_state(id).ok()?;
+                Some(f(&project.pixel_grid(&record)))
+            }
+        }
+    }
+
+    /// Why `candidate` shares no pixel grid with `base`; `None` when it does
+    /// or when either fuse cannot be read.
+    fn grid_mismatch(&self, base: &RowBase, candidate: &RowBase) -> Option<job::GridMismatch> {
+        self.with_grid(base, |base| {
+            self.with_grid(candidate, |candidate| base.mismatch(candidate))
+        })
+        .flatten()
+        .flatten()
+    }
+
+    /// The nearest checkpoint without ops at or above list row `key`: the
+    /// fuse a retouch chain starts from.
+    fn fused_origin(&self, key: &str) -> Option<String> {
+        let saved_origin = |id: &str| {
+            let GuiProject::Opened(project) = &self.project else {
+                return None;
+            };
+            let chain = project.history().ancestors(id).ok()?;
+            chain
+                .into_iter()
+                .find(|c| c.ops.is_empty())
+                .map(|c| c.id.clone())
+        };
+        let Some(mut index) = checkpoints::held_index(key) else {
+            return saved_origin(key);
+        };
+        loop {
+            let entry = self.held.get(index)?;
+            if fused_of(entry).is_some() {
+                return Some(checkpoints::held_key(index));
+            }
+            match entry.parent.as_ref()? {
+                job::ParentRef::Entry(parent) if *parent < index => index = *parent,
+                job::ParentRef::Entry(_) => return None,
+                job::ParentRef::Saved(id) => return saved_origin(id),
+            }
+        }
+    }
+
+    /// The editor list's Results rows: every checkpoint the checkpoint list
+    /// shows, in its order, whose pixel grid matches the edited row's; the
+    /// rest are counted per reason.
+    fn image_groups(&self) -> images::Groups {
+        let (saved, history) = match &self.project {
+            GuiProject::Opened(project) => (project.history().all(), Some(project.history())),
+            GuiProject::Unsaved(_) => (Vec::new(), None),
+        };
+        let listed = checkpoints::build_model(
+            &saved,
+            &self.held,
+            &self.pending_deletes,
+            checkpoints::today(),
+            None,
+            0.0,
+        );
+        let base = self.selected_checkpoint.as_deref();
+        let base_row = base.and_then(|key| self.resolve_row(key));
+        let origin = base
+            .and_then(|key| self.fused_origin(key))
+            .filter(|origin| Some(origin.as_str()) != base);
+        let next_colour = history.map_or(0, |history| history.next_colour_index());
+        let sources = u32::try_from(self.frames.len().max(1)).unwrap_or(u32::MAX);
+        let mut hidden = [0usize; images::MISMATCH_ORDER.len()];
+        let mut rows = Vec::new();
+        for key in listed.entries.into_iter().filter_map(|entry| entry.id) {
+            if base != Some(key.as_str())
+                && let Some(base_row) = &base_row
+                && let Some(candidate) = self.resolve_row(&key)
+                && let Some(reason) = self.grid_mismatch(base_row, &candidate)
+            {
+                let slot = images::MISMATCH_ORDER
+                    .iter()
+                    .position(|r| *r == reason)
+                    .expect("MISMATCH_ORDER names every reason");
+                hidden[slot] += 1;
+                continue;
+            }
+            let held_at = checkpoints::held_index(&key);
+            let (algorithm, created_at, label, strokes, colour) = match held_at {
+                Some(index) => {
+                    let Some(entry) = self.held.get(index) else {
+                        continue;
+                    };
+                    let strokes = match &entry.kind {
+                        job::InMemoryKind::Ops { ops, .. } => stroke_count(ops),
+                        job::InMemoryKind::Fused(_) => 0,
+                    };
+                    (
+                        checkpoints::held_algorithm(index, &self.held, &saved),
+                        entry.created_at(),
+                        None,
+                        strokes,
+                        job::entry_colour_index(next_colour, index),
+                    )
+                }
+                None => {
+                    let Some(history) = history else { continue };
+                    let Ok(checkpoint) = history.get(&key) else {
+                        continue;
+                    };
+                    (
+                        checkpoint.algorithm.clone(),
+                        checkpoint.created_at,
+                        checkpoint.label.clone(),
+                        stroke_count(&checkpoint.ops),
+                        history
+                            .colour_index(&key)
+                            .expect("a listed checkpoint is in the history"),
+                    )
+                }
+            };
+            let mut badges = Vec::new();
+            if base == Some(key.as_str()) {
+                badges.push("BASE");
+            } else if origin.as_deref() == Some(key.as_str()) {
+                badges.push("FUSION");
+            }
+            if held_at.is_some() {
+                badges.push("UNSAVED");
+            }
+            rows.push(images::ResultRow {
+                colour: job::checkpoint_color(colour, sources),
+                label,
+                method: checkpoints::algorithm_label(&algorithm),
+                time: checkpoints::local_hhmmss(created_at),
+                strokes,
+                badges,
+                key,
+            });
+        }
+        let selected = self
+            .source_checkpoint
+            .clone()
+            .filter(|key| rows.iter().any(|row| &row.key == key));
+        images::Groups {
+            rows,
+            hidden: images::MISMATCH_ORDER.into_iter().zip(hidden).collect(),
+            selected,
+            results_collapsed: self.results_collapsed,
+            frames_collapsed: self.frames_collapsed,
+        }
+    }
+
+    /// The chosen brush-source checkpoint, while the Results group lists it.
+    fn listed_source(&self) -> Option<String> {
+        self.source_checkpoint.as_ref()?;
+        self.image_groups().selected
+    }
+
+    /// Falls back to the frame at `selected` once the chosen checkpoint is
+    /// no longer listed.
+    fn prune_source_checkpoint(&mut self) {
+        self.source_checkpoint = self.listed_source();
     }
 
     /// Where a checkpoint taken from the current row is recorded: under the
@@ -3035,6 +3225,7 @@ impl AppController {
         let dropped_session = tab.drop_session();
         tab.selected_checkpoint = Some(key);
         tab.free_unneeded_held();
+        tab.prune_source_checkpoint();
         let on_ops_row = tab.on_ops_row();
         if !unchanged || matches!(tab.row_planes, Some(RowPlanes::Refused(_))) {
             tab.row_planes = None;
@@ -4212,6 +4403,9 @@ impl AppController {
         let Some(rect) = self.pane_rect(pane) else {
             return;
         };
+        if self.source_checkpoint().is_some() {
+            return;
+        }
         let Some(source) = self.brush_source() else {
             return;
         };
@@ -6774,21 +6968,83 @@ impl AppController {
     /// tab active ("+" selected).
     pub fn images_panel(&self) -> images::ImagesModel {
         let legend = self.mode() == ShellMode::Editor;
+        let row_height = self.image_row_height();
         let Some(tab) = self.state.active() else {
-            return images::build_model(&[], &[], None, legend, &HashMap::new());
+            return images::build_model(&[], &[], None, legend, &HashMap::new(), row_height, None);
         };
+        let groups = legend.then(|| tab.image_groups());
+        let source_is_checkpoint = groups.as_ref().is_some_and(|g| g.selected.is_some());
         images::build_model(
             &tab.frames,
             &tab.excluded,
-            Some(tab.selected),
+            (!source_is_checkpoint).then_some(tab.selected),
             legend,
             &tab.meta,
+            row_height,
+            groups.as_ref(),
         )
+    }
+
+    /// The checkpoint chosen as the brush source, `None` while a frame is.
+    pub fn source_checkpoint(&self) -> Option<String> {
+        if self.mode() != ShellMode::Editor {
+            return None;
+        }
+        self.state.active()?.listed_source()
+    }
+
+    /// Acts on a click on row `index` of [`Self::images_panel`]: a frame row
+    /// selects that frame, a checkpoint row chooses it as the brush source
+    /// (the edited checkpoint stays), a group heading folds its group.
+    pub fn select_image_row(&mut self, index: usize) {
+        let Some(row) = self.images_panel().rows.into_iter().nth(index) else {
+            return;
+        };
+        match row.kind {
+            images::RowKind::Frame => {
+                if let Some(frame) = row.frame {
+                    self.select_frame(frame);
+                }
+            }
+            images::RowKind::Checkpoint => {
+                let Some(tab) = self.state.active_mut() else {
+                    return;
+                };
+                tab.source_checkpoint = row.key;
+                self.emit(ShellEvent::ImagesChanged);
+            }
+            images::RowKind::ResultsHeading => self.toggle_image_group(true),
+            images::RowKind::FramesHeading => self.toggle_image_group(false),
+            images::RowKind::Hidden => {}
+        }
+    }
+
+    /// Folds or unfolds the Results (`results`) or Frames group of the
+    /// editor list; the brush source is untouched.
+    fn toggle_image_group(&mut self, results: bool) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let flag = if results {
+            &mut tab.results_collapsed
+        } else {
+            &mut tab.frames_collapsed
+        };
+        *flag = !*flag;
+        self.set_images_scroll(self.state.images_scroll_y);
+        self.refresh_source_previews();
+        self.emit(ShellEvent::ImagesChanged);
     }
 
     /// Queues only the active virtual window. The worker owns all source I/O
     /// and admission; this controller path only replaces immutable identities.
     pub fn refresh_source_previews(&mut self) {
+        self.refresh_source_previews_in(None);
+    }
+
+    /// [`Self::refresh_source_previews`] over `panel`, the model the caller
+    /// already built; `None` builds it when the window needs it.
+    fn refresh_source_previews_in(&mut self, panel: Option<&images::ImagesModel>) {
         if self.any_job_running() {
             self.preview_requests.clear();
             self.preview_budget_bytes = 0;
@@ -6800,18 +7056,32 @@ impl AppController {
         let requests = if self.source_presentation() == SourcePresentation::List {
             Vec::new()
         } else if let Some(tab) = self.state.active() {
-            let height = self.image_row_height();
-            if self.state.images_viewport_height <= 0.0 || height <= 0.0 {
+            if self.state.images_viewport_height <= 0.0 {
                 Vec::new()
             } else {
-                let scroll_y = self.images_scroll_y();
-                let first = (scroll_y / height).floor().max(0.0) as usize;
-                let visible_end = ((scroll_y + self.state.images_viewport_height) / height)
-                    .ceil()
-                    .max(1.0) as usize;
-                let count = tab.frames.len();
-                let first = first.min(count);
-                let visible_end = visible_end.min(count);
+                let built;
+                let panel = match panel {
+                    Some(panel) => panel,
+                    None => {
+                        built = self.images_panel();
+                        &built
+                    }
+                };
+                let scroll_y = self.images_scroll_y_in(panel.content_height());
+                let viewport_end = scroll_y + self.state.images_viewport_height;
+                let count = panel.rows.len();
+                // The model rows meeting the viewport.
+                let first = panel
+                    .rows
+                    .iter()
+                    .position(|row| row.top + row.height > scroll_y)
+                    .unwrap_or(count);
+                let visible_end = panel
+                    .rows
+                    .iter()
+                    .position(|row| row.top >= viewport_end)
+                    .unwrap_or(count)
+                    .max(first);
                 let start = first.saturating_sub(2);
                 let end = visible_end.saturating_add(2).min(count);
                 // Visible rows render first, top to bottom, then the prefetch
@@ -6819,7 +7089,9 @@ impl AppController {
                 let order = [first..visible_end, start..first, visible_end..end];
                 order
                     .into_iter()
-                    .flat_map(|range| &tab.frames[range])
+                    .flat_map(|range| &panel.rows[range])
+                    .filter(|row| row.frame.is_some())
+                    .map(|row| &row.path)
                     .filter(|path| tab.meta.get(*path).is_some_and(|meta| !meta.unresolved))
                     .map(|path| PreviewRequest {
                         tab_id: tab.id,
@@ -6954,16 +7226,13 @@ impl AppController {
 
     /// Whether this model row intersects the current source-list viewport.
     /// Prefetched pixels remain Rust-side only until their row becomes visible.
-    pub fn source_preview_row_visible(&self, index: usize) -> bool {
-        let height = self.image_row_height();
-        if self.state.images_viewport_height <= 0.0 || height <= 0.0 {
+    pub fn source_preview_row_visible(&self, row: &images::ImageRow) -> bool {
+        let viewport = self.state.images_viewport_height;
+        if viewport <= 0.0 || row.height <= 0.0 {
             return false;
         }
-        let first = (self.state.images_scroll_y / height).floor().max(0.0) as usize;
-        let end = ((self.state.images_scroll_y + self.state.images_viewport_height) / height)
-            .ceil()
-            .max(1.0) as usize;
-        index >= first && index < end
+        let scroll_y = self.state.images_scroll_y;
+        row.top < scroll_y + viewport && row.top + row.height > scroll_y
     }
 
     pub fn source_preview_state(&self, path: &Path, unresolved: bool) -> &'static str {
@@ -7060,9 +7329,7 @@ impl AppController {
     }
 
     fn images_content_height(&self) -> f32 {
-        self.state
-            .active()
-            .map_or(0.0, |tab| tab.frames.len() as f32 * self.image_row_height())
+        self.images_panel().content_height()
     }
 
     fn keep_selected_image_visible(&mut self) {
@@ -7072,19 +7339,20 @@ impl AppController {
         self.keep_image_visible(selected);
     }
 
-    /// Scrolls a valid source row into the source-list viewport without
-    /// changing which source is selected.
+    /// Scrolls the row of frame `index` into the source-list viewport
+    /// without changing which source is selected; a frame hidden by a
+    /// collapsed group or past the list is left alone.
     fn keep_image_visible(&mut self, index: usize) {
-        let Some(frame_count) = self.state.active().map(|tab| tab.frames.len()) else {
-            return;
-        };
         let viewport = self.state.images_viewport_height;
-        if viewport <= 0.0 || index >= frame_count {
+        if viewport <= 0.0 {
             return;
         }
-        let row_height = self.image_row_height();
-        let top = index as f32 * row_height;
-        let bottom = top + row_height;
+        let panel = self.images_panel();
+        let Some(row) = panel.row_of_frame(index).map(|row| &panel.rows[row]) else {
+            return;
+        };
+        let top = row.top;
+        let bottom = top + row.height;
         let current = self.state.images_scroll_y;
         let target = if top < current {
             top
@@ -7140,6 +7408,7 @@ impl AppController {
             return;
         }
         tab.selected = index;
+        tab.source_checkpoint = None;
         self.emit(ShellEvent::ImagesChanged);
     }
 
@@ -8221,15 +8490,16 @@ impl AppController {
     /// Mirrors the `Images` list's own scroll offset, clamped, with no event
     /// -- the list already shows it. Returns whether the offset moved.
     pub fn images_viewport_scrolled(&mut self, offset_px: f32) -> bool {
+        let panel = self.images_panel();
         let offset = settings_panel::clamp_panel_scroll(
             offset_px,
-            self.images_content_height(),
+            panel.content_height(),
             self.state.images_viewport_height,
         );
         let moved = offset != self.state.images_scroll_y;
         self.state.images_scroll_y = offset;
         if moved {
-            self.refresh_source_previews();
+            self.refresh_source_previews_in(Some(&panel));
         }
         moved
     }
@@ -8291,9 +8561,15 @@ impl AppController {
 
     /// The `Images` list's scroll offset, clamped to the active tab's rows.
     pub fn images_scroll_y(&self) -> f32 {
+        self.images_scroll_y_in(self.images_content_height())
+    }
+
+    /// [`Self::images_scroll_y`] for a list `content_height` tall, so a caller
+    /// holding the model does not build it again.
+    pub fn images_scroll_y_in(&self, content_height: f32) -> f32 {
         settings_panel::clamp_panel_scroll(
             self.state.images_scroll_y,
-            self.images_content_height(),
+            content_height,
             self.state.images_viewport_height,
         )
     }
@@ -9754,6 +10030,7 @@ impl AppController {
             parent,
         });
         tab.free_unneeded_held();
+        tab.prune_source_checkpoint();
         // The new checkpoint's own extent may differ from what the viewport
         // was fitted to (a first fuse's crop, a re-fuse over a changed frame
         // set) -- refit on the next `fit_if_unfitted` rather than keep
@@ -10089,6 +10366,7 @@ impl AppController {
             parent: Some(parent),
         });
         tab.selected_checkpoint = Some(checkpoints::held_key(tab.held.len() - 1));
+        tab.prune_source_checkpoint();
         tab.row_planes = shown;
         self.mark_fresh_checkpoint(index);
         self.emit(ShellEvent::CheckpointsChanged);
@@ -10116,6 +10394,7 @@ impl AppController {
             Some(index) => job::ParentRef::Entry(index),
             None => job::ParentRef::Saved(id.to_string()),
         });
+        tab.prune_source_checkpoint();
         self.emit(ShellEvent::CheckpointsChanged);
         true
     }
@@ -10476,6 +10755,10 @@ impl AppController {
             {
                 tab.fresh_checkpoint = Some((saved, generation));
             }
+            tab.source_checkpoint = tab
+                .source_checkpoint
+                .as_deref()
+                .and_then(|row| tab.saved_row_key(row, &ids, keep.as_ref()));
             tab.selected_checkpoint =
                 next.or_else(|| project.history().visible().first().map(|c| c.id.clone()));
             tab.row_planes = None;

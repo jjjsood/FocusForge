@@ -2232,7 +2232,13 @@ fn sync_image_rows(
             model.push(row);
             updates += 1;
         } else if let Some(previous) = model.row_data(index)
-            && (previous.chip != row.chip
+            && (previous.kind != row.kind
+                || previous.method != row.method
+                || previous.strokes != row.strokes
+                || previous.badges.iter().ne(row.badges.iter())
+                || previous.collapsed != row.collapsed
+                || previous.height != row.height
+                || previous.chip != row.chip
                 || previous.name != row.name
                 || previous.time_text != row.time_text
                 || previous.capture_stamp != row.capture_stamp
@@ -2363,10 +2369,10 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
     let rows: Vec<GeneratedImageRow> = panel
         .rows
         .iter()
-        .enumerate()
-        .map(|(index, row)| {
-            let visible = controller.source_preview_row_visible(index);
-            let preview = visible
+        .map(|row| {
+            let frame = row.kind == crate::images::RowKind::Frame;
+            let visible = controller.source_preview_row_visible(row);
+            let preview = (visible && frame)
                 .then(|| controller.source_preview(&row.path))
                 .flatten();
             if let Some(pixels) = preview
@@ -2376,9 +2382,37 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
                     native_preview_bytes.saturating_add(pixels.rgba.len() as u64);
             }
             GeneratedImageRow {
+                kind: match row.kind {
+                    crate::images::RowKind::Frame => "frame",
+                    crate::images::RowKind::Checkpoint => "checkpoint",
+                    crate::images::RowKind::Hidden => "hidden",
+                    crate::images::RowKind::ResultsHeading
+                    | crate::images::RowKind::FramesHeading => "heading",
+                }
+                .into(),
+                method: row.method.clone().into(),
+                strokes: row.strokes.clone().into(),
+                badges: slint::ModelRc::new(slint::VecModel::from(
+                    row.badges
+                        .iter()
+                        .map(|badge| badge.as_str().into())
+                        .collect::<Vec<slint::SharedString>>(),
+                )),
+                collapsed: row.collapsed,
+                height: row.height,
                 chip: slint::Color::from_rgb_u8(row.chip[0], row.chip[1], row.chip[2]),
-                name: truncate_tail(&row.name, name_max).into(),
-                full_name: row.name.clone().into(),
+                name: if frame {
+                    truncate_tail(&row.name, name_max)
+                } else {
+                    row.name.clone()
+                }
+                .into(),
+                full_name: if frame {
+                    row.name.clone()
+                } else {
+                    String::new()
+                }
+                .into(),
                 time_text: row.trailing_text.clone().into(),
                 capture_stamp: row.capture_stamp.clone().into(),
                 excluded: row.excluded,
@@ -2388,7 +2422,7 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
                 focused: false,
                 job_disabled: false,
                 preview: source_preview_image(preview),
-                preview_state: if visible {
+                preview_state: if visible && frame {
                     controller.source_preview_state(&row.path, row.unresolved)
                 } else if row.unresolved {
                     "missing"
@@ -2404,8 +2438,8 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
     });
     controller.set_published_preview_bytes(native_preview_bytes);
     record_timing(TimingCounter::RowUpdates, updates as u64);
+    app.set_images_list_viewport_y(-controller.images_scroll_y_in(panel.content_height()));
     app.set_images_header_text(panel.header_text.into());
-    app.set_images_list_viewport_y(-controller.images_scroll_y());
     let sort = match controller.frame_sort() {
         Some(crate::images::FrameSort::Name) => "name",
         Some(crate::images::FrameSort::CaptureTime) => "capture-time",
@@ -4892,7 +4926,7 @@ pub fn install(
         let app_weak = app.as_weak();
         move |i| {
             dispatch(&controller, &canvas, &app_weak, |controller| {
-                controller.select_frame(i as usize);
+                controller.select_image_row(i as usize);
             });
         }
     });
@@ -5538,6 +5572,7 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             let mut controller = controller.lock().unwrap();
             push_checkpoint_panel(app, &mut controller);
             app.set_projects_save_enabled(controller.save_enabled());
+            push_images_panel(app, &controller);
         }
         ShellEvent::EditorChanged => {
             let controller = controller.lock().unwrap();

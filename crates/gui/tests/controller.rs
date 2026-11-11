@@ -332,6 +332,7 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("ff_image_row.slint"), "pointer-event(event)")
             | (Some("ff_image_row.slint"), "moved")
             | (Some("images_panel.slint"), "clicked")
+            | (Some("images_panel.slint"), "toggled")
             | (Some("images_panel.slint"), "key-pressed(event)")
             | (Some("appearance_tab.slint"), "changed menu-open")
             | (Some("appearance_tab.slint"), "previous-requested")
@@ -4534,7 +4535,18 @@ fn tab_switches_and_active_closes_reanchor_image_preview_windows() {
 // ---------------------------------------------------------------------
 
 use focusforge_gui::canvas::OverlayDraw;
-use focusforge_gui::images::FrameSort;
+use focusforge_gui::images::{FrameSort, ImageRow, RowKind};
+
+/// The frame rows of the editor list, in frame order: the Results and Frames
+/// headings and the checkpoint rows between them are left out.
+fn frame_rows(controller: &AppController) -> Vec<ImageRow> {
+    controller
+        .images_panel()
+        .rows
+        .into_iter()
+        .filter(|row| row.kind == RowKind::Frame)
+        .collect()
+}
 
 #[test]
 fn legend_rows_carry_the_z_map_palette() {
@@ -4545,9 +4557,10 @@ fn legend_rows_carry_the_z_map_palette() {
     c.toggle_frame_excluded(1);
     assert!(c.set_mode(ShellMode::Editor));
 
-    let panel = c.images_panel();
+    let rows = frame_rows(&c);
+    assert_eq!(rows.len(), 3);
     let table = focusforge_core::zmap::overlay_table(3, None);
-    for (i, row) in panel.rows.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate() {
         assert_eq!(
             row.chip, table[i],
             "row {i}'s colour must come from the Z-Map palette"
@@ -4560,7 +4573,7 @@ fn legend_rows_carry_the_z_map_palette() {
         assert_eq!(row.trailing_text, (i + 1).to_string());
     }
     assert!(
-        !panel.rows[1].excluded,
+        !rows[1].excluded,
         "an exclusion made after the fuse changes no Z-Map source"
     );
 }
@@ -4594,6 +4607,8 @@ fn legend_header_states() {
         None,
         true,
         &std::collections::HashMap::new(),
+        focusforge_gui::images::ROW_HEIGHT,
+        None,
     );
     assert_eq!(one.header_text, "1 frame");
 }
@@ -4604,8 +4619,11 @@ fn legend_lists_only_frames_and_rejects_a_position_past_them() {
     open_fused_tab(&mut c, "legend_no_source", 3);
     c.set_mode(ShellMode::Stacking);
     assert!(c.set_mode(ShellMode::Editor));
-    let panel = c.images_panel();
-    assert_eq!(panel.rows.len(), 3, "the legend holds one row per frame");
+    assert_eq!(
+        frame_rows(&c).len(),
+        3,
+        "the legend holds one row per frame"
+    );
 
     let before = c.brush_source();
     c.select_frame(3);
@@ -4623,20 +4641,16 @@ fn legend_current_source_row_follows_all_inputs() {
     let (mut c, _) = open_editor("legend_wash");
     let selected_row = |c: &AppController| {
         let panel = c.images_panel();
-        let selected: Vec<usize> = panel
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| row.selected)
-            .map(|(i, _)| i)
-            .collect();
+        let selected: Vec<_> = panel.rows.iter().filter(|row| row.selected).collect();
         assert_eq!(selected.len(), 1, "exactly one row carries the wash");
+        assert_eq!(selected[0].kind, RowKind::Frame);
+        let frame = selected[0].frame.expect("a frame row names its frame");
         assert_eq!(
-            Some(selected[0] as u16),
+            Some(frame as u16),
             c.brush_source(),
             "the washed row is always the brush source"
         );
-        selected[0]
+        frame
     };
 
     c.select_frame(2);
@@ -11033,4 +11047,262 @@ fn stroke_of_the_journey_shape_lands_quickly() {
     ] {
         assert!(took < BUDGET, "{name} took {took:?}, over {BUDGET:?}");
     }
+}
+
+// ---------------------------------------------------------------------
+// The brush source across the editor list's two groups.
+// ---------------------------------------------------------------------
+
+/// The kind, key and frame of every selected row of the editor list.
+fn selected_rows(controller: &AppController) -> Vec<(RowKind, Option<String>, Option<usize>)> {
+    controller
+        .images_panel()
+        .rows
+        .into_iter()
+        .filter(|row| row.selected)
+        .map(|row| (row.kind, row.key, row.frame))
+        .collect()
+}
+
+fn checkpoint_row(controller: &AppController, key: &str) -> usize {
+    controller
+        .images_panel()
+        .rows
+        .iter()
+        .position(|row| row.kind == RowKind::Checkpoint && row.key.as_deref() == Some(key))
+        .unwrap_or_else(|| panic!("no Results row for {key}"))
+}
+
+fn frame_row(controller: &AppController, frame: usize) -> usize {
+    controller
+        .images_panel()
+        .rows
+        .iter()
+        .position(|row| row.kind == RowKind::Frame && row.frame == Some(frame))
+        .unwrap_or_else(|| panic!("no row for frame {frame}"))
+}
+
+fn checkpoints_changed(events: &Arc<Mutex<Vec<ShellEvent>>>) -> bool {
+    events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| matches!(event, ShellEvent::CheckpointsChanged))
+}
+
+/// Ids of the saved project at `path`, in creation order.
+fn creation_order_ids(path: &Path) -> Vec<String> {
+    Project::open(path)
+        .expect("the saved project opens")
+        .history()
+        .all()
+        .into_iter()
+        .rev()
+        .map(|checkpoint| checkpoint.id.clone())
+        .collect()
+}
+
+#[test]
+fn brush_source_selection() {
+    let mut c = common::controller_with_frames("brush_source_selection", 3);
+    common::fuse(&mut c);
+    common::open_session(&mut c);
+    common::retouch(&mut c, &[20]);
+    let edited = common::panel_selected(&c);
+    assert_eq!(edited.as_deref(), Some("held:1"), "the retouch is edited");
+    let frame = c.brush_source().expect("a frame is the source");
+    let other = (frame as usize + 1) % 3;
+    let events = record_events(&mut c);
+
+    // A checkpoint row is the only selected row; the edited state stays.
+    c.select_image_row(checkpoint_row(&c, "held:0"));
+    assert_eq!(
+        selected_rows(&c),
+        [(RowKind::Checkpoint, Some("held:0".to_string()), None)]
+    );
+    assert_eq!(c.source_checkpoint().as_deref(), Some("held:0"));
+    assert_eq!(common::panel_selected(&c), edited);
+    assert!(c.edit_session().is_some(), "the edit session stays open");
+
+    // A frame row takes the selection back.
+    c.select_image_row(frame_row(&c, other));
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(other))]);
+    assert_eq!(c.source_checkpoint(), None);
+    assert_eq!(c.brush_source(), Some(other as u16));
+    assert_eq!(common::panel_selected(&c), edited);
+    assert!(c.edit_session().is_some());
+
+    // A heading folds its group and selects nothing.
+    c.select_image_row(0);
+    assert!(c.images_panel().rows[0].collapsed, "Results folds");
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(other))]);
+    c.select_image_row(0);
+    assert!(!c.images_panel().rows[0].collapsed);
+    let frames_at = c
+        .images_panel()
+        .rows
+        .iter()
+        .position(|row| row.kind == RowKind::FramesHeading)
+        .unwrap();
+    c.select_image_row(frames_at);
+    assert!(c.images_panel().rows[frames_at].collapsed, "Frames folds");
+    assert!(
+        selected_rows(&c).is_empty(),
+        "no frame row is left to select"
+    );
+    c.select_image_row(frames_at);
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(other))]);
+
+    assert_eq!(common::panel_selected(&c), edited);
+    assert!(
+        !checkpoints_changed(&events),
+        "a click on the list never reaches the checkpoint panel"
+    );
+}
+
+#[test]
+fn checkpoint_source_records_no_frame_stroke() {
+    let (mut c, _) = open_editor("brush_checkpoint_source");
+    set_size(&mut c, 8.0);
+    c.set_brush_softness_fraction(0.25);
+    let radius = c.brush_toolbar_view().size / 2.0;
+
+    c.select_image_row(checkpoint_row(&c, "held:0"));
+    assert_eq!(c.source_checkpoint().as_deref(), Some("held:0"));
+    drag(&mut c, &[(10.0, 10.0), (30.0, 25.0), (12.0, 40.0)]);
+    drag(&mut c, &[(20.0, 21.0)]);
+    assert!(
+        ops(&c).is_empty(),
+        "a checkpoint source records no frame stroke"
+    );
+
+    c.select_image_row(frame_row(&c, 1));
+    drag(&mut c, &[(20.0, 21.0)]);
+    assert_eq!(
+        ops(&c),
+        [Op::frame_stroke(
+            1,
+            vec![Point { x: 20, y: 21 }],
+            radius,
+            0.25
+        )],
+        "a frame source records its stroke"
+    );
+}
+
+#[test]
+fn brush_source_survives_state_changes() {
+    use common::{fuse, open_session, panel_selected, retouch, select_panel_row};
+
+    let mut c = common::controller_with_frames("brush_source_survives", 3);
+    fuse(&mut c);
+    open_session(&mut c);
+    retouch(&mut c, &[20]);
+    select_panel_row(&mut c, "held:0");
+    open_session(&mut c);
+    retouch(&mut c, &[30]);
+    assert_eq!(common::panel_ids(&c), ["held:2", "held:1", "held:0"]);
+    let chosen = |key: &str| vec![(RowKind::Checkpoint, Some(key.to_string()), None)];
+    let on_frame = |c: &AppController| {
+        let frame = c.brush_source().expect("a frame is the source");
+        vec![(RowKind::Frame, None, Some(frame as usize))]
+    };
+
+    // A click in the checkpoint panel moves the edited state, not the source.
+    c.select_image_row(checkpoint_row(&c, "held:0"));
+    select_panel_row(&mut c, "held:1");
+    open_session(&mut c);
+    assert_eq!(panel_selected(&c).as_deref(), Some("held:1"));
+    assert_eq!(selected_rows(&c), chosen("held:0"), "after a panel click");
+
+    // So does a new fuse over the same frames.
+    fuse(&mut c);
+    open_session(&mut c);
+    assert_eq!(common::panel_ids(&c).len(), 4);
+    assert_eq!(selected_rows(&c), chosen("held:0"), "after a fuse");
+
+    // And a save, which turns the held row into a saved one.
+    let path = save_to_proposed(&mut c);
+    let ids = creation_order_ids(&path);
+    assert_eq!(ids.len(), 4);
+    assert_eq!(c.source_checkpoint().as_deref(), Some(ids[0].as_str()));
+    assert_eq!(selected_rows(&c), chosen(&ids[0]), "after a save");
+
+    // A deleted source falls back to the frame.
+    assert!(c.queue_checkpoint_delete(&ids[0]));
+    assert_eq!(c.source_checkpoint(), None);
+    assert_eq!(selected_rows(&c), on_frame(&c), "after a delete");
+
+    // A new base on another alignment drops a source it cannot share a grid
+    // with.
+    c.select_image_row(checkpoint_row(&c, &ids[2]));
+    assert_eq!(selected_rows(&c), chosen(&ids[2]));
+    common::stop_editing(&mut c);
+    c.set_align_algorithm("pyramidal-ecc");
+    assert!(c.start_fuse());
+    settle_all(&mut c);
+    if c.pending_divergence().is_some() {
+        c.keep_fused().expect("the parked result is kept");
+    }
+    open_session(&mut c);
+    assert!(
+        c.images_panel()
+            .rows
+            .iter()
+            .any(|row| row.kind == RowKind::Hidden),
+        "the saved retouch is hidden"
+    );
+    assert_eq!(c.source_checkpoint(), None);
+    assert_eq!(
+        selected_rows(&c),
+        on_frame(&c),
+        "after an incompatible base"
+    );
+}
+
+#[test]
+fn held_source_selection_survives_save() {
+    use common::{fuse, open_session, panel_selected, retouch, select_panel_row};
+
+    let mut c = common::controller_with_frames("held_source_save", 3);
+    fuse(&mut c);
+    open_session(&mut c);
+    retouch(&mut c, &[20]);
+    select_panel_row(&mut c, "held:0");
+    open_session(&mut c);
+    retouch(&mut c, &[30]);
+    // The first retouch is deleted and not written, so the second one's
+    // position among the held rows is not its position among the saved ones.
+    assert!(c.queue_checkpoint_delete("held:1"));
+    select_panel_row(&mut c, "held:0");
+    open_session(&mut c);
+    c.select_image_row(checkpoint_row(&c, "held:2"));
+    assert_eq!(c.source_checkpoint().as_deref(), Some("held:2"));
+
+    let path = save_to_proposed(&mut c);
+    let ids = creation_order_ids(&path);
+    assert_eq!(ids.len(), 2, "the fuse and the kept retouch");
+    assert_eq!(c.source_checkpoint().as_deref(), Some(ids[1].as_str()));
+    assert_eq!(
+        selected_rows(&c),
+        [(RowKind::Checkpoint, Some(ids[1].clone()), None)]
+    );
+    assert_eq!(panel_selected(&c).as_deref(), Some(ids[0].as_str()));
+
+    // A held row the save does not write leaves the frame selected.
+    open_session(&mut c);
+    retouch(&mut c, &[40]);
+    select_panel_row(&mut c, &ids[0]);
+    open_session(&mut c);
+    retouch(&mut c, &[50]);
+    select_panel_row(&mut c, &ids[0]);
+    open_session(&mut c);
+    c.select_image_row(checkpoint_row(&c, "held:1"));
+    assert!(c.queue_checkpoint_delete("held:1"));
+    assert!(c.save_active_project(|_| panic!("a saved tab never asks where")));
+    let kept = creation_order_ids(&path);
+    assert_eq!(kept.len(), 3, "only the first new retouch is written");
+    assert_eq!(c.source_checkpoint(), None);
+    let frame = c.brush_source().expect("a frame is the source") as usize;
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(frame))]);
 }

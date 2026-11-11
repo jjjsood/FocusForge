@@ -7,6 +7,7 @@ import { ListView } from "std-widgets.slint";
 import { Theme } from "../../theme.slint";
 import { ShellGeometry } from "../../geometry.slint";
 import { FFImageRow } from "../../components/ff_image_row.slint";
+import { FFSectionHeading } from "../../components/ff_section_heading.slint";
 import { FFDragLandingMarker } from "../../components/ff_drag_landing_marker.slint";
 import { FFScrollbar } from "../../components/ff_scrollbar.slint";
 import { FFMenuList } from "../../components/ff_menu_list.slint";
@@ -14,8 +15,15 @@ import { FFIconButton } from "../../components/ff_icon_button.slint";
 import { FFPanePlaceholder } from "../../components/ff_pane_placeholder.slint";
 
 /// One row of the panel's flat list -- the `.slint` twin of
-/// `crate::images::ImageRow`.
+/// `crate::images::ImageRow`. `kind` is "frame", "checkpoint", "hidden" or
+/// "heading"; a heading carries its count in `time-text`.
 export struct ImageRowView {
+    kind: string,
+    method: string,
+    strokes: string,
+    badges: [string],
+    collapsed: bool,
+    height: length,
     chip: color,
     name: string,
     full-name: string,
@@ -99,10 +107,11 @@ export component FFImagesPanel inherits Rectangle {
     opacity: root.enabled ? 1.0 : 0.5;
 
     VerticalLayout {
-        spacing: Theme.space-2;
+        spacing: root.legend ? 0px : Theme.space-2;
 
         header-row := HorizontalLayout {
-            height: ShellGeometry.image-header-height;
+            visible: !root.legend;
+            height: root.legend ? 0px : ShellGeometry.image-header-height;
             alignment: space-between;
 
             Text {
@@ -140,35 +149,57 @@ export component FFImagesPanel inherits Rectangle {
             changed visible-height => { root.viewport-height-changed(self.visible-height); }
             changed viewport-y => { root.viewport-scrolled(-self.viewport-y); }
 
-            for row[i] in root.rows: FFImageRow {
-                chip: row.chip;
-                name: row.name;
-                full-name: row.full-name;
-                time-text: row.time-text;
-                capture-stamp: row.capture-stamp;
-                presentation: root.presentation;
-                tooltip-max-width: root.tooltip-max-width;
-                preview: row.preview;
-                preview-state: row.preview-state;
-                excluded: row.excluded;
-                unresolved: row.unresolved;
-                selected: row.selected;
-                hovered: row.hovered;
-                focused: row.focused || (keyboard.has-focus && row.selected);
-                job-disabled: row.job-disabled || root.job-disabled;
-                mutable: root.mutable;
-                legend: root.legend;
-                dragging: root.mutable && !root.job-disabled && i == root.dragging-row;
-                clicked => {
-                    keyboard.focus();
-                    root.frame-selected(i);
+            for row[i] in root.rows: Rectangle {
+                height: row.kind == "heading" || row.kind == "hidden" ? row.height : root.row-height;
+
+                if row.kind == "heading": FFSectionHeading {
+                    y: parent.height - ShellGeometry.group-heading-height;
+                    group: true;
+                    label: row.name;
+                    count: row.time-text;
+                    collapsed: row.collapsed;
+                    inset: Theme.space-1;
+                    inset-end: Theme.space-2;
+                    toggled => {
+                        keyboard.focus();
+                        root.frame-selected(i);
+                    }
                 }
-                exclude-toggled => { root.frame-excluded-toggled(i); }
-                remove-requested => { root.frame-remove-requested(i); }
-                drag-pointer(kind, local-y) => {
-                    root.frame-drag-pointer(i, kind, i * root.row-height + local-y);
+                if row.kind != "heading": FFImageRow {
+                    height: parent.height;
+                    kind: row.kind;
+                    method: row.method;
+                    strokes: row.strokes;
+                    badges: row.badges;
+                    chip: row.chip;
+                    name: row.name;
+                    full-name: row.full-name;
+                    time-text: row.time-text;
+                    capture-stamp: row.capture-stamp;
+                    presentation: root.presentation;
+                    tooltip-max-width: root.tooltip-max-width;
+                    preview: row.preview;
+                    preview-state: row.preview-state;
+                    excluded: row.excluded;
+                    unresolved: row.unresolved;
+                    selected: row.selected;
+                    hovered: row.hovered;
+                    focused: row.focused || (keyboard.has-focus && row.selected);
+                    job-disabled: row.job-disabled || root.job-disabled;
+                    mutable: root.mutable;
+                    legend: root.legend;
+                    dragging: root.mutable && !root.job-disabled && i == root.dragging-row;
+                    clicked => {
+                        keyboard.focus();
+                        root.frame-selected(i);
+                    }
+                    exclude-toggled => { root.frame-excluded-toggled(i); }
+                    remove-requested => { root.frame-remove-requested(i); }
+                    drag-pointer(kind, local-y) => {
+                        root.frame-drag-pointer(i, kind, i * root.row-height + local-y);
+                    }
+                    wheel(delta) => { root.frame-wheel(delta); }
                 }
-                wheel(delta) => { root.frame-wheel(delta); }
             }
         }
     }

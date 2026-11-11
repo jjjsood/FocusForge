@@ -20,8 +20,9 @@ use focusforge_gui::source_previews::{self, PreviewError};
 use focusforge_gui::{AppController, OpenAs, OpenOutcome, ShellMode};
 
 use common::{
-    controller_with_frames, controller_with_frames_from, copy_frame, element_center,
-    save_to_proposed, tree,
+    controller_with_frames, controller_with_frames_from, copy_frame, element_center, fuse,
+    open_session, panel_ids, panel_selected, retouch, save_to_proposed, select_panel_row,
+    stop_editing, tree,
 };
 
 fn write_timed(dir: &Path, name: &str, when: Option<&str>) -> PathBuf {
@@ -46,6 +47,15 @@ fn controller_with_timed_frames(name: &str, count: usize) -> AppController {
         OpenOutcome::Opened(_)
     ));
     controller
+}
+
+/// Whether the row of frame `frame` meets the list viewport.
+fn frame_row_visible(controller: &AppController, frame: usize) -> bool {
+    let panel = controller.images_panel();
+    let row = panel
+        .row_of_frame(frame)
+        .expect("the frame has a row in the list");
+    controller.source_preview_row_visible(&panel.rows[row])
 }
 
 fn controller_with_list_frames(name: &str, count: usize) -> AppController {
@@ -93,12 +103,12 @@ fn image_list_queues_only_the_visible_window_plus_two_rows() {
     controller.set_images_viewport_height(120.0);
     let snapshot = controller.source_preview_snapshot();
     assert_eq!(snapshot.scheduled, 3);
-    assert!(controller.source_preview_row_visible(0));
-    assert!(!controller.source_preview_row_visible(1));
+    assert!(frame_row_visible(&controller, 0));
+    assert!(!frame_row_visible(&controller, 1));
     controller.images_viewport_scrolled(360.0);
     assert_eq!(controller.source_preview_snapshot().scheduled, 5);
-    assert!(controller.source_preview_row_visible(3));
-    assert!(!controller.source_preview_row_visible(4));
+    assert!(frame_row_visible(&controller, 3));
+    assert!(!frame_row_visible(&controller, 4));
 }
 
 #[test]
@@ -115,9 +125,9 @@ fn image_list_keeps_a_fractional_thousand_row_viewport_to_the_two_row_margin() {
         4,
         "the two visible top rows retain two prefetched rows below"
     );
-    assert!(controller.source_preview_row_visible(0));
-    assert!(controller.source_preview_row_visible(1));
-    assert!(!controller.source_preview_row_visible(2));
+    assert!(frame_row_visible(&controller, 0));
+    assert!(frame_row_visible(&controller, 1));
+    assert!(!frame_row_visible(&controller, 2));
 
     controller.images_viewport_scrolled(500.0 * 120.0 + 0.25);
     assert_eq!(
@@ -125,10 +135,10 @@ fn image_list_keeps_a_fractional_thousand_row_viewport_to_the_two_row_margin() {
         6,
         "an interior fractional viewport schedules its two visible rows plus two on each side"
     );
-    assert!(controller.source_preview_row_visible(500));
-    assert!(controller.source_preview_row_visible(501));
-    assert!(!controller.source_preview_row_visible(499));
-    assert!(!controller.source_preview_row_visible(502));
+    assert!(frame_row_visible(&controller, 500));
+    assert!(frame_row_visible(&controller, 501));
+    assert!(!frame_row_visible(&controller, 499));
+    assert!(!frame_row_visible(&controller, 502));
 }
 
 #[test]
@@ -175,7 +185,7 @@ fn every_directed_source_presentation_transition_preserves_identity_and_tab_stat
             .position(|row| row.path == selected)
             .expect("selected identity remains listed");
         assert!(
-            controller.source_preview_row_visible(selected_index),
+            frame_row_visible(&controller, selected_index),
             "{from:?} -> {to:?} keeps the selected source visible"
         );
         // Scrolling past the end lands on the last offset the row height allows:
@@ -536,14 +546,23 @@ fn rows_retain_the_recorded_capture_stamp_for_image_metadata() {
 
 #[test]
 fn rows_carry_no_index() {
-    // `ImageRow` names every field it has -- there is no index field to
-    // destructure past.
+    // `ImageRow` names every field it has; a frame row's position is the
+    // explicit `frame`, never the row's place in the list.
     let controller = controller_with_timed_frames("rows_carry_no_index", 3);
     let panel = controller.images_panel();
     for row in &panel.rows {
-        // Exhaustive: if `ImageRow` ever grows an index field, this
+        // Exhaustive: if `ImageRow` ever grows another field, this
         // destructure stops compiling.
         let ImageRow {
+            kind: _,
+            frame: _,
+            key: _,
+            method: _,
+            strokes: _,
+            badges: _,
+            collapsed: _,
+            top: _,
+            height: _,
             path: _,
             chip: _,
             name: _,
@@ -698,7 +717,7 @@ fn confirming_a_reorder_keeps_the_selected_source_visible() {
     );
     assert_eq!(controller.frame_pane_label(), "00.tif");
     assert!(
-        controller.source_preview_row_visible(2),
+        frame_row_visible(&controller, 2),
         "confirmation keeps the moved selected source visible"
     );
     settle_to_stacking(&mut controller, Duration::from_secs(120));
@@ -1909,6 +1928,12 @@ fn row_hover_survives_image_name_timestamp_and_action_surfaces_in_every_presenta
     app.set_list_preview_drag_offset(0.0);
 
     let row = focusforge_gui::ImageRowView {
+        kind: "frame".into(),
+        method: "".into(),
+        strokes: "".into(),
+        badges: Default::default(),
+        collapsed: false,
+        height: 0.0,
         chip: slint::Color::from_rgb_u8(220, 201, 55),
         name: "IMG_9819-long-filename.tif".into(),
         time_text: "16:42:09".into(),
@@ -2190,21 +2215,21 @@ fn keyboard_selection_skips_missing_reanchors_at_edges_and_stays_read_only_in_ed
         "keyboard selection skips an unresolved source"
     );
     assert!(
-        controller.source_preview_row_visible(2),
+        frame_row_visible(&controller, 2),
         "the resolved target is visible after the keyboard step"
     );
 
     controller.images_viewport_scrolled(0.0);
     controller.select_adjacent_resolved_frame(1);
     assert!(
-        controller.source_preview_row_visible(2),
+        frame_row_visible(&controller, 2),
         "a last-row key press reanchors a manually displaced viewport"
     );
     controller.select_frame(0);
     controller.images_viewport_scrolled(f32::MAX);
     controller.select_adjacent_resolved_frame(-1);
     assert!(
-        controller.source_preview_row_visible(0),
+        frame_row_visible(&controller, 0),
         "a first-row key press reanchors a manually displaced viewport"
     );
 
@@ -2219,7 +2244,7 @@ fn keyboard_selection_skips_missing_reanchors_at_edges_and_stays_read_only_in_ed
     assert_eq!(editor.mode(), ShellMode::Editor);
     assert_eq!(editor.source_presentation(), SourcePresentation::ImageList);
     assert!(
-        editor.source_preview_row_visible(1),
+        frame_row_visible(&editor, 1),
         "the read-only editor list follows keyboard selection in the Appearance presentation"
     );
 }
@@ -2245,11 +2270,11 @@ fn editor_source_list_follows_appearance_presentation() {
         editor.select_adjacent_resolved_frame(1);
         editor.select_adjacent_resolved_frame(1);
         assert!(
-            editor.source_preview_row_visible(2),
+            frame_row_visible(&editor, 2),
             "{presentation:?}: keyboard selection keeps the third row visible"
         );
         assert!(
-            !editor.source_preview_row_visible(0),
+            !frame_row_visible(&editor, 0),
             "{presentation:?}: the first row has scrolled out of the viewport"
         );
         assert!(
@@ -2261,7 +2286,9 @@ fn editor_source_list_follows_appearance_presentation() {
             queues_previews,
             "{presentation:?}: preview requests"
         );
-        for (index, row) in editor.images_panel().rows.iter().enumerate() {
+        let panel = editor.images_panel();
+        let frame_rows = panel.rows.iter().filter(|row| row.kind == RowKind::Frame);
+        for (index, row) in frame_rows.enumerate() {
             assert_eq!(
                 row.trailing_text,
                 (index + 1).to_string(),
@@ -2342,7 +2369,15 @@ fn editor_legend_rows_stay_read_only_in_every_presentation() {
         let rows = ElementQuery::from_root(&app)
             .match_id("FFImageRow::area")
             .find_all();
-        let position = element_center(&rows[1]);
+        let results = controller
+            .lock()
+            .unwrap()
+            .images_panel()
+            .rows
+            .iter()
+            .filter(|row| row.kind == RowKind::Checkpoint)
+            .count();
+        let position = element_center(&rows[results + 1]);
         app.window()
             .dispatch_event(WindowEvent::PointerMoved { position });
         i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
@@ -2400,7 +2435,7 @@ fn editor_legend_rows_stay_read_only_in_every_presentation() {
         settle();
         assert_eq!(
             selected_row(),
-            Some(1),
+            controller.lock().unwrap().images_panel().row_of_frame(1),
             "{presentation:?}: a click selects the frame"
         );
     }
@@ -2533,6 +2568,12 @@ fn elided_filename_tooltip_uses_available_window_width_before_wrapping() {
     app.set_list_preview_header_text("1 image".into());
     app.set_list_preview_rows(
         std::rc::Rc::new(slint::VecModel::from(vec![focusforge_gui::ImageRowView {
+            kind: "frame".into(),
+            method: "".into(),
+            strokes: "".into(),
+            badges: Default::default(),
+            collapsed: false,
+            height: 0.0,
             chip: slint::Color::from_rgb_u8(220, 201, 55),
             name: "IMG_9819_composite-exposure-calibrated-master-source-frame.tif".into(),
             time_text: "16:42:09".into(),
@@ -2597,6 +2638,12 @@ fn constrained_filename_tooltip_balances_wrapped_lines_within_the_viewport() {
     app.set_list_preview_header_text("1 image".into());
     app.set_list_preview_rows(
         std::rc::Rc::new(slint::VecModel::from(vec![focusforge_gui::ImageRowView {
+            kind: "frame".into(),
+            method: "".into(),
+            strokes: "".into(),
+            badges: Default::default(),
+            collapsed: false,
+            height: 0.0,
             chip: slint::Color::from_rgb_u8(220, 201, 55),
             name: "IMG_9819_calibrated-composite-exposure-source-frame-with-reference-metadata.tif"
                 .into(),
@@ -4483,6 +4530,12 @@ fn source_row_actions_and_panel_header_buttons_carry_their_names() {
         app.set_list_preview_presentation(presentation.into());
         for (excluded, exclude_label) in [(false, "Exclude"), (true, "Include")] {
             let row = focusforge_gui::ImageRowView {
+                kind: "frame".into(),
+                method: "".into(),
+                strokes: "".into(),
+                badges: Default::default(),
+                collapsed: false,
+                height: 0.0,
                 chip: slint::Color::from_rgb_u8(220, 201, 55),
                 name: "IMG_9819.tif".into(),
                 time_text: "16:42:09".into(),
@@ -4512,4 +4565,556 @@ fn source_row_actions_and_panel_header_buttons_carry_their_names() {
     }
     assert_eq!(named("FFImagesPanel::add-button"), "Add images");
     assert_eq!(named("FFImagesPanel::sort-button"), "Sort");
+}
+
+// ---------------------------------------------------------------------
+// The editor list's Results and Frames groups.
+// ---------------------------------------------------------------------
+
+use focusforge_core::project::Project;
+use focusforge_core::project::container::{ContainerWriter, Index};
+use focusforge_core::zmap::checkpoint_color;
+use focusforge_gui::images::RowKind;
+
+fn method_label(id: &str) -> String {
+    focusforge_core::registry::find_stack(id)
+        .map(|algorithm| algorithm.display_name().to_string())
+        .unwrap_or_else(|_| id.to_string())
+}
+
+fn results_of(controller: &AppController) -> Vec<ImageRow> {
+    controller
+        .images_panel()
+        .rows
+        .into_iter()
+        .filter(|row| row.kind == RowKind::Checkpoint)
+        .collect()
+}
+
+fn result<'a>(rows: &'a [ImageRow], key: &str) -> &'a ImageRow {
+    rows.iter()
+        .find(|row| row.key.as_deref() == Some(key))
+        .unwrap_or_else(|| panic!("no Results row for {key}"))
+}
+
+fn badges_of(rows: &[ImageRow], key: &str) -> Vec<String> {
+    result(rows, key).badges.clone()
+}
+
+/// Three `mantis-64` frames fused twice by different methods and saved, then
+/// two retouches saved on top (one stroke, then three), the second row
+/// labelled and the first fuse's neighbour stripped of its colour number.
+/// Returns the edited project and its ids in creation order.
+fn saved_chain(name: &str) -> (PathBuf, Vec<String>) {
+    let mut controller = common::controller_with_frames(name, 3);
+    fuse(&mut controller);
+    let (path, a, b) = common::save_two_fuses(&mut controller);
+    open_session(&mut controller);
+    retouch(&mut controller, &[14]);
+    retouch(&mut controller, &[24, 34, 44]);
+    assert!(controller.save_active_project(|_| panic!("a saved tab never asks where")));
+
+    let ids: Vec<String> = Project::open(&path)
+        .expect("the saved project opens")
+        .history()
+        .all()
+        .into_iter()
+        .rev()
+        .map(|checkpoint| checkpoint.id.clone())
+        .collect();
+    assert_eq!(ids.len(), 4, "two fuses and two retouches");
+    assert_eq!((&ids[0], &ids[1]), (&a, &b));
+
+    let edited = path.with_file_name("edited.ffp");
+    let index = Index::read(&path).unwrap();
+    let mut writer = ContainerWriter::create(&edited).unwrap();
+    for entry in index.names() {
+        let mut bytes = index.read_entry(&path, entry).unwrap();
+        if entry.starts_with("checkpoints/") {
+            let mut record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let id = record["id"].as_str().unwrap().to_string();
+            if id == ids[1] {
+                record.as_object_mut().unwrap().remove("colour_index");
+            }
+            if id == ids[2] {
+                record["label"] = "Halo fix".into();
+            }
+            bytes = serde_json::to_vec(&record).unwrap();
+        }
+        writer.put_bytes(entry, &bytes).unwrap();
+    }
+    writer.finish().unwrap();
+    (edited, ids)
+}
+
+/// [`saved_chain`] reopened in a fresh controller, in the editor on its head.
+fn reopened_chain(name: &str) -> (AppController, PathBuf, Vec<String>) {
+    let (path, ids) = saved_chain(name);
+    let mut controller = common::scratch_controller(&format!("{name}_reopened"));
+    assert!(matches!(
+        common::open_and_settle(&mut controller, std::slice::from_ref(&path)),
+        OpenOutcome::Opened(_)
+    ));
+    open_session(&mut controller);
+    (controller, path, ids)
+}
+
+/// Three frames fused in memory with the last one excluded the second time
+/// (`held:0` over three frames, `held:1` over two) and, with `aligned`, a
+/// third time by another aligner (`held:2`). The editor is on `held:1`.
+fn grids_apart(name: &str, aligned: bool) -> AppController {
+    let mut controller = common::controller_with_frames(name, 3);
+    fuse(&mut controller);
+    stop_editing(&mut controller);
+    controller.toggle_frame_excluded(2);
+    fuse(&mut controller);
+    stop_editing(&mut controller);
+    if aligned {
+        controller.set_align_algorithm("pyramidal-ecc");
+        assert!(controller.start_fuse());
+        common::settle_all(&mut controller);
+        if controller.pending_divergence().is_some() {
+            controller.keep_fused().expect("the parked result is kept");
+        }
+        stop_editing(&mut controller);
+    }
+    assert_eq!(panel_ids(&controller).len(), 2 + usize::from(aligned));
+    select_panel_row(&mut controller, "held:1");
+    assert!(controller.set_mode(ShellMode::Editor));
+    controller
+}
+
+fn frame_count(controller: &AppController) -> usize {
+    controller
+        .images_panel()
+        .rows
+        .iter()
+        .filter(|row| row.kind == RowKind::Frame)
+        .count()
+}
+
+#[test]
+fn results_group() {
+    let mut controller = common::controller_with_frames("results_group", 3);
+    fuse(&mut controller);
+    common::save_two_fuses(&mut controller);
+    open_session(&mut controller);
+    retouch(&mut controller, &[20]);
+    fuse(&mut controller);
+
+    let ids = panel_ids(&controller);
+    assert_eq!(ids.len(), 4, "two saved fuses, a held retouch, a held fuse");
+    assert!(ids.iter().any(|id| id == "held:0") && ids.iter().any(|id| id == "held:1"));
+
+    let panel = controller.images_panel();
+    let kinds: Vec<_> = panel.rows.iter().map(|row| row.kind).collect();
+    let mut expected = vec![RowKind::ResultsHeading];
+    expected.extend([RowKind::Checkpoint; 4]);
+    expected.push(RowKind::FramesHeading);
+    expected.extend([RowKind::Frame; 3]);
+    assert_eq!(kinds, expected, "no hidden line while every grid matches");
+    assert_eq!(panel.rows[0].name, "Results");
+    assert_eq!(
+        panel.rows[0].trailing_text, "4",
+        "the heading counts the rows"
+    );
+    let keys: Vec<_> = panel.rows[1..5]
+        .iter()
+        .map(|row| row.key.clone().unwrap())
+        .collect();
+    assert_eq!(keys, ids, "checkpoint-panel order");
+    assert_eq!(panel.rows[5].name, "3 frames");
+    for (i, row) in panel.rows[6..].iter().enumerate() {
+        assert_eq!(row.frame, Some(i), "a frame row names its frame");
+        assert!(row.key.is_none());
+    }
+
+    // A row waiting to be deleted is left out and uncounted.
+    assert!(controller.queue_checkpoint_delete("held:0"));
+    let panel = controller.images_panel();
+    assert_eq!(panel.rows[0].trailing_text, "3");
+    let keys: Vec<_> = results_of(&controller)
+        .into_iter()
+        .map(|row| row.key.unwrap())
+        .collect();
+    assert_eq!(keys, panel_ids(&controller));
+    assert!(!keys.iter().any(|key| key == "held:0"));
+
+    // Stacking lists the frames alone.
+    stop_editing(&mut controller);
+    let panel = controller.images_panel();
+    assert_eq!(panel.rows.len(), 3);
+    for (i, row) in panel.rows.iter().enumerate() {
+        assert_eq!(
+            (row.kind, row.frame, row.key.as_ref()),
+            (RowKind::Frame, Some(i), None)
+        );
+        assert_eq!(row.top, i as f32 * row.height);
+        assert!(row.badges.is_empty());
+    }
+    assert_eq!(panel.header_text, "3 frames \u{b7} 0 excluded");
+}
+
+#[test]
+fn checkpoint_row_text() {
+    let (mut controller, path, ids) = reopened_chain("checkpoint_row_text");
+    retouch(&mut controller, &[20]);
+
+    let project = Project::open(&path).unwrap();
+    let history = project.history();
+    let [a, b, r1, r3] = [0, 1, 2, 3].map(|i| history.get(&ids[i]).unwrap());
+    assert_eq!(b.colour_index, None, "the stripped record stores no number");
+    assert!(a.colour_index.is_some() && r1.colour_index.is_some());
+    assert_eq!(r1.ops.len(), 1);
+    assert_eq!(r3.ops.len(), 3);
+    assert_ne!(method_label(&a.algorithm), method_label(&b.algorithm));
+
+    let rows = results_of(&controller);
+    assert_eq!(rows.len(), 5, "four saved rows and the held retouch");
+    let held_colour = history.next_colour_index();
+    for (key, colour, method, strokes, name, time) in [
+        (
+            "held:0".to_string(),
+            held_colour,
+            &b.algorithm,
+            "\u{b7} 1 stroke",
+            "",
+            None,
+        ),
+        (
+            ids[3].clone(),
+            history.colour_index(&ids[3]).unwrap(),
+            &r3.algorithm,
+            "\u{b7} 3 strokes",
+            "",
+            Some(r3.created_at),
+        ),
+        (
+            ids[2].clone(),
+            history.colour_index(&ids[2]).unwrap(),
+            &r1.algorithm,
+            "\u{b7} 1 stroke",
+            "Halo fix",
+            Some(r1.created_at),
+        ),
+        // The derived number follows creation order.
+        (ids[1].clone(), 1, &b.algorithm, "", "", Some(b.created_at)),
+        (
+            ids[0].clone(),
+            history.colour_index(&ids[0]).unwrap(),
+            &a.algorithm,
+            "",
+            "",
+            Some(a.created_at),
+        ),
+    ] {
+        let row = result(&rows, &key);
+        assert_eq!(row.chip, checkpoint_color(colour, 3), "{key}: colour");
+        assert_eq!(row.method, method_label(method), "{key}: method");
+        assert_eq!(row.strokes, strokes, "{key}: strokes");
+        assert_eq!(row.name, name, "{key}: name");
+        assert_eq!(row.frame, None, "{key}: no position");
+        if let Some(created) = time {
+            assert_eq!(
+                row.trailing_text,
+                focusforge_gui::checkpoints::local_hhmmss(created),
+                "{key}: time"
+            );
+        }
+        assert_eq!(row.trailing_text.len(), 8, "{key}: HH:MM:SS");
+        for text in [&row.method, &row.name, &row.strokes] {
+            assert!(!text.contains("Retouch"), "{key}: {text}");
+        }
+    }
+    assert_eq!(result(&rows, &ids[2]).method, result(&rows, &ids[1]).method);
+}
+
+#[test]
+fn checkpoint_badges() {
+    let (mut controller, _, ids) = reopened_chain("checkpoint_badges");
+    let none: [&str; 0] = [];
+
+    // A saved retouched base marks the fuse it grew from.
+    let rows = results_of(&controller);
+    assert_eq!(badges_of(&rows, &ids[3]), ["BASE"]);
+    assert_eq!(badges_of(&rows, &ids[1]), ["FUSION"]);
+    assert_eq!(badges_of(&rows, &ids[2]), none);
+    assert_eq!(badges_of(&rows, &ids[0]), none);
+
+    // A fused, unretouched base carries BASE alone.
+    for fuse_id in [&ids[1], &ids[0]] {
+        stop_editing(&mut controller);
+        select_panel_row(&mut controller, fuse_id);
+        open_session(&mut controller);
+        let rows = results_of(&controller);
+        for id in &ids {
+            let expected: &[&str] = if id == fuse_id { &["BASE"] } else { &[] };
+            assert_eq!(badges_of(&rows, id), expected, "base {fuse_id}, row {id}");
+        }
+    }
+
+    // A held retouch on an older saved fuse starts a branch.
+    open_session(&mut controller);
+    retouch(&mut controller, &[30]);
+    let rows = results_of(&controller);
+    assert_eq!(badges_of(&rows, "held:0"), ["BASE", "UNSAVED"]);
+    assert_eq!(badges_of(&rows, &ids[0]), ["FUSION"]);
+    for id in &ids[1..] {
+        assert_eq!(badges_of(&rows, id), none, "row {id}");
+    }
+
+    // A held retouch on a held fuse.
+    let mut unsaved = common::controller_with_frames("checkpoint_badges_held", 3);
+    fuse(&mut unsaved);
+    open_session(&mut unsaved);
+    retouch(&mut unsaved, &[20]);
+    let rows = results_of(&unsaved);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(badges_of(&rows, "held:1"), ["BASE", "UNSAVED"]);
+    assert_eq!(badges_of(&rows, "held:0"), ["FUSION", "UNSAVED"]);
+}
+
+#[test]
+fn hidden_checkpoints_line() {
+    // Two reasons at once, in `GridMismatch` order; the base alone is listed.
+    let controller = grids_apart("hidden_checkpoints_line", true);
+    let panel = controller.images_panel();
+    assert_eq!(
+        results_of(&controller)
+            .iter()
+            .map(|row| row.key.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("held:1")]
+    );
+    let hidden: Vec<_> = panel
+        .rows
+        .iter()
+        .filter(|row| row.kind == RowKind::Hidden)
+        .collect();
+    assert_eq!(hidden.len(), 1, "one combined line");
+    assert_eq!(
+        hidden[0].name,
+        "2 hidden: 1 different source frames, 1 different alignment"
+    );
+    assert_eq!(
+        hidden[0].height, 44.0,
+        "several reasons wrap onto two lines"
+    );
+    assert_eq!(panel.rows[0].trailing_text, "1");
+
+    // One reason names itself without a count.
+    let controller = grids_apart("hidden_checkpoints_line_one", false);
+    let panel = controller.images_panel();
+    let hidden = panel
+        .rows
+        .iter()
+        .find(|row| row.kind == RowKind::Hidden)
+        .expect("the three-frame fuse is hidden");
+    assert_eq!(hidden.name, "1 hidden: different source frames");
+    assert_eq!(hidden.height, 26.0);
+    let keys: Vec<_> = results_of(&controller)
+        .into_iter()
+        .map(|row| row.key.unwrap())
+        .collect();
+    assert_eq!(keys, ["held:1"]);
+}
+
+#[test]
+fn results_group_collapse() {
+    let mut controller = grids_apart("results_group_collapse", true);
+    let present = |controller: &mut AppController, presentation| {
+        controller.install_appearance(AppearanceSettings {
+            presentation,
+            ..AppearanceSettings::default()
+        });
+    };
+    present(&mut controller, SourcePresentation::ImageList);
+    let open = controller.images_panel();
+    let checkpoint_at = open
+        .rows
+        .iter()
+        .position(|row| row.kind == RowKind::Checkpoint)
+        .unwrap();
+    controller.select_image_row(checkpoint_at);
+    assert_eq!(controller.source_checkpoint().as_deref(), Some("held:1"));
+    let edited = panel_selected(&controller);
+    let before = controller.images_panel();
+    assert!(before.rows[checkpoint_at].selected);
+    assert!(
+        before
+            .rows
+            .iter()
+            .all(|row| row.kind != RowKind::Frame || !row.selected)
+    );
+    assert!(before.rows.iter().any(|row| row.kind == RowKind::Hidden));
+
+    controller.select_image_row(0);
+    let kinds = |controller: &AppController| {
+        controller
+            .images_panel()
+            .rows
+            .iter()
+            .map(|row| row.kind)
+            .collect::<Vec<_>>()
+    };
+    let mut collapsed = vec![RowKind::ResultsHeading, RowKind::FramesHeading];
+    collapsed.extend(vec![RowKind::Frame; frame_count(&controller)]);
+    assert_eq!(kinds(&controller), collapsed, "no rows, no hidden line");
+    let panel = controller.images_panel();
+    assert!(panel.rows[0].collapsed);
+    assert_eq!(panel.rows[0].name, "Results");
+    assert_eq!(
+        panel.rows[0].trailing_text, "1",
+        "the heading keeps its count"
+    );
+    assert_eq!(controller.source_checkpoint().as_deref(), Some("held:1"));
+    assert!(
+        panel.rows.iter().all(|row| !row.selected),
+        "no frame takes over"
+    );
+    assert_eq!(panel_selected(&controller), edited);
+    assert_eq!(controller.images_panel(), panel, "a rebuild keeps the fold");
+
+    for presentation in [
+        SourcePresentation::List,
+        SourcePresentation::Large,
+        SourcePresentation::ImageList,
+    ] {
+        present(&mut controller, presentation);
+        assert_eq!(kinds(&controller), collapsed, "{presentation:?}");
+        assert_eq!(controller.source_checkpoint().as_deref(), Some("held:1"));
+    }
+
+    // Unfolding brings the selected row back.
+    controller.select_image_row(0);
+    assert_eq!(controller.images_panel(), before);
+
+    // Folding Frames hides only the frame rows.
+    let frames_at = before
+        .rows
+        .iter()
+        .position(|row| row.kind == RowKind::FramesHeading)
+        .unwrap();
+    controller.select_image_row(frames_at);
+    let panel = controller.images_panel();
+    assert_eq!(panel.rows.len(), frames_at + 1);
+    assert!(panel.rows[frames_at].collapsed);
+    assert_eq!(controller.source_checkpoint().as_deref(), Some("held:1"));
+}
+
+#[test]
+fn results_group_geometry() {
+    const VIEWPORT: f32 = 150.0;
+    let mut controller = grids_apart("results_group_geometry", true);
+    controller.set_images_viewport_height(VIEWPORT);
+
+    // The model rows the window reaches: those meeting the viewport and two
+    // more on each side.
+    let requests = |heights: &[(f32, bool)], scroll: f32| {
+        let mut top = 0.0;
+        let tops: Vec<f32> = heights
+            .iter()
+            .map(|(height, _)| {
+                top += height;
+                top - height
+            })
+            .collect();
+        let count = heights.len();
+        let first = (0..count)
+            .find(|&i| tops[i] + heights[i].0 > scroll)
+            .unwrap_or(count);
+        let end = (0..count)
+            .find(|&i| tops[i] >= scroll + VIEWPORT)
+            .unwrap_or(count)
+            .max(first);
+        (first.saturating_sub(2)..(end + 2).min(count))
+            .filter(|&i| heights[i].1)
+            .count()
+    };
+
+    for (presentation, row) in [
+        (SourcePresentation::ImageList, 120.0),
+        (SourcePresentation::Large, 200.0),
+    ] {
+        for collapsed in [false, true] {
+            controller.install_appearance(AppearanceSettings {
+                presentation,
+                ..AppearanceSettings::default()
+            });
+            let folded = controller
+                .images_panel()
+                .rows
+                .first()
+                .is_some_and(|row| row.collapsed);
+            if folded != collapsed {
+                controller.select_image_row(0);
+            }
+            let label = format!("{presentation:?}, collapsed {collapsed}");
+
+            // 26 px heading, 44 px hidden line for two reasons, a 12 px gap
+            // above the 26 px Frames heading.
+            let mut heights = vec![(26.0, false)];
+            if collapsed {
+                heights.push((38.0, false));
+            } else {
+                heights.extend([(row, false), (44.0, false), (38.0, false)]);
+            }
+            heights.extend(vec![(row, true); frame_count(&controller)]);
+            let panel = controller.images_panel();
+            assert_eq!(panel.rows.len(), heights.len(), "{label}");
+            let mut top = 0.0;
+            for (model, (height, _)) in panel.rows.iter().zip(&heights) {
+                assert_eq!((model.top, model.height), (top, *height), "{label}");
+                top += height;
+            }
+            assert_eq!(panel.content_height(), top, "{label}");
+
+            // The scrollable extent is that content height.
+            controller.images_viewport_scrolled(1.0e6);
+            assert_eq!(controller.images_scroll_y(), top - VIEWPORT, "{label}");
+
+            // Stepping to the second frame scrolls its row, below the group,
+            // into view.
+            controller.images_viewport_scrolled(0.0);
+            controller.select_frame(0);
+            controller.select_adjacent_resolved_frame(1);
+            let second = controller.images_panel().rows[panel.row_of_frame(1).unwrap()].clone();
+            assert_eq!(
+                controller.images_scroll_y(),
+                second.top + second.height - VIEWPORT,
+                "{label}: keep visible"
+            );
+
+            let results_end = if collapsed { 64.0 } else { 26.0 + row + 44.0 };
+            for scroll in [40.0, results_end, top - VIEWPORT] {
+                controller.images_viewport_scrolled(scroll);
+                assert_eq!(
+                    controller.source_preview_snapshot().scheduled,
+                    requests(&heights, scroll),
+                    "{label}: requests at {scroll}"
+                );
+                if !collapsed && scroll == 40.0 {
+                    // Still inside the Results group, no frame row is near
+                    // in Large; one frame row is in Image list.
+                    let near = controller.source_preview_snapshot().scheduled;
+                    assert_eq!(near, if row == 120.0 { 1 } else { 0 }, "{label}");
+                }
+                for model in &panel.rows {
+                    assert_eq!(
+                        controller.source_preview_row_visible(model),
+                        model.top < scroll + VIEWPORT && model.top + model.height > scroll,
+                        "{label}: row at {} when scrolled to {scroll}",
+                        model.top
+                    );
+                }
+            }
+        }
+    }
+
+    controller.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::List,
+        ..AppearanceSettings::default()
+    });
+    controller.images_viewport_scrolled(0.0);
+    assert_eq!(controller.source_preview_snapshot().scheduled, 0, "List");
 }

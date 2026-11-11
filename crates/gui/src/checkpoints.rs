@@ -196,7 +196,11 @@ impl Row<'_> {
 
 /// The algorithm `held[index]` carries once written: a fused entry's own, an
 /// op-bearing one's parent chain's (the checkpoint it is replayed onto). Empty when the chain does not resolve.
-fn held_algorithm(index: usize, held: &[InMemoryCheckpoint], saved: &[&Checkpoint]) -> String {
+pub(crate) fn held_algorithm(
+    index: usize,
+    held: &[InMemoryCheckpoint],
+    saved: &[&Checkpoint],
+) -> String {
     let Some(entry) = held.get(index) else {
         return String::new();
     };

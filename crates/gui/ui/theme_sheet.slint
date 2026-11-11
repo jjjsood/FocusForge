@@ -31,6 +31,7 @@ import { FFHeatLegend } from "components/ff_heat_legend.slint";
 import { FFSpinner } from "components/ff_spinner.slint";
 import { FFLoadingPanel } from "components/ff_loading_panel.slint";
 import { FFImageRow } from "components/ff_image_row.slint";
+import { FFBadge } from "components/ff_badge.slint";
 import { FFTooltip } from "components/ff_tooltip.slint";
 import { FFDragLandingMarker } from "components/ff_drag_landing_marker.slint";
 import { FFCheckpointRow } from "components/ff_checkpoint_row.slint";
@@ -222,6 +223,76 @@ component StagePane inherits Rectangle {
     }
 }
 
+// One specimen row of a results column: a group heading, a vertical gap or an
+// `FFImageRow` of kind "frame", "checkpoint" or "hidden".
+struct ResultsRow {
+    kind: string,
+    name: string,
+    method: string,
+    strokes: string,
+    badges: [string],
+    time-text: string,
+    count: string,
+    chip: color,
+    preview: image,
+    preview-state: string,
+    presentation: string,
+    height: length,
+    selected: bool,
+    hovered: bool,
+    collapsed: bool,
+}
+
+struct ResultsColumn {
+    presentation: string,
+    rows: [ResultsRow],
+}
+
+// A column of results specimens. Every row of every column is one repeated
+// body, so the row component is generated once however many specimens a
+// sheet shows.
+component ResultsColumnView inherits VerticalLayout {
+    in property <ResultsColumn> column;
+    property <length> row-height: root.column.presentation == "image-list" ? ShellGeometry.image-list-row-height
+        : root.column.presentation == "large" ? ShellGeometry.large-preview-row-height
+        : ShellGeometry.image-row-height;
+
+    alignment: start;
+
+    for row in root.column.rows: Rectangle {
+        height: row.height > 0px ? row.height
+            : row.kind == "heading" ? ShellGeometry.group-heading-height
+            : row.kind == "hidden" ? ShellGeometry.hidden-line-height
+            : root.row-height;
+
+        if row.kind == "heading": FFSectionHeading {
+            group: true;
+            label: row.name;
+            count: row.count;
+            collapsed: row.collapsed;
+            inset: Theme.space-1;
+            inset-end: Theme.space-2;
+        }
+        if row.kind != "heading" && row.kind != "gap": FFImageRow {
+            height: parent.height;
+            kind: row.kind;
+            presentation: row.presentation != "" ? row.presentation : root.column.presentation;
+            chip: row.chip;
+            name: row.name;
+            method: row.method;
+            strokes: row.strokes;
+            badges: row.badges;
+            time-text: row.time-text;
+            preview: row.preview;
+            preview-state: row.preview-state;
+            selected: row.selected;
+            hovered: row.hovered;
+            legend: row.kind == "frame";
+            mutable: false;
+        }
+    }
+}
+
 export component ThemeSheet inherits Window {
     in property <image> stage-fusing;
     in property <image> stage-fusing-bare;
@@ -232,6 +303,84 @@ export component ThemeSheet inherits Window {
     in-out property <bool> demo-shown: true;
     in-out property <bool> demo-loop: true;
     in-out property <int> guard-clicks: 0;
+    // Checkpoint colours c0 to c3 for a 61-frame stack.
+    in property <color> checkpoint-c0;
+    in property <color> checkpoint-c1;
+    in property <color> checkpoint-c2;
+    in property <color> checkpoint-c3;
+    property <[ResultsColumn]> results-columns: [
+        { presentation: "list", rows: [
+            { kind: "heading", name: "Results", count: "4" },
+            { kind: "checkpoint", chip: root.checkpoint-c2, method: "Focus map", time-text: "14:51:07", badges: ["BASE"] },
+            { kind: "checkpoint", chip: root.checkpoint-c1, name: "Halo fix", method: "Detail", time-text: "14:32:10", strokes: "· 12 strokes", selected: true },
+            { kind: "checkpoint", chip: root.checkpoint-c0, method: "Laplacian", time-text: "14:02:44", badges: ["FUSION"] },
+            { kind: "checkpoint", chip: root.checkpoint-c3, method: "Focus map", time-text: "15:03:12", strokes: "· 1 stroke" },
+            { kind: "hidden", name: "2 hidden: different alignment" },
+            { kind: "gap", height: ShellGeometry.group-gap },
+            { kind: "heading", name: "61 frames" },
+            { kind: "frame", chip: root.checkpoint-c0, name: "IMG_9811.tif" },
+            { kind: "frame", chip: root.checkpoint-c0, name: "IMG_9812.tif" },
+            { kind: "frame", chip: root.checkpoint-c2, name: "IMG_9813.tif" },
+        ] },
+        { presentation: "image-list", rows: [
+            { kind: "heading", name: "Results", count: "3" },
+            { kind: "checkpoint", preview: @image-url("../../../assets/build/social-preview-dark.png"), preview-state: "ready", chip: root.checkpoint-c2, method: "Focus map", time-text: "14:51:07", badges: ["BASE"] },
+            { kind: "checkpoint", preview: @image-url("../../../assets/build/social-preview-dark.png"), preview-state: "ready", chip: root.checkpoint-c1, name: "Halo fix", method: "Detail", time-text: "14:32:10", strokes: "· 12 strokes", selected: true },
+            { kind: "checkpoint", preview-state: "loading", chip: root.checkpoint-c0, method: "Laplacian", time-text: "14:02:44", badges: ["FUSION"] },
+            { kind: "hidden", name: "2 hidden: different alignment" },
+            { kind: "gap", height: ShellGeometry.group-gap },
+            { kind: "heading", name: "61 frames" },
+            { kind: "frame", preview: @image-url("../../../assets/build/social-preview-dark.png"), preview-state: "ready", chip: root.checkpoint-c0, name: "IMG_9811.tif", time-text: "14:02:11" },
+        ] },
+        { presentation: "large", rows: [
+            { kind: "heading", name: "Results", count: "2" },
+            { kind: "checkpoint", preview: @image-url("../../../assets/build/social-preview-dark.png"), preview-state: "ready", chip: root.checkpoint-c2, method: "Focus map", time-text: "14:51:07", badges: ["BASE"] },
+            { kind: "checkpoint", preview: @image-url("../../../assets/build/social-preview-dark.png"), preview-state: "ready", chip: root.checkpoint-c1, name: "Halo fix", method: "Detail", time-text: "14:32:10", strokes: "· 12 strokes", selected: true },
+            { kind: "gap", height: ShellGeometry.group-gap },
+            { kind: "heading", name: "61 frames" },
+            { kind: "frame", preview: @image-url("../../../assets/build/social-preview-dark.png"), preview-state: "ready", chip: root.checkpoint-c0, name: "IMG_9811.tif", time-text: "14:02:11" },
+        ] },
+    ];
+    property <[ResultsColumn]> results-state-columns: [
+        { presentation: "list", rows: [
+            { kind: "heading", name: "Results", count: "4", collapsed: true },
+            { kind: "heading", name: "61 frames" },
+            { kind: "frame", chip: root.checkpoint-c0, name: "IMG_9811.tif" },
+            { kind: "frame", chip: root.checkpoint-c0, name: "IMG_9812.tif" },
+            { kind: "frame", chip: root.checkpoint-c2, name: "IMG_9813.tif" },
+            { kind: "gap", height: ShellGeometry.group-gap },
+            { kind: "heading", name: "61 frames", collapsed: true },
+        ] },
+        { presentation: "list", rows: [
+            { kind: "heading", name: "Results", count: "3" },
+            { kind: "checkpoint", chip: root.checkpoint-c2, method: "Focus map", time-text: "14:51:07", badges: ["BASE"], hovered: true },
+            { kind: "checkpoint", chip: root.checkpoint-c1, name: "Halo fix", method: "Detail", time-text: "14:32:10", strokes: "· 12 strokes" },
+            { kind: "checkpoint", chip: root.checkpoint-c0, method: "Laplacian", time-text: "14:02:44", badges: ["FUSION"] },
+        ] },
+        { presentation: "list", rows: [
+            { kind: "heading", name: "Results", count: "2" },
+            { kind: "checkpoint", chip: root.checkpoint-c3, method: "Focus map", time-text: "15:03:12", strokes: "· 1 stroke", badges: ["UNSAVED"] },
+            { kind: "checkpoint", chip: root.checkpoint-c0, method: "Laplacian", time-text: "14:02:44", badges: ["BASE"] },
+            { kind: "checkpoint", chip: root.checkpoint-c3, method: "Focus map", time-text: "15:03:12", strokes: "· 1 stroke", badges: ["BASE", "UNSAVED"] },
+            { kind: "checkpoint", chip: root.checkpoint-c3, method: "Focus map", time-text: "15:03:12", strokes: "· 1 stroke", badges: ["UNSAVED"], selected: true },
+        ] },
+        { presentation: "list", rows: [
+            { kind: "heading", name: "Results", count: "2" },
+            { kind: "checkpoint", chip: root.checkpoint-c2, method: "Focus map", time-text: "14:51:07", badges: ["BASE"] },
+            { kind: "hidden", name: "1 hidden: different alignment" },
+            { kind: "hidden", name: "3 hidden: 2 different alignment, 1 different crop", height: ShellGeometry.hidden-line-wrapped-height },
+            { kind: "hidden", name: "3 hidden: 2 different alignment, 1 different crop", height: ShellGeometry.hidden-line-wrapped-height, presentation: "image-list" },
+        ] },
+        { presentation: "image-list", rows: [
+            { kind: "heading", name: "Results", count: "2" },
+            { kind: "checkpoint", preview: @image-url("../../../assets/build/social-preview-dark.png"), preview-state: "ready", chip: root.checkpoint-c3, method: "Focus map", time-text: "15:03:12", strokes: "· 1 stroke", badges: ["BASE", "UNSAVED"] },
+            { kind: "checkpoint", preview: @image-url("../../../assets/build/social-preview-dark.png"), preview-state: "ready", chip: root.checkpoint-c3, method: "Focus map", time-text: "15:03:12", strokes: "· 1 stroke", badges: ["UNSAVED"] },
+        ] },
+        { presentation: "large", rows: [
+            { kind: "heading", name: "Results", count: "1" },
+            { kind: "checkpoint", preview: @image-url("../../../assets/build/social-preview-dark.png"), preview-state: "ready", chip: root.checkpoint-c3, method: "Focus map", time-text: "15:03:12", strokes: "· 1 stroke", badges: ["BASE", "UNSAVED"] },
+        ] },
+    ];
 
     title: "FocusForge -- token sheet";
     preferred-width: 1100px;
@@ -866,6 +1015,37 @@ export component ThemeSheet inherits Window {
                 }
             }
         }
+
+        GroupHeading { text: "Results: List, Image list and Large previews"; }
+        Rectangle {
+            width: 3 * ShellGeometry.image-row-band-width + 2 * Theme.space-4;
+            height: 680px;
+
+            for column[ci] in root.results-columns: ResultsColumnView {
+                x: ci * (ShellGeometry.image-row-band-width + Theme.space-4);
+                width: ShellGeometry.image-row-band-width;
+                column: column;
+            }
+        }
+
+        GroupHeading { text: "Results states: collapsed, hover with tooltip, unsaved, hidden-line variants, pills"; }
+        Rectangle {
+            width: 6 * ShellGeometry.image-row-band-width + 5 * Theme.space-4;
+            height: 340px;
+
+            for column[ci] in root.results-state-columns: ResultsColumnView {
+                x: ci * (ShellGeometry.image-row-band-width + Theme.space-4);
+                width: ShellGeometry.image-row-band-width;
+                column: column;
+            }
+
+            FFTooltip { x: ShellGeometry.image-row-band-width + Theme.space-4 + 32px; y: 50px; tooltip-max-width: ShellGeometry.image-row-band-width - 32px; text: "Use as brush source"; }
+            FFTooltip { x: ShellGeometry.image-row-band-width + Theme.space-4 + Theme.space-2; y: 130px; tooltip-max-width: ShellGeometry.image-row-band-width - Theme.space-2; text: "Use as brush source"; detail: "Halo fix · Detail 14:32:10 · 12 strokes"; }
+            FFBadge { x: 2 * (ShellGeometry.image-row-band-width + Theme.space-4) + Theme.space-2; y: 160px; text: "BASE"; }
+            FFBadge { x: 2 * (ShellGeometry.image-row-band-width + Theme.space-4) + 64px; y: 160px; text: "FUSION"; }
+            FFBadge { x: 2 * (ShellGeometry.image-row-band-width + Theme.space-4) + 128px; y: 160px; text: "UNSAVED"; }
+        }
+
 
         GroupHeading { text: "Settings: size field rows, unavailable (one disabled box) / not probed (placeholder, unit enabled)"; }
         SettingsGround {
