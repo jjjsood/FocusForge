@@ -25,14 +25,14 @@ pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
-/// `crates/gui/ui` -- the `.slint` source tree.
+/// `crates/ui/ui` -- the `.slint` source tree.
 ///
 /// `#[allow(dead_code)]`: each integration test file compiles this shared
 /// module into its own binary crate, and not every one of this crate's test
 /// binaries calls every helper here (`icons.rs` does not need `ui_dir`).
 #[allow(dead_code)]
 pub fn ui_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("ui")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/ui")
 }
 
 /// `assets/fonts` at the workspace root.

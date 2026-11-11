@@ -539,12 +539,12 @@ mod stage_tests {
 
     #[test]
     fn landing_fade_matches_the_stage_primitives_motion() {
-        let theme = include_str!("../ui/theme.slint");
+        let theme = include_str!("../../ui/ui/theme.slint");
         assert!(theme.contains("motion-slow: reduce-motion ? 0ms : 400ms;"));
         assert_eq!(LANDING_FADE, Duration::from_millis(400));
         for primitive in [
-            include_str!("../ui/components/ff_stage_view.slint"),
-            include_str!("../ui/components/ff_stage_inset.slint"),
+            include_str!("../../ui/ui/components/ff_stage_view.slint"),
+            include_str!("../../ui/ui/components/ff_stage_inset.slint"),
         ] {
             assert!(primitive.contains("duration: Theme.motion-slow;"));
         }

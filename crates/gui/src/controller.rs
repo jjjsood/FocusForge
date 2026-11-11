@@ -1496,7 +1496,7 @@ struct ShellState {
     /// the empty state shown. Always `None` while `projects` is empty.
     active: Option<usize>,
     /// Both panes' current geometry, pushed by `set_pane_geometry`
-    /// (`ui/shell/canvas.slint`'s five `out` properties, read once by
+    /// (`crates/ui/ui/shell/canvas.slint`'s five `out` properties, read once by
     /// `src/main.rs` at startup and again on every `canvas-resized`).
     panes: Option<(PaneRect, PaneRect)>,
     /// Last valid rect for each side, including a side whose window is
@@ -4426,7 +4426,7 @@ impl AppController {
         })
     }
 
-    /// Installs both panes' current geometry, pushed by `ui/shell/canvas.slint`'s
+    /// Installs both panes' current geometry, pushed by `crates/ui/ui/shell/canvas.slint`'s
     /// five `out` properties (`src/bridge.rs`'s `canvas-resized` handler and
     /// `src/main.rs`'s startup push). Fits the viewport on the first call
     /// after a project opens (`open_project` cannot, having no pane rect of
@@ -5299,7 +5299,7 @@ impl AppController {
     // -- Tabs as controller state. --
 
     /// Every open tab, in order -- the plain twin of
-    /// `ui/shell/tab_strip.slint`'s `ProjectTabView`.
+    /// `crates/ui/ui/shell/tab_strip.slint`'s `ProjectTabView`.
     pub fn project_tabs(&self) -> Vec<ProjectTabRow> {
         self.state
             .projects
@@ -11255,14 +11255,14 @@ impl AppController {
     }
 }
 
-/// `ShellGeometry.tab-pitch` (`ui/geometry.slint`): one tab plus its gap.
+/// `ShellGeometry.tab-pitch` (`crates/ui/ui/geometry.slint`): one tab plus its gap.
 pub const TAB_PITCH: f32 = 228.0;
-/// `ShellGeometry.tab-width` (`ui/geometry.slint`).
+/// `ShellGeometry.tab-width` (`crates/ui/ui/geometry.slint`).
 pub const TAB_WIDTH: f32 = 224.0;
-/// `ShellGeometry.strip-box-width` (`ui/geometry.slint`): each scroll arrow
+/// `ShellGeometry.strip-box-width` (`crates/ui/ui/geometry.slint`): each scroll arrow
 /// and "+".
 pub const STRIP_BOX_WIDTH: f32 = 30.0;
-/// `ShellGeometry.strip-box-gap` (`ui/geometry.slint`, `Theme.space-1`).
+/// `ShellGeometry.strip-box-gap` (`crates/ui/ui/geometry.slint`, `Theme.space-1`).
 pub const STRIP_BOX_GAP: f32 = 4.0;
 
 /// Whether `tab_count` tabs plus the trailing "+" outrun a tabs-region
@@ -11276,7 +11276,7 @@ pub fn tabs_overflow(tab_count: usize, region_width: f32) -> bool {
 /// The scrolling viewport's width inside a tabs-region `region_width` wide:
 /// the whole region without overflow; on overflow, the region less the left
 /// arrow, the right arrow and the pinned "+", each with its box gap
-/// (`ui/shell/tab_strip.slint`'s `tabs-viewport`).
+/// (`crates/ui/ui/shell/tab_strip.slint`'s `tabs-viewport`).
 pub fn tab_viewport_width(tab_count: usize, region_width: f32) -> f32 {
     if tabs_overflow(tab_count, region_width) {
         (region_width - 3.0 * (STRIP_BOX_WIDTH + STRIP_BOX_GAP)).max(0.0)

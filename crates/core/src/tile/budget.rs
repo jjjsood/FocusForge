@@ -44,7 +44,7 @@ use std::time::Instant;
 use crate::host::{FactsOrigin, HostFacts, HostProbe};
 use crate::params::Provenance;
 use crate::tile::control::{ADMISSION_RECHECK, TileControl};
-use crate::tile::scheduler::{DEFAULT_MAX_BYTES_IN_FLIGHT, in_flight_for_budget};
+use crate::tile::scheduler::{DEFAULT_MAX_BYTES_IN_FLIGHT, InFlightBound, in_flight_for_budget};
 
 /// The share of the available memory beyond [`HOST_FIXED_BYTES`] that a
 /// host-derived budget claims: `share * (usable_available - fixed) / 100`.
@@ -174,8 +174,9 @@ impl Default for HostSources {
 
 /// The host in-flight-byte budget: a number of bytes, where it came from,
 /// and whether it was actually derived from a live probe (which is what
-/// arms the runtime back-off -- an explicit or flag-capped budget never
-/// probes at all, keeping every existing test deterministic).
+/// arms the runtime back-off -- an `explicit` budget, and a cap applied to
+/// one, never probes unless the reader reports a page-cache working set,
+/// keeping every other test deterministic).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostBudget {
     bytes: u64,
@@ -223,8 +224,8 @@ impl HostBudget {
         }
     }
 
-    /// A caller-supplied budget: never probes, always floors at 1 tile
-    /// rather than refusing.
+    /// A caller-supplied budget: never arms the back-off, always floors at 1
+    /// tile rather than refusing.
     pub fn explicit(bytes: u64) -> Self {
         HostBudget {
             bytes,
@@ -313,8 +314,9 @@ impl HostBudget {
 
     /// Whether this budget arms the runtime back-off: only a budget that
     /// actually came from a live probe watches for pressure. An `explicit`
-    /// budget (including one produced by [`Self::capped_to`]) never probes,
-    /// keeping every test that passes a fixed budget deterministic.
+    /// budget, and a cap applied to one, never watches, keeping every test
+    /// that passes a fixed budget deterministic. A cap applied to a
+    /// host-derived budget keeps it armed.
     pub fn arms_back_off(&self) -> bool {
         self.host_probed
     }
@@ -337,6 +339,32 @@ fn back_off_now(
     let grown = rss_now.saturating_sub(rss_at_start);
     let threshold = available_at_start * PRESSURE_SHARE_PERCENT / 100;
     grown > threshold && reserved_bytes > bytes_per_tile
+}
+
+/// How many tile columns' file-cache working sets fit the memory limit once
+/// [`HOST_FIXED_BYTES`] and the heap of `in_flight` tiles of `bytes_per_tile`
+/// are set aside, floored at 1. The limit is the cgroup's, else the host's
+/// available memory (a cgroup's free figure counts the cache itself). `None`
+/// without a working set or a real probe.
+fn band_columns(
+    facts: &HostFacts,
+    in_flight: usize,
+    bytes_per_tile: u64,
+    working_set_bytes: u64,
+) -> Option<usize> {
+    if working_set_bytes == 0 || facts.origin() == FactsOrigin::Fallback {
+        return None;
+    }
+    let limit = facts
+        .cgroup_limit()
+        .unwrap_or_else(|| facts.available_memory());
+    let heap = (in_flight as u64).saturating_mul(bytes_per_tile);
+    let cache = limit.saturating_sub(HOST_FIXED_BYTES).saturating_sub(heap);
+    Some(
+        usize::try_from(cache / working_set_bytes)
+            .unwrap_or(usize::MAX)
+            .max(1),
+    )
 }
 
 struct GateState {
@@ -369,6 +397,8 @@ pub struct HostBudgetGate {
     state: Mutex<GateState>,
     condvar: Condvar,
     initial_limit: usize,
+    initial_bound: InFlightBound,
+    band_columns: Option<usize>,
     bytes_per_tile: u64,
     peak: AtomicUsize,
     sources: HostSources,
@@ -384,17 +414,32 @@ impl HostBudgetGate {
     /// (`std::thread::available_parallelism`, the same source
     /// `TileScheduler::new` already reads) -- never more in-flight tiles
     /// than there are workers to hold them.
-    pub fn new(budget: HostBudget, bytes_per_tile: u64, cap: usize, sources: HostSources) -> Self {
-        let initial_limit = in_flight_for_budget(bytes_per_tile, budget.bytes(), cap);
+    ///
+    /// `working_set_bytes` is the file-cache memory one tile's reads keep hot
+    /// across all frames (zero for a reader that has none). A non-zero value
+    /// leaves the initial limit alone and sets [`Self::band_columns`].
+    pub fn new(
+        budget: HostBudget,
+        bytes_per_tile: u64,
+        working_set_bytes: u64,
+        cap: usize,
+        sources: HostSources,
+    ) -> Self {
+        let (initial_limit, initial_bound) =
+            in_flight_for_budget(bytes_per_tile, budget.bytes(), cap);
         let arms_back_off = budget.arms_back_off();
-        // Only a host-derived, uncapped budget probes at all -- an
-        // `explicit`/flag-capped budget never reads `sources.probe`, so a
-        // test that supplies no probe worth calling stays deterministic.
-        let (rss_at_start, available_at_start) = if arms_back_off {
-            let facts = sources.probe.facts();
-            (facts.process_rss(), facts.usable_available())
-        } else {
-            (None, 0)
+        // The probe is read only for a host-derived budget (capped or not) or
+        // a reader with a page-cache working set: an `explicit` budget, or a
+        // cap applied to one, over a reader without one never reads
+        // `sources.probe`, so a test that supplies no probe worth calling
+        // stays deterministic.
+        let facts = (arms_back_off || working_set_bytes > 0).then(|| sources.probe.facts());
+        let band_columns = facts.as_ref().and_then(|facts| {
+            band_columns(facts, initial_limit, bytes_per_tile, working_set_bytes)
+        });
+        let (rss_at_start, available_at_start) = match facts {
+            Some(facts) if arms_back_off => (facts.process_rss(), facts.usable_available()),
+            _ => (None, 0),
         };
         HostBudgetGate {
             state: Mutex::new(GateState {
@@ -403,6 +448,8 @@ impl HostBudgetGate {
             }),
             condvar: Condvar::new(),
             initial_limit,
+            initial_bound,
+            band_columns,
             bytes_per_tile,
             peak: AtomicUsize::new(0),
             sources,
@@ -454,6 +501,18 @@ impl HostBudgetGate {
     /// The limit this gate was constructed with, before any back-off.
     pub fn initial_limit(&self) -> usize {
         self.initial_limit
+    }
+
+    /// The term that set [`Self::initial_limit`] before the floor of 1.
+    pub fn initial_bound(&self) -> InFlightBound {
+        self.initial_bound
+    }
+
+    /// How many tile columns' working sets the page cache holds, when the
+    /// reader reports a working set and the host facts are real; the width of
+    /// the vertical bands tiles are admitted in. Never below 1.
+    pub fn band_columns(&self) -> Option<usize> {
+        self.band_columns
     }
 
     /// The high-water mark of tiles admitted at once since construction.
@@ -684,6 +743,206 @@ mod tests {
         assert!(!back_off_now(Some(2_000), None, 1_000, 20, 10));
     }
 
+    /// A [`HostProbe`] double that answers fixed facts and counts its reads.
+    struct CountingProbe {
+        facts: HostFacts,
+        calls: AtomicUsize,
+    }
+
+    impl CountingProbe {
+        fn new(facts: HostFacts) -> Arc<Self> {
+            Arc::new(CountingProbe {
+                facts,
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl HostProbe for CountingProbe {
+        fn facts(&self) -> HostFacts {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.facts
+        }
+    }
+
+    fn sources_of(probe: Arc<CountingProbe>) -> HostSources {
+        HostSources {
+            probe,
+            clock: Arc::new(ManualClock::new()),
+        }
+    }
+
+    /// 64 GB host, `available` free, an optional cgroup limit with
+    /// `cgroup_free` left under it.
+    fn host_facts(available: u64, cgroup: Option<(u64, u64)>) -> HostFacts {
+        HostFacts::new(
+            64_000_000_000,
+            available,
+            cgroup.map(|(limit, _)| limit),
+            cgroup.map(|(_, free)| free),
+            16,
+        )
+        .with_process_rss(Some(1_000))
+    }
+
+    const TILE: u64 = 100_000_000;
+    const WORKING_SET: u64 = 300_000_000;
+
+    #[test]
+    fn band_columns_divide_the_remainder_after_the_in_flight_tiles() {
+        let facts = host_facts(50_000_000_000, Some((4_000_000_000, 10)));
+        // (4.0e9 - 1.563e9 - 6 x 1.0e8) / 3.0e8 = 6.12
+        assert_eq!(band_columns(&facts, 6, TILE, WORKING_SET), Some(6));
+        // Fewer tiles in flight leave more cache: 2.237e9 / 3.0e8 = 7.46
+        assert_eq!(band_columns(&facts, 2, TILE, WORKING_SET), Some(7));
+        // Smaller tiles do too: (2.437e9 - 6 x 5.0e7) / 3.0e8 = 7.12
+        assert_eq!(band_columns(&facts, 6, 50_000_000, WORKING_SET), Some(7));
+        // A larger working set is the divisor: 1.837e9 / 6.0e8 = 3.06
+        assert_eq!(band_columns(&facts, 6, TILE, 600_000_000), Some(3));
+    }
+
+    #[test]
+    fn band_columns_use_available_memory_when_there_is_no_cgroup() {
+        // (5.0e9 - 1.563e9 - 4 x 1.0e8) / 3.0e8 = 10.12, whatever the host total is
+        let facts = host_facts(5_000_000_000, None);
+        assert_eq!(band_columns(&facts, 4, TILE, WORKING_SET), Some(10));
+    }
+
+    #[test]
+    fn band_columns_read_the_cgroup_limit_not_its_free_memory() {
+        // The cgroup's free memory is depressed by the scratch's own cache,
+        // and a huge host MemAvailable must not lift the limit either.
+        let facts = host_facts(60_000_000_000, Some((4_000_000_000, 1)));
+        assert_eq!(band_columns(&facts, 6, TILE, WORKING_SET), Some(6));
+    }
+
+    #[test]
+    fn band_columns_are_none_without_a_working_set_or_a_probe() {
+        let facts = host_facts(50_000_000_000, Some((4_000_000_000, 10)));
+        assert_eq!(band_columns(&facts, 6, TILE, 0), None);
+        assert_eq!(
+            band_columns(&HostFacts::fallback(), 6, TILE, WORKING_SET),
+            None
+        );
+    }
+
+    #[test]
+    fn band_columns_floor_at_one_below_the_fixed_part_or_one_working_set() {
+        let under_fixed = host_facts(50_000_000_000, Some((1 << 30, 0)));
+        assert_eq!(band_columns(&under_fixed, 6, TILE, WORKING_SET), Some(1));
+        // 200 MB above the fixed part, one 100 MB tile in flight: 100 MB of
+        // cache, less than one working set.
+        let barely_over = host_facts(50_000_000_000, Some((HOST_FIXED_BYTES + 200_000_000, 0)));
+        assert_eq!(band_columns(&barely_over, 1, TILE, WORKING_SET), Some(1));
+        // The in-flight tiles alone exceed the limit.
+        assert_eq!(band_columns(&barely_over, 32, TILE, WORKING_SET), Some(1));
+        let no_memory = host_facts(0, None);
+        assert_eq!(band_columns(&no_memory, 6, TILE, WORKING_SET), Some(1));
+    }
+
+    #[test]
+    fn page_cache_working_set_leaves_the_in_flight_limit() {
+        let facts = host_facts(50_000_000_000, Some((4_000_000_000, 3_000_000_000)));
+        let host = HostBudget::host_derived(&facts);
+        // (3.0e9 - 1.563e9) * 65 % / 1.0e8 = 9 tiles by the budget alone.
+        assert_eq!(in_flight_for_budget(TILE, host.bytes(), 32).0, 9);
+        // (name, budget, limit, band columns for that limit)
+        for (name, budget, limit, bands) in [
+            ("host", host, 9, 5),
+            ("explicit", HostBudget::explicit(500_000_000), 5, 6),
+            ("capped", host.capped_to(Some(800_000_000)), 8, 5),
+        ] {
+            let probe = CountingProbe::new(facts);
+            let gate = HostBudgetGate::new(budget, TILE, WORKING_SET, 32, sources_of(probe));
+            assert_eq!(gate.initial_limit(), limit, "{name}");
+            assert_eq!(gate.band_columns(), Some(bands), "{name}");
+        }
+        // The thread count still bounds the limit, and the bands follow it.
+        let roomy = host_facts(100_000_000_000, None);
+        let gate = HostBudgetGate::new(
+            HostBudget::explicit(u64::MAX),
+            TILE,
+            WORKING_SET,
+            4,
+            sources_of(CountingProbe::new(roomy)),
+        );
+        assert_eq!(gate.initial_limit(), 4);
+        // (100e9 - 1.563e9 - 4 x 1.0e8) / 3.0e8 = 326.8
+        assert_eq!(gate.band_columns(), Some(326));
+    }
+
+    #[test]
+    fn band_columns_follow_the_frame_count_through_the_working_set() {
+        let facts = host_facts(50_000_000_000, Some((4_000_000_000, 10)));
+        // 100 frames x 3 MB against 200 frames x 3 MB per tile, 8 in flight.
+        for (frames, expected) in [(100u64, 5usize), (200, 2)] {
+            let gate = HostBudgetGate::new(
+                HostBudget::explicit(u64::MAX),
+                TILE,
+                3_000_000 * frames,
+                8,
+                sources_of(CountingProbe::new(facts)),
+            );
+            // (2.437e9 - 8 x 1.0e8) / (3e6 * frames): 5.46 and 2.73
+            assert_eq!(gate.band_columns(), Some(expected), "{frames} frames");
+        }
+    }
+
+    #[test]
+    fn zero_working_set_keeps_the_budget_limit_and_never_probes_a_fixed_budget() {
+        let facts = host_facts(1_000_000_000, Some((1 << 30, 0)));
+        for budget in [
+            HostBudget::explicit(500_000_000),
+            HostBudget::explicit(u64::MAX).capped_to(Some(500_000_000)),
+        ] {
+            let probe = CountingProbe::new(facts);
+            let gate = HostBudgetGate::new(budget, TILE, 0, 32, sources_of(probe.clone()));
+            assert_eq!(
+                gate.initial_limit(),
+                in_flight_for_budget(TILE, 500_000_000, 32).0
+            );
+            assert_eq!(probe.calls(), 0, "{:?}", budget.provenance());
+            assert_eq!(gate.band_columns(), None);
+        }
+    }
+
+    #[test]
+    fn zero_working_set_reads_the_probe_once_for_a_host_budget_as_before() {
+        let facts = host_facts(50_000_000_000, None);
+        let budget = HostBudget::host_derived(&facts);
+        let probe = CountingProbe::new(facts);
+        let gate = HostBudgetGate::new(budget, TILE, 0, 32, sources_of(probe.clone()));
+        assert_eq!(
+            gate.initial_limit(),
+            in_flight_for_budget(TILE, budget.bytes(), 32).0
+        );
+        assert_eq!(probe.calls(), 1);
+        assert_eq!(gate.band_columns(), None);
+    }
+
+    #[test]
+    fn page_cache_working_set_reads_the_probe_once_under_a_host_budget() {
+        let facts = host_facts(50_000_000_000, None);
+        let probe = CountingProbe::new(facts);
+        let gate = HostBudgetGate::new(
+            HostBudget::host_derived(&facts),
+            TILE,
+            WORKING_SET,
+            32,
+            sources_of(probe.clone()),
+        );
+        assert!(gate.initial_limit() >= 1);
+        assert_eq!(
+            probe.calls(),
+            1,
+            "one read serves the band width and the back-off start"
+        );
+    }
+
     /// A [`HostProbe`] double that plays back a fixed script of facts:
     /// advances one entry per call, then repeats its last entry forever.
     struct ScriptedProbe {
@@ -738,7 +997,7 @@ mod tests {
 
         let facts = probed_facts(HOST_FIXED_BYTES + 1_000, Some(1_000));
         let budget = HostBudget::host_derived(&facts);
-        let gate = Arc::new(HostBudgetGate::new(budget, 1, 8, sources));
+        let gate = Arc::new(HostBudgetGate::new(budget, 1, 0, 8, sources));
         assert_eq!(gate.initial_limit(), 8);
 
         // Baseline workload: two permits held for most of the test, at
@@ -815,7 +1074,7 @@ mod tests {
             probe,
             clock: clock.clone(),
         };
-        let gate = HostBudgetGate::new(HostBudget::explicit(100), 1, 8, sources);
+        let gate = HostBudgetGate::new(HostBudget::explicit(100), 1, 0, 8, sources);
         assert_eq!(gate.initial_limit(), 8);
         clock.advance(10 * PRESSURE_POLL_INTERVAL_MS);
         for _ in 0..10 {
@@ -830,6 +1089,7 @@ mod tests {
         let gate = Arc::new(HostBudgetGate::new(
             HostBudget::explicit(1),
             1,
+            0,
             3,
             HostSources::default(),
         ));
@@ -881,6 +1141,7 @@ mod tests {
         let gate = Arc::new(HostBudgetGate::new(
             HostBudget::explicit(6),
             1,
+            0,
             6,
             HostSources::default(),
         ));
@@ -945,7 +1206,7 @@ mod tests {
             clock: clock.clone(),
         };
         let budget = HostBudget::host_derived(&probed_facts(HOST_FIXED_BYTES + 1_000, Some(1_000)));
-        let gate = Arc::new(HostBudgetGate::new(budget, 1, 8, sources));
+        let gate = Arc::new(HostBudgetGate::new(budget, 1, 0, 8, sources));
         assert_eq!(gate.initial_limit(), 8);
         let control = Arc::new(CapControl::new(4));
 
