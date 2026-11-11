@@ -51,9 +51,8 @@
 //! 16-bit strip TIFF read through `mmap` (`laplacian`, `depth-map`,
 //! `weighted-average`), compressed TIFF (`decoded`) and JPEG (`laplacian`),
 //! and Canon CR3 developed into memory or into a scratch file
-//! (`laplacian`). Every other input
-//! still gets a prediction, from the first row of its family, with
-//! [`RunPrediction::calibrated`] false.
+//! (`laplacian`). Every other input still gets a prediction, from the first
+//! row of its family, with [`RunPrediction::calibrated`] false.
 //!
 //! The blends were fitted and held out on the uncompressed TIFF versions of
 //! those two stacks, over `--cpu` and GPU-backed alignment: −12.1 to +8.3 %
@@ -74,9 +73,8 @@
 //! frames (decode then falls in fuse), decoded frames beyond the frame
 //! cache, the align backend of a CPU-only blend (`--cpu` and GPU-backed
 //! were measured), the host budget of a scratch-file run (6 GiB), brightness
-//! equalization, or a cold GPU (6 to 19 % more fuse
-//! time than a warm one). Time outside the stages, up to 0.4 s warm, is
-//! not modelled.
+//! equalization, or a cold GPU (6 to 19 % more fuse time than a warm one).
+//! Time outside the stages, up to 0.4 s warm, is not modelled.
 
 use serde::Serialize;
 
