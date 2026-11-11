@@ -26,6 +26,8 @@ crates/diagnostics/ the shared `tracing` subscriber (stderr sink, rotating
                recorder, the native-crash monitor process and the
                diagnostics bundle writer -- linked only by `crates/cli` and
                `crates/gui`, never by `crates/core` or `crates/gpu`
+crates/ui/     focusforge-ui: the `.slint` sources and their generated Rust
+               bindings, compiled once and depending on nothing but `slint`
 crates/gui/    focusforge-gui: a Slint window shell (toolbar, dock, tab
                strip, projects overlay, settings modal), a wgpu-backed
                canvas that renders a composite/Z-Map pair and, in editor
@@ -69,7 +71,8 @@ docs/          the user manual, an mdBook (`book.toml` at the root); its
 - `focusforge-gui`: `slint = "~1.17"` (`default-features = false`, features
   `std`, `compat-1-2`, `backend-winit`, `renderer-femtovg-wgpu`,
   `unstable-wgpu-29` pinned to the same wgpu major `focusforge-gpu`
-  declares, and `unstable-winit-030`), `slint-build` (build dependency),
+  declares, and `unstable-winit-030`; `focusforge-ui` declares the same
+  line plus `slint-build` as its build dependency),
   `i-slint-backend-testing` (dev dependency), `clap`, `rfd` (native
   folder/file picker), `toml`/`toml_edit`/`serde` (`settings.toml`'s
   `[recent]`, `[appearance]`, `[input]` and `[export]` tables), `notify-rust`

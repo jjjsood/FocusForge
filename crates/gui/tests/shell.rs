@@ -2200,8 +2200,8 @@ fn overlay_toggle_is_inert_while_disabled() {
 
 #[test]
 fn detached_pane_uses_a_distinct_accessible_dock_control() {
-    let pane = include_str!("../ui/components/ff_pane.slint");
-    let control = include_str!("../ui/components/ff_undock_control.slint");
+    let pane = include_str!("../../ui/ui/components/ff_pane.slint");
+    let control = include_str!("../../ui/ui/components/ff_undock_control.slint");
     assert!(pane.contains("visible: root.project-loaded && root.undock-enabled"));
     assert!(control.contains("Dock pane"));
     assert!(control.contains("dock-pane.svg"));

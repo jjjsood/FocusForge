@@ -27,6 +27,7 @@ clap = { version = "4", features = ["derive"] }
 png = "0.18"
 thiserror = "2.0.20"
 focusforge-core = { path = "../core" }
+focusforge-ui = { path = "../ui" }
 focusforge-diagnostics = { path = "../diagnostics" }
 focusforge-gpu = { path = "../gpu", features = ["gpu"] }
 toml = "1"
@@ -43,9 +44,6 @@ webbrowser = "1.2"
 # since the Windows build is a windowed binary.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_Console"] }
-
-[build-dependencies]
-slint-build = "~1.17"
 
 [dev-dependencies]
 focusforge-core = { path = "../core", features = ["test-algorithms"] }
