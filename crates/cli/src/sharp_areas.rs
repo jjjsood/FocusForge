@@ -67,11 +67,17 @@ pub(crate) fn run(dir: &Path, set: &SetArgs, json: bool, priority: Priority) -> 
             );
             (index, file, *count)
         });
+    let pairs = result
+        .overlaps
+        .iter()
+        .enumerate()
+        .map(|(index, overlap)| (format!("{}-{}", index + 1, index + 2), overlap.share()));
     if json {
         let document = serde_json::json!({
             "params": {
                 "cell-size": values["cell-size"],
                 "contrast": values["contrast"],
+                "overlap-threshold": values["overlap-threshold"],
             },
             "cells": result.cells,
             "frames": rows
@@ -81,6 +87,9 @@ pub(crate) fn run(dir: &Path, set: &SetArgs, json: bool, priority: Priority) -> 
                     "count": count,
                 }))
                 .collect::<Vec<_>>(),
+            "overlaps": pairs
+                .map(|(pair, share)| serde_json::json!({ "pair": pair, "share": share }))
+                .collect::<Vec<_>>(),
         });
         match serde_json::to_string_pretty(&document) {
             Ok(text) => println!("{text}"),
@@ -89,6 +98,12 @@ pub(crate) fn run(dir: &Path, set: &SetArgs, json: bool, priority: Priority) -> 
     } else {
         for (index, file, count) in rows {
             println!("{index}  {file}  {count}");
+        }
+        for (pair, share) in pairs {
+            match share {
+                Some(share) => println!("overlap  {pair}  {:.1}%", share * 100.0),
+                None => println!("overlap  {pair}  no data"),
+            }
         }
     }
     ExitCode::SUCCESS

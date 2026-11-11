@@ -58,6 +58,26 @@ pub static SHARP_AREA_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             host_default: None,
             stack_max: None,
         },
+        ParamDesc {
+            id: "overlap-threshold".to_string(),
+            label: "Sharp share of the cell peak".to_string(),
+            help: "A frame counts as sharp in a counted cell when its score is at least this \
+                   share of the cell's best score (0.5 to 1.0). The overlap of two \
+                   neighbouring frames is twice the cells sharp in both, divided by the sum \
+                   of the cells sharp in each."
+                .to_string(),
+            kind: ParamKind::Float {
+                min: 0.5,
+                max: 1.0,
+                step: 0.05,
+                logarithmic: false,
+            },
+            default: ParamValue::Float(0.8),
+            advanced: false,
+            auto: None,
+            host_default: None,
+            stack_max: None,
+        },
     ]
 });
 
@@ -68,6 +88,30 @@ pub struct SharpAreas {
     pub cells: u32,
     /// Cells counted in each frame, in input order.
     pub counts: Vec<u32>,
+    /// One entry per neighbour pair (frames `i` and `i + 1`), in input order:
+    /// `frames - 1` entries, none for fewer than two frames.
+    pub overlaps: Vec<PairOverlap>,
+}
+
+/// How two neighbouring frames share their sharp cells, over the cells the
+/// count counts. A frame is sharp in a cell when its score there is at least
+/// `overlap-threshold` times the cell's best score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PairOverlap {
+    /// Cells sharp in both frames.
+    pub both: u32,
+    /// Cells sharp in at least one of the frames.
+    pub either: u32,
+}
+
+impl PairOverlap {
+    /// `2 × both / (both + either)`: the overlap of the two sharp zones as a
+    /// share of one zone. `None` when no cell is sharp in either frame, which
+    /// is not the same as a share of 0.
+    pub fn share(&self) -> Option<f64> {
+        (self.either > 0)
+            .then(|| 2.0 * f64::from(self.both) / (f64::from(self.both) + f64::from(self.either)))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -240,6 +284,9 @@ pub fn count_sharp_areas_reporting(
     let contrast = resolved["contrast"]
         .as_f64()
         .expect("contrast resolves to a number");
+    let threshold = resolved["overlap-threshold"]
+        .as_f64()
+        .expect("overlap-threshold resolves to a number");
 
     let plan = sharpness_plan((width, height), tile_size)?;
     let columns = width.div_ceil(cell) as usize;
@@ -275,6 +322,7 @@ pub fn count_sharp_areas_reporting(
     // sums are the serial ones whatever the worker count.
     let mut sums = vec![vec![0.0f64; cells]; frames];
     let mut counts = vec![0u32; frames];
+    let mut overlaps = vec![PairOverlap { both: 0, either: 0 }; frames.saturating_sub(1)];
     let (pool, gate) = frame_workers()?;
     for tile in plan.tiles() {
         let (read, interior) = (tile.read(), tile.interior());
@@ -316,6 +364,12 @@ pub fn count_sharp_areas_reporting(
                 }
                 if peak > contrast * floor {
                     counts[peak_frame] += 1;
+                    let sharp = |frame: usize| sums[frame][index] / area[index] >= threshold * peak;
+                    for (pair, overlap) in overlaps.iter_mut().enumerate() {
+                        let (first, second) = (sharp(pair), sharp(pair + 1));
+                        overlap.either += u32::from(first || second);
+                        overlap.both += u32::from(first && second);
+                    }
                 }
             }
         }
@@ -324,6 +378,7 @@ pub fn count_sharp_areas_reporting(
     Ok(SharpAreas {
         cells: cells as u32,
         counts,
+        overlaps,
     })
 }
 
@@ -384,15 +439,24 @@ mod tests {
         ((h >> 16) as u16) | 0x4000
     }
 
-    /// A grey frame, textured at the columns where `textured` holds.
-    fn frame(textured: impl Fn(u32) -> bool) -> Vec<u16> {
+    /// A grey frame, textured at the pixels where `textured` holds.
+    fn frame_where(textured: impl Fn(u32, u32) -> bool) -> Vec<u16> {
         let mut samples = Vec::new();
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
-                samples.push(if textured(x) { texture(x, y) } else { 30_000 });
+                samples.push(if textured(x, y) {
+                    texture(x, y)
+                } else {
+                    30_000
+                });
             }
         }
         samples
+    }
+
+    /// A grey frame, textured at the columns where `textured` holds.
+    fn frame(textured: impl Fn(u32) -> bool) -> Vec<u16> {
+        frame_where(|x, _| textured(x))
     }
 
     /// Frame 0 is sharp left of column 128, frame 2 right of it, frame 1 flat.
@@ -787,8 +851,133 @@ mod tests {
         );
     }
 
+    /// The frames that are sharp in cell (`column`, `row`) of the 16 px grid:
+    /// 30 cells in frame 1 only, 7 in frame 2 only, one in frames 1 and 2, one
+    /// in frames 2 and 3. Every other cell, and every odd row, is textured in
+    /// all four frames and so counts in none; those rows keep the roles apart.
+    fn overlap_roles(column: u32, row: u32) -> &'static [usize] {
+        const ALL: &[usize] = &[0, 1, 2, 3];
+        if row % 2 == 1 || row > 6 || column > 11 {
+            return ALL;
+        }
+        match (row / 2) * 12 + column {
+            0..30 => &[1],
+            30..37 => &[2],
+            37 => &[1, 2],
+            38 => &[2, 3],
+            _ => ALL,
+        }
+    }
+
+    /// Four frames whose neighbour pairs share 0, 1 and 1 of the 31, 39 and 9
+    /// cells that are sharp in at least one of them.
+    fn overlap_stack() -> VecReader {
+        let frames = (0..4)
+            .map(|index| frame_where(|x, y| overlap_roles(x / 16, y / 16).contains(&index)))
+            .collect();
+        VecReader { frames }
+    }
+
+    fn overlap_values() -> ParamValues {
+        values(&[("cell-size", ParamValue::Int(16))])
+    }
+
     #[test]
-    fn the_table_declares_both_parameters_with_their_bounds() {
+    fn overlap_pairs_come_out_at_the_built_shares() {
+        let result = count(&overlap_stack(), &overlap_values()).unwrap();
+        assert_eq!(result.cells, 117);
+        assert_eq!(result.counts.iter().sum::<u32>(), 39);
+        assert_eq!(
+            result.overlaps,
+            vec![
+                PairOverlap {
+                    both: 0,
+                    either: 31
+                },
+                PairOverlap {
+                    both: 1,
+                    either: 39
+                },
+                PairOverlap { both: 1, either: 9 },
+            ]
+        );
+        let shares: Vec<_> = result.overlaps.iter().map(PairOverlap::share).collect();
+        assert_eq!(shares, vec![Some(0.0), Some(0.05), Some(0.2)]);
+    }
+
+    #[test]
+    fn overlap_does_not_depend_on_the_tile_size_or_the_admission_cap() {
+        let stack = overlap_stack();
+        let values = overlap_values();
+        let wanted = count(&stack, &values).unwrap();
+        for tile_size in [96, 160, 512] {
+            for cap in [Some(1), None] {
+                let control = JobControl::new();
+                control.set_admission_cap(cap);
+                let result = count_sharp_areas_reporting(
+                    &stack,
+                    4,
+                    (WIDTH, HEIGHT),
+                    1,
+                    &values,
+                    tile_size,
+                    &*control,
+                    &mut |_| {},
+                )
+                .unwrap();
+                assert_eq!(result, wanted, "tile {tile_size}, cap {cap:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn overlap_of_a_single_frame_is_empty() {
+        let single = VecReader {
+            frames: vec![frame(|_| true)],
+        };
+        let result = count(&single, &ParamValues::new()).unwrap();
+        assert!(result.overlaps.is_empty());
+    }
+
+    #[test]
+    fn overlap_of_a_flat_stack_has_no_data() {
+        let flat = VecReader {
+            frames: vec![frame(|_| false), frame(|_| false), frame(|_| false)],
+        };
+        let result = count(&flat, &ParamValues::new()).unwrap();
+        assert_eq!(result.overlaps, vec![PairOverlap { both: 0, either: 0 }; 2]);
+        assert!(result.overlaps.iter().all(|pair| pair.share().is_none()));
+    }
+
+    #[test]
+    fn overlap_both_never_rises_with_the_threshold() {
+        let stack = overlap_stack();
+        let at = |threshold: f64| {
+            let mut values = overlap_values();
+            values.insert(
+                "overlap-threshold".to_string(),
+                ParamValue::Float(threshold),
+            );
+            count(&stack, &values).unwrap().overlaps
+        };
+        let thresholds = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+        let runs: Vec<_> = thresholds.iter().map(|&threshold| at(threshold)).collect();
+        for (step, window) in runs.windows(2).enumerate() {
+            for (index, (before, after)) in window[0].iter().zip(&window[1]).enumerate() {
+                assert!(
+                    after.both <= before.both,
+                    "threshold {} to {}, pair {index}: {before:?} to {after:?}",
+                    thresholds[step],
+                    thresholds[step + 1],
+                );
+            }
+        }
+        let both = |run: &[PairOverlap]| run.iter().map(|pair| pair.both).sum::<u32>();
+        assert!(both(&runs[5]) < both(&runs[0]), "{runs:?}");
+    }
+
+    #[test]
+    fn the_table_declares_every_parameter_with_its_bounds() {
         let resolved = params::resolve_in(
             &SHARP_AREA_PARAMS,
             &ParamValues::new(),
@@ -799,6 +988,8 @@ mod tests {
         let resolved = params::resolved_values(&resolved);
         assert_eq!(resolved["cell-size"], ParamValue::Int(64));
         assert_eq!(resolved["contrast"], ParamValue::Float(2.0));
+        assert_eq!(resolved["overlap-threshold"], ParamValue::Float(0.8));
+        assert_eq!(SHARP_AREA_PARAMS.len(), 3);
         assert!(matches!(
             SHARP_AREA_PARAMS[0].kind,
             ParamKind::Int { min: 16, max: 512 }
@@ -806,6 +997,10 @@ mod tests {
         assert!(matches!(
             SHARP_AREA_PARAMS[1].kind,
             ParamKind::Float { min, max, .. } if min == 1.0 && max == 10.0
+        ));
+        assert!(matches!(
+            SHARP_AREA_PARAMS[2].kind,
+            ParamKind::Float { min, max, .. } if min == 0.5 && max == 1.0
         ));
         assert!(
             SHARP_AREA_PARAMS
@@ -820,6 +1015,8 @@ mod tests {
             ("cell-size", ParamValue::Int(15)),
             ("cell-size", ParamValue::Int(513)),
             ("contrast", ParamValue::Float(0.5)),
+            ("overlap-threshold", ParamValue::Float(0.4)),
+            ("overlap-threshold", ParamValue::Float(1.1)),
         ];
         for (id, value) in refused {
             let result = count_sharp_areas(

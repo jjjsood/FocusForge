@@ -885,17 +885,31 @@ number of cells. A cell counts in the first or the last frame like any other.
 Frames are read tile by tile and counted as they are, without alignment. A
 single frame, or a stack with no detail, gives a count of 0 for every frame.
 
+Neighbouring frames also get an overlap, which tells whether two focus steps
+leave a band sharp in neither. Over the counted cells, a frame is sharp in a
+cell when its score there is at least `overlap-threshold` times the cell's
+best score. The overlap of frames `i` and `i + 1` is twice the cells sharp in
+both, divided by the sum of the cells sharp in each: the overlap of the two
+sharp zones as a share of one zone. It is `no data` when neither frame is
+sharp in any counted cell, which differs from an overlap of 0 %. A stack of
+`N` frames has `N - 1` overlaps; a single frame has none. Few counted cells
+make a coarse share, so a pair with a small union can read 0 % or 100 % by
+chance.
+
 | parameter | unit | default | allowed |
 |---|---|---|---|
 | `cell-size` | px | 64 | 16 to 512 |
 | `contrast` | peak-to-floor ratio | 2 | 1 to 10 |
+| `overlap-threshold` | share of the cell's best score | 0.8 | 0.5 to 1 |
 
 A value outside its range, an unknown key or an unparsable value is
 reported on stderr, one line per violation, and the exit code is 1. So are
 a directory without frames, a frame that cannot be read, and frames of
 different sizes.
 
-The text output is one row per frame: its index, its file name and its count.
+The text output is one row per frame, its index, its file name and its
+count, then one line per neighbour pair with its 1-based label and its overlap
+in percent, or `no data`.
 
 ```
 $ focusforge-cli sharp-areas fixtures/mantis-512/frames
@@ -907,15 +921,22 @@ $ focusforge-cli sharp-areas fixtures/mantis-512/frames
 5  05.tif  0
 6  06.tif  0
 7  07.tif  1
+overlap  1-2  0.0%
+overlap  2-3  0.0%
+overlap  3-4  0.0%
+overlap  4-5  0.0%
+overlap  5-6  no data
+overlap  6-7  0.0%
+overlap  7-8  100.0%
 ```
 
-`--json` prints the resolved parameters, the number of cells and the same
-rows (here with `--set cell-size=256`):
+`--json` prints the resolved parameters, the number of cells, the same rows
+and the overlaps, each a fraction from 0 to 1 or `null` for no data:
 
 ```
-$ focusforge-cli sharp-areas fixtures/mantis-512/frames --set cell-size=256 --json
+$ focusforge-cli sharp-areas fixtures/mantis-512/frames --json
 {
-  "cells": 4,
+  "cells": 64,
   "frames": [
     {
       "count": 0,
@@ -924,9 +945,22 @@ $ focusforge-cli sharp-areas fixtures/mantis-512/frames --set cell-size=256 --js
     },
     ...
   ],
+  "overlaps": [
+    {
+      "pair": "1-2",
+      "share": 0.0
+    },
+    ...
+    {
+      "pair": "5-6",
+      "share": null
+    },
+    ...
+  ],
   "params": {
-    "cell-size": 256,
-    "contrast": 2.0
+    "cell-size": 64,
+    "contrast": 2.0,
+    "overlap-threshold": 0.8
   }
 }
 ```

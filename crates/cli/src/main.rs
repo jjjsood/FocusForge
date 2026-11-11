@@ -214,7 +214,9 @@ enum Command {
     /// The image is divided into square cells. A cell is counted in the frame where
     /// its mean focus score peaks, when that peak exceeds the contrast times the cell's
     /// lowest score over the stack; a cell without that contrast is counted in no frame.
-    /// Frames are counted as read, without alignment.
+    /// Each pair of neighbouring frames also gets an overlap: twice the counted cells
+    /// sharp in both, divided by the sum of the counted cells sharp in each, or `no data`
+    /// when neither is sharp in any. Frames are counted as read, without alignment.
     #[command(after_help = set::parameter_help(&focusforge_core::sharp_areas::SHARP_AREA_PARAMS))]
     SharpAreas {
         /// Directory of frames to count (non-recursive, descending into a `frames` subdirectory).

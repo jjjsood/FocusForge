@@ -10,6 +10,8 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 - `focusforge-cli sharpness-map` writes the focus score of every frame, and of a composite, as `f32` TIFF maps on one scale for the whole stack, so equal values mean equal sharpness in every map.
 
+- `focusforge-cli sharp-areas` reports, for each pair of neighbouring frames, how much their sharp zones overlap, with the `overlap-threshold` parameter that sets what counts as sharp.
+
 ### Fixed
 
 - On a machine without a hardware GPU (a virtual machine, a Remote Desktop session), stacking runs on the CPU instead of a slow software graphics adapter.
