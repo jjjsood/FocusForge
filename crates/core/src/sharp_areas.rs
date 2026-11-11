@@ -17,10 +17,12 @@ use crate::fuse::laplacian::score_plane;
 use crate::fuse::sharpness::{DETAIL_REACH, detail_plane};
 use crate::params::{self, ParamDesc, ParamError, ParamKind, ParamValue, ParamValues};
 use crate::tile::plan::TileSupport;
-use crate::tile::{HostBudget, HostBudgetGate, HostSources, TileControl, TileError, TilePlan};
+use crate::tile::{
+    HostBudget, HostBudgetGate, HostSources, Rect, TileControl, TileError, TilePlan,
+};
 
 /// Radius of the box the focus score sums over, the depth map's default.
-const SCORE_RADIUS: u32 = 4;
+pub(crate) const SCORE_RADIUS: u32 = 4;
 
 /// The count's inputs, in the shape every front end reads.
 pub static SHARP_AREA_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
@@ -81,6 +83,101 @@ pub enum SharpAreasError {
     Detail(#[from] PyramidError),
     #[error("the count was stopped")]
     Stopped,
+}
+
+/// The tiles the focus score is computed on: each tile reads
+/// `DETAIL_REACH + SCORE_RADIUS` px beyond its interior, so a score does not
+/// depend on the tile size.
+pub fn sharpness_plan((width, height): (u32, u32), tile_size: u32) -> Result<TilePlan, TileError> {
+    TilePlan::new(
+        width,
+        height,
+        tile_size,
+        TileSupport {
+            reach_px: DETAIL_REACH + SCORE_RADIUS,
+            decimation_levels: 1,
+        },
+    )
+}
+
+/// The focus score of `frame` over `read`, one value per pixel of `read`
+/// (channels summed). `samples` is the caller's reusable read buffer.
+pub(crate) fn score_tile(
+    reader: &dyn TileReader,
+    frame: usize,
+    read: Rect,
+    spp: u32,
+    samples: &mut Vec<u16>,
+) -> Result<Vec<f32>, SharpAreasError> {
+    samples.resize(
+        read.width as usize * read.height as usize * spp as usize,
+        0u16,
+    );
+    reader.read_tile_into(frame, read, samples)?;
+    let detail = detail_plane(samples, read.width, read.height, spp)?;
+    Ok(score_plane(&detail, SCORE_RADIUS))
+}
+
+/// A worker pool with one thread per core and the gate that admits frame
+/// reads to it, at most `control.admission_cap()` at a time.
+pub(crate) fn frame_workers() -> Result<(rayon::ThreadPool, HostBudgetGate), TileError> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("focusforge-sharp-{i}"))
+        .panic_handler(crate::pool::log_worker_panic)
+        .build()
+        .map_err(|source| TileError::ThreadPool { source })?;
+    let gate = HostBudgetGate::new(
+        HostBudget::explicit(0),
+        0,
+        0,
+        threads,
+        HostSources::default(),
+    );
+    Ok((pool, gate))
+}
+
+/// Scores `read` in every frame, the frames in parallel, and hands frame `i`'s
+/// scores to `fold` with `rows[i]`. `control` is asked to stop before each
+/// read and told of each finished one; a read or detail error wins over the
+/// stop the other workers then see.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn score_frames_of_tile<A: Send>(
+    pool: &rayon::ThreadPool,
+    gate: &HostBudgetGate,
+    reader: &dyn TileReader,
+    read: Rect,
+    spp: u32,
+    control: &dyn TileControl,
+    rows: &mut [A],
+    fold: impl Fn(&mut A, &[f32]) + Sync,
+) -> Result<(), SharpAreasError> {
+    let first_error: Mutex<Option<SharpAreasError>> = Mutex::new(None);
+    let run: Result<(), ()> = pool.install(|| {
+        rows.par_iter_mut().enumerate().try_for_each_init(
+            Vec::new,
+            |samples: &mut Vec<u16>, (frame, row)| {
+                let _permit = gate.acquire(control);
+                if control.should_stop() {
+                    return Err(());
+                }
+                match score_tile(reader, frame, read, spp, samples) {
+                    Ok(scores) => fold(row, &scores),
+                    Err(error) => {
+                        first_error.lock().unwrap().get_or_insert(error);
+                        return Err(());
+                    }
+                }
+                control.unit_completed(u64::from(read.width) * u64::from(read.height));
+                Ok(())
+            },
+        )
+    });
+    if let Some(error) = first_error.lock().unwrap().take() {
+        return Err(error);
+    }
+    run.map_err(|()| SharpAreasError::Stopped)
 }
 
 /// Counts the sharp areas of each of `frames` frames of `(width, height)`
@@ -144,15 +241,7 @@ pub fn count_sharp_areas_reporting(
         .as_f64()
         .expect("contrast resolves to a number");
 
-    let plan = TilePlan::new(
-        width,
-        height,
-        tile_size,
-        TileSupport {
-            reach_px: DETAIL_REACH + SCORE_RADIUS,
-            decimation_levels: 1,
-        },
-    )?;
+    let plan = sharpness_plan((width, height), tile_size)?;
     let columns = width.div_ceil(cell) as usize;
     let cells = columns * height.div_ceil(cell) as usize;
     // Pixels in each cell: the edge cells are cut short.
@@ -184,71 +273,30 @@ pub fn count_sharp_areas_reporting(
     // Per frame and cell, the sum of the focus scores read so far. A frame
     // only ever adds into its own row, tile by tile in plan order, so the f64
     // sums are the serial ones whatever the worker count.
-    let mut sums = vec![0.0f64; frames * cells];
+    let mut sums = vec![vec![0.0f64; cells]; frames];
     let mut counts = vec![0u32; frames];
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .thread_name(|i| format!("focusforge-sharp-{i}"))
-        .panic_handler(crate::pool::log_worker_panic)
-        .build()
-        .map_err(|source| TileError::ThreadPool { source })?;
-    let gate = HostBudgetGate::new(
-        HostBudget::explicit(0),
-        0,
-        0,
-        threads,
-        HostSources::default(),
-    );
-    // A read or detail error wins over the stop the other workers then see.
-    let first_error: Mutex<Option<SharpAreasError>> = Mutex::new(None);
+    let (pool, gate) = frame_workers()?;
     for tile in plan.tiles() {
         let (read, interior) = (tile.read(), tile.interior());
-        let tile_run: Result<(), ()> = pool.install(|| {
-            sums.par_chunks_mut(cells).enumerate().try_for_each_init(
-                Vec::new,
-                |samples: &mut Vec<u16>, (frame, frame_sums)| {
-                    let _permit = gate.acquire(control);
-                    if control.should_stop() {
-                        return Err(());
+        score_frames_of_tile(
+            &pool,
+            &gate,
+            reader,
+            read,
+            spp,
+            control,
+            &mut sums,
+            |frame_sums, scores| {
+                for y in interior.y..interior.y + interior.height {
+                    let row = ((y - read.y) * read.width) as usize;
+                    let cell_row = (y / cell) as usize * columns;
+                    for x in interior.x..interior.x + interior.width {
+                        frame_sums[cell_row + (x / cell) as usize] +=
+                            f64::from(scores[row + (x - read.x) as usize]);
                     }
-                    samples.resize(
-                        read.width as usize * read.height as usize * spp as usize,
-                        0u16,
-                    );
-                    let scored = reader
-                        .read_tile_into(frame, read, samples)
-                        .map_err(SharpAreasError::from)
-                        .and_then(|()| {
-                            let detail = detail_plane(samples, read.width, read.height, spp)?;
-                            Ok(score_plane(&detail, SCORE_RADIUS))
-                        });
-                    let scores = match scored {
-                        Ok(scores) => scores,
-                        Err(error) => {
-                            first_error.lock().unwrap().get_or_insert(error);
-                            return Err(());
-                        }
-                    };
-                    for y in interior.y..interior.y + interior.height {
-                        let row = ((y - read.y) * read.width) as usize;
-                        let cell_row = (y / cell) as usize * columns;
-                        for x in interior.x..interior.x + interior.width {
-                            frame_sums[cell_row + (x / cell) as usize] +=
-                                f64::from(scores[row + (x - read.x) as usize]);
-                        }
-                    }
-                    control.unit_completed(u64::from(read.width) * u64::from(read.height));
-                    Ok(())
-                },
-            )
-        });
-        if let Some(error) = first_error.lock().unwrap().take() {
-            return Err(error);
-        }
-        if tile_run.is_err() {
-            return Err(SharpAreasError::Stopped);
-        }
+                }
+            },
+        )?;
         let (across, down) = touched(interior);
         for row in down {
             for column in across.clone() {
@@ -258,8 +306,8 @@ pub fn count_sharp_areas_reporting(
                     continue;
                 }
                 let (mut peak, mut peak_frame, mut floor) = (f64::NEG_INFINITY, 0, f64::INFINITY);
-                for frame in 0..frames {
-                    let mean = sums[frame * cells + index] / area[index];
+                for (frame, frame_sums) in sums.iter().enumerate() {
+                    let mean = frame_sums[index] / area[index];
                     if mean > peak {
                         peak = mean;
                         peak_frame = frame;
@@ -495,16 +543,7 @@ mod tests {
     fn every_finished_tile_reports_its_read_area() {
         let (control, result) = run_with(usize::MAX);
         result.unwrap();
-        let plan = TilePlan::new(
-            WIDTH,
-            HEIGHT,
-            TILE,
-            TileSupport {
-                reach_px: DETAIL_REACH + SCORE_RADIUS,
-                decimation_levels: 1,
-            },
-        )
-        .unwrap();
+        let plan = sharpness_plan((WIDTH, HEIGHT), TILE).unwrap();
         let per_frame: Vec<u64> = plan
             .tiles()
             .iter()
@@ -546,18 +585,10 @@ mod tests {
                 let at = format!("cell {cell}, tile {tile_size}");
                 let (reported, result) = reports(&stack, &values, tile_size);
                 assert_eq!(result, wanted, "{at}: the result ignores the tile size");
-                let tiles = TilePlan::new(
-                    WIDTH,
-                    HEIGHT,
-                    tile_size,
-                    TileSupport {
-                        reach_px: DETAIL_REACH + SCORE_RADIUS,
-                        decimation_levels: 1,
-                    },
-                )
-                .unwrap()
-                .tiles()
-                .len();
+                let tiles = sharpness_plan((WIDTH, HEIGHT), tile_size)
+                    .unwrap()
+                    .tiles()
+                    .len();
                 assert_eq!(reported.len(), tiles, "{at}: one report per tile");
                 for pair in reported.windows(2) {
                     assert!(
@@ -623,18 +654,10 @@ mod tests {
     }
 
     fn tile_count(tile_size: u32) -> usize {
-        TilePlan::new(
-            WIDTH,
-            HEIGHT,
-            tile_size,
-            TileSupport {
-                reach_px: DETAIL_REACH + SCORE_RADIUS,
-                decimation_levels: 1,
-            },
-        )
-        .unwrap()
-        .tiles()
-        .len()
+        sharpness_plan((WIDTH, HEIGHT), tile_size)
+            .unwrap()
+            .tiles()
+            .len()
     }
 
     #[test]

@@ -4,7 +4,7 @@
 .SH NAME
 focusforge\-cli\-export \- Turn a project into an image file: the image with `\-o`, the Z\-Map with `\-\-zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image
 .SH SYNOPSIS
-\fBfocusforge\-cli export\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-zmap\fR] [\fB\-\-checkpoint\fR] [\fB\-\-format\fR] [\fB\-\-tiff\-bits\fR] [\fB\-\-tiff\-compression\fR] [\fB\-\-png\-bits\fR] [\fB\-\-png\-compression\fR] [\fB\-\-jpeg\-quality\fR] [\fB\-\-jpeg\-subsampling\fR] [\fB\-\-exif\fR] [\fB\-\-icc\fR] [\fB\-\-xmp\fR] [\fB\-\-iptc\fR] [\fB\-v \fR]... [\fB\-\-frame\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-frame\-output\fR] [\fB\-\-json\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> 
+\fBfocusforge\-cli export\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-zmap\fR] [\fB\-\-checkpoint\fR] [\fB\-\-format\fR] [\fB\-\-tiff\-bits\fR] [\fB\-\-tiff\-compression\fR] [\fB\-\-png\-bits\fR] [\fB\-\-png\-compression\fR] [\fB\-\-jpeg\-quality\fR] [\fB\-\-jpeg\-subsampling\fR] [\fB\-\-exif\fR] [\fB\-\-icc\fR] [\fB\-\-xmp\fR] [\fB\-\-iptc\fR] [\fB\-\-frame\fR] [\fB\-v \fR]... [\fB\-\-frame\-output\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-json\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPROJECT\fR> 
 .SH DESCRIPTION
 Turn a project into an image file: the image with `\-o`, the Z\-Map with `\-\-zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image
 .SH OPTIONS
@@ -51,17 +51,17 @@ Carry the source frame\*(Aqs XMP packet, with any `tiff:Orientation` set to 1: `
 \fB\-\-iptc\fR \fI<IPTC>\fR
 Carry the source frame\*(Aqs IPTC block verbatim: `on` or `off` (default). Never written to PNG
 .TP
-\fB\-v\fR
-Increase log detail (repeatable)
-.TP
 \fB\-\-frame\fR \fI<INDEX>\fR
 Write this source frame "as fused" \-\- warped by its recorded transform and offset by the applied crop, at the resolved checkpoint\*(Aqs own composite width and height. Requires `\-\-frame\-output`
 .TP
-\fB\-q\fR, \fB\-\-quiet\fR
-Log errors only
+\fB\-v\fR
+Increase log detail (repeatable)
 .TP
 \fB\-\-frame\-output\fR \fI<FILE>\fR
 Where to write the frame `\-\-frame` names
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Log errors only
 .TP
 \fB\-\-json\fR
 Emit the JSON report instead of human\-readable text

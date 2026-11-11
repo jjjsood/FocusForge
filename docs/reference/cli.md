@@ -21,6 +21,7 @@ focusforge-cli [OPTIONS] <COMMAND>
 | [`algorithms`](#algorithms) | lists registered algorithms, or prints one's full parameter schema |
 | [`step-plan`](#step-plan) | computes the focus step, frame count, duration and disk need of a focus stack from the optics and a depth range |
 | [`sharp-areas`](#sharp-areas) | counts the areas of the image that are sharpest in each frame of a directory |
+| [`sharpness-map`](#sharpness-map) | writes the focus score of each frame, and of a composite, as maps on one scale for the whole stack |
 | [`stack`](#stack) | fuses a directory's frames into one project per detected stack |
 | [`export`](#export) | renders a checkpoint to a TIFF, PNG, JPEG or (for RAW projects) DNG image, and/or writes its Z-Map or one source frame |
 | [`retouch`](#retouch) | appends an op list of brush strokes to a project as new checkpoints |
@@ -32,7 +33,8 @@ focusforge-cli [OPTIONS] <COMMAND>
 | [`check-update`](#check-update) | reports whether a newer release exists |
 
 Root help groups `stack`, `align`, `retouch` and `export` under Processing;
-`info`, `review`, `algorithms`, `step-plan` and `sharp-areas` under Inspection; and
+`info`, `review`, `algorithms`, `step-plan`, `sharp-areas` and `sharpness-map` under
+Inspection; and
 `history`, `cache`, `diagnostics` and `check-update` under Maintenance.
 
 ## Global options
@@ -926,6 +928,76 @@ $ focusforge-cli sharp-areas fixtures/mantis-512/frames --set cell-size=256 --js
     "cell-size": 256,
     "contrast": 2.0
   }
+}
+```
+
+## `sharpness-map`
+
+```
+focusforge-cli sharpness-map [OPTIONS] --out <OUT> <DIR>
+```
+
+| flag | meaning |
+|---|---|
+| `--out <OUT>` | the directory the maps are written to; created if missing |
+| `--composite <COMPOSITE>` | a composite image of the frames' size, mapped on the frames' scale |
+| `--json` | print the scale and the written maps as one JSON object |
+| `--priority <low\|normal>` | `low` reads one frame at a time, `normal` (the default) as many as the host has threads; the maps are the same |
+
+Writes, for each frame of a directory, a map of its focus score on one scale
+for the whole stack, so the same value means the same sharpness in every frame
+and in the composite. `<DIR>` is read like `info`'s: the frames directly inside
+it, or inside its `frames/` subdirectory when that exists.
+
+The scale is the 99th percentile of each pixel's peak focus score (the score
+`depth-map` fuses by) over the frames. It is taken over the image's pixels,
+not over every frame's pixels, so it does not move with the frame count, and
+it is read to a relative resolution of 2^-11. A map holds the focus score of
+each pixel divided by the scale; a value above 1 is sharper than the scale and
+is kept. A stack with no detail has scale 0 and maps of zeros.
+
+Each map is an `f32` TIFF of the frames' size with one sample per pixel,
+`<frame>-sharpness.tif`. With `--composite` the composite image is scored the
+same way and divided by the frames' scale, giving `composite-sharpness.tif`:
+it shows the composite as it is, so a fusion that is sharper than any frame
+reads above 1. Frames are read tile by tile and mapped as they are, without
+alignment. The values do not depend on the tile size.
+
+A composite whose size or samples per pixel differ from the frames', a
+directory without frames, a frame that cannot be read and an output directory
+that cannot be created are reported on stderr with exit code 1; a failed run
+leaves no map behind.
+
+The text output is the scale, then one row per frame (its index, its file name
+and its map) and, with `--composite`, a `composite` row:
+
+```
+$ focusforge-cli sharpness-map fixtures/mantis-512/frames --out maps --composite fixtures/mantis-512/reference.tif
+scale  213248
+0  00.tif  maps/00-sharpness.tif
+...
+7  07.tif  maps/07-sharpness.tif
+composite  reference.tif  maps/composite-sharpness.tif
+```
+
+`--json` prints the percentile, the scale and the same rows:
+
+```
+{
+  "composite": {
+    "file": "reference.tif",
+    "map": "maps/composite-sharpness.tif"
+  },
+  "frames": [
+    {
+      "file": "00.tif",
+      "index": 0,
+      "map": "maps/00-sharpness.tif"
+    },
+    ...
+  ],
+  "percentile": 0.99,
+  "scale": 213248.0
 }
 ```
 
