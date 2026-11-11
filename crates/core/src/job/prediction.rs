@@ -36,14 +36,14 @@
 //! CR3 stack developed into memory. Held out, a 30-frame TIFF stack and a
 //! different 25-frame CR3 stack (25 other frames of the same burst), each
 //! on CPU and GPU with one cold and three warm runs, all 16 predictions
-//! land within the ±20 % target of the
-//! measured wall time, the worst −13.0 % (cold GPU, CR3). TIFF runs miss
-//! by −1.2 to +2.6 %, warm CR3 runs by −2.6 to −8.2 %.
+//! land within ±20 % of the measured wall time, the worst −13.0 % (cold
+//! GPU, CR3). TIFF runs miss by −1.2 to +2.6 %, warm CR3 runs by −2.6 to
+//! −8.2 %.
 //!
 //! # Calibrated classes
 //!
 //! A row of `CALIBRATIONS` is one measured class: reader, RAW file
-//! extension, develop store and blend algorithm. Measured today: an
+//! extension, develop store and blend algorithm. Measured: an
 //! uncompressed 16-bit TIFF read through `mmap` with `laplacian`, and a
 //! Canon CR3 developed into memory with `laplacian`. Every other input
 //! still gets a prediction, from the first row of its family, with
@@ -102,7 +102,7 @@ pub(crate) struct Calibration {
 /// The measured classes. A record matches a row exactly (reader, blend
 /// algorithm and, for RAW, extension and develop store) and is then
 /// `calibrated`; otherwise the first row of its family (RAW or not) is the
-/// fallback. A new measurement adds a row.
+/// fallback.
 ///
 /// - Uncompressed 16-bit TIFF, `mmap`, `laplacian`: least squares over 61-,
 ///   32- and 8-frame stacks of 15.0 and 0.26 Mpx frames on the reference
@@ -649,7 +649,7 @@ mod tests {
             assert_eq!(p.stages, base.stages, "{at}");
         }
 
-        // A calibration round appends a row; only its own class flips.
+        // An appended row flips only its own class.
         let mut table = CALIBRATIONS.to_vec();
         let mut row = table[0];
         row.reader = ReaderKind::Decoded;

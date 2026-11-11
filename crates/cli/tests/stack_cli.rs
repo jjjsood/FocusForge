@@ -2056,7 +2056,7 @@ fn dry_run_reports_prediction() {
         "prediction",
     ];
     expected.sort_unstable();
-    assert_eq!(keys, expected, "the pre-existing keys plus `prediction`");
+    assert_eq!(keys, expected, "the plan keys, `prediction` included");
 
     let prediction = &plan["prediction"];
     let mut prediction_keys: Vec<&str> = prediction
