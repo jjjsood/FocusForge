@@ -61,7 +61,9 @@ pub mod stage_cache;
 
 pub use control::{ControlState, JobControl};
 pub use fingerprint::{FingerprintMismatch, FrameCount, FrameFingerprint, StackFingerprint};
-pub use ledger::{Ledger, RecordingConsumer, Resumable, ResumeError, ResumeStore, read_alignment};
+pub use ledger::{
+    Ledger, RecordingConsumer, Resumable, ResumeError, ResumeStore, TimingConsumer, read_alignment,
+};
 pub use progress::JobProgress;
 pub use record::{ALIGN_SOLVER_VERSION, AlignIdentity, DRIVER_POLICY_FIELDS, JobRecord};
 pub use stage_cache::{

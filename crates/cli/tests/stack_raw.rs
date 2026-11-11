@@ -1083,3 +1083,47 @@ fn raw_stack_output_is_identical_in_ram_and_on_disk() {
         "the stores gave different composites"
     );
 }
+
+#[test]
+fn run_plan_names_raw_input() {
+    let input = common::tmp_dir("stack_raw_run_plan");
+    let cwd = common::tmp_dir("stack_raw_run_plan_cwd");
+    let source = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![512; 64]),
+        false,
+    );
+    for index in 0..2 {
+        std::fs::copy(source.path(), input.join(format!("{index:02}.dng")))
+            .expect("copy RAW frame");
+    }
+    let plan = |extra: &[&str]| -> serde_json::Value {
+        let mut args = vec![
+            "stack".to_string(),
+            input.display().to_string(),
+            "-o".to_string(),
+            cwd.display().to_string(),
+            "--algorithm".to_string(),
+            "laplacian".to_string(),
+            "--no-align".to_string(),
+            "--no-crop".to_string(),
+            "--json".to_string(),
+        ];
+        args.extend(extra.iter().map(ToString::to_string));
+        if cfg!(feature = "gpu") {
+            args.push("--cpu".to_string());
+        }
+        let output = run(&cwd, &args);
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("--json must parse")
+    };
+    let dry = plan(&["--dry-run"]);
+    let ran = plan(&[]);
+    assert_eq!(ran["run_plan"], dry["run_plan"], "{ran}");
+    assert_eq!(ran["run_plan"]["reader"], "raw", "{ran}");
+    assert_eq!(ran["run_plan"]["source_bits_per_sample"], 32, "{ran}");
+    assert_eq!(ran["run_plan"]["frame_count"], 2, "{ran}");
+}

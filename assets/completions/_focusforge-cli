@@ -105,6 +105,7 @@ _arguments "${_arguments_options[@]}" : \
 '--dry-run[Resolve everything, print what would happen -- parameters with their provenance, tile geometry, output paths -- and exit 0 without computing or writing anything. Stops *before* alignment, so it reports no crop rect and no output extent]' \
 '--cpu[Force the CPU path even when a usable GPU adapter is available. Only in builds with GPU support]' \
 '--no-cache[Skip the stage cache\: recompute the alignment even when a valid entry exists, and store no new entry]' \
+'--trace-accounting[Count bytes read and converted, cache hits, worker peaks and each fused tile'\''s duration during the run, and add them to the --json report as \`trace_accounting\` and \`fuse_tiles\`. Off by default; it costs a little time when on]' \
 '*-v[Increase log detail (repeatable)]' \
 '-q[Log errors only]' \
 '--quiet[Log errors only]' \

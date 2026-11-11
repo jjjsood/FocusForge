@@ -14,11 +14,12 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use serde::Serialize;
 
 use crate::algorithm::{AlgorithmError, AlignAlgorithm, StackAlgorithm, TileReader};
 use crate::align::{
@@ -39,7 +40,7 @@ use crate::io::{
 use crate::job::{
     AlignIdentity, ControlState, FrameFingerprint, Job, JobControl, JobOutcome, JobProgress,
     JobRecord, JobStage, RecordingConsumer, Resumable, ResumeStore, StackFingerprint, StageCache,
-    StageKey, read_alignment,
+    StageKey, TimingConsumer, read_alignment,
 };
 use crate::params::{self, ParamValue, ParamValues, Provenance, ResolvedParams};
 use crate::project::{
@@ -50,7 +51,7 @@ use crate::tile::{
     InFlightBound, NoopPreprocess, SampleFormat, TileConsumer, TileError, TilePlan, TileScheduler,
     TileSchedulerOptions,
 };
-use crate::timing::{Stage, StageTimer, StageTimings, equalize_scope};
+use crate::timing::{Stage, StageTimer, StageTimings, equalize_scope, timing_enabled};
 
 /// An alignment request: which algorithm, its explicit parameters, and
 /// whether a frame that fails to converge is refused (`Strict`) or falls
@@ -235,11 +236,114 @@ pub struct FuseReport {
     /// Full-frame RAW develops per frame across every stage of the run;
     /// `None` when the reader keeps no count.
     pub develop_counts: Option<Vec<u64>>,
+    /// Each tile this run fused, by index, with its wall duration; `None`
+    /// unless trace accounting was on when the fuse stage began.
+    pub fuse_tiles: Option<Vec<FuseTileTiming>>,
+    /// Fuse tiles taken from a resume ledger instead of fused; `0` on a
+    /// fresh run.
+    pub resumed_units: usize,
     pub wall_seconds: f64,
     pub metrics: Metrics,
     /// The time spent building and delivering each preview kind; zero when
     /// the observer asked for none.
     pub preview_cost: PreviewCost,
+}
+
+/// The host worker count a run's develop, prepare and align stages use: the
+/// available parallelism, capped by the frame count and by `admission_cap`
+/// (`usize::MAX` for none), and at least 1.
+pub fn host_workers(frames: usize, admission_cap: usize) -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(frames)
+        .min(admission_cap)
+        .max(1)
+}
+
+/// The run-plan inputs a duration model reads, all known before the first
+/// stage starts. [`Self::new`] describes a cold run; the driver's report
+/// fills the two hit fields with what the run resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunPlanFeatures {
+    /// Frames in the stack.
+    pub frame_count: usize,
+    /// Pixels in one frame (width times height), not samples.
+    pub frame_pixels: u64,
+    /// Bit depth of one source sample: 8, 16, or 32 for developed RAW.
+    pub source_bits_per_sample: u16,
+    /// The reader serving the frames, which names the input format.
+    pub reader: ReaderKind,
+    /// Whether the plan targets the GPU backend. A mid-run fallback to the
+    /// host shows in the report's `gpu_fallback`, not here.
+    pub gpu: bool,
+    /// Host worker threads the develop, prepare and align stages use.
+    pub workers: usize,
+    /// The blend method's algorithm id.
+    pub algorithm: String,
+    /// Whether the alignment was taken from the stage cache.
+    pub align_cache_hit: bool,
+    /// Fuse tiles skipped because a `--resume` ledger already held them.
+    pub resumed_units: usize,
+}
+
+impl RunPlanFeatures {
+    /// Describes a cold run of `ctx` (no cache hit, nothing resumed) without
+    /// touching the filesystem. `admission_cap` is the job's worker cap
+    /// (`usize::MAX` for none).
+    pub fn new(
+        ctx: &crate::params::StackContext,
+        reader: ReaderKind,
+        source_bits_per_sample: u16,
+        gpu: bool,
+        algorithm: &str,
+        admission_cap: usize,
+    ) -> Self {
+        Self {
+            frame_count: ctx.frame_count,
+            frame_pixels: u64::from(ctx.width) * u64::from(ctx.height),
+            source_bits_per_sample,
+            reader,
+            gpu,
+            workers: host_workers(ctx.frame_count, admission_cap),
+            algorithm: algorithm.to_string(),
+            align_cache_hit: false,
+            resumed_units: 0,
+        }
+    }
+}
+
+/// One fused tile's size and wall duration, as noted when trace accounting
+/// is on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FuseTileTiming {
+    /// The tile's position in the plan.
+    pub index: usize,
+    /// Pixels of the rectangle read from every frame (interior plus margin).
+    pub read_pixels: u64,
+    /// Pixels of the tile's interior, the part of the output it owns.
+    pub output_pixels: u64,
+    /// Whether the interior reaches any side of the frame.
+    pub touches_edge: bool,
+    /// Wall time of the fuse consumer for this tile, in nanoseconds; the
+    /// on-demand frame-tile reads inside it count, the wait for admission
+    /// and the ledger write do not.
+    pub duration_ns: u64,
+}
+
+impl FuseTileTiming {
+    fn new(tile: &crate::tile::PlannedTile, extent: (u32, u32), duration_ns: u64) -> Self {
+        let (read, interior) = (tile.read(), tile.interior());
+        Self {
+            index: tile.index(),
+            read_pixels: u64::from(read.width) * u64::from(read.height),
+            output_pixels: u64::from(interior.width) * u64::from(interior.height),
+            touches_edge: interior.x == 0
+                || interior.y == 0
+                || interior.x + interior.width == extent.0
+                || interior.y + interior.height == extent.1,
+            duration_ns,
+        }
+    }
 }
 
 /// The intensity encoding of the code values a reader delivers: RAW frames
@@ -689,11 +793,7 @@ pub fn run(
         }
     }
 
-    let workers = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZero::get)
-        .min(frame_reader.len())
-        .min(control.admission_cap())
-        .max(1);
+    let workers = host_workers(frame_reader.len(), control.admission_cap());
     let cancel_requested = || control.state() == ControlState::CancelRequested;
     let developed_store = frame_reader.develop_store(
         develop_budget,
@@ -1283,8 +1383,16 @@ pub fn run(
         Some(bc) => bc,
         None => &sink,
     };
-    let recording = RecordingConsumer {
+    let tile_durations = timing_enabled().then(|| Mutex::new(Vec::new()));
+    let timed = tile_durations.as_ref().map(|durations| TimingConsumer {
         inner: consumer,
+        durations,
+    });
+    let recording = RecordingConsumer {
+        inner: match &timed {
+            Some(timed) => timed,
+            None => consumer,
+        },
         ledger: &ledger,
     };
 
@@ -1418,6 +1526,18 @@ pub fn run(
     let wall_seconds = timer.total_seconds();
     let stages = timer.finish();
     let plan = scheduler.plan();
+    let fuse_tiles = tile_durations.map(|durations| {
+        let mut durations = durations
+            .into_inner()
+            .expect("no thread panicked while noting a tile duration");
+        durations.sort_unstable_by_key(|&(index, _)| index);
+        durations
+            .into_iter()
+            .map(|(index, duration_ns)| {
+                FuseTileTiming::new(&plan.tiles()[index], (width, height), duration_ns)
+            })
+            .collect()
+    });
 
     let align_report =
         alignment_result.map(
@@ -1468,6 +1588,8 @@ pub fn run(
         align_backend_used,
         stages,
         develop_counts: frame_reader.develop_counts(),
+        fuse_tiles,
+        resumed_units: surviving.as_ref().map_or(0, Vec::len),
         wall_seconds,
         metrics,
         preview_cost: feed.as_ref().map(PreviewFeed::cost).unwrap_or_default(),
@@ -2194,5 +2316,66 @@ mod tests {
         }
         let fits = run_space(&big(1), true).expect("one row fits");
         assert!(fits.scratch > 16 * u64::from(u32::MAX));
+    }
+
+    fn plan_features(ctx: &crate::params::StackContext, cap: usize) -> RunPlanFeatures {
+        RunPlanFeatures::new(ctx, ReaderKind::Mmap, 16, false, "laplacian", cap)
+    }
+
+    #[test]
+    fn run_plan_features_serialize_the_nine_stable_names() {
+        let ctx = crate::params::StackContext::new(3, 64, 48, 3);
+        let value = serde_json::to_value(plan_features(&ctx, usize::MAX)).unwrap();
+        let object = value.as_object().expect("a record serializes as an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "algorithm",
+                "align_cache_hit",
+                "frame_count",
+                "frame_pixels",
+                "gpu",
+                "reader",
+                "resumed_units",
+                "source_bits_per_sample",
+                "workers",
+            ]
+        );
+        assert_eq!(object["reader"], "mmap");
+        assert_eq!(object["frame_pixels"], 64 * 48);
+    }
+
+    #[test]
+    fn run_plan_features_start_cold_and_map_the_context() {
+        let ctx = crate::params::StackContext::new(7, 100, 50, 3);
+        let features = RunPlanFeatures::new(&ctx, ReaderKind::Raw, 32, true, "pmax", usize::MAX);
+        assert_eq!(features.frame_count, 7);
+        assert_eq!(features.frame_pixels, 5000);
+        assert_eq!(features.source_bits_per_sample, 32);
+        assert_eq!(features.reader, ReaderKind::Raw);
+        assert!(features.gpu);
+        assert_eq!(features.algorithm, "pmax");
+        assert!(!features.align_cache_hit);
+        assert_eq!(features.resumed_units, 0);
+    }
+
+    #[test]
+    fn run_plan_features_frame_pixels_do_not_wrap() {
+        let ctx = crate::params::StackContext::new(2, 70_000, 70_000, 3);
+        assert_eq!(plan_features(&ctx, usize::MAX).frame_pixels, 4_900_000_000);
+    }
+
+    #[test]
+    fn run_plan_features_workers_respect_frames_and_cap() {
+        let one = crate::params::StackContext::new(1, 8, 8, 1);
+        assert_eq!(plan_features(&one, 2).workers, 1);
+        let many = crate::params::StackContext::new(100_000, 8, 8, 1);
+        let host = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        assert_eq!(plan_features(&many, usize::MAX).workers, host);
+        assert_eq!(plan_features(&many, 1).workers, 1);
+        let none = crate::params::StackContext::new(0, 8, 8, 1);
+        assert_eq!(plan_features(&none, usize::MAX).workers, 1);
     }
 }

@@ -295,6 +295,7 @@ for the full workflow (`--groups`, `--write-groups`, `--only`).
 | `--dry-run` | resolve everything and print what would happen, without computing or writing anything, the run manifest included |
 | `--cpu` | force the CPU path even when a usable GPU adapter is present; absent when the binary was built `--no-default-features` |
 | `--no-cache` | skip the stage cache: recompute the alignment even when a valid entry exists, and store no new entry |
+| `--trace-accounting` | requires `--json`. Count bytes read and converted, cache hits, worker peaks and each fused tile's duration during the run, and add them to the report as `trace_accounting` and `fuse_tiles`; both are `null` without it. The counters are process-wide and cumulative, so a multi-group run's later documents include the earlier groups. Costs a little time when on |
 
 **Project settings.** Beside the algorithm's own parameters, `--set` and a
 preset's `[stack]` table accept the settings that belong to the whole run
@@ -489,6 +490,23 @@ or host-memory ceiling. It is `null`
 for TIFF and JPEG stacks, and
 the human summary prints a `develops per frame: min= mean= max=` line only
 when the field is present.
+
+The `run_plan` field names the inputs a duration estimate reads, all known
+before the first stage starts: `frame_count`, `frame_pixels` (one frame's
+width times height), `source_bits_per_sample` (8, 16, or 32 for developed
+RAW), `reader` (`mmap`, `decoded`, `raw` or `jpeg`, which names the input
+format), `gpu` (the planned backend; a mid-run fallback shows in
+`gpu_fallback`), `workers` (host worker threads), `algorithm`,
+`align_cache_hit` and `resumed_units` (fuse tiles taken from a `--resume`
+ledger). `--dry-run --json` carries the same record for a cold run
+(`align_cache_hit` false, `resumed_units` 0) and lists `alignment cache` under
+`not_computed`. With `--trace-accounting`, `trace_accounting` holds the
+process-wide counters (bytes decoded, converted and uploaded, cache hits and
+misses, worker peaks, GPU tile phase nanoseconds, and `saturated`, which is
+`true` when the bounded record budget ran out and the counters are lower
+bounds) and `fuse_tiles` lists each fused tile's `index`, `read_pixels`,
+`output_pixels`, `touches_edge` and `duration_ns`; both are `null` otherwise.
+The counters are cumulative across the groups of one process.
 
 Before any frame is read for fusion, every `stack` run measures the free space
 on each volume it writes to (the one holding `.scratch` and the one holding the
