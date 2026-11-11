@@ -508,6 +508,21 @@ bounds) and `fuse_tiles` lists each fused tile's `index`, `read_pixels`,
 `output_pixels`, `touches_edge` and `duration_ns`; both are `null` otherwise.
 The counters are cumulative across the groups of one process.
 
+`--dry-run --json` also carries `prediction`, a cold-run estimate in seconds
+for a reference machine (a 4-core laptop CPU, or its integrated GPU):
+`stages` with the same six keys as a run report's `stages` (`develop` is
+`null` unless the reader is `raw`, `align` is `null` with `--no-align`, and
+`warp_write` is always `null`, since `stack` never enters it),
+`total_seconds` (the sum of the stages) and `calibrated`. `calibrated` is
+`true` for uncompressed 16-bit TIFF frames read through `mmap` and for Canon
+CR3 frames developed into memory, both with the `laplacian` blend; every
+other input still gets an estimate, marked `calibrated: false`, and the
+human summary then prints `predicted duration: ~N s (not calibrated for this
+input)`. The flag cannot see which camera wrote a CR3, whether the frames
+are a real focus stack rather than repeated frames, or frame sizes far from
+the measured ones (0.26 and 15 Mpx TIFF, 17 Mpx CR3). The field is `null`
+for a stack without frames or pixels.
+
 Before any frame is read for fusion, every `stack` run measures the free space
 on each volume it writes to (the one holding `.scratch` and the one holding the
 output's directory) and refuses, with a failure naming each short directory,

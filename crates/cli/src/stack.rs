@@ -20,6 +20,7 @@ use focusforge_core::io::{
     DevelopStore, FrameReader, Group, Proposal, Rect, open_frame_set, propose,
     source_bits_per_sample,
 };
+use focusforge_core::job::prediction::{RawSource, RunPrediction, predict_run};
 use focusforge_core::job::{JobControl, StageCache};
 use focusforge_core::params::{self, ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{
@@ -316,6 +317,10 @@ pub struct DryRunPlan {
     /// The run-plan inputs as a cold run would start: no alignment cache hit,
     /// nothing resumed.
     pub run_plan: RunPlanFeatures,
+    /// Seconds on the reference machine for a cold run; a stage the plan does
+    /// not enter is `null`, and `calibrated` says whether the input matches
+    /// a measured class. `null` when the stack has no frames or pixels.
+    pub prediction: Option<RunPrediction>,
     pub backend: String,
     /// The paths this invocation *would* write. None of them exists.
     pub would_write: Vec<String>,
@@ -1205,6 +1210,12 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         let geometry = scheduler.plan();
         // One project, and nothing else: a run writes no image at all.
         let would_write = vec![output.display().to_string()];
+        let raw = developed_store.zip(paths[0].extension().and_then(|ext| ext.to_str()));
+        let prediction = predict_run(
+            &run_plan,
+            align_prepared.is_some(),
+            raw.map(|(store, extension)| RawSource { extension, store }),
+        );
         let plan = DryRunPlan {
             dry_run: true,
             input: dir.display().to_string(),
@@ -1242,6 +1253,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
             max_bytes_in_flight: scheduler_budget.bytes(),
             developed_store,
             run_plan,
+            prediction,
             backend: backend
                 .map(|b| b.info().to_string())
                 .unwrap_or_else(|| "cpu".to_string()),
@@ -1813,6 +1825,17 @@ fn render_plan(plan: &DryRunPlan) -> String {
     for output in &plan.would_write {
         lines.push(format!("would write: {output}"));
     }
+    lines.push(match &plan.prediction {
+        Some(p) if p.calibrated => format!(
+            "predicted duration: {:.1} s (estimate for the reference machine, cold run)",
+            p.total_seconds
+        ),
+        Some(p) => format!(
+            "predicted duration: ~{:.1} s (not calibrated for this input)",
+            p.total_seconds
+        ),
+        None => "predicted duration: unknown".to_string(),
+    });
     lines.push("crop: not computed -- --dry-run stops before alignment".to_string());
     lines.push("output size: not computed -- it follows from the crop".to_string());
     lines.join("\n")

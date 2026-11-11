@@ -131,6 +131,53 @@ fn raw_dry_run_reports_the_run_budget() {
 }
 
 #[test]
+fn raw_dry_run_predicts_develop() {
+    let input = common::tmp_dir("stack_raw_dry_run_prediction");
+    let cwd = common::tmp_dir("stack_raw_dry_run_prediction_cwd");
+    let source = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![512; 64]),
+        false,
+    );
+    for index in 0..2 {
+        std::fs::copy(source.path(), input.join(format!("{index:02}.dng")))
+            .expect("copy RAW frame");
+    }
+    let mut args = vec![
+        "stack".to_string(),
+        input.display().to_string(),
+        "-o".to_string(),
+        cwd.display().to_string(),
+        "--algorithm".to_string(),
+        "laplacian".to_string(),
+        "--no-align".to_string(),
+        "--no-crop".to_string(),
+        "--dry-run".to_string(),
+        "--json".to_string(),
+    ];
+    if cfg!(feature = "gpu") {
+        args.push("--cpu".to_string());
+    }
+    let output = run(&cwd, &args);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("the dry run prints JSON");
+    assert_eq!(plan["run_plan"]["reader"], "raw", "{plan}");
+    let prediction = &plan["prediction"];
+    let develop = prediction["stages"]["develop"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("a RAW run develops: {prediction}"));
+    assert!(develop > 0.0, "{prediction}");
+    assert_eq!(
+        prediction["calibrated"], false,
+        "DNG is not the measured format: {prediction}"
+    );
+}
+
+#[test]
 fn identical_raw_frames_stack_to_the_frame() {
     let cwd = common::tmp_dir("stack_raw_identical");
     let source = write_dng(

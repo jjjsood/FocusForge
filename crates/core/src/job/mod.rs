@@ -55,6 +55,7 @@
 pub mod control;
 pub mod fingerprint;
 pub mod ledger;
+pub mod prediction;
 pub mod progress;
 pub mod record;
 pub mod stage_cache;

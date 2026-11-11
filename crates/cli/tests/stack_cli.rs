@@ -1976,6 +1976,153 @@ fn run_plan_matches_between_dry_run_and_run() {
     }
 }
 
+/// One `stack --dry-run` over `fixtures/<fixture>/frames` with a computed
+/// alignment half, in an empty working directory that must stay empty:
+/// the `--json` document and the human summary.
+fn dry_run_prediction(
+    label: &str,
+    fixture: &str,
+    algorithm: &str,
+    extra: &[&str],
+) -> (serde_json::Value, String) {
+    let frames = common::fixtures_dir().join(fixture).join("frames");
+    let cwd = tmp_dir(label);
+    let out_dir = tmp_dir(&format!("{label}_out"));
+    let run = |json: bool| {
+        let mut args = vec![
+            "stack",
+            frames.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algorithm",
+            algorithm,
+            "--align-algorithm",
+            "dummy-align",
+            "--no-crop",
+            "--dry-run",
+        ];
+        if json {
+            args.push("--json");
+        }
+        args.extend(extra);
+        let out = run_cli_in(&cwd, &common::push_no_gpu(args));
+        assert!(out.success, "stderr: {}", out.stderr);
+        out.stdout
+    };
+    let json = serde_json::from_str(&run(true)).expect("valid JSON");
+    let human = run(false);
+    assert_eq!(
+        std::fs::read_dir(&*cwd).unwrap().count(),
+        0,
+        "a dry run writes nothing"
+    );
+    (json, human)
+}
+
+#[test]
+fn dry_run_reports_prediction() {
+    let (plan, human) = dry_run_prediction("prediction_calibrated", "mantis-64", "laplacian", &[]);
+    let mut keys: Vec<&str> = plan
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    let mut expected = vec![
+        "dry_run",
+        "input",
+        "frame_count",
+        "width",
+        "height",
+        "samples_per_pixel",
+        "algorithm",
+        "display_name",
+        "params",
+        "align",
+        "tile_size",
+        "levels",
+        "margin",
+        "tiles",
+        "in_flight_limit",
+        "in_flight_bound",
+        "page_cache_bytes_per_tile",
+        "max_bytes_in_flight",
+        "developed_store",
+        "run_plan",
+        "backend",
+        "would_write",
+        "not_computed",
+        "prediction",
+    ];
+    expected.sort_unstable();
+    assert_eq!(keys, expected, "the pre-existing keys plus `prediction`");
+
+    let prediction = &plan["prediction"];
+    let mut prediction_keys: Vec<&str> = prediction
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    prediction_keys.sort_unstable();
+    assert_eq!(prediction_keys, ["calibrated", "stages", "total_seconds"]);
+    assert_eq!(prediction["calibrated"], true, "{prediction}");
+    let stages = &prediction["stages"];
+    assert_eq!(stages.as_object().unwrap().len(), 6, "{stages}");
+    for key in ["develop", "warp_write"] {
+        assert!(stages[key].is_null(), "{key} in {stages}");
+    }
+    let mut sum = 0.0;
+    for key in ["setup", "align", "fuse", "finalize"] {
+        sum += stages[key]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{key} in {stages}"));
+    }
+    let total = prediction["total_seconds"].as_f64().unwrap();
+    assert!((total - sum).abs() <= 1e-9 * total, "{total} vs {sum}");
+    let lines: Vec<&str> = human
+        .lines()
+        .filter(|l| l.starts_with("predicted duration:"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{human}");
+    assert!(
+        !lines[0].contains('~') && !lines[0].contains("not calibrated"),
+        "{human}"
+    );
+    let crop = human.find("crop: not computed").expect("crop line");
+    assert!(human.find("predicted duration:").unwrap() < crop, "{human}");
+
+    let (no_align, _) = dry_run_prediction(
+        "prediction_no_align",
+        "mantis-64",
+        "laplacian",
+        &["--no-align"],
+    );
+    let no_align = &no_align["prediction"];
+    assert!(no_align["stages"]["align"].is_null(), "{no_align}");
+    assert!(no_align["total_seconds"].as_f64().unwrap() < total);
+    assert_eq!(no_align["calibrated"], true);
+
+    for (label, fixture, algorithm) in [
+        ("prediction_decoded", "mantis8-64", "laplacian"),
+        ("prediction_depth_map", "mantis-64", "depth-map"),
+    ] {
+        let (plan, human) = dry_run_prediction(label, fixture, algorithm, &[]);
+        assert_eq!(plan["prediction"]["calibrated"], false, "{label}");
+        assert!(plan["prediction"]["total_seconds"].as_f64().unwrap() > 0.0);
+        let line = human
+            .lines()
+            .find(|l| l.starts_with("predicted duration:"))
+            .unwrap_or_else(|| panic!("{label}: {human}"));
+        assert!(
+            line.starts_with("predicted duration: ~")
+                && line.ends_with("(not calibrated for this input)"),
+            "{label}: {line}"
+        );
+    }
+}
+
 #[test]
 fn fuse_tiles_cover_the_plan_when_accounting_is_on() {
     let frames = common::fixtures_dir().join("mantis-64").join("frames");
