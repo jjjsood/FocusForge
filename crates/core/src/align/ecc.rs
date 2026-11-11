@@ -100,10 +100,11 @@
 //!
 //! **Converged** when the step measure -- the maximum, over `region`'s four
 //! corners `x`, of `‖ΔW^-1(x) - x‖` in template pixels -- falls below
-//! [`EccParams::epsilon_px`]; at [`EccParams::max_iterations`] without that,
-//! **stalled** if the last ten steps are flat or oscillating (best-ρ transform
-//! returned) and **hit the cap** otherwise. **Diverged** (see
-//! [`DivergenceReason`]) returns the best-ρ transform seen, never the last.
+//! [`EccParams::epsilon_px`]. **Stalled** when the last ten steps are flat or
+//! oscillating and either all lie below twice `epsilon_px` (the level ends
+//! there) or [`EccParams::max_iterations`] is reached; the best-ρ transform is
+//! returned. Reaching the cap otherwise is a **hit of the cap**. **Diverged**
+//! (see [`DivergenceReason`]) returns the best-ρ transform seen, never the last.
 //!
 //! The raw `‖Δp‖` is not used: in similarity mode it mixes dimensionless
 //! `c`, `s` with pixel-valued `tx`, `ty` and cannot be scaled between pyramid
@@ -188,16 +189,36 @@ pub enum EccStatus {
     /// [`EccParams::max_iterations`] was reached with no convergence and the
     /// steps were not flat or oscillating.
     HitCap,
-    /// [`EccParams::max_iterations`] was reached and the last ten
-    /// steps were flat or oscillating: more iterations would not converge.
-    /// The result is the best-ρ transform seen.
+    /// The last ten steps were flat or oscillating and either all lay below
+    /// twice [`EccParams::epsilon_px`] or [`EccParams::max_iterations`] was
+    /// reached: more iterations would not converge. The result is the best-ρ
+    /// transform seen.
     Stalled,
     /// Registration failed; see [`DivergenceReason`].
     Diverged(DivergenceReason),
 }
 
-/// Steps a capped level must have behind it before it can be called stalled.
+/// Steps a level must have behind it before it can be called stalled.
 const STALL_WINDOW: usize = 10;
+
+/// Multiple of a level's [`EccParams::epsilon_px`] below which a stalled
+/// window ends the level before the cap. In the checked-in recording of a
+/// device whose level-0 window coordinates were formed in `f32`, steps stayed
+/// at 1.2e-4 to 1.8e-4 px against `epsilon_px = 1e-4`, below the floor; the
+/// nearest stall-shaped window of a level that goes on to converge peaks at
+/// 2.312 times epsilon, above it.
+const STALL_FLOOR_FACTOR: f64 = 2.0;
+
+/// Whether the level ends as stalled after `iterations_done` iterations whose
+/// last [`STALL_WINDOW`] steps are `window`: the window is stalled and either
+/// the cap is reached or every step lies below [`STALL_FLOOR_FACTOR`] times
+/// `epsilon_px`.
+fn stops_stalled(window: &[f64; STALL_WINDOW], iterations_done: u32, params: &EccParams) -> bool {
+    let floor = STALL_FLOOR_FACTOR * params.epsilon_px;
+    iterations_done as usize >= STALL_WINDOW
+        && (iterations_done == params.max_iterations || window.iter().all(|&step| step < floor))
+        && is_stalled(window)
+}
 
 /// Whether the last [`STALL_WINDOW`] step measures, oldest first, stopped
 /// shrinking: flat (`max / min <= 1.05`) or changing direction at least three
@@ -1120,8 +1141,8 @@ fn solve_generic<const K: usize, E>(
             });
         }
 
-        if iterations_done == params.max_iterations {
-            let stalled = iterations_done as usize >= STALL_WINDOW && is_stalled(&recent_steps);
+        let stalled = stops_stalled(&recent_steps, iterations_done, params);
+        if stalled || iterations_done == params.max_iterations {
             return Ok(EccResult {
                 transform: if stalled { best_transform } else { w },
                 status: if stalled {
@@ -1849,6 +1870,24 @@ mod tests {
     /// reports `Stalled` and returns the best correlation it saw.
     #[test]
     fn a_capped_level_whose_steps_stop_shrinking_is_stalled() {
+        let (result, trace) = speckle_solve(150.0, 1e-300, 60);
+        assert_eq!(result.status, EccStatus::Stalled, "{result:?}");
+        assert_eq!(result.iterations, 60);
+        let best = trace
+            .iter()
+            .map(|i| i.correlation)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert_eq!(result.correlation, best, "{result:?}");
+        assert_eq!(trace.last().map(|i| i.step), result.final_step);
+    }
+
+    /// The speckle level of the test above with noise of `amplitude`, solved
+    /// with `epsilon_px` and `max_iterations`; returns the result and its trace.
+    fn speckle_solve(
+        amplitude: f32,
+        epsilon_px: f64,
+        max_iterations: u32,
+    ) -> (EccResult, Vec<EccIteration>) {
         let (width, height) = (SINUSOID_WIDTH, SINUSOID_HEIGHT);
         let (clean, moving, region, _w_true) = hit_cap_setup();
         let speckled: Vec<f32> = (0..height)
@@ -1864,13 +1903,13 @@ mod tests {
                 .unwrap_or(0.0);
                 let hash =
                     ((f64::from(x) * 12.9898 + f64::from(y) * 78.233).sin() * 43758.5453).fract();
-                clean + 150.0 * hash as f32
+                clean + amplitude * hash as f32
             })
             .collect();
         let template = Plane::from_f32(&speckled, width, height, 1).unwrap();
         let params = EccParams {
-            max_iterations: 60,
-            epsilon_px: 1e-300,
+            max_iterations,
+            epsilon_px,
             min_valid_fraction: 0.99,
         };
         let mut trace = Vec::new();
@@ -1884,14 +1923,265 @@ mod tests {
             &mut trace,
         )
         .expect("valid solver inputs");
+        (result, trace)
+    }
+
+    fn params_with(max_iterations: u32, epsilon_px: f64) -> EccParams {
+        EccParams {
+            max_iterations,
+            epsilon_px,
+            min_valid_fraction: 0.99,
+        }
+    }
+
+    #[test]
+    fn a_flat_window_below_the_floor_stops_before_the_cap() {
+        let params = params_with(400, 1e-4);
+        let window = [1.5e-4; STALL_WINDOW];
+        assert!(stops_stalled(&window, STALL_WINDOW as u32, &params));
+        assert!(stops_stalled(&window, 399, &params));
+    }
+
+    #[test]
+    fn an_oscillating_window_below_the_floor_stops_before_the_cap() {
+        let params = params_with(400, 1e-4);
+        let window = [
+            1.9e-4, 1.2e-4, 1.8e-4, 1.1e-4, 1.7e-4, 1.2e-4, 1.8e-4, 1.1e-4, 1.7e-4, 1.2e-4,
+        ];
+        assert!(is_stalled(&window));
+        assert!(stops_stalled(&window, 50, &params));
+    }
+
+    #[test]
+    fn a_window_at_or_above_the_floor_runs_on_to_the_cap() {
+        let params = params_with(400, 1e-4);
+        let at_floor = [STALL_FLOOR_FACTOR * params.epsilon_px; STALL_WINDOW];
+        assert!(!stops_stalled(&at_floor, 100, &params));
+        assert!(stops_stalled(&at_floor, 400, &params));
+        let above = [3.0 * params.epsilon_px; STALL_WINDOW];
+        assert!(!stops_stalled(&above, 100, &params));
+        assert!(stops_stalled(&above, 400, &params));
+        let mut one_step_above = [1.5e-4; STALL_WINDOW];
+        one_step_above[4] = STALL_FLOOR_FACTOR * params.epsilon_px;
+        assert!(!stops_stalled(&one_step_above, 100, &params));
+    }
+
+    #[test]
+    fn a_shrinking_window_below_the_floor_does_not_stop() {
+        let params = params_with(400, 1e-4);
+        let window = geometric_window(0.8).map(|s| s * 1.9e-4);
+        assert!(!stops_stalled(&window, 100, &params));
+        assert!(!stops_stalled(&window, 400, &params));
+    }
+
+    #[test]
+    fn fewer_iterations_than_the_window_never_stop_as_stalled() {
+        let params = params_with(9, 1e-4);
+        let window = [1.5e-4; STALL_WINDOW];
+        assert!(!stops_stalled(&window, 9, &params));
+        assert!(stops_stalled(&window, 10, &params_with(10, 1e-4)));
+    }
+
+    /// The cap of the flat-floor solves below.
+    const FLAT_FLOOR_CAP: u32 = 150;
+
+    /// The `STALL_WINDOW` steps that precede index `n`.
+    fn window_before(steps: &[f64], n: usize) -> &[f64; STALL_WINDOW] {
+        steps[n - STALL_WINDOW..n]
+            .try_into()
+            .expect("a window of STALL_WINDOW steps")
+    }
+
+    /// Iteration indices `k` whose last ten steps (ending at `k`) are
+    /// stall-shaped and lie within a factor of 1.9 of the smallest step seen
+    /// up to `k`, paired with that smallest step.
+    fn flat_floor_candidates(steps: &[f64]) -> Vec<(usize, f64)> {
+        (STALL_WINDOW - 1..steps.len())
+            .filter_map(|k| {
+                let window = window_before(steps, k + 1);
+                let smallest = steps[..=k].iter().copied().fold(f64::INFINITY, f64::min);
+                let peak = window.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                (peak < 1.9 * smallest && is_stalled(window)).then_some((k, smallest))
+            })
+            .collect()
+    }
+
+    fn steps_of(trace: &[EccIteration]) -> Vec<f64> {
+        trace.iter().map(|i| i.step).collect()
+    }
+
+    /// A speckle level whose steps settle on a floor, found by trying noise
+    /// amplitudes in turn: `steps` of its solve at a vanishing epsilon, and
+    /// the first index `k` where a flat window lies within a factor of 1.9 of
+    /// the smallest step up to `k` (`smallest`).
+    struct FlatFloor {
+        amplitude: f32,
+        steps: Vec<f64>,
+        k: usize,
+        smallest: f64,
+    }
+
+    /// Noise amplitudes the flat-floor searches try, in order.
+    fn amplitudes() -> impl Iterator<Item = f32> {
+        (0..160).map(|i| 0.5 * 1.05f32.powi(i))
+    }
+
+    fn find_flat_floor() -> FlatFloor {
+        amplitudes()
+            .find_map(|amplitude| {
+                let (_, trace) = speckle_solve(amplitude, 1e-300, FLAT_FLOOR_CAP);
+                let steps = steps_of(&trace);
+                let (k, smallest) = *flat_floor_candidates(&steps).first()?;
+                Some(FlatFloor {
+                    amplitude,
+                    steps,
+                    k,
+                    smallest,
+                })
+            })
+            .expect("some noise amplitude settles the speckle level on a flat floor")
+    }
+
+    /// An epsilon just under the smallest step up to the first flat window
+    /// keeps the level from converging, while that window lies below twice
+    /// epsilon: the level ends there instead of at the cap.
+    #[test]
+    fn a_level_settled_below_the_floor_stalls_before_the_cap() {
+        let floor = find_flat_floor();
+        let epsilon = floor.smallest * 0.999;
+        let (result, trace) = speckle_solve(floor.amplitude, epsilon, FLAT_FLOOR_CAP);
         assert_eq!(result.status, EccStatus::Stalled, "{result:?}");
-        assert_eq!(result.iterations, 60);
+        assert_eq!(result.iterations as usize, floor.k + 1, "{result:?}");
+        assert_eq!(trace.len(), result.iterations as usize);
+        assert!(trace.iter().all(|i| i.step > epsilon));
         let best = trace
             .iter()
             .map(|i| i.correlation)
             .fold(f64::NEG_INFINITY, f64::max);
         assert_eq!(result.correlation, best, "{result:?}");
         assert_eq!(trace.last().map(|i| i.step), result.final_step);
+    }
+
+    /// An epsilon whose floor lies below every step leaves the exit to the
+    /// cap.
+    #[test]
+    fn a_level_settled_above_the_floor_runs_to_the_cap() {
+        let floor = find_flat_floor();
+        let smallest = floor.steps.iter().copied().fold(f64::INFINITY, f64::min);
+        let (result, _) = speckle_solve(floor.amplitude, smallest * 0.4, FLAT_FLOOR_CAP);
+        assert_eq!(result.status, EccStatus::Stalled, "{result:?}");
+        assert_eq!(result.iterations, FLAT_FLOOR_CAP);
+    }
+
+    /// The first step below epsilon ends the level `Converged` even though the
+    /// window that step completes is also one the exit would stop. Needs a
+    /// level whose step `k` is smaller than all before it, closes a window
+    /// below twice its own value, and with no earlier window below that floor.
+    #[test]
+    fn a_converging_step_wins_over_a_stall_eligible_window() {
+        let (amplitude, k, epsilon) = amplitudes()
+            .find_map(|amplitude| {
+                let (_, trace) = speckle_solve(amplitude, 1e-300, FLAT_FLOOR_CAP);
+                let steps = steps_of(&trace);
+                (STALL_WINDOW - 1..steps.len()).find_map(|k| {
+                    let epsilon = steps[k] * 1.000_000_1;
+                    let params = params_with(u32::MAX, epsilon);
+                    let stops_at = |j: usize| {
+                        stops_stalled(window_before(&steps, j + 1), j as u32 + 1, &params)
+                    };
+                    (steps[..k].iter().all(|&s| s >= epsilon)
+                        && (STALL_WINDOW - 1..k).all(|j| !stops_at(j))
+                        && stops_at(k))
+                    .then_some((amplitude, k, epsilon))
+                })
+            })
+            .expect("some noise amplitude closes a flat window on a new smallest step");
+        let (result, _) = speckle_solve(amplitude, epsilon, FLAT_FLOOR_CAP);
+        assert_eq!(result.status, EccStatus::Converged, "{result:?}");
+        assert_eq!(result.iterations as usize, k + 1);
+    }
+
+    const MANTIS_STEP_SERIES: &str =
+        include_str!("../../tests/data/gpu-ecc-step-series-mantis.txt");
+    const BEETLE_STEP_SERIES: &str =
+        include_str!("../../tests/data/gpu-ecc-step-series-beetle.txt");
+
+    /// One recorded level: `<hop> <level> <status> <epsilon> <step>...`.
+    struct RecordedLevel {
+        converged: bool,
+        epsilon: f64,
+        steps: Vec<f64>,
+    }
+
+    fn recorded_levels(text: &str) -> Vec<RecordedLevel> {
+        text.lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .map(|line| {
+                let mut fields = line.split_whitespace();
+                let _hop = fields.next().expect("hop");
+                let _level = fields.next().expect("level");
+                let converged = match fields.next().expect("status") {
+                    "converged" => true,
+                    "stalled" => false,
+                    other => panic!("unexpected status `{other}`"),
+                };
+                let epsilon = fields.next().expect("epsilon").parse().expect("epsilon");
+                let steps = fields.map(|s| s.parse().expect("a step measure")).collect();
+                RecordedLevel {
+                    converged,
+                    epsilon,
+                    steps,
+                }
+            })
+            .collect()
+    }
+
+    /// Replays the recorded GPU step series of the chain hops of two stacks
+    /// through the exit predicate the loop calls: with the cap out of reach,
+    /// only the floor path is live.
+    #[test]
+    fn no_converging_gpu_level_stops_at_the_stall_floor() {
+        let mut converging = 0;
+        let mut stopped_early = 0;
+        let mut saved = 0;
+        let mut nearest = f64::INFINITY;
+        for text in [MANTIS_STEP_SERIES, BEETLE_STEP_SERIES] {
+            for level in recorded_levels(text) {
+                let params = params_with(u32::MAX, level.epsilon);
+                assert!(level.steps.len() >= STALL_WINDOW);
+                // The last step of a converging level is the converging one,
+                // which wins over any window it completes.
+                let judged = if level.converged {
+                    level.steps.len() - 1
+                } else {
+                    level.steps.len()
+                };
+                let first_stop = (STALL_WINDOW..=judged)
+                    .find(|&n| stops_stalled(window_before(&level.steps, n), n as u32, &params));
+                if level.converged {
+                    converging += 1;
+                    assert_eq!(first_stop, None, "a converging level would stop as stalled");
+                    for n in STALL_WINDOW..=judged {
+                        let window = window_before(&level.steps, n);
+                        if is_stalled(window) {
+                            let peak = window.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                            nearest = nearest.min(peak / level.epsilon);
+                        }
+                    }
+                } else if let Some(n) = first_stop.filter(|&n| n < level.steps.len()) {
+                    stopped_early += 1;
+                    saved += level.steps.len() - n;
+                }
+            }
+        }
+        assert!(converging >= 3, "{converging} converging levels recorded");
+        assert_eq!(stopped_early, 8, "stalled levels stopped early");
+        assert_eq!(saved, 3068, "iterations saved by the early stops");
+        eprintln!("nearest converging stall-shaped window: {nearest:.3} x epsilon");
+        assert!(
+            STALL_FLOOR_FACTOR < nearest,
+            "the factor {STALL_FLOOR_FACTOR} reaches a converging level's stall-shaped window ({nearest} x epsilon)"
+        );
     }
 
     /// The bracketing check: pins [`EccResult::final_step`] as *the operand

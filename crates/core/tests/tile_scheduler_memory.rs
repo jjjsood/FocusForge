@@ -515,6 +515,81 @@ fn host_refusal_counts_reader_scratch() {
     }
 }
 
+/// A zero-filling reader whose every frame keeps a fixed number of file-cache
+/// bytes hot per read.
+struct PageCacheReader(u64);
+
+impl TileReader for PageCacheReader {
+    fn read_tile_into(
+        &self,
+        _frame: usize,
+        _rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        out.fill(0);
+        Ok(())
+    }
+
+    fn read_page_cache_bytes(&self, _width: u32, _height: u32) -> u64 {
+        self.0
+    }
+}
+
+/// A reader's page-cache working set times the frame count sets the band
+/// width from the cgroup limit and leaves the in-flight limit at the
+/// zero-working-set value.
+#[test]
+fn page_cache_working_set_sets_band_columns() {
+    use focusforge_core::host::FixedFacts;
+    use focusforge_core::tile::{HostSources, MonotonicClock};
+
+    let _guard = serial();
+    // 12 MB above the fixed part; a tile is 128 x 128 x 7 B = 114_688 B.
+    let facts = HostFacts::new(
+        64_000_000_000,
+        50_000_000_000,
+        Some(HOST_FIXED_BYTES + 12_000_000),
+        Some(0),
+        16,
+    );
+    let scheduler_for = |reader: &dyn TileReader, frame_count: usize, name: &str| {
+        let scratch_base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+        let mut options = TileSchedulerOptions::explicit_budget(scratch_base, u64::MAX);
+        options.host = HostSources {
+            probe: std::sync::Arc::new(FixedFacts(facts)),
+            clock: std::sync::Arc::new(MonotonicClock::new()),
+        };
+        options.tile_size = 128;
+        options.levels = 0;
+        let stack_ctx = StackContext::new(frame_count, 512, 512, 3);
+        let scheduler =
+            TileScheduler::new(reader, stack_ctx, 3, &options).expect("scheduler must build");
+        (scheduler.in_flight_limit(), scheduler.band_columns())
+    };
+    let (none_limit, none_bands) =
+        scheduler_for(&ZeroReader, 8, "tile_scheduler_memory_bands_none");
+    assert_eq!(none_bands, None, "no working set, no bands");
+    // 12e6 less `limit` tiles of 114_688 B, over 1e6 x frames:
+    // 2 frames, (12e6 - limit x 114_688) / 2e6 = 5 for a limit of 6 or more;
+    // 8 frames, (12e6 - limit x 114_688) / 8e6 = 1.
+    let (limit, bands) = scheduler_for(
+        &PageCacheReader(1_000_000),
+        2,
+        "tile_scheduler_memory_bands_2",
+    );
+    assert_eq!(limit, none_limit, "the working set leaves the limit");
+    let expected = (12_000_000 - limit as u64 * 114_688) / 2_000_000;
+    assert_eq!(bands, Some(expected as usize));
+    let (limit, bands) = scheduler_for(
+        &PageCacheReader(1_000_000),
+        8,
+        "tile_scheduler_memory_bands_8",
+    );
+    assert_eq!(limit, none_limit);
+    let expected = ((12_000_000 - limit as u64 * 114_688) / 8_000_000).max(1);
+    assert_eq!(bands, Some(expected as usize));
+}
+
 /// A scaling warp reads a wider footprint than the tile it delivers, so the
 /// same explicit budget admits fewer tiles than an identity warp does.
 #[test]

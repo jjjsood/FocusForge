@@ -3,7 +3,7 @@
 //! The checkpoint dock panel's view model: day-grouped rows built from a
 //! project's saved history, in the local clock. Plain Rust, no `use
 //! slint::`; `crate::controller` builds a [`CheckpointsModel`](crate::checkpoints::CheckpointsModel) and hands it
-//! to `ui/shell/dock/checkpoint_panel.slint`'s `for` loop.
+//! to `crates/ui/ui/shell/dock/checkpoint_panel.slint`'s `for` loop.
 
 use std::cmp::Ordering;
 

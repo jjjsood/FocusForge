@@ -256,6 +256,10 @@ impl TileReader for GainReader<'_> {
         self.inner.read_scratch_bytes(width, height)
     }
 
+    fn read_page_cache_bytes(&self, width: u32, height: u32) -> u64 {
+        self.inner.read_page_cache_bytes(width, height)
+    }
+
     fn read_tile_step_into(
         &self,
         frame: usize,
@@ -624,6 +628,10 @@ mod tests {
 
         fn read_scratch_bytes(&self, width: u32, height: u32) -> u64 {
             u64::from(width) * u64::from(height) + 7
+        }
+
+        fn read_page_cache_bytes(&self, width: u32, height: u32) -> u64 {
+            u64::from(width) * u64::from(height) * 6 + 5
         }
     }
 
@@ -1271,6 +1279,19 @@ mod tests {
             stack.read_tile_into(1, rect, &mut d).unwrap();
             d
         });
+    }
+
+    #[test]
+    fn gain_reader_forwards_working_set() {
+        let stack = shifted_stack(64, 32, 1, &[1.0, 0.9]);
+        for gains in [[UNIT_GAIN, UNIT_GAIN], [UNIT_GAIN, UNIT_GAIN / 2]] {
+            let reader = GainReader::new(&stack, &gains);
+            assert_eq!(reader.read_page_cache_bytes(8, 4), 8 * 4 * 6 + 5);
+            assert_eq!(
+                reader.read_page_cache_bytes(8, 4),
+                stack.read_page_cache_bytes(8, 4)
+            );
+        }
     }
 
     #[test]

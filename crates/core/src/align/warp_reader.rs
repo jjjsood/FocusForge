@@ -181,6 +181,31 @@ impl WarpingReader<'_> {
         record_timing(TimingCounter::CopyOperations, 1);
         Ok(covered.contains(&false).then_some(covered))
     }
+
+    /// The `width x height` rect centred in the frame, clamped to it.
+    fn centred(&self, width: u32, height: u32) -> Rect {
+        let (width, height) = (width.min(self.frame.0), height.min(self.frame.1));
+        Rect {
+            x: (self.frame.0 - width) / 2,
+            y: (self.frame.1 - height) / 2,
+            width,
+            height,
+        }
+    }
+
+    /// The inner read rect of every non-identity transform whose source
+    /// footprint for `dst` lies in the frame.
+    fn source_reads(&self, dst: Rect) -> impl Iterator<Item = Rect> + '_ {
+        self.transforms
+            .iter()
+            .filter(|transform| **transform != Transform::identity())
+            .filter_map(
+                move |transform| match transform.source_footprint(dst, self.frame) {
+                    Ok(SourceFootprint::Covers { read, .. }) => Some(read),
+                    _ => None,
+                },
+            )
+    }
 }
 
 impl TileReader for WarpingReader<'_> {
@@ -194,28 +219,28 @@ impl TileReader for WarpingReader<'_> {
     /// all at the inner reader's sample width.
     fn read_scratch_bytes(&self, width: u32, height: u32) -> u64 {
         let sample_bytes = u64::from(self.samples_per_pixel) * self.inner.sample_format().bytes();
-        let (width, height) = (width.min(self.frame.0), height.min(self.frame.1));
-        let dst = Rect {
-            x: (self.frame.0 - width) / 2,
-            y: (self.frame.1 - height) / 2,
-            width,
-            height,
-        };
-        let warped = u64::from(width) * u64::from(height) * (sample_bytes + 1);
-        let mut largest = self.inner.read_scratch_bytes(width, height);
-        for transform in &self.transforms {
-            if *transform == Transform::identity() {
-                continue;
-            }
-            if let Ok(SourceFootprint::Covers { read, .. }) =
-                transform.source_footprint(dst, self.frame)
-            {
-                let pixels = u64::from(read.width) * u64::from(read.height);
-                let inner = self.inner.read_scratch_bytes(read.width, read.height);
-                largest = largest.max(pixels * sample_bytes + warped + inner);
-            }
+        let dst = self.centred(width, height);
+        let warped = u64::from(dst.width) * u64::from(dst.height) * (sample_bytes + 1);
+        let mut largest = self.inner.read_scratch_bytes(dst.width, dst.height);
+        for read in self.source_reads(dst) {
+            let pixels = u64::from(read.width) * u64::from(read.height);
+            let inner = self.inner.read_scratch_bytes(read.width, read.height);
+            largest = largest.max(pixels * sample_bytes + warped + inner);
         }
         largest
+    }
+
+    /// The inner reader's working set over the rect, or over the widest
+    /// source footprint a non-identity transform reads for a centred rect
+    /// this size.
+    fn read_page_cache_bytes(&self, width: u32, height: u32) -> u64 {
+        let dst = self.centred(width, height);
+        self.source_reads(dst)
+            .map(|read| self.inner.read_page_cache_bytes(read.width, read.height))
+            .fold(
+                self.inner.read_page_cache_bytes(dst.width, dst.height),
+                u64::max,
+            )
     }
 
     fn read_tile_into(

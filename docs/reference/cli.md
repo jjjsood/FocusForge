@@ -432,6 +432,21 @@ group's *configured* host in-flight-tile limit, not a measured high-water
 mark — the engine this command drives does not expose the real observed
 concurrency, so the configured bound is reported instead.
 
+Tile admission fields: `in_flight_bound` says which term set
+`in_flight_limit` — `"host_budget"` (the memory budget allowed fewer tiles
+than the pool has threads, or no whole tile; a tie also reads this) or
+`"thread_cap"` (the pool's thread count, the budget would have allowed more).
+`developed_store` says where developed RAW frames live: `"memory"` when the
+host budget holds them all, otherwise `"scratch_file"` (read back with
+positioned reads); `null` for TIFF and JPEG input. `page_cache_bytes_per_tile`
+is the file-cache bytes one tile's reads keep hot across all frames, or `null`
+when the reader reports none (TIFF, JPEG, RAW developed into memory).
+`band_columns` is the width in tile columns of the vertical bands tiles are
+admitted in, sized so a band's reads fit the page cache under the memory cap;
+`null` when tiles are admitted in plan order. The human summary appends
+`band_columns=` to the tile line when present. `--dry-run --json` reports
+`in_flight_bound`, `page_cache_bytes_per_tile` and `developed_store` as well.
+
 Device (VRAM) budget fields, GPU path only:
 `max_device_bytes_in_flight` (the in-flight device-byte budget actually in
 force), `device_budget_provenance` (`"Host"` — a startup probe settled on
@@ -459,7 +474,7 @@ was produced — `"computed"` (a real solve), `"cached"` (a stage-cache hit),
 `"resumed"` (a `--resume` ledger peek) or `"skipped"` (`--no-align`) — because
 a cache hit or a resume enters the stage and reports a small real number that
 is not "alignment took 10ms". The `align_workers` and `peak_align_workers`
-fields give the anchor arm's worker bound and the peak it actually reached -- numbers only
+fields give the worker bound and the peak it actually reached -- numbers only
 when `align_source == "computed"`, `null` otherwise. A `"cached"`, `"resumed"`
 or `"skipped"` run never runs the alignment driver itself, so it has no
 worker count of its own; reporting one from a previous run's cache entry
@@ -469,8 +484,8 @@ prevent.
 The `develop_counts` field counts full-frame RAW develops: one count per frame,
 in frame order, across every stage of this group (preparation, alignment,
 fusion and metrics together). A `stack` run develops every frame once, in a
-parallel pass before preparation, into scratch files that later reads map, so
-every count is 1 whatever the tile size or host-memory ceiling. It is `null`
+parallel pass before preparation, so every count is 1 whatever the tile size
+or host-memory ceiling. It is `null`
 for TIFF and JPEG stacks, and
 the human summary prints a `develops per frame: min= mean= max=` line only
 when the field is present.
@@ -616,9 +631,11 @@ timing relationship `stack --json` documents. The `align_source` field is always
 `"computed"` for `align` (no `--resume`, no stage cache, no `--no-align`
 here), carried so a consumer reading both reports' `align` stage does not
 need to know which command produced it. The `align_workers` and
-`peak_align_workers` fields give the anchor arm's worker bound and the peak
-it actually reached (chain mode always reports `1`/`1` -- it is serial
-by construction) -- always numbers here, since every `align` run computes.
+`peak_align_workers` fields give the worker bound and the peak it actually
+reached -- always numbers here, since every `align` run computes. Both policies
+solve several registrations at the same time on one worker pool; the bound is
+the available cores limited by the host memory budget, and each frame's
+alignment pyramid is built once and shared by the registrations that use it.
 
 ```json
 {
@@ -671,8 +688,9 @@ diverged frame carries `reason`: `singular-hessian`, `lemma-one-region`,
 transform leaves a large residual at patches away from the fit region) or
 `weak-match` (the final correlation is below 0.2, the floor a correct
 registration reaches; the fit is kept).
-`stalled` means the iteration cap was reached with flat or oscillating steps
-and the best-correlation transform is kept, or that a middle pyramid level
+`stalled` means the level's last ten steps are flat or oscillating and either
+the iteration cap was reached or every one of them is below twice the level's
+`epsilon_px`; the best-correlation transform is kept. It also means that a middle pyramid level
 lost correlation and handed its best fit to the next finer level; only `diverged` counts as a
 failure, so a `stalled` frame neither fails a strict run nor adds to
 `failure_count`. In the text report a diverged row

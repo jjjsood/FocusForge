@@ -10,12 +10,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use focusforge_core::algorithm::{
-    AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, TileReader,
+    AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus, TileReader,
 };
-use focusforge_core::align::{PyramidalEcc, Transform};
+use focusforge_core::align::warp::warp_from_tile;
+use focusforge_core::align::{AlignPyramid, FrameAlignment, PyramidalEcc, Transform};
 use focusforge_core::io::{FrameError, TiffError, TiffStack};
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
-use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 use focusforge_core::tile::{Rect, Tile};
 
 /// The sharpest `fixtures/mantis-512` frame, the one the ground-truth tests
@@ -162,10 +162,19 @@ pub fn uncached_outcomes(
 pub const PATCH_COUNT: usize = 8;
 
 /// Reads one registration makes of a frame's own pixels up to its solve: the
-/// level-1 bands (each output band of `DEFAULT_TILE_SIZE / 2` rows reads its
-/// rows plus halo), without the level-0 window or patches.
+/// level-1 build reads each input row once, the first band in one read and
+/// every later band of `AlignPyramid::BAND_ROWS` output rows in one read of
+/// its new rows (none once the frame's last row is in), without the level-0
+/// window or patches.
 pub fn streamed_band_reads(stack: &StackContext) -> usize {
-    stack.height.div_ceil(2).div_ceil(DEFAULT_TILE_SIZE / 2) as usize
+    let band = AlignPyramid::BAND_ROWS;
+    let (height, output_rows) = (stack.height, stack.height.div_ceil(2));
+    let later = (1..)
+        .map(|k| k * band)
+        .take_while(|&start| start < output_rows)
+        .filter(|&start| 2 * start + 3 < height)
+        .count();
+    1 + later
 }
 
 /// The reference frame is read as bands, one level-0 template window and one
@@ -268,6 +277,206 @@ pub fn two_frame_reader(
         spp,
         frames: vec![reference, moving],
     }
+}
+
+/// Hashes a lattice point to `[-1, 1]`.
+fn lattice(ix: i64, iy: i64, seed: u32) -> f64 {
+    let mut h = (ix as u32).wrapping_mul(0x9E37_79B1)
+        ^ (iy as u32).wrapping_mul(0x85EB_CA77)
+        ^ seed.wrapping_mul(0xC2B2_AE3D);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2C1B_3C6D);
+    h ^= h >> 12;
+    h = h.wrapping_mul(0x297A_2D39);
+    h ^= h >> 15;
+    f64::from(h) / f64::from(u32::MAX) * 2.0 - 1.0
+}
+
+/// Smooth value noise of wavelength `period` px, in `[-1, 1]`, defined at
+/// every real coordinate.
+pub fn value_noise(x: f64, y: f64, period: f64, seed: u32) -> f64 {
+    let (u, v) = (x / period, y / period);
+    let (iu, iv) = (u.floor(), v.floor());
+    let fade = |t: f64| t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+    let (fu, fv) = (fade(u - iu), fade(v - iv));
+    let (ix, iy) = (iu as i64, iv as i64);
+    let top = lattice(ix, iy, seed) * (1.0 - fu) + lattice(ix + 1, iy, seed) * fu;
+    let bottom = lattice(ix, iy + 1, seed) * (1.0 - fu) + lattice(ix + 1, iy + 1, seed) * fu;
+    top * (1.0 - fv) + bottom * fv
+}
+
+/// A multi-scale texture with detail at every pyramid level, in `[-1, 1]`,
+/// as a camera focused `sigma` px off the surface sees it: each octave of
+/// wavelength `p` keeps the share `exp(-2 pi^2 sigma^2 / p^2)` of its amplitude.
+pub fn blurred_scene(x: f64, y: f64, sigma: f64) -> f64 {
+    [
+        (256.0, 1.0),
+        (96.0, 0.8),
+        (40.0, 0.6),
+        (18.0, 0.4),
+        (9.0, 0.25),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, &(period, weight))| {
+        let kept = (-2.0 * std::f64::consts::PI.powi(2) * sigma * sigma / (period * period)).exp();
+        weight * kept * value_noise(x, y, period, 11 + i as u32)
+    })
+    .sum::<f64>()
+        / 2.2
+}
+
+/// How far frame `i` of a drifting stack has moved from the reference.
+pub struct Drift {
+    pub shift: (f64, f64),
+    pub scale: f64,
+}
+
+/// `count` one-sample frames of a scene whose depth ramps from left to right;
+/// frame `i` is focused on the column `i / (count - 1)` of the way across and
+/// blurred in proportion to each column's distance from it. Each frame is
+/// magnified and shifted by `drift` for every step it lies from the middle
+/// frame. Returns the frames and, per frame, the transform that maps the
+/// middle frame onto it.
+pub fn drifting_focus_stack(
+    (width, height): (u32, u32),
+    count: usize,
+    drift: &Drift,
+    blur_px: f64,
+) -> (FramesReader, Vec<Transform>) {
+    let middle = (count - 1) / 2;
+    let (cx, cy) = (f64::from(width) / 2.0, f64::from(height) / 2.0);
+    let truth: Vec<Transform> = (0..count)
+        .map(|i| {
+            let steps = i as f64 - middle as f64;
+            Transform::translation(drift.shift.0 * steps, drift.shift.1 * steps)
+                .compose(&similarity_about(1.0 + drift.scale * steps, 0.0, cx, cy))
+        })
+        .collect();
+    let mut rng = XorShift32(0xF0C5_0001);
+    let frames = truth
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let inverse = w.inverse().expect("a similarity is invertible");
+            let focus = i as f64 / (count - 1) as f64;
+            let mut samples = Vec::with_capacity((width * height) as usize);
+            for y in 0..height {
+                for x in 0..width {
+                    let (sx, sy) = inverse
+                        .map_point(f64::from(x), f64::from(y))
+                        .expect("a similarity maps every pixel");
+                    let sigma = blur_px * (sx / f64::from(width) - focus).abs();
+                    let noise = f64::from(rng.next() % 321) - 160.0;
+                    let value = 0.5 + 0.4 * blurred_scene(sx, sy, sigma);
+                    samples.push((value * 65_535.0 + noise).clamp(0.0, 65_535.0) as u16);
+                }
+            }
+            samples
+        })
+        .collect();
+    (
+        FramesReader {
+            width,
+            height,
+            spp: 1,
+            frames,
+        },
+        truth,
+    )
+}
+
+/// Frame 3 of `fixtures/mantis-512` translated by `dx` columns with the
+/// vacated columns zero-filled, with the unwarped frame's tile, width, height
+/// and samples per pixel.
+pub fn shifted_frame_3(dx: f64) -> (Vec<u16>, Tile, u32, u32, u32) {
+    let (tile, width, height, spp) = frame_3_tile();
+    let warped = warp_from_tile(
+        &tile,
+        (width, height),
+        full_rect(width, height),
+        &Transform::translation(dx, 0.0),
+    )
+    .expect("the translation stays inside the frame");
+    (warped.tile.samples, tile, width, height, spp)
+}
+
+/// One alignment result as exact bits and its status, so a recorded run and a
+/// later one compare without a tolerance.
+fn fingerprint(
+    transform: &Transform,
+    status: AlignStatus,
+    iterations: u32,
+    residual: f64,
+) -> String {
+    let m: Vec<String> = transform
+        .m
+        .iter()
+        .flatten()
+        .map(|v| format!("{:016x}", v.to_bits()))
+        .collect();
+    format!(
+        "m=[{}] status={:?} iterations={} residual={:016x}",
+        m.join(","),
+        status,
+        iterations,
+        residual.to_bits()
+    )
+}
+
+pub fn outcome_fingerprint(outcome: &AlignOutcome) -> String {
+    fingerprint(
+        &outcome.transform,
+        outcome.status,
+        outcome.iterations,
+        outcome.residual,
+    )
+}
+
+pub fn frame_fingerprint(frame: &FrameAlignment) -> String {
+    fingerprint(
+        &frame.transform,
+        frame.status,
+        frame.iterations,
+        frame.residual,
+    )
+}
+
+/// A fingerprint without its status token: the transform, iteration count and
+/// residual bits alone.
+fn without_status(fingerprint: &str) -> String {
+    fingerprint
+        .split_whitespace()
+        .filter(|token| !token.starts_with("status="))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Asserts `now` equals `recorded` frame by frame, solve tokens before the
+/// status token, so a changed status cannot hide a changed solve.
+pub fn assert_fingerprints_match(input: &str, now: &[String], recorded: &[&str]) {
+    assert_eq!(now.len(), recorded.len(), "{input}: frame count");
+    for (i, (now, then)) in now.iter().zip(recorded).enumerate() {
+        assert_eq!(
+            without_status(now),
+            without_status(then),
+            "{input}: frame {i} transform, iterations, residual"
+        );
+        assert_eq!(now, then, "{input}: frame {i} full fingerprint with status");
+    }
+}
+
+/// A 64-bit FNV-1a digest over every sample of every frame in little-endian
+/// byte order, stable across toolchains and platforms.
+pub fn samples_digest(reader: &FramesReader) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for sample in reader.frames.iter().flatten() {
+        for byte in sample.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    format!("{hash:016x}")
 }
 
 /// Wraps another [`TileReader`], counting `read_tile_into` calls per frame
