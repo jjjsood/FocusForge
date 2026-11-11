@@ -95,10 +95,10 @@ export component FFImagesPanel inherits Rectangle {
     callback frame-drag-pointer(int, int, length);
     // The list's own scroll offset after it moved.
     callback viewport-scrolled(length);
-    // A plain wheel over a list row -- steps the selected/brush-source frame,
-    // the same effect `Ctrl + Wheel` over the canvas has. Raw wheel delta,
-    // unnegated, matching `AppController::wheel`'s own convention.
-    callback frame-wheel(length);
+    // A plain wheel over list row `row`, raw wheel delta (unnegated, as
+    // `AppController::wheel` takes it); `false` leaves the wheel to the
+    // list's own scrolling.
+    callback frame-wheel(int, length) -> bool;
     callback scrollbar-pointer(int, length);
     callback scrollbar-dragged(length);
     callback viewport-height-changed(length);
@@ -198,7 +198,7 @@ export component FFImagesPanel inherits Rectangle {
                     drag-pointer(kind, local-y) => {
                         root.frame-drag-pointer(i, kind, i * root.row-height + local-y);
                     }
-                    wheel(delta) => { root.frame-wheel(delta); }
+                    wheel(delta) => { return root.frame-wheel(i, delta); }
                 }
             }
         }

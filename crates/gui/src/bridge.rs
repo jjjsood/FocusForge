@@ -2381,9 +2381,12 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
         .map(|row| {
             let frame = row.kind == crate::images::RowKind::Frame;
             let visible = controller.source_preview_row_visible(row);
-            let preview = (visible && frame)
-                .then(|| controller.source_preview(&row.path))
+            let source = visible
+                .then(|| controller.row_preview_source(row))
                 .flatten();
+            let preview = source
+                .as_ref()
+                .and_then(|source| controller.source_preview(source));
             if let Some(pixels) = preview
                 && native_previews.insert(Arc::as_ptr(pixels))
             {
@@ -2431,8 +2434,8 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
                 focused: false,
                 job_disabled: false,
                 preview: source_preview_image(preview),
-                preview_state: if visible && frame {
-                    controller.source_preview_state(&row.path, row.unresolved)
+                preview_state: if let Some(source) = &source {
+                    controller.source_preview_state(source, row.unresolved)
                 } else if row.unresolved {
                     "missing"
                 } else {
@@ -4748,17 +4751,21 @@ pub fn install(
             }
         }
     });
-    // A plain wheel over the `Images` list steps the selected/brush-source
-    // frame -- the same effect `Ctrl + Wheel` over the canvas has, so this
-    // also needs a repaint.
+    // A plain wheel over an `Images` row steps the source row, which also
+    // needs a repaint; a refused wheel is the list's own scroll and gets none.
     app.on_images_frame_wheel({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
-        move |delta| {
-            dispatch(&controller, &canvas, &app_weak, |controller| {
-                controller.images_list_wheel(delta);
-            });
+        move |row, delta| {
+            let used = controller
+                .lock()
+                .unwrap()
+                .images_list_wheel(row as usize, delta);
+            if used {
+                dispatch(&controller, &canvas, &app_weak, |_| {});
+            }
+            used
         }
     });
     app.on_images_scrollbar_pointer({
@@ -4946,7 +4953,7 @@ pub fn install(
         move |delta| {
             record_images_input();
             dispatch(&controller, &canvas, &app_weak, |controller| {
-                controller.select_adjacent_resolved_frame(delta);
+                controller.select_adjacent_image_row(delta);
             });
         }
     });

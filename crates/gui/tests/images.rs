@@ -2208,7 +2208,7 @@ fn keyboard_selection_skips_missing_reanchors_at_edges_and_stays_read_only_in_ed
 
     controller.select_frame(0);
     controller.images_viewport_scrolled(0.0);
-    controller.select_adjacent_resolved_frame(1);
+    controller.select_adjacent_image_row(1);
     assert_eq!(
         controller.frame_pane_label(),
         "02.tif",
@@ -2220,14 +2220,14 @@ fn keyboard_selection_skips_missing_reanchors_at_edges_and_stays_read_only_in_ed
     );
 
     controller.images_viewport_scrolled(0.0);
-    controller.select_adjacent_resolved_frame(1);
+    controller.select_adjacent_image_row(1);
     assert!(
         frame_row_visible(&controller, 2),
         "a last-row key press reanchors a manually displaced viewport"
     );
     controller.select_frame(0);
     controller.images_viewport_scrolled(f32::MAX);
-    controller.select_adjacent_resolved_frame(-1);
+    controller.select_adjacent_image_row(-1);
     assert!(
         frame_row_visible(&controller, 0),
         "a first-row key press reanchors a manually displaced viewport"
@@ -2240,7 +2240,7 @@ fn keyboard_selection_skips_missing_reanchors_at_edges_and_stays_read_only_in_ed
     });
     editor.set_images_viewport_height(10.0);
     editor.select_frame(0);
-    editor.select_adjacent_resolved_frame(1);
+    editor.select_adjacent_image_row(1);
     assert_eq!(editor.mode(), ShellMode::Editor);
     assert_eq!(editor.source_presentation(), SourcePresentation::ImageList);
     assert!(
@@ -2267,8 +2267,8 @@ fn editor_source_list_follows_appearance_presentation() {
 
         editor.select_frame(0);
         editor.images_viewport_scrolled(0.0);
-        editor.select_adjacent_resolved_frame(1);
-        editor.select_adjacent_resolved_frame(1);
+        editor.select_adjacent_image_row(1);
+        editor.select_adjacent_image_row(1);
         assert!(
             frame_row_visible(&editor, 2),
             "{presentation:?}: keyboard selection keeps the third row visible"
@@ -5057,7 +5057,7 @@ fn results_group_geometry() {
             if collapsed {
                 heights.push((38.0, false));
             } else {
-                heights.extend([(row, false), (44.0, false), (38.0, false)]);
+                heights.extend([(row, true), (44.0, false), (38.0, false)]);
             }
             heights.extend(vec![(row, true); frame_count(&controller)]);
             let panel = controller.images_panel();
@@ -5077,7 +5077,7 @@ fn results_group_geometry() {
             // into view.
             controller.images_viewport_scrolled(0.0);
             controller.select_frame(0);
-            controller.select_adjacent_resolved_frame(1);
+            controller.select_adjacent_image_row(1);
             let second = controller.images_panel().rows[panel.row_of_frame(1).unwrap()].clone();
             assert_eq!(
                 controller.images_scroll_y(),
@@ -5094,10 +5094,11 @@ fn results_group_geometry() {
                     "{label}: requests at {scroll}"
                 );
                 if !collapsed && scroll == 40.0 {
-                    // Still inside the Results group, no frame row is near
-                    // in Large; one frame row is in Image list.
+                    // Still inside the Results group: its checkpoint row is
+                    // requested; no frame row is near in Large, one is in
+                    // Image list.
                     let near = controller.source_preview_snapshot().scheduled;
-                    assert_eq!(near, if row == 120.0 { 1 } else { 0 }, "{label}");
+                    assert_eq!(near, if row == 120.0 { 2 } else { 1 }, "{label}");
                 }
                 for model in &panel.rows {
                     assert_eq!(
@@ -5117,4 +5118,166 @@ fn results_group_geometry() {
     });
     controller.images_viewport_scrolled(0.0);
     assert_eq!(controller.source_preview_snapshot().scheduled, 0, "List");
+}
+
+#[test]
+fn checkpoint_thumbnail_requests() {
+    let (mut controller, _, ids) = reopened_chain("checkpoint_thumbnail_requests");
+    retouch(&mut controller, &[20]);
+    fuse(&mut controller);
+    open_session(&mut controller);
+    let rows = results_of(&controller);
+    let keys: Vec<_> = rows.iter().map(|row| row.key.clone().unwrap()).collect();
+    for expected in &ids {
+        assert!(
+            keys.contains(expected),
+            "saved fused and saved retouch rows"
+        );
+    }
+    assert!(
+        keys.iter().any(|key| key == "held:0") && keys.iter().any(|key| key == "held:1"),
+        "a held retouch and a held fuse"
+    );
+    controller.set_images_viewport_height(4000.0);
+
+    let in_view = |controller: &AppController| {
+        controller
+            .images_panel()
+            .rows
+            .iter()
+            .filter(|row| controller.row_preview_source(row).is_some())
+            .count()
+    };
+    let present = |controller: &mut AppController, presentation| {
+        controller.install_appearance(AppearanceSettings {
+            presentation,
+            ..AppearanceSettings::default()
+        });
+        controller.refresh_source_previews();
+    };
+    present(&mut controller, SourcePresentation::List);
+    assert_eq!(controller.source_preview_snapshot().scheduled, 0, "List");
+    for presentation in [SourcePresentation::ImageList, SourcePresentation::Large] {
+        present(&mut controller, presentation);
+        for row in results_of(&controller) {
+            assert!(
+                controller.row_preview_source(&row).is_some(),
+                "{presentation:?}: {:?} has a thumbnail source",
+                row.key
+            );
+        }
+        assert_eq!(
+            controller.source_preview_snapshot().scheduled,
+            in_view(&controller),
+            "{presentation:?}: one request per visible checkpoint and frame row"
+        );
+        assert!(controller.source_preview_snapshot().scheduled >= keys.len());
+    }
+
+    // Every checkpoint kind renders at the fused image's own size: under the
+    // 256 px edge nothing is rescaled, so a non-square crop stays non-square.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let held = controller.held_checkpoints();
+    let (width, height) = (held[0].width, held[0].height);
+    assert_ne!(width, height, "the fixture crop is not square");
+    loop {
+        controller.poll_source_previews();
+        let states: Vec<_> = results_of(&controller)
+            .iter()
+            .map(|row| {
+                let source = controller.row_preview_source(row).unwrap();
+                controller.source_preview_state(&source, false)
+            })
+            .collect();
+        assert!(!states.contains(&"unavailable"), "{states:?}");
+        if states.iter().all(|state| *state == "ready") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "thumbnails never settled");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for row in results_of(&controller) {
+        let source = controller.row_preview_source(&row).unwrap();
+        let pixels = controller.source_preview(&source).unwrap();
+        assert!(pixels.width.max(pixels.height) <= 256, "{:?}", row.key);
+        assert_eq!(
+            (pixels.width, pixels.height),
+            (width, height),
+            "{:?}: thumbnail keeps the checkpoint's size and aspect",
+            row.key
+        );
+    }
+
+    // A set cancel flag stops the render before it reads anything.
+    let saved = results_of(&controller)
+        .into_iter()
+        .find(|row| row.key.as_deref() == Some(ids[0].as_str()))
+        .unwrap();
+    let source = controller.row_preview_source(&saved).unwrap();
+    let cancelled = AtomicBool::new(true);
+    assert!(matches!(
+        source_previews::render_source(&source, job::host_budget(), &cancelled),
+        Err(PreviewError::Cancelled)
+    ));
+}
+
+#[test]
+fn stepping_skips_the_hidden_line() {
+    let mut controller = grids_apart("stepping_hidden_line", false);
+    let panel = controller.images_panel();
+    let hidden = panel
+        .rows
+        .iter()
+        .position(|row| row.kind == RowKind::Hidden)
+        .expect("the hidden line");
+    assert!(
+        !controller.images_list_wheel(hidden, 60.0),
+        "the list scrolls under the hidden line"
+    );
+    controller.select_frame(0);
+    controller.select_adjacent_image_row(-1);
+    assert_eq!(controller.source_checkpoint().as_deref(), Some("held:1"));
+    controller.select_adjacent_image_row(1);
+    assert_eq!(controller.source_checkpoint(), None);
+    assert!(
+        controller.images_panel().rows[panel.row_of_frame(0).unwrap()].selected,
+        "down from the last checkpoint passes the hidden line and the Frames heading"
+    );
+}
+
+#[test]
+fn stepping_to_a_checkpoint_row_scrolls_it_into_view() {
+    const VIEWPORT: f32 = 100.0;
+    let mut controller = grids_apart("stepping_scrolls_results", false);
+    controller.install_appearance(AppearanceSettings {
+        presentation: SourcePresentation::ImageList,
+        ..AppearanceSettings::default()
+    });
+    controller.set_images_viewport_height(VIEWPORT);
+    let panel = controller.images_panel();
+    let content = panel.content_height();
+
+    controller.images_viewport_scrolled(-50.0);
+    assert_eq!(controller.images_scroll_y(), 0.0, "0 is the top");
+    controller.images_viewport_scrolled(1.0e6);
+    assert_eq!(controller.images_scroll_y(), content - VIEWPORT);
+
+    // Up from the first frame, at the bottom: the checkpoint row's top.
+    controller.select_frame(0);
+    controller.select_adjacent_image_row(-1);
+    let checkpoint = panel
+        .rows
+        .iter()
+        .find(|row| row.kind == RowKind::Checkpoint)
+        .unwrap();
+    assert_eq!(controller.source_checkpoint().as_deref(), Some("held:1"));
+    assert_eq!(controller.images_scroll_y(), checkpoint.top);
+
+    // Down again: the first frame's bottom edge.
+    controller.select_adjacent_image_row(1);
+    let first = &panel.rows[panel.row_of_frame(0).unwrap()];
+    assert_eq!(
+        controller.images_scroll_y(),
+        first.top + first.height - VIEWPORT
+    );
 }

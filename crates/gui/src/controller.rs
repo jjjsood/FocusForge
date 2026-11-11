@@ -48,7 +48,8 @@ use crate::settings_panel::{
     self, PanelModel, ParamValue, ParamValues, ParamViolation, StackContext, slider_value,
 };
 use crate::source_previews::{
-    MAX_CACHE_BYTES, PreviewError, PreviewPixels, PreviewRequest, PreviewWorker,
+    HeldSnapshot, MAX_CACHE_BYTES, PreviewError, PreviewPixels, PreviewRequest, PreviewSource,
+    PreviewWorker,
 };
 use crate::update_settings::{self, PreviewRelease, UpdateSettings};
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
@@ -971,6 +972,33 @@ fn fused_of(entry: &job::InMemoryCheckpoint) -> Option<&job::HeldCheckpoint> {
     }
 }
 
+/// A number that changes when unsaved entry `index` or any entry it builds
+/// on changes: each link's creation time and its fuse files or op count
+/// (ops are only appended), so a new stroke gives a new preview identity.
+fn held_stamp(held: &[job::InMemoryCheckpoint], index: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut next = Some(index);
+    while let Some(at) = next.take() {
+        let Some(entry) = held.get(at) else { break };
+        at.hash(&mut hasher);
+        match &entry.kind {
+            job::InMemoryKind::Fused(fused) => {
+                (fused.created_at, &fused.composite).hash(&mut hasher);
+            }
+            job::InMemoryKind::Ops { ops, created_at } => {
+                (created_at, ops.len()).hash(&mut hasher);
+            }
+        }
+        match &entry.parent {
+            Some(job::ParentRef::Entry(parent)) if *parent < at => next = Some(*parent),
+            Some(job::ParentRef::Saved(id)) => id.hash(&mut hasher),
+            _ => {}
+        }
+    }
+    hasher.finish()
+}
+
 /// How many brush strokes `ops` hold.
 fn stroke_count(ops: &[job::Op]) -> usize {
     ops.iter()
@@ -1384,6 +1412,40 @@ impl ProjectTab {
             selected,
             results_collapsed: self.results_collapsed,
             frames_collapsed: self.frames_collapsed,
+        }
+    }
+
+    /// What the thumbnail of `row` shows: the frame, or the checkpoint with a
+    /// copy of the unsaved entries (`held` builds it, only when an unsaved row
+    /// needs it). `None` for rows without a thumbnail and for a frame whose
+    /// file is unresolved.
+    fn preview_source(
+        &self,
+        row: &images::ImageRow,
+        held: impl FnOnce() -> HeldSnapshot,
+    ) -> Option<PreviewSource> {
+        match row.kind {
+            images::RowKind::Frame => {
+                let unresolved = self.meta.get(&row.path).is_none_or(|meta| meta.unresolved);
+                (row.frame.is_some() && !unresolved).then(|| PreviewSource::Frame(row.path.clone()))
+            }
+            images::RowKind::Checkpoint => {
+                let key = row.key.clone()?;
+                let (stamp, held) = match checkpoints::held_index(&key) {
+                    Some(index) => (held_stamp(&self.held, index), held()),
+                    None => (0, HeldSnapshot::default()),
+                };
+                Some(PreviewSource::Checkpoint {
+                    project: match &self.project {
+                        GuiProject::Opened(project) => Some(project.path().to_path_buf()),
+                        GuiProject::Unsaved(_) => None,
+                    },
+                    key,
+                    stamp,
+                    held,
+                })
+            }
+            _ => None,
         }
     }
 
@@ -3913,7 +3975,7 @@ impl AppController {
             ActionEvent::Fired {
                 action: Action::StepSourceFrame,
                 steps,
-            } => self.step_source_frame(steps),
+            } => self.step_source_rows(steps),
             ActionEvent::Fired {
                 action: Action::BrushSize,
                 steps,
@@ -4022,36 +4084,82 @@ impl AppController {
         }
     }
 
-    /// `Ctrl + Wheel` over the canvas, or a plain wheel over the `Images`
-    /// list ([`Self::images_list_wheel`]): steps the left pane's selected
-    /// frame, clamped to the frame list. In editor mode this is also the
-    /// brush source, which reads `tab.selected` directly
-    /// ([`AppController::brush_source`]).
-    fn step_source_frame(&mut self, steps: f32) {
-        // Negated: scrolling toward the user (positive `steps`) steps to an
-        // earlier frame, matching how the `Images` list itself scrolls.
-        let detents = self.wheel_detents(Action::StepSourceFrame, -steps);
-        if detents == 0 {
-            return;
-        }
-        let Some(tab) = self.state.active() else {
+    /// `Ctrl + Wheel` over the canvas: steps the brush source through the
+    /// selectable rows of the `Images` list, as the arrow keys and the list
+    /// wheel do (see [`Self::select_adjacent_image_row`]), clamped at the
+    /// list's ends. A no-op with no row on screen.
+    fn step_source_rows(&mut self, steps: f32) {
+        let panel = self.images_panel();
+        let Some(from) = self.current_image_row(&panel) else {
             return;
         };
-        let len = tab.frames.len();
-        if len == 0 {
-            return;
+        // Negated: scrolling toward the user (positive `steps`) steps to an
+        // earlier row, matching how the `Images` list itself scrolls.
+        let detents = self.wheel_detents(Action::StepSourceFrame, -steps);
+        if detents != 0 {
+            self.step_image_rows(&panel, from, detents);
         }
-        let next = (tab.selected as i32 + detents).clamp(0, len as i32 - 1) as usize;
-        self.select_frame(next);
     }
 
-    /// A plain wheel over the `Images` list: the same effect `Ctrl + Wheel`
-    /// over the canvas has (`step_source_frame`) -- not gated on `Ctrl`,
-    /// `legend` or `mutable`, so it works identically in stacking and editor
-    /// mode.
-    pub fn images_list_wheel(&mut self, steps: f32) {
-        self.step_source_frame(steps);
-        self.keep_selected_image_visible();
+    /// A plain wheel over row `row` of the `Images` list: steps the source
+    /// through the selectable rows in list order (see
+    /// [`Self::select_adjacent_image_row`]) and returns `true`. Returns
+    /// `false` and leaves the wheel to the list's own scrolling when the row
+    /// is a heading or the hidden line, or no selectable row lies in the
+    /// wheel's direction.
+    pub fn images_list_wheel(&mut self, row: usize, steps: f32) -> bool {
+        if steps == 0.0 {
+            return false;
+        }
+        let panel = self.images_panel();
+        let over_source = panel.rows.get(row).is_some_and(|row| {
+            matches!(
+                row.kind,
+                images::RowKind::Frame | images::RowKind::Checkpoint
+            )
+        });
+        // Positive `steps` steps to an earlier row (see `step_source_rows`).
+        let step = if steps > 0.0 { -1 } else { 1 };
+        let Some(from) = self.current_image_row(&panel) else {
+            return false;
+        };
+        if !over_source || panel.next_selectable(from, step).is_none() {
+            return false;
+        }
+        let detents = self.wheel_detents(Action::StepSourceFrame, -steps);
+        self.step_image_rows(&panel, from, detents);
+        true
+    }
+
+    /// The row of `panel` holding the brush source: the selected checkpoint
+    /// or frame, else the selected frame's row; `None` while a collapsed
+    /// group hides it.
+    fn current_image_row(&self, panel: &images::ImagesModel) -> Option<usize> {
+        panel
+            .rows
+            .iter()
+            .position(|row| row.selected)
+            .or_else(|| panel.row_of_frame(self.state.active()?.selected))
+    }
+
+    /// Moves the brush source `detents` selectable rows from row `from`
+    /// (negative up), stopping at the list's end, and scrolls the landed row
+    /// into view. A landed checkpoint row is chosen as a click does.
+    fn step_image_rows(&mut self, panel: &images::ImagesModel, from: usize, detents: i32) {
+        let step = detents.signum() as isize;
+        let mut at = from;
+        for _ in 0..detents.unsigned_abs() {
+            match panel.next_selectable(at, step) {
+                Some(next) => at = next,
+                None => break,
+            }
+        }
+        let row = panel.rows[at].clone();
+        let (top, height) = (row.top, row.height);
+        if at != from {
+            self.select_row(row);
+        }
+        self.scroll_rows_into_view(top, height);
     }
 
     /// The active tab's fused image's shorter side -- `Size`'s ceiling.
@@ -6997,9 +7105,12 @@ impl AppController {
     /// selects that frame, a checkpoint row chooses it as the brush source
     /// (the edited checkpoint stays), a group heading folds its group.
     pub fn select_image_row(&mut self, index: usize) {
-        let Some(row) = self.images_panel().rows.into_iter().nth(index) else {
-            return;
-        };
+        if let Some(row) = self.images_panel().rows.into_iter().nth(index) {
+            self.select_row(row);
+        }
+    }
+
+    fn select_row(&mut self, row: images::ImageRow) {
         match row.kind {
             images::RowKind::Frame => {
                 if let Some(frame) = row.frame {
@@ -7087,16 +7198,20 @@ impl AppController {
                 // Visible rows render first, top to bottom, then the prefetch
                 // rows above and below.
                 let order = [first..visible_end, start..first, visible_end..end];
+                let mut held = None;
                 order
                     .into_iter()
                     .flat_map(|range| &panel.rows[range])
-                    .filter(|row| row.frame.is_some())
-                    .map(|row| &row.path)
-                    .filter(|path| tab.meta.get(*path).is_some_and(|meta| !meta.unresolved))
-                    .map(|path| PreviewRequest {
+                    .filter_map(|row| {
+                        tab.preview_source(row, || {
+                            held.get_or_insert_with(|| HeldSnapshot(tab.held.clone().into()))
+                                .clone()
+                        })
+                    })
+                    .map(|source| PreviewRequest {
                         tab_id: tab.id,
                         generation: self.preview_generation,
-                        path: path.clone(),
+                        source,
                     })
                     .collect()
             }
@@ -7215,12 +7330,20 @@ impl AppController {
         changed
     }
 
-    pub fn source_preview(&self, path: &Path) -> Option<&Arc<PreviewPixels>> {
+    /// The source `row`'s thumbnail shows, for [`Self::source_preview`] and
+    /// [`Self::source_preview_state`]; `None` for rows without a thumbnail.
+    pub fn row_preview_source(&self, row: &images::ImageRow) -> Option<PreviewSource> {
+        self.state
+            .active()?
+            .preview_source(row, HeldSnapshot::default)
+    }
+
+    pub fn source_preview(&self, source: &PreviewSource) -> Option<&Arc<PreviewPixels>> {
         let tab_id = self.state.active()?.id;
         self.preview_cache.get(&PreviewRequest {
             tab_id,
             generation: self.preview_generation,
-            path: path.to_path_buf(),
+            source: source.clone(),
         })
     }
 
@@ -7235,18 +7358,18 @@ impl AppController {
         row.top < scroll_y + viewport && row.top + row.height > scroll_y
     }
 
-    pub fn source_preview_state(&self, path: &Path, unresolved: bool) -> &'static str {
+    pub fn source_preview_state(&self, source: &PreviewSource, unresolved: bool) -> &'static str {
         if unresolved {
             return "missing";
         }
-        if self.source_preview(path).is_some() {
+        if self.source_preview(source).is_some() {
             return "ready";
         }
         let active = self.state.active().map(|tab| tab.id);
         if self.preview_failures.keys().any(|request| {
             Some(request.tab_id) == active
                 && request.generation == self.preview_generation
-                && request.path == path
+                && request.source == *source
         }) {
             return "unavailable";
         }
@@ -7351,8 +7474,17 @@ impl AppController {
         let Some(row) = panel.row_of_frame(index).map(|row| &panel.rows[row]) else {
             return;
         };
-        let top = row.top;
-        let bottom = top + row.height;
+        self.scroll_rows_into_view(row.top, row.height);
+    }
+
+    /// Scrolls the source-list viewport the least that shows the span
+    /// `top .. top + height`.
+    fn scroll_rows_into_view(&mut self, top: f32, height: f32) {
+        let viewport = self.state.images_viewport_height;
+        if viewport <= 0.0 {
+            return;
+        }
+        let bottom = top + height;
         let current = self.state.images_scroll_y;
         let target = if top < current {
             top
@@ -7412,38 +7544,19 @@ impl AppController {
         self.emit(ShellEvent::ImagesChanged);
     }
 
-    /// Selects the next resolved source in `direction`, retaining the current
-    /// source when the selection is already at that edge.
-    pub fn select_adjacent_resolved_frame(&mut self, direction: i32) {
-        let step = direction.signum() as isize;
-        let next = {
-            let Some(tab) = self.state.active() else {
-                return;
-            };
-            if step == 0 {
-                None
-            } else {
-                let mut index = tab.selected as isize;
-                loop {
-                    index += step;
-                    if index < 0 || index >= tab.frames.len() as isize {
-                        break None;
-                    }
-                    let index = index as usize;
-                    if tab
-                        .meta
-                        .get(&tab.frames[index])
-                        .is_some_and(|meta| !meta.unresolved)
-                    {
-                        break Some(index);
-                    }
-                }
-            }
-        };
-        if let Some(next) = next {
-            self.select_frame(next);
+    /// Selects the next resolved source in `direction` (negative up) in list
+    /// order: in the editor the Results group's checkpoint rows come before
+    /// the frames, so stepping up from the first frame lands on the last
+    /// checkpoint row. Headings, the hidden line and unresolved frames are
+    /// skipped; the source is retained at either end of the list.
+    pub fn select_adjacent_image_row(&mut self, direction: i32) {
+        if direction == 0 {
+            return;
         }
-        self.keep_selected_image_visible();
+        let panel = self.images_panel();
+        if let Some(from) = self.current_image_row(&panel) {
+            self.step_image_rows(&panel, from, direction.signum());
+        }
     }
 
     /// The selected frame's path -- `None` with no tab active or an empty
@@ -12015,7 +12128,21 @@ mod tests {
 
     use super::{AppController, OpenOutcome, plain_cause};
     use crate::appearance_settings::{AppearanceSettings, SourcePresentation};
-    use crate::source_previews::{PreviewError, PreviewPixels, PreviewReservation, PreviewWorker};
+    use crate::source_previews::{
+        PreviewError, PreviewPixels, PreviewRequest, PreviewReservation, PreviewSource,
+        PreviewWorker,
+    };
+
+    fn frame_source(path: &Path) -> PreviewSource {
+        PreviewSource::Frame(path.to_path_buf())
+    }
+
+    fn frame_path(request: &PreviewRequest) -> &Path {
+        match &request.source {
+            PreviewSource::Frame(path) => path,
+            PreviewSource::Checkpoint { key, .. } => panic!("checkpoint request {key}"),
+        }
+    }
 
     fn install_blocked_preview_worker(
         controller: &mut AppController,
@@ -12032,8 +12159,11 @@ mod tests {
         let release_rx = Arc::new(Mutex::new(release_rx));
         let (completed_tx, completed_rx) = mpsc::channel();
         controller.previews = Some(PreviewWorker::new_with_renderer(Arc::new(
-            move |path, _, _| {
-                if path != blocked_path {
+            move |source, _, _| {
+                let PreviewSource::Frame(path) = source else {
+                    return Err(PreviewError::Cancelled);
+                };
+                if *path != blocked_path {
                     return Err(PreviewError::Cancelled);
                 }
                 started_tx.send(path.to_path_buf()).unwrap();
@@ -12082,7 +12212,7 @@ mod tests {
         controller
             .preview_cache
             .keys()
-            .any(|request| request.path == source)
+            .any(|request| frame_path(request) == source)
     }
 
     fn seal_project_with_sources(dir: &Path, sources: &[PathBuf]) -> PathBuf {
@@ -12203,7 +12333,7 @@ mod tests {
         );
         wait_for_preview_quiescence(&mut controller);
         assert_eq!(controller.source_preview_snapshot().cache_entries, 0);
-        assert!(controller.source_preview(&source).is_none());
+        assert!(controller.source_preview(&frame_source(&source)).is_none());
         assert!(!cache_has_source(&controller, &source));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -12253,7 +12383,7 @@ mod tests {
             controller
                 .preview_requests
                 .iter()
-                .map(|request| request.path.clone())
+                .map(|request| frame_path(request).to_path_buf())
                 .collect::<Vec<_>>(),
             [3, 1, 2, 4, 5].map(|index| frames[index].clone()),
             "the visible row is first, then the rows above, then the rows below"
@@ -12267,7 +12397,7 @@ mod tests {
         let request = |index: usize| super::PreviewRequest {
             tab_id,
             generation: controller.preview_generation,
-            path: frames[index].clone(),
+            source: frame_source(&frames[index]),
         };
         let finished = request(3);
         controller.preview_cache.insert(
@@ -12300,7 +12430,7 @@ mod tests {
             worker
                 .drain()
                 .iter()
-                .any(|outcome| outcome.request.path == frames[1] && outcome.result.is_ok()),
+                .any(|outcome| frame_path(&outcome.request) == frames[1] && outcome.result.is_ok()),
             "the render that was in flight is published, not cancelled"
         );
 
@@ -12322,7 +12452,7 @@ mod tests {
             worker
                 .drain()
                 .iter()
-                .all(|outcome| outcome.request.path != frames[1]),
+                .all(|outcome| frame_path(&outcome.request) != frames[1]),
             "a scroll that leaves the row cancels its render"
         );
         let _ = std::fs::remove_dir_all(root);
@@ -12391,7 +12521,7 @@ mod tests {
         wait_for_preview_quiescence(&mut controller);
 
         assert!(!cache_has_source(&controller, &source));
-        assert!(controller.source_preview(&source).is_none());
+        assert!(controller.source_preview(&frame_source(&source)).is_none());
         let _ = std::fs::remove_dir_all(&first);
         let _ = std::fs::remove_dir_all(&second);
     }
@@ -12452,7 +12582,11 @@ mod tests {
         wait_for_preview_quiescence(&mut controller);
 
         assert!(!cache_has_source(&controller, &old_source));
-        assert!(controller.source_preview(&old_source).is_none());
+        assert!(
+            controller
+                .source_preview(&frame_source(&old_source))
+                .is_none()
+        );
         assert_eq!(controller.images_panel().rows[0].path, new_source);
         let _ = std::fs::remove_dir_all(&root);
     }

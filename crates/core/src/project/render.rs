@@ -288,6 +288,30 @@ impl CheckpointImage {
         Ok(image)
     }
 
+    /// The render of entry `index` of the unsaved list `entries`: a held
+    /// fuse's composite, or the ops of the entry and of the op-bearing
+    /// entries it descends from over the fuse they are recorded on. Needs
+    /// `project` when that fuse is a saved checkpoint. Refuses an `index`
+    /// past the list, and a saved fuse without a `project`, as
+    /// [`ProjectError::Container`].
+    pub fn prepare_unsaved(
+        entries: &[InMemoryCheckpoint],
+        index: usize,
+        project: Option<&Project>,
+    ) -> Result<Self, ProjectError> {
+        let path = project.map_or_else(|| Path::new(""), |project| project.path());
+        if index >= entries.len() {
+            return Err(ProjectError::container(
+                path,
+                format!(
+                    "checkpoint {index} is not in the list of {} unsaved checkpoints",
+                    entries.len()
+                ),
+            ));
+        }
+        Self::prepare_entry(entries, index, project, path)
+    }
+
     /// The render of unsaved entry `j`: a held fuse's composite, or its own
     /// ops and those of the op-bearing entries it descends from over the
     /// fuse they are recorded on, never the strokes of the session. Strokes
@@ -397,7 +421,7 @@ impl CheckpointImage {
         let (width, height) = stack.dimensions();
         let samples_per_pixel = stack.header(0).samples_per_pixel;
         check_pending_sources(&state.sources, composite)?;
-        open_pending_sources(&state.sources, composite, samples_per_pixel)?;
+        open_pending_sources(&state.sources, composite, samples_per_pixel, None)?;
         let info = ZMapInfo::new(width, height, state.sources.len() as u32)
             .map_err(|err| ProjectError::container(composite, err))?;
         let format = stack.sample_format();
@@ -514,6 +538,15 @@ impl CheckpointImage {
     /// for any budget.
     pub fn with_source_bytes(mut self, bytes: u64) -> Self {
         self.source_bytes = bytes;
+        self
+    }
+
+    /// Lowers the memory the source frames of an op-bearing image may take
+    /// when a render opens them to `cap` bytes; `None` takes the
+    /// host-derived budget. A cap below the frames' decode reservation
+    /// refuses the render before any frame is decoded.
+    pub fn with_memory_cap(mut self, cap: Option<u64>) -> Self {
+        self.memory_cap = cap;
         self
     }
 
@@ -692,13 +725,15 @@ fn open_checkpoint_sources(
 }
 
 /// [`open_sources`] for a pending state's `paths`, refusing frames whose
-/// samples per pixel differ from `composite`'s `samples_per_pixel`.
+/// samples per pixel differ from `composite`'s `samples_per_pixel`, under
+/// `memory_cap` as [`open_sources`] takes it.
 fn open_pending_sources(
     paths: &[PathBuf],
     composite: &Path,
     samples_per_pixel: u32,
+    memory_cap: Option<u64>,
 ) -> Result<FrameSet, ProjectError> {
-    let set = open_sources(paths, composite, None)?;
+    let set = open_sources(paths, composite, memory_cap)?;
     let found = set.reader.stack_context().samples_per_pixel;
     if found != samples_per_pixel {
         return Err(ProjectError::container(
@@ -1153,7 +1188,7 @@ fn render_pending<S: DocumentSample>(
             continue;
         }
         let rendered = render_areas::<S>(project.as_deref_mut(), checkpoints, &areas, spp, limits)?;
-        let set = open_pending_sources(sources, composite, spp)?;
+        let set = open_pending_sources(sources, composite, spp, limits.memory_cap)?;
         let gained = GainReader::new(&*set.reader, registration.gains());
         let warping = warp(&set, &gained, registration, sources.len(), spp);
         let mut blend = blend_bands(
@@ -1254,8 +1289,7 @@ pub fn render_checkpoint(
     path: &Path,
     memory_cap: Option<u64>,
 ) -> Result<(), ProjectError> {
-    let mut image = CheckpointImage::prepare(project, id)?;
-    image.memory_cap = memory_cap;
+    let image = CheckpointImage::prepare(project, id)?.with_memory_cap(memory_cap);
     match image.sample_format {
         SampleFormat::U16 => write_tiff(
             &image,

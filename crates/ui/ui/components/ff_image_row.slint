@@ -92,7 +92,9 @@ export component FFImageRow inherits Rectangle {
     // The compact filename surface forwards a drag stream; ordinary clicks
     // continue selecting the row through `clicked`.
     callback drag-pointer(int, length);
-    callback wheel(length);
+    // A plain wheel over the row; `true` when it was used, `false` leaves the
+    // wheel to the list's own scrolling.
+    callback wheel(length) -> bool;
 
     property <bool> is-checkpoint: root.kind == "checkpoint";
     property <bool> is-hidden: root.kind == "hidden";
@@ -137,8 +139,7 @@ export component FFImageRow inherits Rectangle {
         width: 100%;
         height: 100%;
         scroll-event(event) => {
-            root.wheel(event.delta-y);
-            accept
+            if root.wheel(event.delta-y) { accept } else { reject }
         }
     }
 
@@ -197,8 +198,7 @@ export component FFImageRow inherits Rectangle {
             }
         }
         scroll-event(event) => {
-            root.wheel(event.delta-y);
-            accept
+            if root.wheel(event.delta-y) { accept } else { reject }
         }
 
     if root.dragging: Rectangle {

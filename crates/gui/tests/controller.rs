@@ -20,6 +20,7 @@ use focusforge_gpu::device::SharedDevice;
 use focusforge_gpu::device::shared_device_or_skip;
 use focusforge_gui::appearance_settings::{AppearanceSettings, SourcePresentation};
 use focusforge_gui::canvas::PaneSource;
+use focusforge_gui::source_previews::PreviewSource;
 use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode, performance_settings};
 
 use common::{open_mantis64_tab, record_events, save_to_proposed, scratch_controller, settle_all};
@@ -331,6 +332,7 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("ff_slider.slint"), "focus-changed-event(reason)")
             | (Some("ff_image_row.slint"), "pointer-event(event)")
             | (Some("ff_image_row.slint"), "moved")
+            | (Some("ff_image_row.slint"), "scroll-event(event)")
             | (Some("images_panel.slint"), "clicked")
             | (Some("images_panel.slint"), "toggled")
             | (Some("images_panel.slint"), "key-pressed(event)")
@@ -4412,7 +4414,12 @@ fn brush_controls_convert_to_storage_units() {
     c.wheel(0.0, 60.0, 0.0, 0.0, CTRL);
     assert_eq!(c.brush_source(), Some(1), "Ctrl + Wheel steps the source");
     c.wheel(0.0, 120.0, 0.0, 0.0, CTRL);
-    assert_eq!(c.brush_source(), Some(0), "clamped to the frame list");
+    assert_eq!(
+        c.source_checkpoint().as_deref(),
+        Some("held:0"),
+        "two rows up from frame 1 passes frame 0 and lands on the Results row"
+    );
+    assert_eq!(c.brush_source(), Some(1), "the frame selection is kept");
 
     let mut narrow = scratch_controller("brush_units_narrow");
     open_cropped_tab(&mut narrow, "brush_units_narrow", 40, 24);
@@ -4440,14 +4447,14 @@ fn plain_wheel_over_the_images_list_steps_the_source_frame_in_both_modes() {
     let mut stacking = scratch_controller("images_wheel_stacking");
     open_mantis64_tab(&mut stacking, "images_wheel_stacking", 3);
     stacking.select_frame(2);
-    stacking.images_list_wheel(60.0);
+    assert!(stacking.images_list_wheel(2, 60.0));
     assert_eq!(
         stacking.frame_pane_label(),
         "01.tif",
         "plain wheel over the list steps the source in stacking mode, matching \
          Ctrl + Wheel's own direction"
     );
-    stacking.images_list_wheel(120.0);
+    assert!(stacking.images_list_wheel(1, 120.0));
     assert_eq!(
         stacking.frame_pane_label(),
         "00.tif",
@@ -4456,11 +4463,236 @@ fn plain_wheel_over_the_images_list_steps_the_source_frame_in_both_modes() {
 
     let (mut editor, _) = open_editor("images_wheel_editor");
     editor.select_frame(2);
-    editor.images_list_wheel(60.0);
+    let row = frame_row(&editor, 2);
+    assert!(editor.images_list_wheel(row, 60.0));
     assert_eq!(
         editor.frame_pane_label(),
         "01.tif",
         "the same wheel steps the source in editor mode too, with no Ctrl needed"
+    );
+}
+
+#[test]
+fn list_stepping_crosses_between_frames_and_the_results_group() {
+    let (mut c, _) = open_editor("list_step_cross");
+    let edited = common::panel_selected(&c);
+    let events = record_events(&mut c);
+    let ckpt = [(RowKind::Checkpoint, Some("held:0".to_string()), None)];
+
+    c.select_frame(0);
+    c.select_adjacent_image_row(-1);
+    assert_eq!(c.source_checkpoint().as_deref(), Some("held:0"));
+    assert_eq!(
+        selected_rows(&c),
+        ckpt,
+        "up from frame 0 lands on the Results row"
+    );
+    assert!(
+        ops(&c).is_empty(),
+        "choosing the source records no frame stroke"
+    );
+    assert_eq!(common::panel_selected(&c), edited, "no restore");
+    assert!(!checkpoints_changed(&events));
+
+    c.select_adjacent_image_row(-1);
+    assert_eq!(selected_rows(&c), ckpt, "the first row up is a no-op");
+
+    c.select_adjacent_image_row(1);
+    assert_eq!(c.source_checkpoint(), None);
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(0))]);
+
+    c.select_frame(2);
+    c.select_adjacent_image_row(1);
+    assert_eq!(
+        selected_rows(&c),
+        [(RowKind::Frame, None, Some(2))],
+        "last row down"
+    );
+
+    // A checkpoint source steps from its own row, not from the selected frame.
+    c.select_image_row(checkpoint_row(&c, "held:0"));
+    c.select_adjacent_image_row(1);
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(0))]);
+}
+
+#[test]
+fn list_stepping_reaches_every_held_row_and_skips_headings() {
+    let mut c = common::controller_with_frames("list_step_held", 3);
+    common::fuse(&mut c);
+    common::open_session(&mut c);
+    common::retouch(&mut c, &[20]);
+    let keys: Vec<String> = c
+        .images_panel()
+        .rows
+        .iter()
+        .filter(|row| row.kind == RowKind::Checkpoint)
+        .map(|row| row.key.clone().unwrap())
+        .collect();
+    assert!(keys.contains(&"held:0".to_string()) && keys.contains(&"held:1".to_string()));
+
+    c.select_frame(0);
+    for key in keys.iter().rev() {
+        c.select_adjacent_image_row(-1);
+        assert_eq!(c.source_checkpoint().as_ref(), Some(key));
+    }
+    c.select_adjacent_image_row(-1);
+    assert_eq!(
+        c.source_checkpoint().as_ref(),
+        keys.first(),
+        "Results heading is no stop"
+    );
+    for key in keys.iter().skip(1) {
+        c.select_adjacent_image_row(1);
+        assert_eq!(c.source_checkpoint().as_ref(), Some(key));
+    }
+    c.select_adjacent_image_row(1);
+    assert_eq!(
+        selected_rows(&c),
+        [(RowKind::Frame, None, Some(0))],
+        "Frames heading is no stop"
+    );
+}
+
+#[test]
+fn collapsed_results_gives_no_checkpoint_stop() {
+    let (mut c, _) = open_editor("list_step_collapsed");
+    c.select_frame(0);
+    c.select_image_row(0);
+    assert!(c.images_panel().rows[0].collapsed);
+    c.select_adjacent_image_row(-1);
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(0))]);
+    assert_eq!(c.source_checkpoint(), None);
+    let first = frame_row(&c, 0);
+    assert!(
+        !c.images_list_wheel(first, 60.0),
+        "no row above: the list scrolls"
+    );
+
+    // A checkpoint source hidden by the fold steps from the selected frame.
+    c.select_image_row(0);
+    c.select_frame(1);
+    c.select_image_row(checkpoint_row(&c, "held:0"));
+    c.select_image_row(0);
+    assert!(c.images_panel().rows[0].collapsed);
+    c.select_adjacent_image_row(1);
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(2))]);
+    assert_eq!(c.source_checkpoint(), None);
+}
+
+#[test]
+fn plain_wheel_steps_the_one_list_and_defers_to_scrolling_at_its_ends() {
+    let (mut c, _) = open_editor("list_wheel_groups");
+    let events = record_events(&mut c);
+    let ckpt = [(RowKind::Checkpoint, Some("held:0".to_string()), None)];
+    c.select_frame(0);
+    let first_frame = frame_row(&c, 0);
+    assert!(c.images_list_wheel(first_frame, 60.0));
+    assert_eq!(selected_rows(&c), ckpt, "wheel up from frame 0");
+    assert!(ops(&c).is_empty());
+    assert!(!checkpoints_changed(&events));
+
+    let at = checkpoint_row(&c, "held:0");
+    assert!(
+        !c.images_list_wheel(at, 60.0),
+        "first row up scrolls the list"
+    );
+    assert_eq!(selected_rows(&c), ckpt);
+    assert!(
+        c.images_list_wheel(at, -30.0),
+        "a sub-detent tick is consumed"
+    );
+    assert_eq!(selected_rows(&c), ckpt, "without stepping");
+    assert!(c.images_list_wheel(at, -30.0));
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(0))]);
+
+    let rows = c.images_panel().rows;
+    let frames_heading = rows
+        .iter()
+        .position(|row| row.kind == RowKind::FramesHeading)
+        .unwrap();
+    for over in [0, frames_heading, rows.len()] {
+        assert!(
+            !c.images_list_wheel(over, 60.0),
+            "row {over} scrolls natively"
+        );
+        assert!(
+            !c.images_list_wheel(over, -60.0),
+            "row {over} scrolls natively"
+        );
+    }
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(0))]);
+
+    c.select_frame(2);
+    let last = frame_row(&c, 2);
+    assert!(
+        !c.images_list_wheel(last, -60.0),
+        "last row down scrolls the list"
+    );
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(2))]);
+
+    // A checkpoint source steps from its own row.
+    c.select_image_row(at);
+    assert!(c.images_list_wheel(at, -60.0));
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(0))]);
+    assert_eq!(c.source_checkpoint(), None);
+}
+
+#[test]
+fn plain_wheel_skips_unresolved_frames_in_stacking() {
+    let mut c = scratch_controller("list_wheel_unresolved");
+    let root = open_mantis64_tab(&mut c, "list_wheel_unresolved", 3);
+    fs::remove_file(root.join("01.tif")).unwrap();
+    assert!(!c.start_fuse(), "the missing source is refused");
+    assert!(c.images_panel().rows[1].unresolved);
+    assert!(
+        c.images_panel()
+            .rows
+            .iter()
+            .all(|row| row.kind == RowKind::Frame)
+    );
+
+    c.select_frame(2);
+    assert!(c.images_list_wheel(2, 60.0));
+    assert_eq!(
+        c.frame_pane_label(),
+        "00.tif",
+        "the unresolved frame is no stop"
+    );
+    assert!(!c.images_list_wheel(0, 60.0), "first row up");
+    c.select_frame(2);
+    assert!(!c.images_list_wheel(2, -60.0), "last row down");
+}
+
+#[test]
+fn ctrl_wheel_over_the_canvas_steps_the_one_list() {
+    let (mut c, _) = open_editor("ctrl_wheel_list");
+    let events = record_events(&mut c);
+    let ckpt = [(RowKind::Checkpoint, Some("held:0".to_string()), None)];
+
+    c.select_frame(0);
+    c.wheel(0.0, 60.0, 0.0, 0.0, CTRL);
+    assert_eq!(
+        selected_rows(&c),
+        ckpt,
+        "up from frame 0 lands on the Results row"
+    );
+    assert!(ops(&c).is_empty());
+    assert!(!checkpoints_changed(&events));
+    c.wheel(0.0, 60.0, 0.0, 0.0, CTRL);
+    assert_eq!(selected_rows(&c), ckpt, "first row: no-op");
+
+    c.wheel(0.0, -30.0, 0.0, 0.0, CTRL);
+    assert_eq!(selected_rows(&c), ckpt, "a sub-detent tick does not step");
+    c.wheel(0.0, -30.0, 0.0, 0.0, CTRL);
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(0))]);
+    assert_eq!(c.source_checkpoint(), None);
+
+    c.select_frame(2);
+    c.wheel(0.0, -60.0, 0.0, 0.0, CTRL);
+    assert_eq!(
+        selected_rows(&c),
+        [(RowKind::Frame, None, Some(2))],
+        "last row: no-op"
     );
 }
 
@@ -10839,7 +11071,12 @@ fn exercise_open_folder(controller: &mut AppController) -> (Vec<&'static str>, V
         controller.poll_source_previews();
         let states: Vec<_> = rows
             .iter()
-            .map(|row| controller.source_preview_state(&row.path, row.unresolved))
+            .map(|row| {
+                let source = controller
+                    .row_preview_source(row)
+                    .unwrap_or_else(|| PreviewSource::Frame(row.path.clone()));
+                controller.source_preview_state(&source, row.unresolved)
+            })
             .collect();
         if !states.contains(&"loading") {
             break states;

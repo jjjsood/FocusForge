@@ -16,8 +16,9 @@ use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter, open_frame_set}
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
-    self, AppendRequest, BrushMode, CheckpointImage, Metrics, Op, ParentRef, PendingState, Point,
-    Project, ProjectError, SealRequest, StrokeSource, partial_path,
+    self, AppendRequest, BrushMode, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint,
+    InMemoryKind, Metrics, Op, ParentRef, PendingState, Point, Project, ProjectError, SealRequest,
+    StrokeSource, held_key, partial_path,
 };
 use focusforge_core::retouch::blend::{self, Blend};
 use focusforge_core::retouch::{ModeConditions, overlay_colors};
@@ -179,6 +180,34 @@ fn write_sources(dir: &Path, spp: u32, seed: usize) -> Vec<PathBuf> {
         .collect()
 }
 
+/// JPEG frames of the size `write_sources` makes: a decoded source, whose
+/// cache a memory cap can refuse.
+fn write_jpeg_sources(dir: &Path, spp: u32, seed: usize) -> Vec<PathBuf> {
+    let (w, h) = (W + 2 * CROP.x, H + 2 * CROP.y);
+    (0..FRAMES)
+        .map(|i| {
+            let path = dir.join(format!("frame-{seed}-{i}.jpg"));
+            let samples: Vec<u8> = (0..(w * h * spp) as usize)
+                .map(|j| {
+                    let p = j / spp as usize;
+                    hash(
+                        i + 1 + seed * 5,
+                        p % w as usize,
+                        p / w as usize,
+                        j % spp as usize,
+                    ) as u8
+                })
+                .collect();
+            let mut bytes = Vec::new();
+            jpeg_encoder::Encoder::new(&mut bytes, 90)
+                .encode(&samples, w as u16, h as u16, jpeg_encoder::ColorType::Rgb)
+                .unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            path
+        })
+        .collect()
+}
+
 fn stage_composite(dir: &Path, name: &str, spp: u32, wide: bool) -> PathBuf {
     let path = dir.join(name);
     let spec = TiffSpec {
@@ -225,12 +254,21 @@ fn cropped(rect: Rect) -> Registration {
 }
 
 fn build<S: Doc>(name: &str, spp: u32) -> Project1 {
+    build_from::<S>(name, spp, write_sources)
+}
+
+/// [`build`] over the source frames `frames` writes into the project's directory.
+fn build_from<S: Doc>(
+    name: &str,
+    spp: u32,
+    frames: fn(&Path, u32, usize) -> Vec<PathBuf>,
+) -> Project1 {
     let dir = tmp_dir(name);
     let staging = dir.join("staging");
     std::fs::create_dir_all(&staging).unwrap();
     let composite = stage_composite(&staging, "composite.tif", spp, S::WIDE);
     let zmap = stage_zmap(&staging);
-    let sources = write_sources(&dir, spp, 0);
+    let sources = frames(&dir, spp, 0);
     let registration = cropped(CROP);
     let path = dir.join(format!("demo.{}", project::PROJECT_EXTENSION));
     let sealed = project::seal(SealRequest {
@@ -644,6 +682,174 @@ fn export_equals_view() {
     }
     check::<u16>();
     check::<f32>();
+}
+
+/// An unsaved fuse over `p`'s sources whose composite is staged in `tag`.
+fn unsaved_fuse(p: &Project1, tag: &str, parent: Option<ParentRef>) -> InMemoryCheckpoint {
+    let staging = p.dir.join(format!("staging-{tag}"));
+    std::fs::create_dir_all(&staging).unwrap();
+    InMemoryCheckpoint {
+        kind: InMemoryKind::Fused(HeldCheckpoint {
+            composite: stage_composite(&staging, "composite.tif", p.spp, false),
+            zmap: stage_zmap(&staging),
+            width: W,
+            height: H,
+            sources: p.sources.clone(),
+            algorithm: "laplacian".to_string(),
+            params: ParamValues::new(),
+            align: None,
+            registration: p.registration.clone(),
+            composite_description: "staged composite".to_string(),
+            metrics: Metrics::default(),
+            created_at: 900,
+            compressed_composite: None,
+        }),
+        parent,
+    }
+}
+
+fn unsaved_retouch(ops: Vec<Op>, created_at: i64, parent: ParentRef) -> InMemoryCheckpoint {
+    InMemoryCheckpoint {
+        kind: InMemoryKind::Ops { ops, created_at },
+        parent: Some(parent),
+    }
+}
+
+/// Every sample of `image` as the 16-bit view shows it.
+fn view_of(
+    image: &CheckpointImage,
+    project: Option<&mut Project>,
+) -> Result<Vec<u16>, ProjectError> {
+    let spp = image.samples_per_pixel as usize;
+    let mut out = vec![0u16; (W * H) as usize * spp];
+    image.render(project, image.full(), &mut |band, rect| {
+        gather(&mut out, image.full(), spp, band, rect);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+#[test]
+fn prepare_unsaved() {
+    // Retouches held on a saved base render as the pending state of their
+    // strokes does, one of them painting from the other.
+    let p = build::<u16>("cs_unsaved_tiff", 3);
+    let mut project = Project::open(&p.path).unwrap();
+    let first = vec![stroke(
+        frame(1),
+        &[(10, 12), (30, 20)],
+        6.0,
+        BrushMode::Normal,
+        1.0,
+    )];
+    let second = vec![stroke(
+        from(&held_key(0)),
+        &[(8, 30), (50, 12)],
+        7.0,
+        BrushMode::Normal,
+        1.0,
+    )];
+    let on_saved = vec![
+        unsaved_retouch(first.clone(), 1_000, ParentRef::Saved(p.root.clone())),
+        unsaved_retouch(second.clone(), 1_100, ParentRef::Entry(0)),
+    ];
+    let untouched = u16::read(&p.composite);
+    for (index, ops) in [(0, first.clone()), (1, [first.clone(), second].concat())] {
+        let held = CheckpointImage::prepare_unsaved(&on_saved, index, Some(&project)).unwrap();
+        let state = PendingState {
+            held: on_saved[..index].to_vec(),
+            ..pending_over(&p, ops)
+        };
+        let pending = CheckpointImage::prepare_pending(&state, Some(&project)).unwrap();
+        let want = view_of(&pending, Some(&mut project)).unwrap();
+        assert_ne!(want, untouched, "entry {index} changes the image");
+        let got = view_of(&held, Some(&mut project)).unwrap();
+        assert!(got == want, "entry {index} equals its pending render");
+    }
+
+    // A list with no saved checkpoint renders without a project; one that
+    // hangs from a saved checkpoint is refused without it.
+    let all_held = vec![
+        unsaved_fuse(&p, "held", None),
+        unsaved_retouch(first.clone(), 1_000, ParentRef::Entry(0)),
+    ];
+    let InMemoryKind::Fused(fuse) = &all_held[0].kind else {
+        unreachable!("the first entry is a fuse")
+    };
+    let image = CheckpointImage::prepare_unsaved(&all_held, 0, None).unwrap();
+    assert!(view_of(&image, None).unwrap() == u16::read(&fuse.composite));
+    let image = CheckpointImage::prepare_unsaved(&all_held, 1, None).unwrap();
+    let state = PendingState {
+        composite: fuse.composite.clone(),
+        held: all_held[..1].to_vec(),
+        ..pending_over(&p, first)
+    };
+    let pending = CheckpointImage::prepare_pending(&state, None).unwrap();
+    assert!(view_of(&image, None).unwrap() == view_of(&pending, None).unwrap());
+    assert!(matches!(
+        CheckpointImage::prepare_unsaved(&on_saved, 0, None),
+        Err(ProjectError::Container { message, .. }) if message.contains("no project is open")
+    ));
+
+    // An index past the list is a refusal, not a panic.
+    assert!(matches!(
+        CheckpointImage::prepare_unsaved(&on_saved, 2, Some(&project)),
+        Err(ProjectError::Container { message, .. }) if message.contains("is not in the list")
+    ));
+    assert!(matches!(
+        CheckpointImage::prepare_unsaved(&[], 0, None),
+        Err(ProjectError::Container { .. })
+    ));
+
+    // Decoded frames cache under the memory cap: below one frame's decode
+    // reservation the render refuses, above it the samples are the same.
+    let q = build_from::<u16>("cs_unsaved_jpeg", 3, write_jpeg_sources);
+    let mut project = Project::open(&q.path).unwrap();
+    let stroked = vec![stroke(
+        frame(1),
+        &[(10, 12), (30, 20)],
+        6.0,
+        BrushMode::Normal,
+        1.0,
+    )];
+    for (name, entries, saved) in [
+        (
+            "retouch on a saved base",
+            vec![unsaved_retouch(
+                stroked.clone(),
+                1_000,
+                ParentRef::Saved(q.root.clone()),
+            )],
+            true,
+        ),
+        (
+            "retouch on an unsaved fuse",
+            vec![
+                unsaved_fuse(&q, "held", None),
+                unsaved_retouch(stroked.clone(), 1_000, ParentRef::Entry(0)),
+            ],
+            false,
+        ),
+    ] {
+        let last = entries.len() - 1;
+        let image = |cap: Option<u64>, project: &Project| {
+            CheckpointImage::prepare_unsaved(&entries, last, saved.then_some(project))
+                .unwrap()
+                .with_memory_cap(cap)
+        };
+        let want = view_of(&image(None, &project), saved.then_some(&mut project)).unwrap();
+        let roomy = view_of(
+            &image(Some(1 << 30), &project),
+            saved.then_some(&mut project),
+        );
+        assert!(
+            roomy.unwrap() == want,
+            "{name}: a roomy cap changes nothing"
+        );
+        let capped = view_of(&image(Some(1), &project), saved.then_some(&mut project));
+        let message = capped.expect_err(name).to_string();
+        assert!(message.contains("memory limit allows"), "{name}: {message}");
+    }
 }
 
 #[test]

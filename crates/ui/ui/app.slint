@@ -515,7 +515,7 @@ export component AppWindow inherits Window {
     callback images-frame-remove-requested(int);
     callback images-frame-drag-pointer(int, int, length);
     callback images-viewport-scrolled(length);
-    callback images-frame-wheel(length);
+    callback images-frame-wheel(int, length) -> bool;
     callback images-scrollbar-pointer(int, length);
     callback images-scrollbar-dragged(length);
     callback images-viewport-height-changed(length);
@@ -583,7 +583,7 @@ export component AppWindow inherits Window {
         images-frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
         images-frame-drag-pointer(i, kind, y) => { root.images-frame-drag-pointer(i, kind, y); }
         images-viewport-scrolled(offset) => { root.images-viewport-scrolled(offset); }
-        images-frame-wheel(delta) => { root.images-frame-wheel(delta); }
+        images-frame-wheel(row, delta) => { return root.images-frame-wheel(row, delta); }
         images-scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }
         images-scrollbar-dragged(y) => { root.images-scrollbar-dragged(y); }
         images-viewport-height-changed(h) => { root.images-viewport-height-changed(h); }

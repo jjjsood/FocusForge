@@ -94,6 +94,21 @@ impl ImagesModel {
     pub fn row_of_frame(&self, frame: usize) -> Option<usize> {
         self.rows.iter().position(|row| row.frame == Some(frame))
     }
+
+    /// The nearest row from `from` in direction `step` (`-1` up, `1` down)
+    /// that can become the source: a resolved frame or a checkpoint.
+    /// Headings, the hidden line and unresolved frames are skipped.
+    pub fn next_selectable(&self, from: usize, step: isize) -> Option<usize> {
+        let mut index = from as isize;
+        loop {
+            index += step;
+            let row = self.rows.get(usize::try_from(index).ok()?)?;
+            let selectable = matches!(row.kind, RowKind::Frame | RowKind::Checkpoint);
+            if selectable && !row.unresolved {
+                return Some(index as usize);
+            }
+        }
+    }
 }
 
 /// One checkpoint of the editor's Results group.
