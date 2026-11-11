@@ -514,14 +514,19 @@ for a reference machine (a 4-core laptop CPU, or its integrated GPU):
 `null` unless the reader is `raw`, `align` is `null` with `--no-align`, and
 `warp_write` is always `null`, since `stack` never enters it),
 `total_seconds` (the sum of the stages) and `calibrated`. `calibrated` is
-`true` for uncompressed 16-bit TIFF frames read through `mmap` and for Canon
-CR3 frames developed into memory, both with the `laplacian` blend; every
-other input still gets an estimate, marked `calibrated: false`, and the
-human summary then prints `predicted duration: ~N s (not calibrated for this
-input)`. The flag cannot see which camera wrote a CR3, whether the frames
-are a real focus stack rather than repeated frames, or frame sizes far from
-the measured ones (0.26 and 15 Mpx TIFF, 17 Mpx CR3). The field is `null`
-for a stack without frames or pixels.
+`true` for uncompressed 16-bit TIFF frames read through `mmap` (with the
+`laplacian`, `depth-map` or `weighted-average` blend), for compressed or
+otherwise non-`mmap` TIFF frames and for JPEG frames (both with
+`laplacian`), and for Canon CR3 frames developed into memory or into a
+scratch file (with `laplacian`); every other input still gets an estimate,
+marked `calibrated: false`, and the human summary then prints `predicted
+duration: ~N s (not calibrated for this input)`. The flag cannot see which
+camera wrote a CR3, whether the frames are a real focus stack rather than
+repeated frames, frame sizes far from the measured ones (0.26 and 15 Mpx
+TIFF, 17 Mpx CR3), a TIFF's compression, layout and bit depth (16-bit
+Deflate strips were measured), `--no-align` on compressed TIFF or JPEG
+frames, or the host budget of a scratch-file run (6 GiB was measured). The
+field is `null` for a stack without frames or pixels.
 
 Before any frame is read for fusion, every `stack` run measures the free space
 on each volume it writes to (the one holding `.scratch` and the one holding the

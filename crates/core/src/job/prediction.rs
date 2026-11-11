@@ -38,16 +38,28 @@
 //! on CPU and GPU with one cold and three warm runs, all 16 predictions
 //! land within ±20 % of the measured wall time, the worst −13.0 % (cold
 //! GPU, CR3). TIFF runs miss by −1.2 to +2.6 %, warm CR3 runs by −2.6 to
-//! −8.2 %.
+//! −8.2 %. The other classes reuse the TIFF setup terms and fit their stage
+//! terms on the same machine. A 30-frame 15.0 Mpx stack, as 16-bit Deflate
+//! TIFF (horizontal predictor, strips) and as quality-95 JPEG, fits the
+//! `decoded` and JPEG classes; a 32-frame 15.0 Mpx stack held out predicts
+//! them within +1.4 to +3.1 % and +1.8 to +4.1 %, every run within ±20 %.
 //!
 //! # Calibrated classes
 //!
 //! A row of `CALIBRATIONS` is one measured class: reader, RAW file
-//! extension, develop store and blend algorithm. Measured: an
-//! uncompressed 16-bit TIFF read through `mmap` with `laplacian`, and a
-//! Canon CR3 developed into memory with `laplacian`. Every other input
+//! extension, develop store and blend algorithm. Measured: uncompressed
+//! 16-bit strip TIFF read through `mmap` (`laplacian`, `depth-map`,
+//! `weighted-average`), compressed TIFF (`decoded`) and JPEG (`laplacian`),
+//! and Canon CR3 developed into memory or into a scratch file
+//! (`laplacian`). Every other input
 //! still gets a prediction, from the first row of its family, with
 //! [`RunPrediction::calibrated`] false.
+//!
+//! The blends were fitted and held out on the uncompressed TIFF versions of
+//! those two stacks, over `--cpu` and GPU-backed alignment: −12.1 to +8.3 %
+//! for `depth-map`, −10.5 to +8.2 % for `weighted-average`. CR3 into a
+//! scratch file was fitted and held out on two disjoint 25-frame 17.3 Mpx
+//! stacks at a 6 GiB host budget: −8.0 to +1.2 %.
 //!
 //! `calibrated` reads only what the record and [`RawSource`] carry. It
 //! cannot see which camera wrote a CR3 (two disjoint 25-frame stacks of
@@ -57,8 +69,12 @@
 //! stack (repeated frames run far cheaper), the scene (align time differs
 //! 17 to 20 % between two halves of one burst), frame sizes and counts far
 //! from the measured ones (RAW frame-count and size scaling is assumed),
-//! sample type or compression within the mmap reader, a non-default host
-//! budget, brightness equalization, or a cold GPU (6 to 19 % more fuse
+//! compression, layout or bit depth within the `decoded` reader (only
+//! 16-bit Deflate strips were measured), `--no-align` on decoded or JPEG
+//! frames (decode then falls in fuse), decoded frames beyond the frame
+//! cache, the align backend of a CPU-only blend (`--cpu` and GPU-backed
+//! were measured), the host budget of a scratch-file run (6 GiB), brightness
+//! equalization, or a cold GPU (6 to 19 % more fuse
 //! time than a warm one). Time outside the stages, up to 0.4 s warm, is
 //! not modelled.
 
@@ -110,6 +126,10 @@ pub(crate) struct Calibration {
 /// - Canon CR3 into memory, `laplacian`: one 25-frame 17.3 Mpx stack on the
 ///   same machine, CPU and GPU (a second, disjoint 25-frame stack of the
 ///   same burst was held out). Setup is the TIFF fit's.
+///
+/// Setup is the `mmap` TIFF fit's in every row. The other rows' stacks and
+/// held-out errors are in the module docs. A CPU-only blend row repeats its
+/// `cpu` costs in `gpu`, which no plan with that blend reads.
 pub(crate) const CALIBRATIONS: &[Calibration] = &[
     Calibration {
         reader: ReaderKind::Mmap,
@@ -153,6 +173,116 @@ pub(crate) const CALIBRATIONS: &[Calibration] = &[
             align: 0.045_501_246_753_700_32,
             fuse: 0.114_348_145_913_178_07,
             finalize: 0.175_458_290_774_584_3,
+        },
+    },
+    Calibration {
+        reader: ReaderKind::Decoded,
+        raw_extension: None,
+        raw_store: None,
+        algorithm: "laplacian",
+        cpu: StageCost {
+            setup_fixed: 5.700_419_114_984_098e-5,
+            setup_per_frame: 0.000_325_912_683_680_398_4,
+            develop: 0.0,
+            align: 0.039_322_546_807_054_326,
+            fuse: 0.203_596_291_748_992_77,
+            finalize: 0.073_252_178_835_414_63,
+        },
+        gpu: StageCost {
+            setup_fixed: 0.000_106_572_996_944_319_9,
+            setup_per_frame: 0.000_320_863_014_825_713,
+            develop: 0.0,
+            align: 0.026_784_707_328_002_026,
+            fuse: 0.103_915_241_358_714_06,
+            finalize: 0.079_923_559_445_151_74,
+        },
+    },
+    Calibration {
+        reader: ReaderKind::Jpeg,
+        raw_extension: None,
+        raw_store: None,
+        algorithm: "laplacian",
+        cpu: StageCost {
+            setup_fixed: 5.700_419_114_984_098e-5,
+            setup_per_frame: 0.000_325_912_683_680_398_4,
+            develop: 0.0,
+            align: 0.034_773_364_314_026_854,
+            fuse: 0.200_792_003_411_743_03,
+            finalize: 0.065_759_544_850_150_9,
+        },
+        gpu: StageCost {
+            setup_fixed: 0.000_106_572_996_944_319_9,
+            setup_per_frame: 0.000_320_863_014_825_713,
+            develop: 0.0,
+            align: 0.020_167_923_638_218_132,
+            fuse: 0.104_480_860_154_241_32,
+            finalize: 0.075_106_655_970_273_5,
+        },
+    },
+    Calibration {
+        reader: ReaderKind::Mmap,
+        raw_extension: None,
+        raw_store: None,
+        algorithm: "depth-map",
+        cpu: StageCost {
+            setup_fixed: 5.700_419_114_984_098e-5,
+            setup_per_frame: 0.000_325_912_683_680_398_4,
+            develop: 0.0,
+            align: 0.023_540_205_053_520_478,
+            fuse: 0.061_480_628_592_013_434,
+            finalize: 0.073_810_028_807_361_94,
+        },
+        gpu: StageCost {
+            setup_fixed: 5.700_419_114_984_098e-5,
+            setup_per_frame: 0.000_325_912_683_680_398_4,
+            develop: 0.0,
+            align: 0.023_540_205_053_520_478,
+            fuse: 0.061_480_628_592_013_434,
+            finalize: 0.073_810_028_807_361_94,
+        },
+    },
+    Calibration {
+        reader: ReaderKind::Mmap,
+        raw_extension: None,
+        raw_store: None,
+        algorithm: "weighted-average",
+        cpu: StageCost {
+            setup_fixed: 5.700_419_114_984_098e-5,
+            setup_per_frame: 0.000_325_912_683_680_398_4,
+            develop: 0.0,
+            align: 0.023_504_347_290_559_897,
+            fuse: 0.069_038_485_145_826_39,
+            finalize: 0.074_691_010_137_518_2,
+        },
+        gpu: StageCost {
+            setup_fixed: 5.700_419_114_984_098e-5,
+            setup_per_frame: 0.000_325_912_683_680_398_4,
+            develop: 0.0,
+            align: 0.023_504_347_290_559_897,
+            fuse: 0.069_038_485_145_826_39,
+            finalize: 0.074_691_010_137_518_2,
+        },
+    },
+    Calibration {
+        reader: ReaderKind::Raw,
+        raw_extension: Some("cr3"),
+        raw_store: Some(DevelopStore::ScratchFile),
+        algorithm: "laplacian",
+        cpu: StageCost {
+            setup_fixed: 5.700_419_114_984_098e-5,
+            setup_per_frame: 0.000_325_912_683_680_398_4,
+            develop: 0.021_558_968_534_685_755,
+            align: 0.166_238_222_430_539_9,
+            fuse: 0.204_963_900_580_328_68,
+            finalize: 0.167_254_499_378_161_3,
+        },
+        gpu: StageCost {
+            setup_fixed: 0.000_106_572_996_944_319_9,
+            setup_per_frame: 0.000_320_863_014_825_713,
+            develop: 0.021_623_588_451_739_943,
+            align: 0.046_545_544_461_478_565,
+            fuse: 0.121_900_874_836_370_44,
+            finalize: 0.171_252_801_069_687_63,
         },
     },
 ];
@@ -370,12 +500,23 @@ mod tests {
 
                             let mut other = rec.clone();
                             other.workers = 64;
-                            other.algorithm = "depth-map".to_string();
-                            let q = predict_run(&other, align, None).expect(&at);
-                            assert_eq!(
-                                q.stages, p.stages,
-                                "{at}: workers/algorithm/raw move seconds"
-                            );
+                            let q = predict_run(&other, align, CR3).expect(&at);
+                            assert_eq!(q.stages, p.stages, "{at}: workers move seconds");
+
+                            let family = if reader == ReaderKind::Raw {
+                                ReaderKind::Raw
+                            } else {
+                                ReaderKind::Mmap
+                            };
+                            let mut fallback = record(family, gpu, frames, pixels);
+                            fallback.align_cache_hit = hit;
+                            fallback.resumed_units = resumed;
+                            let mut unknown = rec.clone();
+                            unknown.algorithm = "no-such-algorithm".to_string();
+                            let u = predict_run(&unknown, align, CR3).expect(&at);
+                            let f = predict_run(&fallback, align, CR3).expect(&at);
+                            assert!(!u.calibrated, "{at}");
+                            assert_eq!(u.stages, f.stages, "{at}: unknown id misses the fallback");
                         }
                     }
                 }
@@ -404,29 +545,37 @@ mod tests {
             (None, None) => true,
             _ => false,
         };
-        for reader in [ReaderKind::Mmap, ReaderKind::Raw] {
+        for row in CALIBRATIONS {
+            let raw = row
+                .raw_extension
+                .zip(row.raw_store)
+                .map(|(extension, store)| RawSource { extension, store });
+            let key = |gpu, frames, pixels| {
+                let mut rec = record(row.reader, gpu, frames, pixels);
+                rec.algorithm = row.algorithm.to_string();
+                rec
+            };
             for gpu in [false, true] {
-                let base = predict_run(&record(reader, gpu, 10, 1_000_000), true, CR3).unwrap();
+                let at = format!("{:?} {} gpu={gpu}", row.reader, row.algorithm);
+                let base = predict_run(&key(gpu, 10, 1_000_000), true, raw).unwrap();
+                assert!(base.calibrated, "{at}");
                 assert!(base.total_seconds > 0.0);
-                for bigger in [
-                    record(reader, gpu, 20, 1_000_000),
-                    record(reader, gpu, 10, 2_000_000),
-                ] {
-                    let p = predict_run(&bigger, true, CR3).unwrap();
+                for bigger in [key(gpu, 20, 1_000_000), key(gpu, 10, 2_000_000)] {
+                    let p = predict_run(&bigger, true, raw).unwrap();
                     assert!(p.total_seconds >= base.total_seconds);
                     for (a, b) in stage_list(&p.stages)
                         .into_iter()
                         .zip(stage_list(&base.stages))
                     {
-                        assert!(at_least(a, b), "{reader:?} gpu={gpu}: {a:?} < {b:?}");
+                        assert!(at_least(a, b), "{at}: {a:?} < {b:?}");
                     }
                 }
-                let mut hit = record(reader, gpu, 10, 1_000_000);
+                let mut hit = key(gpu, 10, 1_000_000);
                 hit.align_cache_hit = true;
-                let mut resumed = record(reader, gpu, 10, 1_000_000);
+                let mut resumed = key(gpu, 10, 1_000_000);
                 resumed.resumed_units = 5;
                 for rec in [hit, resumed] {
-                    let p = predict_run(&rec, true, CR3).unwrap();
+                    let p = predict_run(&rec, true, raw).unwrap();
                     assert!(p.total_seconds <= base.total_seconds);
                     assert!(p.stages.align.unwrap_or(0.0) <= base.stages.align.unwrap());
                 }
@@ -549,6 +698,192 @@ mod tests {
     }
 
     #[test]
+    fn run_prediction_matches_class_fits() {
+        let scratch = Some(RawSource {
+            extension: "cr3",
+            store: DevelopStore::ScratchFile,
+        });
+        // class, frames, pixels, reader, algorithm, raw, gpu,
+        // [setup, develop, align, fuse, finalize], total
+        type Row = (
+            &'static str,
+            usize,
+            u64,
+            ReaderKind,
+            &'static str,
+            Option<RawSource<'static>>,
+            bool,
+            [Option<f64>; 5],
+            f64,
+        );
+        let tiff = 14_997_654;
+        let raw = 17_258_496;
+        let rows: [Row; 8] = [
+            (
+                "decoded cpu",
+                32,
+                tiff,
+                ReaderKind::Decoded,
+                "laplacian",
+                None,
+                false,
+                [
+                    Some(0.0105),
+                    None,
+                    Some(18.2821),
+                    Some(97.7109),
+                    Some(1.0986),
+                ],
+                117.102,
+            ),
+            (
+                "decoded gpu",
+                32,
+                tiff,
+                ReaderKind::Decoded,
+                "laplacian",
+                None,
+                true,
+                [
+                    Some(0.0104),
+                    None,
+                    Some(12.4529),
+                    Some(49.8715),
+                    Some(1.1987),
+                ],
+                63.533,
+            ),
+            (
+                "jpeg cpu",
+                32,
+                tiff,
+                ReaderKind::Jpeg,
+                "laplacian",
+                None,
+                false,
+                [
+                    Some(0.0105),
+                    None,
+                    Some(16.1671),
+                    Some(96.3651),
+                    Some(0.9862),
+                ],
+                113.529,
+            ),
+            (
+                "jpeg gpu",
+                32,
+                tiff,
+                ReaderKind::Jpeg,
+                "laplacian",
+                None,
+                true,
+                [
+                    Some(0.0104),
+                    None,
+                    Some(9.3766),
+                    Some(50.1430),
+                    Some(1.1264),
+                ],
+                60.656,
+            ),
+            (
+                "depth-map",
+                32,
+                tiff,
+                ReaderKind::Mmap,
+                "depth-map",
+                None,
+                false,
+                [
+                    Some(0.0105),
+                    None,
+                    Some(10.9445),
+                    Some(29.5061),
+                    Some(1.1070),
+                ],
+                41.568,
+            ),
+            (
+                "weighted-average",
+                32,
+                tiff,
+                ReaderKind::Mmap,
+                "weighted-average",
+                None,
+                false,
+                [
+                    Some(0.0105),
+                    None,
+                    Some(10.9278),
+                    Some(33.1333),
+                    Some(1.1202),
+                ],
+                45.192,
+            ),
+            (
+                "cr3 scratch cpu",
+                25,
+                raw,
+                ReaderKind::Raw,
+                "laplacian",
+                scratch,
+                false,
+                [
+                    Some(0.0082),
+                    Some(9.3019),
+                    Some(68.8565),
+                    Some(88.4342),
+                    Some(2.8866),
+                ],
+                169.487,
+            ),
+            (
+                "cr3 scratch gpu",
+                25,
+                raw,
+                ReaderKind::Raw,
+                "laplacian",
+                scratch,
+                true,
+                [
+                    Some(0.0081),
+                    Some(9.3298),
+                    Some(19.2793),
+                    Some(52.5956),
+                    Some(2.9556),
+                ],
+                84.168,
+            ),
+        ];
+        for (class, frames, pixels, reader, algorithm, source, gpu, want, total) in rows {
+            let mut rec = record(reader, gpu, frames, pixels);
+            rec.algorithm = algorithm.to_string();
+            let p = predict_run(&rec, true, source).expect(class);
+            assert!(p.calibrated, "{class}");
+            let s = p.stages;
+            let got = [s.setup, s.develop, s.align, s.fuse, s.finalize];
+            for (i, (g, w)) in got.into_iter().zip(want).enumerate() {
+                match (g, w) {
+                    (Some(g), Some(w)) if i == 0 => {
+                        assert!((g - w).abs() < 1e-4, "{class} setup {g}");
+                    }
+                    (Some(g), Some(w)) => {
+                        assert!(rel_close(g, w, 0.01), "{class} stage {i}: {g} vs {w}");
+                    }
+                    (None, None) => {}
+                    other => panic!("{class} stage {i}: {other:?}"),
+                }
+            }
+            assert!(
+                rel_close(p.total_seconds, total, 0.01),
+                "{class} total {}",
+                p.total_seconds
+            );
+        }
+    }
+
+    #[test]
     fn run_prediction_degenerate() {
         for (frames, pixels) in [(0usize, 1_000_000u64), (5, 0), (0, 0)] {
             for reader in READERS {
@@ -613,31 +948,47 @@ mod tests {
         };
         let flag = |rec: &RunPlanFeatures, raw| predict_run(rec, true, raw).unwrap().calibrated;
 
-        assert!(flag(&with(ReaderKind::Mmap, "laplacian"), None));
-        assert!(flag(&with(ReaderKind::Raw, "laplacian"), cr3("cr3", mem)));
-        assert!(flag(&with(ReaderKind::Raw, "laplacian"), cr3("CR3", mem)));
-        assert!(flag(
-            &with(ReaderKind::Mmap, "laplacian"),
-            cr3("dng", DevelopStore::ScratchFile)
-        ));
-
         let scratch = DevelopStore::ScratchFile;
+        for (reader, algorithm, raw) in [
+            (ReaderKind::Mmap, "laplacian", None),
+            (ReaderKind::Decoded, "laplacian", None),
+            (ReaderKind::Jpeg, "laplacian", None),
+            (ReaderKind::Mmap, "depth-map", None),
+            (ReaderKind::Mmap, "weighted-average", None),
+            (ReaderKind::Raw, "laplacian", cr3("cr3", mem)),
+            (ReaderKind::Raw, "laplacian", cr3("CR3", mem)),
+            (ReaderKind::Raw, "laplacian", cr3("cr3", scratch)),
+            (ReaderKind::Raw, "laplacian", cr3("CR3", scratch)),
+            // `raw` is ignored for a non-RAW reader.
+            (ReaderKind::Mmap, "laplacian", cr3("dng", scratch)),
+        ] {
+            assert!(
+                flag(&with(reader, algorithm), raw),
+                "{reader:?} {algorithm} {:?}",
+                raw.map(|r| (r.extension, r.store))
+            );
+        }
+
         let uncalibrated = [
-            (with(ReaderKind::Jpeg, "laplacian"), None),
-            (with(ReaderKind::Decoded, "laplacian"), None),
             (with(ReaderKind::Decoded, "depth-map"), None),
-            (with(ReaderKind::Mmap, "depth-map"), None),
-            (with(ReaderKind::Mmap, "weighted-average"), None),
+            (with(ReaderKind::Jpeg, "depth-map"), None),
             (with(ReaderKind::Mmap, "no-such-algorithm"), None),
-            (with(ReaderKind::Raw, "laplacian"), cr3("cr3", scratch)),
+            (with(ReaderKind::Mmap, "dummy-stack"), None),
             (with(ReaderKind::Raw, "laplacian"), cr3("dng", mem)),
+            (with(ReaderKind::Raw, "laplacian"), cr3("dng", scratch)),
             (with(ReaderKind::Raw, "laplacian"), cr3("raf", mem)),
             (with(ReaderKind::Raw, "laplacian"), cr3("rw2", mem)),
             (with(ReaderKind::Raw, "laplacian"), None),
             (with(ReaderKind::Raw, "depth-map"), cr3("cr3", mem)),
+            (with(ReaderKind::Raw, "depth-map"), cr3("cr3", scratch)),
         ];
         for (rec, raw) in &uncalibrated {
-            let at = format!("{:?} {:?}", rec.reader, raw.map(|r| r.extension));
+            let at = format!(
+                "{:?} {} {:?}",
+                rec.reader,
+                rec.algorithm,
+                raw.map(|r| r.extension)
+            );
             let p = predict_run(rec, true, *raw).unwrap();
             assert!(!p.calibrated, "{at}");
             let family = if rec.reader == ReaderKind::Raw {
@@ -647,6 +998,30 @@ mod tests {
             };
             let base = predict_run(&with(family, "laplacian"), true, cr3("cr3", mem)).unwrap();
             assert_eq!(p.stages, base.stages, "{at}");
+        }
+
+        // The two rows measured first stay first, which pins each family's fallback.
+        let key = |row: &Calibration| (row.reader, row.raw_extension, row.raw_store, row.algorithm);
+        assert_eq!(
+            key(&CALIBRATIONS[0]),
+            (ReaderKind::Mmap, None, None, "laplacian")
+        );
+        assert_eq!(
+            key(&CALIBRATIONS[1]),
+            (ReaderKind::Raw, Some("cr3"), Some(mem), "laplacian")
+        );
+
+        // A CPU-only blend is never planned on the GPU, so both costs agree.
+        for row in CALIBRATIONS.iter().filter(|r| r.algorithm != "laplacian") {
+            assert_eq!(row.gpu, row.cpu, "{}", row.algorithm);
+            let mut on = with(row.reader, row.algorithm);
+            on.gpu = true;
+            let mut off = on.clone();
+            off.gpu = false;
+            assert_eq!(
+                predict_run(&on, true, None).unwrap().stages,
+                predict_run(&off, true, None).unwrap().stages
+            );
         }
 
         // An appended row flips only its own class.
@@ -660,7 +1035,10 @@ mod tests {
         let (hit, calibrated) = calibration(&table, &decoded_depth_map, None);
         assert!(calibrated && hit.cpu.fuse == 9.0);
         assert!(!calibration(CALIBRATIONS, &decoded_depth_map, None).1);
-        for (rec, raw) in &uncalibrated[..2] {
+        for (rec, raw) in uncalibrated
+            .iter()
+            .filter(|(rec, _)| rec.algorithm != "depth-map" || rec.reader != ReaderKind::Decoded)
+        {
             assert!(!calibration(&table, rec, *raw).1);
         }
         for (rec, raw) in [

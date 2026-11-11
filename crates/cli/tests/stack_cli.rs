@@ -2104,23 +2104,49 @@ fn dry_run_reports_prediction() {
     assert!(no_align["total_seconds"].as_f64().unwrap() < total);
     assert_eq!(no_align["calibrated"], true);
 
-    for (label, fixture, algorithm) in [
-        ("prediction_decoded", "mantis8-64", "laplacian"),
-        ("prediction_depth_map", "mantis-64", "depth-map"),
+    for (label, fixture, algorithm, reader) in [
+        (
+            "prediction_deflate",
+            "mantis-64-deflate-p2-strip-ii",
+            "laplacian",
+            "decoded",
+        ),
+        ("prediction_decoded", "mantis8-64", "laplacian", "decoded"),
+        ("prediction_depth_map", "mantis-64", "depth-map", "mmap"),
+        (
+            "prediction_weighted_average",
+            "mantis-64",
+            "weighted-average",
+            "mmap",
+        ),
     ] {
         let (plan, human) = dry_run_prediction(label, fixture, algorithm, &[]);
-        assert_eq!(plan["prediction"]["calibrated"], false, "{label}");
+        assert_eq!(plan["run_plan"]["reader"], reader, "{label}");
+        assert_eq!(plan["prediction"]["calibrated"], true, "{label}");
         assert!(plan["prediction"]["total_seconds"].as_f64().unwrap() > 0.0);
         let line = human
             .lines()
             .find(|l| l.starts_with("predicted duration:"))
             .unwrap_or_else(|| panic!("{label}: {human}"));
         assert!(
-            line.starts_with("predicted duration: ~")
-                && line.ends_with("(not calibrated for this input)"),
+            !line.contains('~') && !line.contains("not calibrated"),
             "{label}: {line}"
         );
     }
+
+    let (plan, human) =
+        dry_run_prediction("prediction_dummy_stack", "mantis-64", "dummy-stack", &[]);
+    assert_eq!(plan["prediction"]["calibrated"], false);
+    assert!(plan["prediction"]["total_seconds"].as_f64().unwrap() > 0.0);
+    let line = human
+        .lines()
+        .find(|l| l.starts_with("predicted duration:"))
+        .unwrap_or_else(|| panic!("{human}"));
+    assert!(
+        line.starts_with("predicted duration: ~")
+            && line.ends_with("(not calibrated for this input)"),
+        "{line}"
+    );
 }
 
 #[test]
