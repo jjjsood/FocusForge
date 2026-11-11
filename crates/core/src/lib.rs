@@ -26,6 +26,7 @@ pub mod project;
 pub mod registry;
 pub mod retouch;
 pub mod sharp_areas;
+pub mod sharpness_map;
 pub mod step_plan;
 pub mod tile;
 pub mod timing;

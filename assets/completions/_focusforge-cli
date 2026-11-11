@@ -79,6 +79,21 @@ normal\:"As many frames at once as the host has threads"))' \
 ':dir -- Directory of frames to count (non-recursive, descending into a `frames` subdirectory):_files' \
 && ret=0
 ;;
+(sharpness-map)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Directory the maps are written to; created if missing]:OUT:_files' \
+'--composite=[A composite image of the frames'\'' size to map on the frames'\'' scale]:COMPOSITE:_files' \
+'--priority=[How many frames are read at once; the maps are the same at either value]:PRIORITY:((low\:"One frame at a time, leaving the other cores to other work"
+normal\:"As many frames at once as the host has threads"))' \
+'--json[Print the scale and the written maps as one JSON object]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':dir -- Directory of frames to map (non-recursive, descending into a `frames` subdirectory):_files' \
+&& ret=0
+;;
 (stack)
 _arguments "${_arguments_options[@]}" : \
 '-o+[Directory to collect this run'\''s projects into. Omit to write each project beside its own frames]:DIR:_files' \
@@ -384,6 +399,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(sharpness-map)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (stack)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -480,6 +499,7 @@ _focusforge-cli_commands() {
 'algorithms:List every registered algorithm, or print one named algorithm'\''s full parameter schema' \
 'step-plan:Compute the focus step, frame count, duration and disk need of a focus stack' \
 'sharp-areas:Count the areas of the image that are sharpest in each frame of a stack' \
+'sharpness-map:Write the focus score of every frame of a stack, and of a composite, as maps on one scale' \
 'stack:Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run \`focusforge-cli export\` for that' \
 'export:Turn a project into an image file\: the image with \`-o\`, the Z-Map with \`--zmap\`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image' \
 'retouch:Append an op list to a project as new states, one per op, each the previous one'\''s child\: on the current head, or on \`--from\` as a branch. \`export --checkpoint\` writes any of them' \
@@ -556,6 +576,7 @@ _focusforge-cli__subcmd__help_commands() {
 'algorithms:List every registered algorithm, or print one named algorithm'\''s full parameter schema' \
 'step-plan:Compute the focus step, frame count, duration and disk need of a focus stack' \
 'sharp-areas:Count the areas of the image that are sharpest in each frame of a stack' \
+'sharpness-map:Write the focus score of every frame of a stack, and of a composite, as maps on one scale' \
 'stack:Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run \`focusforge-cli export\` for that' \
 'export:Turn a project into an image file\: the image with \`-o\`, the Z-Map with \`--zmap\`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image' \
 'retouch:Append an op list to a project as new states, one per op, each the previous one'\''s child\: on the current head, or on \`--from\` as a branch. \`export --checkpoint\` writes any of them' \
@@ -655,6 +676,11 @@ _focusforge-cli__subcmd__help__subcmd__sharp-areas_commands() {
     local commands; commands=()
     _describe -t commands 'focusforge-cli help sharp-areas commands' commands "$@"
 }
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__sharpness-map_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__sharpness-map_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help sharpness-map commands' commands "$@"
+}
 (( $+functions[_focusforge-cli__subcmd__help__subcmd__stack_commands] )) ||
 _focusforge-cli__subcmd__help__subcmd__stack_commands() {
     local commands; commands=()
@@ -739,6 +765,11 @@ _focusforge-cli__subcmd__review_commands() {
 _focusforge-cli__subcmd__sharp-areas_commands() {
     local commands; commands=()
     _describe -t commands 'focusforge-cli sharp-areas commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__sharpness-map_commands] )) ||
+_focusforge-cli__subcmd__sharpness-map_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli sharpness-map commands' commands "$@"
 }
 (( $+functions[_focusforge-cli__subcmd__stack_commands] )) ||
 _focusforge-cli__subcmd__stack_commands() {
