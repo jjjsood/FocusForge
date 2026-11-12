@@ -20,6 +20,16 @@ debug = "line-tables-only"
 debug = false
 opt-level = 2
 
+# The Slint UI crate is one 69 MB generated source file, and one rustc process
+# holds 16 GB while it compiles. Cold `cargo build --workspace --tests -j 24`:
+# `debug = false` lowers the peak from 16.70 to 15.39 GB; `incremental = false`
+# cuts the crate's compile time from 387 to 205 s and the peak to 16.22 GB.
+# `codegen-units = 16` (20.32 GB) and `opt-level = 1` (17.05 GB) raised the
+# peak and stay off.
+[profile.dev.package.focusforge-ui]
+debug = false
+incremental = false
+
 # Installers retain this same-build information only long enough for the
 # platform packagers to extract native symbols.  Shipping copies are stripped.
 [profile.release]

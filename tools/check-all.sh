@@ -28,6 +28,9 @@
 # `build`'s GPU-enabled binary is written last, the one later stages use.
 # Cargo and direct binary runs go through tools/with-lock.sh build; clippy
 # stays out of --static because it compiles; RUSTFLAGS is never set here.
+# Every cargo stage runs with CARGO_BUILD_JOBS=min(24, cores) unless the caller
+# sets it (tools/lib/cargo-jobs.sh holds the cap). A cold
+# `cargo build --workspace --all-targets` at 24 jobs peaks at 13.0 GB.
 # `manual book` (mdBook build plus link check) runs only when mdbook is on PATH;
 # otherwise it prints a SKIP line.
 #
@@ -76,6 +79,11 @@ done
 case "$TAIL_LINES" in
   ''|*[!0-9]*) usage ;;
 esac
+
+# shellcheck source=lib/cargo-jobs.sh
+. "$REPO/tools/lib/cargo-jobs.sh"
+CARGO_BUILD_JOBS="$(cargo_jobs)"
+export CARGO_BUILD_JOBS
 
 # On a Linux desktop the test stages briefly saturate every core and push
 # memory into swap, which freezes the session. A building run therefore
@@ -236,6 +244,7 @@ tool_selftest "release smoke selftest" tools/smoke-release-selftest.sh
 run_gate "fixture manifest" tools/check-fixtures.sh
 tool_selftest "fixture manifest selftest" tools/check-fixtures-selftest.sh
 tool_selftest "lock directory selftest" tools/with-lock-selftest.sh
+tool_selftest "cargo jobs selftest" tools/cargo-jobs-selftest.sh
 tool_selftest "tiff-diff selftest" python3 tools/tiff-diff.py --selftest
 tool_selftest "image-metrics selftest" python3 tools/image-metrics.py --selftest
 tool_selftest "rawtiff selftest" python3 tools/lib/rawtiff.py --selftest
