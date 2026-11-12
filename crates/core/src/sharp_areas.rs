@@ -238,7 +238,7 @@ pub fn count_sharp_areas_reporting(
                                 f64::from(scores[row + (x - read.x) as usize]);
                         }
                     }
-                    control.unit_completed(u64::from(read.width) * u64::from(read.height));
+                    control.unit_completed(tile);
                     Ok(())
                 },
             )
@@ -453,8 +453,12 @@ mod tests {
             self.pixels.lock().unwrap().len() >= self.stop_after
         }
 
-        fn unit_completed(&self, pixels: u64) {
-            self.pixels.lock().unwrap().push(pixels);
+        fn unit_completed(&self, tile: &crate::tile::plan::PlannedTile) {
+            let read = tile.read();
+            self.pixels
+                .lock()
+                .unwrap()
+                .push(u64::from(read.width) * u64::from(read.height));
         }
 
         fn admission_cap(&self) -> usize {

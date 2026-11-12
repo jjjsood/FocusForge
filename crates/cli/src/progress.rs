@@ -239,6 +239,7 @@ mod tests {
             prepare_total: 0,
             develop_done: 0,
             develop_total: 0,
+            total_eta: None,
         }
     }
 
@@ -257,6 +258,7 @@ mod tests {
             prepare_total: 0,
             develop_done: 0,
             develop_total: 0,
+            total_eta: None,
         }
     }
 
@@ -278,6 +280,7 @@ mod tests {
             stage: JobStage::Develop,
             develop_done,
             develop_total,
+            total_eta: None,
             ..progress(0, 0, None)
         }
     }

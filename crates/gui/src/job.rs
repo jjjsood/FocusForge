@@ -355,6 +355,7 @@ mod stage_tests {
             prepare_total: 0,
             develop_done: 0,
             develop_total: 0,
+            total_eta: None,
         }
     }
 
@@ -1169,6 +1170,7 @@ impl StageObserver for GuiObserver {
             prepare_total,
             develop_done: 0,
             develop_total,
+            total_eta: None,
         };
         match stage {
             RunStage::Develop { frames } => self.tick(&snapshot(JobStage::Develop, 0, frames)),

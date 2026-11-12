@@ -1168,6 +1168,7 @@ fn phases_map_onto_engine_stages() {
         prepare_total: 0,
         develop_done: 0,
         develop_total: 0,
+        total_eta: None,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&aligning)),
@@ -1189,6 +1190,7 @@ fn phases_map_onto_engine_stages() {
         prepare_total: 0,
         develop_done: 0,
         develop_total: 0,
+        total_eta: None,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&fusing)),
@@ -1209,6 +1211,7 @@ fn phases_map_onto_engine_stages() {
         prepare_total: 0,
         develop_done: 0,
         develop_total: 0,
+        total_eta: None,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&sealing)),
@@ -1243,6 +1246,7 @@ fn align_progress(align_done: usize, align_total: usize) -> focusforge_core::job
         prepare_total: 0,
         develop_done: 0,
         develop_total: 0,
+        total_eta: None,
     }
 }
 
@@ -1262,6 +1266,7 @@ fn fuse_progress(units_done: usize, unit_total: usize) -> focusforge_core::job::
         prepare_total: 0,
         develop_done: 0,
         develop_total: 0,
+        total_eta: None,
     }
 }
 
@@ -1364,6 +1369,7 @@ fn develop_progress(
         stage: focusforge_core::job::JobStage::Develop,
         develop_done,
         develop_total,
+        total_eta: None,
         ..fuse_progress(0, 0)
     }
 }
@@ -1411,6 +1417,7 @@ fn developing_hands_over_to_the_next_phase_from_zero() {
     let preparing = focusforge_core::job::JobProgress {
         develop_done: 8,
         develop_total: 8,
+        total_eta: None,
         ..prepare_progress(0, 8)
     };
     assert_eq!(progress_phase(Some(&preparing)), Phase::Preparing);
@@ -1418,6 +1425,7 @@ fn developing_hands_over_to_the_next_phase_from_zero() {
     let fusing = focusforge_core::job::JobProgress {
         develop_done: 8,
         develop_total: 8,
+        total_eta: None,
         ..fuse_progress(0, 10)
     };
     assert_eq!(progress_phase(Some(&fusing)), Phase::Fusing);

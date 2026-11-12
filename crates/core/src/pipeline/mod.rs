@@ -35,8 +35,9 @@ use crate::gpu::{AlignBackend, TileBackend};
 use crate::io::tiff::writer::file_len;
 use crate::io::{
     COMPOSITE_FILENAME, DevelopStore, FrameDesc, FrameReader, ReaderKind, Rect, TiffStack,
-    ZMAP_FILENAME, open_frame_set,
+    ZMAP_FILENAME, open_frame_set, source_bits_per_sample,
 };
+use crate::job::prediction::{RawSource, fuse_tile_cost, predict_run};
 use crate::job::{
     AlignIdentity, ControlState, FrameFingerprint, Job, JobControl, JobOutcome, JobProgress,
     JobRecord, JobStage, RecordingConsumer, Resumable, ResumeStore, StackFingerprint, StageCache,
@@ -337,13 +338,37 @@ impl FuseTileTiming {
             index: tile.index(),
             read_pixels: u64::from(read.width) * u64::from(read.height),
             output_pixels: u64::from(interior.width) * u64::from(interior.height),
-            touches_edge: interior.x == 0
-                || interior.y == 0
-                || interior.x + interior.width == extent.0
-                || interior.y + interior.height == extent.1,
+            touches_edge: touches_edge(tile, extent),
             duration_ns,
         }
     }
+}
+
+/// Whether `tile`'s interior reaches any side of the `extent` frame.
+fn touches_edge(tile: &crate::tile::PlannedTile, extent: (u32, u32)) -> bool {
+    let interior = tile.interior();
+    interior.x == 0
+        || interior.y == 0
+        || interior.x + interior.width == extent.0
+        || interior.y + interior.height == extent.1
+}
+
+/// The relative cost of every fuse tile of `plan` over `frame_count` frames,
+/// in tile index order, which weights the fuse stage's progress.
+pub(crate) fn fuse_costs(
+    plan: &crate::tile::TilePlan,
+    gpu: bool,
+    frame_count: usize,
+    extent: (u32, u32),
+) -> Vec<f64> {
+    plan.tiles()
+        .iter()
+        .map(|tile| {
+            let read = tile.read();
+            let read_pixels = u64::from(read.width) * u64::from(read.height);
+            fuse_tile_cost(gpu, frame_count, read_pixels, touches_edge(tile, extent))
+        })
+        .collect()
 }
 
 /// The intensity encoding of the code values a reader delivers: RAW frames
@@ -721,6 +746,7 @@ pub fn run(
     let start = Instant::now();
     let mut timer = StageTimer::from_start(start);
     timer.enter(Stage::Setup);
+    control.enter_stage(Stage::Setup);
 
     let mut options = TileSchedulerOptions::new(&request.scratch_root);
     options.budget = options.budget.capped_to(request.max_host_memory);
@@ -807,6 +833,29 @@ pub fn run(
             request.backend.is_some() && cap_fallback.is_none(),
         ),
     )?;
+    // A header that cannot be read leaves the run without a prediction, and
+    // so without a total ETA.
+    if let Some(first) = request.frames.first()
+        && let Ok(bits) = source_bits_per_sample(opened.kind, first)
+    {
+        let features = RunPlanFeatures::new(
+            &stack_ctx,
+            opened.kind,
+            bits,
+            request.backend.is_some() && cap_fallback.is_none(),
+            request.algorithm.id(),
+            control.admission_cap(),
+        );
+        let raw = developed_store
+            .zip(first.extension().and_then(|ext| ext.to_str()))
+            .map(|(store, extension)| RawSource { extension, store });
+        if let Some(prediction) = predict_run(&features, request.align.is_some(), raw) {
+            control.seed_prediction(&prediction.stages);
+            if developed_store.is_none() {
+                control.drop_prediction(Stage::Develop);
+            }
+        }
+    }
     // Frames held in memory come off the tiles' budget.
     if developed_store == Some(DevelopStore::Memory) {
         options.budget = develop_budget.reduced_by(scratch_needed);
@@ -856,6 +905,7 @@ pub fn run(
     if let Some(store) = developed_store {
         timer.mark(Stage::Setup);
         timer.enter(Stage::Develop);
+        control.enter_stage(Stage::Develop);
         let developed = control.begin_develop(frame_reader.len());
         control.set_stage(JobStage::Develop);
         observer.stage(RunStage::Develop {
@@ -873,6 +923,7 @@ pub fn run(
         });
         timer.mark(Stage::Develop);
         timer.enter(Stage::Setup);
+        control.enter_stage(Stage::Setup);
         // Workers that claimed their frame before a cancel finish it, so the
         // pass can return Ok with the cancel already raised.
         let cancelled = match result {
@@ -952,6 +1003,7 @@ pub fn run(
 
     if let Some(align_req) = &request.align {
         timer.enter(Stage::Align);
+        control.enter_stage(Stage::Align);
         // The control exists before this stage starts (`Job::with_control`'s
         // whole point), so a poller reading `control.progress()` right now
         // sees `stage == Align`.
@@ -992,6 +1044,7 @@ pub fn run(
 
         if let Some(alignment) = peeked.flatten() {
             used_peeked_alignment = true;
+            control.drop_prediction(Stage::Align);
             align_source = "resumed".to_string();
             alignment_result = Some((align_req.algorithm, align_resolved, policy, alignment));
         } else {
@@ -1012,6 +1065,7 @@ pub fn run(
 
             if let Some(alignment) = cache_hit {
                 align_cached = true;
+                control.drop_prediction(Stage::Align);
                 align_source = "cached".to_string();
                 observer.stage(RunStage::Align {
                     frames: frame_reader.len(),
@@ -1075,7 +1129,7 @@ pub fn run(
                             on_pause: Some(&|control| {
                                 let held = Instant::now();
                                 observer.paused(control);
-                                control.add_align_hold(held.elapsed());
+                                control.add_hold(held.elapsed());
                             }),
                             align_backend: request.align_backend,
                             preview: feed.as_ref().and_then(PreviewFeed::aligned_sink),
@@ -1131,6 +1185,7 @@ pub fn run(
         timer.mark(Stage::Align);
     }
     timer.enter(Stage::Fuse);
+    control.enter_stage(Stage::Fuse);
 
     let alignment_for_crop: StackAlignment = match &alignment_result {
         Some((_, _, _, alignment)) => alignment.clone(),
@@ -1350,6 +1405,12 @@ pub fn run(
     let sink = sink.with_preview(mosaic, heat);
 
     control.set_stage(JobStage::Fuse);
+    control.set_fuse_costs(fuse_costs(
+        scheduler.plan(),
+        backend.is_some(),
+        frame_reader.len(),
+        (width, height),
+    ));
     // `Job::with_control` is what credits `control` with the plan's real
     // unit/pixel totals (and any already-completed units on a resume);
     // constructing it before `observer.stage` fires means the very first
@@ -1421,6 +1482,7 @@ pub fn run(
     }
     timer.mark(Stage::Fuse);
     timer.enter(Stage::Finalize);
+    control.enter_stage(Stage::Finalize);
     debug_assert_eq!(
         outcome,
         JobOutcome::Completed,
@@ -1523,6 +1585,7 @@ pub fn run(
     observer.stage(RunStage::Finished);
 
     timer.mark(Stage::Finalize);
+    control.finish_stages();
     let wall_seconds = timer.total_seconds();
     let stages = timer.finish();
     let plan = scheduler.plan();
@@ -1633,7 +1696,9 @@ fn drive_job(
                     // A cancel raced the pause within the same segment.
                     continue;
                 }
+                let held = Instant::now();
                 observer.paused(control);
+                control.add_hold(held.elapsed());
             }
         }
     }

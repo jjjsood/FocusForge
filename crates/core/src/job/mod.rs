@@ -75,7 +75,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::tile::plan::PlannedTile;
-use crate::tile::{FramePreprocess, TileConsumer, TileError, TileScheduler};
+use crate::tile::{FramePreprocess, TileConsumer, TileControl, TileError, TileScheduler};
 
 /// A job's current phase, reported as data.
 #[non_exhaustive]
@@ -187,12 +187,12 @@ impl<'a> Job<'a> {
             .filter(|tile| !completed_set.contains(&tile.index()))
             .copied()
             .collect();
-        let completed_pixels: u64 = tiles
+        for tile in tiles
             .iter()
             .filter(|tile| completed_set.contains(&tile.index()))
-            .map(tile_area)
-            .sum();
-        control.add_progress(completed_set.len(), completed_pixels);
+        {
+            control.unit_completed(tile);
+        }
 
         Job {
             scheduler,
@@ -240,7 +240,7 @@ impl<'a> Job<'a> {
             }
         };
 
-        // No `add_progress` here: every unit this segment ran already
+        // No credit here: every unit this segment ran already
         // credited itself through `JobControl::unit_completed` via the
         // scheduler's own per-tile bookkeeping, so counting them again here
         // would double them.

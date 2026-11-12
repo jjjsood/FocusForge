@@ -491,7 +491,16 @@ fn raw_stack_reports_the_develop_stage() {
                 .unwrap_or_else(|| panic!("no {needle:?} in: {stderr}"))
         };
         let entry = position(&format!("develop {count} frames (RAW)"));
-        let first = position(&format!("develop 0/{count} frames eta --"));
+        let develop_start = format!("develop 0/{count} frames eta ");
+        let first = position(&develop_start);
+        let estimate = stderr[first + develop_start.len()..]
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        assert!(
+            !estimate.is_empty() && estimate != "--",
+            "the develop line at 0 frames carries a seeded estimate: {stderr}"
+        );
         assert!(entry < first, "entry line precedes the count: {stderr}");
         assert!(
             first < position("fuse "),
