@@ -131,6 +131,53 @@ fn raw_dry_run_reports_the_run_budget() {
 }
 
 #[test]
+fn raw_dry_run_predicts_develop() {
+    let input = common::tmp_dir("stack_raw_dry_run_prediction");
+    let cwd = common::tmp_dir("stack_raw_dry_run_prediction_cwd");
+    let source = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![512; 64]),
+        false,
+    );
+    for index in 0..2 {
+        std::fs::copy(source.path(), input.join(format!("{index:02}.dng")))
+            .expect("copy RAW frame");
+    }
+    let mut args = vec![
+        "stack".to_string(),
+        input.display().to_string(),
+        "-o".to_string(),
+        cwd.display().to_string(),
+        "--algorithm".to_string(),
+        "laplacian".to_string(),
+        "--no-align".to_string(),
+        "--no-crop".to_string(),
+        "--dry-run".to_string(),
+        "--json".to_string(),
+    ];
+    if cfg!(feature = "gpu") {
+        args.push("--cpu".to_string());
+    }
+    let output = run(&cwd, &args);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("the dry run prints JSON");
+    assert_eq!(plan["run_plan"]["reader"], "raw", "{plan}");
+    let prediction = &plan["prediction"];
+    let develop = prediction["stages"]["develop"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("a RAW run develops: {prediction}"));
+    assert!(develop > 0.0, "{prediction}");
+    assert_eq!(
+        prediction["calibrated"], false,
+        "DNG is not the measured format: {prediction}"
+    );
+}
+
+#[test]
 fn identical_raw_frames_stack_to_the_frame() {
     let cwd = common::tmp_dir("stack_raw_identical");
     let source = write_dng(
@@ -444,7 +491,16 @@ fn raw_stack_reports_the_develop_stage() {
                 .unwrap_or_else(|| panic!("no {needle:?} in: {stderr}"))
         };
         let entry = position(&format!("develop {count} frames (RAW)"));
-        let first = position(&format!("develop 0/{count} frames eta --"));
+        let develop_start = format!("develop 0/{count} frames eta ");
+        let first = position(&develop_start);
+        let estimate = stderr[first + develop_start.len()..]
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        assert!(
+            !estimate.is_empty() && estimate != "--",
+            "the develop line at 0 frames carries a seeded estimate: {stderr}"
+        );
         assert!(entry < first, "entry line precedes the count: {stderr}");
         assert!(
             first < position("fuse "),
@@ -1082,4 +1138,48 @@ fn raw_stack_output_is_identical_in_ram_and_on_disk() {
         composites[0] == composites[1],
         "the stores gave different composites"
     );
+}
+
+#[test]
+fn run_plan_names_raw_input() {
+    let input = common::tmp_dir("stack_raw_run_plan");
+    let cwd = common::tmp_dir("stack_raw_run_plan_cwd");
+    let source = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![512; 64]),
+        false,
+    );
+    for index in 0..2 {
+        std::fs::copy(source.path(), input.join(format!("{index:02}.dng")))
+            .expect("copy RAW frame");
+    }
+    let plan = |extra: &[&str]| -> serde_json::Value {
+        let mut args = vec![
+            "stack".to_string(),
+            input.display().to_string(),
+            "-o".to_string(),
+            cwd.display().to_string(),
+            "--algorithm".to_string(),
+            "laplacian".to_string(),
+            "--no-align".to_string(),
+            "--no-crop".to_string(),
+            "--json".to_string(),
+        ];
+        args.extend(extra.iter().map(ToString::to_string));
+        if cfg!(feature = "gpu") {
+            args.push("--cpu".to_string());
+        }
+        let output = run(&cwd, &args);
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("--json must parse")
+    };
+    let dry = plan(&["--dry-run"]);
+    let ran = plan(&[]);
+    assert_eq!(ran["run_plan"], dry["run_plan"], "{ran}");
+    assert_eq!(ran["run_plan"]["reader"], "raw", "{ran}");
+    assert_eq!(ran["run_plan"]["source_bits_per_sample"], 32, "{ran}");
+    assert_eq!(ran["run_plan"]["frame_count"], 2, "{ran}");
 }

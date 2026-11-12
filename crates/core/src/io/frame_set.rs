@@ -9,7 +9,8 @@ use super::{
 use crate::tile::HostBudget;
 
 /// The reader selected for a frame set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReaderKind {
     /// Direct memory-mapped reads from uncompressed strips.
     Mmap,
@@ -59,6 +60,20 @@ fn format_name(path: &Path) -> &'static str {
         "JPEG"
     } else {
         "TIFF"
+    }
+}
+
+/// The bit depth of the samples a `kind` reader's source holds: the first
+/// TIFF channel's depth for the TIFF readers, 8 for JPEG, and 32 for RAW
+/// (developed to `f32`). Reads only `first_frame`'s header.
+pub fn source_bits_per_sample(kind: ReaderKind, first_frame: &Path) -> Result<u16, TiffError> {
+    match kind {
+        ReaderKind::Mmap | ReaderKind::Decoded => {
+            let header = TiffHeader::open(first_frame)?;
+            Ok(header.bits_per_sample.first().copied().unwrap_or(16))
+        }
+        ReaderKind::Jpeg => Ok(8),
+        ReaderKind::Raw => Ok(32),
     }
 }
 

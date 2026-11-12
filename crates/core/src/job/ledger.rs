@@ -541,6 +541,36 @@ impl TileConsumer for RecordingConsumer<'_> {
     }
 }
 
+/// Decorates a [`TileConsumer`], noting each successfully consumed tile's
+/// index and wall duration in nanoseconds. The duration covers the inner
+/// call alone: the admission-gate wait before it and the ledger write after
+/// it are outside.
+pub struct TimingConsumer<'a> {
+    pub inner: &'a dyn TileConsumer,
+    pub durations: &'a Mutex<Vec<(usize, u64)>>,
+}
+
+impl TileConsumer for TimingConsumer<'_> {
+    fn consume(&self, job: &TileJob<'_>) -> Result<(), AlgorithmError> {
+        let started = std::time::Instant::now();
+        self.inner.consume(job)?;
+        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.durations
+            .lock()
+            .expect("no thread panicked while noting a tile duration")
+            .push((job.tile().index(), nanos));
+        Ok(())
+    }
+
+    fn abort(&self) {
+        self.inner.abort();
+    }
+
+    fn supplies_own_pixels(&self) -> bool {
+        self.inner.supplies_own_pixels()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +650,20 @@ mod tests {
 
         drop(ledger);
         let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn timing_consumer_forwards_supplies_own_pixels() {
+        let inner = PixelSupplier;
+        let durations = Mutex::new(Vec::new());
+        let timing = TimingConsumer {
+            inner: &inner,
+            durations: &durations,
+        };
+        assert!(
+            timing.supplies_own_pixels(),
+            "the timing decorator must not put the scheduler's host read loop back"
+        );
     }
 
     #[test]

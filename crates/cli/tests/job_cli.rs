@@ -1181,4 +1181,87 @@ mod unix_signals {
             }
         }
     }
+
+    /// `run_plan` in the `--json` report records what the driver resolved: the
+    /// stage-cache hit of a second identical run, and the ledger units a
+    /// resume kept. The cancelled run prints no document.
+    #[test]
+    fn run_plan_counts_cache_and_resume_hits() {
+        let mantis = mantis_512_dir();
+
+        let cached = tmp_dir("job_cli_run_plan_cache");
+        let cached_out = cached.join("out");
+        std::fs::create_dir_all(&cached_out).unwrap();
+        let mut cache_args = vec![
+            "stack",
+            mantis.to_str().unwrap(),
+            "-o",
+            cached_out.to_str().unwrap(),
+            "--algorithm",
+            "dummy-stack",
+            "--no-crop",
+            "--align-algorithm",
+            "dummy-align",
+            "--json",
+        ];
+        if cfg!(feature = "gpu") {
+            cache_args.push("--cpu");
+        }
+        let run_json = |dir: &Path, args: &[&str]| -> serde_json::Value {
+            let out = run_cli_in(dir, args);
+            assert!(out.success, "stderr: {}", out.stderr);
+            serde_json::from_str(&out.stdout).expect("--json must parse")
+        };
+        let first = run_json(&cached, &cache_args);
+        assert_eq!(first["run_plan"]["align_cache_hit"], false, "{first}");
+        assert_eq!(first["align_source"], "computed", "{first}");
+        assert_eq!(first["run_plan"]["resumed_units"], 0, "{first}");
+        let second = run_json(&cached, &cache_args);
+        assert_eq!(second["run_plan"]["align_cache_hit"], true, "{second}");
+        assert_eq!(second["align_source"], "cached", "{second}");
+
+        let dir = tmp_dir("job_cli_run_plan_resume");
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let mut args =
+            interruptible_stack_args(mantis.to_str().unwrap(), out_dir.to_str().unwrap());
+        args.extend(["--json", "--trace-accounting"]);
+        let mut child = spawn_piped(&dir, &args);
+        let (lines, reader) = read_stamped(child.stderr.take().unwrap(), Instant::now());
+        wait_for(&lines, Duration::from_secs(300), |line| {
+            fuse_counts(line).first().is_some_and(|(done, _)| *done > 0)
+        })
+        .expect("a unit must complete before the cancel is requested");
+        send(child.id(), "-INT");
+        let status = child.wait().expect("child must exit");
+        reader.join().unwrap();
+        assert_eq!(status.code(), Some(130), "status: {status:?}");
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        assert!(
+            stdout.is_empty(),
+            "a cancelled run prints no document: {stdout}"
+        );
+
+        args.push("--resume");
+        let resumed = run_json(&dir, &args);
+        let kept = resumed["run_plan"]["resumed_units"]
+            .as_u64()
+            .expect("count");
+        let tiles = resumed["tiles"].as_u64().expect("tiles");
+        assert!(
+            kept > 0 && kept < tiles,
+            "kept {kept} of {tiles}: {resumed}"
+        );
+        assert_eq!(
+            resumed["fuse_tiles"].as_array().map(Vec::len),
+            Some((tiles - kept) as usize),
+            "a resumed run lists only the tiles it fused: {resumed}"
+        );
+    }
 }

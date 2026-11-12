@@ -976,3 +976,77 @@ fn a_one_group_run_writes_a_manifest_too() {
     assert_eq!(groups.len(), 1, "exactly one entry for the one group");
     assert_eq!(groups[0]["outcome"], "completed");
 }
+
+/// Every group document in the `groups` wrapper carries its own `run_plan` and
+/// the process-wide counters as they stand at the end of that group; a failed
+/// run prints no document.
+#[test]
+fn groups_json_carries_run_plan_and_trace_accounting() {
+    let dump = common::tmp_dir("groups_cli_run_plan");
+    for (file, when) in [
+        ("IMG_9801.tif", "2026:08:29 18:42:41"),
+        ("IMG_9802.tif", "2026:08:29 18:42:42"),
+        ("IMG_9910.tif", "2026:08:29 19:02:55"),
+        ("IMG_9911.tif", "2026:08:29 19:02:56"),
+        ("IMG_9912.tif", "2026:08:29 19:02:57"),
+    ] {
+        frame(&dump, file, Some(when));
+    }
+    let out_dir = common::tmp_dir("groups_cli_run_plan_out");
+    let cwd = common::tmp_dir("groups_cli_run_plan_cwd");
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            dump.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algorithm",
+            "dummy-stack",
+            "--no-align",
+            "--no-crop",
+            "--json",
+            "--trace-accounting",
+        ],
+    );
+    assert!(out.success, "stderr: {}", out.stderr);
+    let wrapped: serde_json::Value = serde_json::from_str(&out.stdout).expect("one document");
+    let groups = wrapped["groups"].as_array().expect("a groups array");
+    let counts: Vec<u64> = groups
+        .iter()
+        .map(|g| g["run_plan"]["frame_count"].as_u64().expect("frame_count"))
+        .collect();
+    assert_eq!(counts, [2, 3], "each group's run_plan is its own");
+    let decoded: Vec<u64> = groups
+        .iter()
+        .map(|g| {
+            g["trace_accounting"]["decoded_bytes"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("trace_accounting per group: {g}"))
+        })
+        .collect();
+    assert!(
+        decoded.windows(2).all(|w| w[0] <= w[1]),
+        "the counters are cumulative: {decoded:?}"
+    );
+
+    let missing = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            cwd.join("no-such-input").to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algorithm",
+            "dummy-stack",
+            "--json",
+            "--trace-accounting",
+        ],
+    );
+    assert_eq!(missing.code, Some(1), "stderr: {}", missing.stderr);
+    assert!(
+        missing.stdout.is_empty(),
+        "a failed run prints no document: {}",
+        missing.stdout
+    );
+}

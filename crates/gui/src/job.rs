@@ -355,6 +355,7 @@ mod stage_tests {
             prepare_total: 0,
             develop_done: 0,
             develop_total: 0,
+            total_eta: None,
         }
     }
 
@@ -1169,6 +1170,7 @@ impl StageObserver for GuiObserver {
             prepare_total,
             develop_done: 0,
             develop_total,
+            total_eta: self.last_progress().and_then(|p| p.total_eta),
         };
         match stage {
             RunStage::Develop { frames } => self.tick(&snapshot(JobStage::Develop, 0, frames)),
@@ -1426,17 +1428,22 @@ pub fn phase_line(state: &RunState, progress: Option<&JobProgress>) -> Option<St
     })
 }
 
-/// `estimating` while `eta` is `None` and no unit has finished yet,
-/// `ETA M:SS` while running with a real estimate, `ETA —` once paused,
-/// cancelling or failed -- never a rendered zero.
+/// The time left in the whole run, not just the current stage: `estimating`
+/// while no total estimate exists, `ETA M:SS` while running with one (`ETA
+/// H:MM:SS` from an hour up), `ETA —` once paused, cancelling or failed --
+/// never a rendered zero.
 pub fn eta_text(state: &RunState, progress: Option<&JobProgress>) -> String {
     match state {
         RunState::Paused | RunState::Cancelling | RunState::Failed(_) => "ETA —".to_string(),
         RunState::Idle | RunState::Fused { .. } | RunState::Queued { .. } => String::new(),
-        RunState::Running => match progress.and_then(|p| p.eta) {
+        RunState::Running => match progress.and_then(|p| p.total_eta) {
             Some(eta) => {
                 let secs = eta.as_secs();
-                format!("ETA {}:{:02}", secs / 60, secs % 60)
+                if secs >= 3600 {
+                    format!("ETA {}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
+                } else {
+                    format!("ETA {}:{:02}", secs / 60, secs % 60)
+                }
             }
             None => "estimating".to_string(),
         },
