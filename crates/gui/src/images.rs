@@ -162,7 +162,7 @@ fn hidden_text(hidden: &[(GridMismatch, usize)]) -> Option<String> {
     Some(format!("{total} hidden: {detail}"))
 }
 
-fn stroke_text(strokes: usize) -> String {
+pub(crate) fn stroke_text(strokes: usize) -> String {
     match strokes {
         0 => String::new(),
         1 => "\u{b7} 1 stroke".to_string(),

@@ -321,6 +321,7 @@ mod tests {
         let overlay = crate::canvas::OverlayDraw {
             table: focusforge_core::zmap::overlay_table(1, None),
             ops: Arc::from([]),
+            checkpoint_colors: Arc::default(),
             alpha: focusforge_core::display::alpha_from_opacity(0.65),
             origin: None,
         };

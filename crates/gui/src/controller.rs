@@ -521,6 +521,29 @@ pub struct OverlayView {
     pub opacity: f32,
 }
 
+/// What the left pane shows -- [`AppController::frame_pane`]'s return value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FramePane {
+    /// The selected frame, with its view onto the newest fuse.
+    Frame(PathBuf, Option<FrameView>),
+    /// The scratch render of the chosen checkpoint, read as it is.
+    Checkpoint(PathBuf),
+    /// The chosen checkpoint is still rendering; the pane shows nothing.
+    Rendering,
+    /// The chosen checkpoint cannot be rendered; the pane shows these lines.
+    Refused(Vec<String>),
+}
+
+/// The mark ahead of the left pane label -- [`AppController::frame_pane_label_mark`]'s
+/// return value, in the colour carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelMark {
+    /// The checkpoint glyph, in the checkpoint's colour.
+    Icon([u8; 3]),
+    /// A filled square in the selected frame's source colour.
+    Swatch([u8; 3]),
+}
+
 /// The brush cursor overlay's own view -- [`AppController::brush_cursor_view`]'s
 /// return value.
 #[derive(Debug, Clone, PartialEq)]
@@ -541,6 +564,9 @@ pub struct BrushCursorView {
     pub mode_tag: &'static str,
     /// The tag chip's top-left on both axes of the cursor square.
     pub tag_origin: f32,
+    /// The chosen checkpoint's colour while the brush source is a checkpoint,
+    /// `None` for a frame source.
+    pub checkpoint_colour: Option<[u8; 3]>,
 }
 
 /// The diagnostics panel's own state: the data directory a bundle is
@@ -1023,6 +1049,23 @@ fn held_stamp(held: &[job::InMemoryCheckpoint], index: usize) -> u64 {
     hasher.finish()
 }
 
+/// The left pane's label for the checkpoint of `row`, the fields its Results
+/// row shows.
+fn checkpoint_pane_label(row: &images::ResultRow) -> String {
+    let mut label = String::from("Checkpoint \u{b7} ");
+    if let Some(name) = &row.label {
+        label.push_str(name);
+        label.push_str(" \u{b7} ");
+    }
+    label.push_str(&format!("{} {}", row.method, row.time));
+    let strokes = images::stroke_text(row.strokes);
+    if !strokes.is_empty() {
+        label.push(' ');
+        label.push_str(&strokes);
+    }
+    label
+}
+
 /// How many brush strokes `ops` hold.
 fn stroke_count(ops: &[job::Op]) -> usize {
     ops.iter()
@@ -1335,6 +1378,30 @@ impl ProjectTab {
         }
     }
 
+    /// Whether the editor list shows checkpoint `key` as a Results row.
+    fn lists_checkpoint(&self, key: &str) -> bool {
+        self.image_groups().rows.iter().any(|row| row.key == key)
+    }
+
+    /// The colour of checkpoint `key`, a saved id or an unsaved entry's key:
+    /// hidden checkpoints keep theirs. `None` for a key the tab does not hold.
+    fn checkpoint_colour(&self, key: &str) -> Option<[u8; 3]> {
+        let history = match &self.project {
+            GuiProject::Opened(project) => Some(project.history()),
+            GuiProject::Unsaved(_) => None,
+        };
+        let colour = match checkpoints::held_index(key) {
+            Some(index) if index < self.held.len() => job::entry_colour_index(
+                history.map_or(0, |history| history.next_colour_index()),
+                index,
+            ),
+            Some(_) => return None,
+            None => history?.colour_index(key).ok()?,
+        };
+        let sources = u32::try_from(self.frames.len().max(1)).unwrap_or(u32::MAX);
+        Some(job::checkpoint_color(colour, sources))
+    }
+
     /// The editor list's Results rows: every checkpoint the checkpoint list
     /// shows, in its order, whose pixel grid matches the edited row's; the
     /// rest are counted per reason.
@@ -1356,8 +1423,6 @@ impl ProjectTab {
         let origin = base
             .and_then(|key| self.fused_origin(key))
             .filter(|origin| Some(origin.as_str()) != base);
-        let next_colour = history.map_or(0, |history| history.next_colour_index());
-        let sources = u32::try_from(self.frames.len().max(1)).unwrap_or(u32::MAX);
         let mut hidden = [0usize; images::MISMATCH_ORDER.len()];
         let mut rows = Vec::new();
         for key in listed.entries.into_iter().filter_map(|entry| entry.id) {
@@ -1374,7 +1439,7 @@ impl ProjectTab {
                 continue;
             }
             let held_at = checkpoints::held_index(&key);
-            let (algorithm, created_at, label, strokes, colour) = match held_at {
+            let (algorithm, created_at, label, strokes) = match held_at {
                 Some(index) => {
                     let Some(entry) = self.held.get(index) else {
                         continue;
@@ -1388,7 +1453,6 @@ impl ProjectTab {
                         entry.created_at(),
                         None,
                         strokes,
-                        job::entry_colour_index(next_colour, index),
                     )
                 }
                 None => {
@@ -1401,9 +1465,6 @@ impl ProjectTab {
                         checkpoint.created_at,
                         checkpoint.label.clone(),
                         stroke_count(&checkpoint.ops),
-                        history
-                            .colour_index(&key)
-                            .expect("a listed checkpoint is in the history"),
                     )
                 }
             };
@@ -1417,7 +1478,9 @@ impl ProjectTab {
                 badges.push("UNSAVED");
             }
             rows.push(images::ResultRow {
-                colour: job::checkpoint_color(colour, sources),
+                colour: self
+                    .checkpoint_colour(&key)
+                    .expect("a listed checkpoint has a colour"),
                 label,
                 method: checkpoints::algorithm_label(&algorithm),
                 time: checkpoints::local_hhmmss(created_at),
@@ -3347,7 +3410,19 @@ impl AppController {
         let tab = self.state.active()?;
         let sources = tab.fused()?.0.len();
         let mut draw = OverlayDraw::for_opacity(sources as u32, self.state.overlay.opacity);
-        draw.ops = tab.overlay_ops().into();
+        let ops = tab.overlay_ops();
+        draw.checkpoint_colors = ops
+            .iter()
+            .filter_map(|op| match op {
+                job::Op::BrushStroke {
+                    source: job::StrokeSource::Checkpoint(id),
+                    ..
+                } => Some((id.clone(), tab.checkpoint_colour(id)?)),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>()
+            .into();
+        draw.ops = ops.into();
         draw.origin = tab.origin.clone().map(SharedOrigin);
         Some(draw)
     }
@@ -4445,9 +4520,23 @@ impl AppController {
                 let (pane, local) = self.anchor_pane();
                 self.source_index_at(pane, local).ok().flatten()
             })
-            .flatten()
-            .filter(|&source| source != job::NO_SOURCE);
-        let source = hovered.unwrap_or_else(|| u16::try_from(tab.selected).unwrap_or(u16::MAX));
+            .flatten();
+        let chosen = || {
+            self.source_checkpoint()
+                .and_then(|key| tab.checkpoint_colour(&key))
+                .unwrap_or_else(|| {
+                    job::source_color(u16::try_from(tab.selected).unwrap_or(u16::MAX), sources)
+                })
+        };
+        let pick_color = match hovered {
+            Some(job::StrokeSource::Frame(n)) if n != job::NO_SOURCE => {
+                job::source_color(n, sources)
+            }
+            Some(job::StrokeSource::Checkpoint(key)) if tab.lists_checkpoint(&key) => {
+                tab.checkpoint_colour(&key).unwrap_or_else(chosen)
+            }
+            _ => chosen(),
+        };
         let (active_pane, local) = self.anchor_pane();
         let source_point = viewport.to_source_in(local, self.pane_rect(active_pane)?);
         Some(BrushCursorView {
@@ -4455,7 +4544,7 @@ impl AppController {
             ring_commands: paths.ring,
             core_commands: paths.core,
             picking,
-            pick_color: job::source_color(source, sources),
+            pick_color,
             frame_position: viewport.from_source_in(source_point, left),
             composite_position: viewport.from_source_in(source_point, right),
             mode_tag: if picking {
@@ -4469,6 +4558,9 @@ impl AppController {
                 }
             },
             tag_origin: paths.tag_origin,
+            checkpoint_colour: self
+                .source_checkpoint()
+                .and_then(|key| tab.checkpoint_colour(&key)),
         })
     }
 
@@ -4602,15 +4694,16 @@ impl AppController {
         self.emit(ShellEvent::EditorChanged);
     }
 
-    /// The frame the overlay shows under `local` (pane-local coordinates):
-    /// the latest stroke covering the pixel by more than half, else the
-    /// stored Z-Map's index. `None` off the image or with nothing to read;
-    /// callers decide what `NO_SOURCE` means to them.
+    /// The source the overlay shows under `local` (pane-local coordinates):
+    /// the latest stroke covering the pixel by more than half (a frame or a
+    /// checkpoint, hidden-but-kept ones included), else the stored Z-Map's
+    /// frame. `None` off the image or with nothing to read; callers decide
+    /// what `NO_SOURCE` and an unlisted checkpoint mean to them.
     fn source_index_at(
         &self,
         pane: PaneSource,
         local: (f32, f32),
-    ) -> Result<Option<u16>, job::RetouchError> {
+    ) -> Result<Option<job::StrokeSource>, job::RetouchError> {
         let Some(tab) = self.state.active() else {
             return Ok(None);
         };
@@ -4647,17 +4740,18 @@ impl AppController {
         } else {
             job::ModeConditions::default()
         };
-        let top = match job::top_source(&ops, info, x, y, &conditions, &|_| None) {
-            Some(job::StrokeSource::Frame(n)) => Some(*n),
-            Some(job::StrokeSource::Checkpoint(_)) | None => None,
-        };
-        Ok(top.or_else(|| edit.stored_source(x, y)))
+        let top = job::top_source(&ops, info, x, y, &conditions, &|id| {
+            tab.checkpoint_colour(id)
+        })
+        .cloned();
+        Ok(top.or_else(|| edit.stored_source(x, y).map(job::StrokeSource::Frame)))
     }
 
-    /// `Alt + click`, or the armed pipette's `Start`: reads the frame the
+    /// `Alt + click`, or the armed pipette's `Start`: reads the source the
     /// overlay shows under `local` (pane-local coordinates) and makes it the
-    /// brush source.
-    /// `NO_SOURCE` and a point off the image leave the source unchanged.
+    /// brush source: a frame, or a listed checkpoint as a click on its row
+    /// does. `NO_SOURCE`, a hidden-but-kept checkpoint and a point off the
+    /// image leave the source unchanged.
     fn pick_source_at(&mut self, pane: PaneSource, local: (f32, f32)) {
         self.start_origin_readers(true);
         let source = match self.source_index_at(pane, local) {
@@ -4671,10 +4765,19 @@ impl AppController {
                 return;
             }
         };
-        if source == job::NO_SOURCE {
-            return;
+        match source {
+            job::StrokeSource::Frame(job::NO_SOURCE) => {}
+            job::StrokeSource::Frame(frame) => self.select_frame(usize::from(frame)),
+            job::StrokeSource::Checkpoint(key) => {
+                if self
+                    .state
+                    .active()
+                    .is_some_and(|tab| tab.lists_checkpoint(&key))
+                {
+                    self.choose_checkpoint_source(key);
+                }
+            }
         }
-        self.select_frame(source as usize);
     }
 
     /// `Alt + click`: picks without arming the pipette.
@@ -7319,26 +7422,32 @@ impl AppController {
                 }
             }
             images::RowKind::Checkpoint => {
-                let Some(tab) = self.state.active_mut() else {
-                    return;
-                };
-                tab.source_checkpoint = row.key.clone();
-                let tab_id = tab.id;
                 if let Some(key) = row.key {
-                    self.state
-                        .sources
-                        .failed
-                        .retain(|(tab, _, failed)| (*tab, failed) != (tab_id, &key));
+                    self.choose_checkpoint_source(key);
                 }
-                if let Some(index) = self.state.active {
-                    self.ensure_checkpoint_sources(index);
-                }
-                self.emit(ShellEvent::ImagesChanged);
             }
             images::RowKind::ResultsHeading => self.toggle_image_group(true),
             images::RowKind::FramesHeading => self.toggle_image_group(false),
             images::RowKind::Hidden => {}
         }
+    }
+
+    /// Chooses listed checkpoint `key` as the brush source (the edited
+    /// checkpoint stays).
+    fn choose_checkpoint_source(&mut self, key: String) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        tab.source_checkpoint = Some(key.clone());
+        let tab_id = tab.id;
+        self.state
+            .sources
+            .failed
+            .retain(|(tab, _, failed)| (*tab, failed) != (tab_id, &key));
+        if let Some(index) = self.state.active {
+            self.ensure_checkpoint_sources(index);
+        }
+        self.emit(ShellEvent::ImagesChanged);
     }
 
     /// Folds or unfolds the Results (`results`) or Frames group of the
@@ -7801,12 +7910,75 @@ impl AppController {
         })
     }
 
-    /// The left pane's label: the selected frame's file name, or empty with
-    /// no tab active or nothing selected.
+    /// What the left pane shows: the chosen checkpoint's scratch render (or
+    /// its pending or refused state) while one is the brush source, else the
+    /// selected frame. `None` with no tab active or nothing selected.
+    pub fn frame_pane(&self) -> Option<FramePane> {
+        let Some(row) = self.source_row() else {
+            let path = self.selected_frame_path()?;
+            return Some(FramePane::Frame(path, self.selected_frame_view()));
+        };
+        let tab = self.state.active()?;
+        if let Some(path) = tab
+            .edit
+            .as_ref()
+            .and_then(|edit| edit.checkpoint_source_path(&row.key))
+        {
+            return Some(FramePane::Checkpoint(path.to_path_buf()));
+        }
+        let failed = self
+            .state
+            .sources
+            .failed
+            .iter()
+            .any(|(id, generation, key)| {
+                (*id, *generation, key.as_str())
+                    == (tab.id, tab.session_generation, row.key.as_str())
+            });
+        Some(if failed {
+            FramePane::Refused(job::checkpoint_refusal_lines(&checkpoint_pane_label(&row)))
+        } else {
+            FramePane::Rendering
+        })
+    }
+
+    /// The chosen brush-source checkpoint's Results row, while it is listed.
+    fn source_row(&self) -> Option<images::ResultRow> {
+        if self.mode() != ShellMode::Editor {
+            return None;
+        }
+        let groups = self.state.active()?.image_groups();
+        let key = groups.selected?;
+        groups.rows.into_iter().find(|row| row.key == key)
+    }
+
+    /// The left pane's label: `Checkpoint · [<name> · ]<method> <time>[ · N
+    /// strokes]` while a checkpoint is the brush source, else the selected
+    /// frame's file name; empty with no tab active or nothing selected.
     pub fn frame_pane_label(&self) -> String {
+        if let Some(row) = self.source_row() {
+            return checkpoint_pane_label(&row);
+        }
         self.selected_frame_path()
             .map(|path| images::file_name(&path))
             .unwrap_or_default()
+    }
+
+    /// The mark ahead of the left pane label: the checkpoint icon in the
+    /// checkpoint's colour, or for a chosen frame a square in the colour the
+    /// overlay and the pipette swatch use for it. `None` with no tab active
+    /// or nothing selected.
+    pub fn frame_pane_label_mark(&self) -> Option<LabelMark> {
+        if let Some(row) = self.source_row() {
+            return Some(LabelMark::Icon(row.colour));
+        }
+        self.selected_frame_path()?;
+        let tab = self.state.active()?;
+        let source = u16::try_from(tab.selected).unwrap_or(u16::MAX);
+        Some(LabelMark::Swatch(job::source_color(
+            source,
+            tab.frames.len().max(1) as u32,
+        )))
     }
 
     /// Adds `paths` to the active tab: hashes on a worker thread, then

@@ -21,6 +21,9 @@ export component ComparisonWindow inherits Window {
 
     in property <image> source;
     in property <string> pane-label: "";
+    in property <bool> pane-label-icon: false;
+    in property <bool> pane-label-swatch: false;
+    in property <color> pane-label-icon-color;
     in property <string> bar-title: "FocusForge — Frame";
     in property <[string]> message-lines: [];
     in property <bool> project-loaded: false;
@@ -46,6 +49,8 @@ export component ComparisonWindow inherits Window {
     in property <color> cursor-pick-color;
     in property <string> cursor-mode-tag: "";
     in property <length> cursor-tag-origin;
+    in property <bool> cursor-checkpoint-source: false;
+    in property <color> cursor-glyph-color;
     in property <bool> cursor-visible: false;
     in property <length> cursor-x;
     in property <length> cursor-y;
@@ -149,6 +154,9 @@ export component ComparisonWindow inherits Window {
         height: parent.height - ShellGeometry.comparison-window-bar-height - 2px;
         source: root.source;
         label: root.pane-label;
+        label-icon: root.pane-label-icon;
+        label-swatch: root.pane-label-swatch;
+        label-icon-color: root.pane-label-icon-color;
         message-lines: root.message-lines;
         project-loaded: root.project-loaded;
         image-x: root.image-x;
@@ -211,6 +219,8 @@ export component ComparisonWindow inherits Window {
             pick-color: root.cursor-pick-color;
             mode-tag: root.cursor-mode-tag;
             tag-origin: root.cursor-tag-origin;
+            checkpoint-source: root.cursor-checkpoint-source;
+            glyph-color: root.cursor-glyph-color;
         }
     }
 }

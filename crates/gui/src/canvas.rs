@@ -10,7 +10,7 @@
 //! `wgpu` or `slint::wgpu_29`.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -1006,6 +1006,9 @@ pub struct EditedView<'a> {
 pub struct OverlayDraw {
     pub table: Vec<[u8; 3]>,
     pub ops: Arc<[Op]>,
+    /// The colour of each checkpoint a stroke in `ops` was painted from,
+    /// by checkpoint key; a stroke whose checkpoint is not here is skipped.
+    pub checkpoint_colors: Arc<BTreeMap<String, [u8; 3]>>,
     pub alpha: u8,
     /// The readers that tell where a Lighten or Darken stroke acts; `None`
     /// until they are open.
@@ -1036,6 +1039,7 @@ impl OverlayDraw {
         Self {
             table: overlay_table(sources, None),
             ops: Arc::from([]),
+            checkpoint_colors: Arc::default(),
             alpha: alpha_from_opacity(opacity),
             origin: None,
         }
@@ -1044,8 +1048,8 @@ impl OverlayDraw {
     /// The colour of each texel of the `step` lattice of `rect`, from its
     /// stored Z-Map index in `indices`. A Lighten or Darken stroke shows its
     /// source only where the readers say it acts; without them, when a read
-    /// fails, the stored colour stays. A stroke painted from a checkpoint has
-    /// no colour here and is skipped.
+    /// fails, the stored colour stays. A stroke painted from a checkpoint
+    /// shows that checkpoint's colour from `checkpoint_colors`.
     pub fn colors(
         &self,
         info: ZMapInfo,
@@ -1075,7 +1079,7 @@ impl OverlayDraw {
             step,
             &conditions,
             &self.table,
-            &|_| None,
+            &|id| self.checkpoint_colors.get(id).copied(),
             indices,
             &mut colors,
         );

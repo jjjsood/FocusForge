@@ -26,9 +26,9 @@ use crate::canvas::{
 };
 use crate::comparison::{self, ComparisonWindow};
 use crate::controller::{
-    AppController, ChromeKey, DockTab, GroupingQuestion, GuardSecondary, JobView, LocateTarget,
-    OpenAs, OpenOutcome, RefusalAction, SaveAsk, SettingsSection, ShellEvent, ShellMode,
-    StoragePath, WindowChromeIntent, WindowTarget,
+    AppController, ChromeKey, DockTab, FramePane, GroupingQuestion, GuardSecondary, JobView,
+    LabelMark, LocateTarget, OpenAs, OpenOutcome, RefusalAction, SaveAsk, SettingsSection,
+    ShellEvent, ShellMode, StoragePath, WindowChromeIntent, WindowTarget,
 };
 use crate::diagnostics::{
     DiagnosticsStatus, InputBatch, InputSurface, finish_input_batches, input_trace_incomplete,
@@ -214,6 +214,30 @@ impl Canvas {
                 self.failed_frame = Some(path.to_path_buf());
             }
         }
+    }
+
+    /// Shows what the controller says the left pane holds: a frame or the
+    /// checkpoint's render, the refusal lines of an unrenderable checkpoint,
+    /// or nothing while it renders. A checkpoint render that fails to open is
+    /// refused as the checkpoint `label` names.
+    pub fn show_frame_pane(&mut self, pane: Option<FramePane>, label: &str) {
+        match pane {
+            Some(FramePane::Frame(path, view)) => self.set_frame(Some(&path), view),
+            Some(FramePane::Checkpoint(path)) => {
+                self.set_frame(Some(&path), None);
+                if self.failed_frame.as_deref() == Some(path.as_path()) {
+                    self.frame_refusal = job::checkpoint_refusal_lines(label);
+                }
+            }
+            Some(FramePane::Refused(lines)) => self.refuse_frame(lines),
+            Some(FramePane::Rendering) | None => self.set_frame(None, None),
+        }
+    }
+
+    /// Drops whatever frame was open and shows `lines` in its place.
+    pub fn refuse_frame(&mut self, lines: Vec<String>) {
+        self.set_frame(None, None);
+        self.frame_refusal = lines;
     }
 
     /// Hands the worker one request for every pane whose texture does not
@@ -460,11 +484,13 @@ fn show_comparison_pane(
     plane_draw: Option<PaneDraw>,
 ) {
     let cursor_hovered = cursor_hovered(app);
-    let (detached, frame_label, project_loaded, editor_mode, messages, cursor) = {
+    let (detached, frame_label, label_mark, project_loaded, editor_mode, messages, cursor) = {
         let controller = controller.lock().unwrap();
+        let label_mark = controller.frame_pane_label_mark();
         (
             controller.detached_pane(),
-            truncate_pane_label(&controller.frame_pane_label()),
+            pane_label_text(&controller.frame_pane_label(), label_mark),
+            label_mark,
             controller.active_project().is_some(),
             controller.mode() == ShellMode::Editor,
             controller.composite_message_lines(),
@@ -487,6 +513,8 @@ fn show_comparison_pane(
             window.set_cursor_picking(cursor.picking);
             window.set_cursor_mode_tag(cursor.mode_tag.into());
             window.set_cursor_tag_origin(cursor.tag_origin);
+            window.set_cursor_checkpoint_source(cursor.checkpoint_colour.is_some());
+            window.set_cursor_glyph_color(glyph_color(cursor.checkpoint_colour));
             window.set_cursor_pick_color(slint::Color::from_rgb_u8(
                 cursor.pick_color[0],
                 cursor.pick_color[1],
@@ -522,6 +550,9 @@ fn show_comparison_pane(
         match detached {
             PaneSource::Frame => {
                 window.set_pane_label(frame_label.into());
+                window.set_pane_label_icon(matches!(label_mark, Some(LabelMark::Icon(_))));
+                window.set_pane_label_swatch(matches!(label_mark, Some(LabelMark::Swatch(_))));
+                window.set_pane_label_icon_color(label_mark_color(label_mark));
                 window.set_bar_title("FocusForge — Frame".into());
                 window.set_message_lines(string_model(canvas.frame_refusal()));
                 match frame_draw
@@ -549,6 +580,8 @@ fn show_comparison_pane(
                 }
             }
             PaneSource::Composite => {
+                window.set_pane_label_icon(false);
+                window.set_pane_label_swatch(false);
                 window.set_bar_title("FocusForge — Composite".into());
                 window.set_message_lines(string_model(&messages));
                 match plane_draw
@@ -578,6 +611,30 @@ fn show_comparison_pane(
         }
         window.window().request_redraw();
     });
+}
+
+/// The left pane label as the window shows it: a frame's file name is cut to
+/// the pill, a checkpoint label (with its icon) is left whole for the pill to
+/// elide.
+fn pane_label_text(label: &str, mark: Option<LabelMark>) -> String {
+    if matches!(mark, Some(LabelMark::Icon(_))) {
+        label.to_string()
+    } else {
+        truncate_pane_label(label)
+    }
+}
+
+fn label_mark_color(mark: Option<LabelMark>) -> slint::Color {
+    let Some(LabelMark::Icon([r, g, b]) | LabelMark::Swatch([r, g, b])) = mark else {
+        return slint::Color::default();
+    };
+    slint::Color::from_rgb_u8(r, g, b)
+}
+
+fn set_frame_label_mark(app: &AppWindow, mark: Option<LabelMark>) {
+    app.set_frame_label_icon(matches!(mark, Some(LabelMark::Icon(_))));
+    app.set_frame_label_swatch(matches!(mark, Some(LabelMark::Swatch(_))));
+    app.set_frame_label_icon_color(label_mark_color(mark));
 }
 
 /// A fresh model for `lines`, or `None` when `current` already holds them:
@@ -662,9 +719,9 @@ pub fn repaint(
     }
 
     let (
-        frame_path,
-        frame_view,
+        frame_pane,
         frame_label,
+        frame_label_mark,
         frame_draw,
         plane_draw,
         readout,
@@ -674,9 +731,9 @@ pub fn repaint(
     ) = {
         let controller = controller.lock().unwrap();
         (
-            controller.selected_frame_path(),
-            controller.selected_frame_view(),
+            controller.frame_pane(),
             controller.frame_pane_label(),
+            controller.frame_pane_label_mark(),
             controller.frame_draw(),
             controller.plane_draw(),
             controller.zoom_readout(),
@@ -687,11 +744,12 @@ pub fn repaint(
     };
     canvas
         .borrow_mut()
-        .set_frame(frame_path.as_deref(), frame_view);
+        .show_frame_pane(frame_pane, &frame_label);
 
     app.set_zoom_readout(readout.into());
     app.set_project_loaded(project_loaded);
-    app.set_frame_label(truncate_pane_label(&frame_label).into());
+    app.set_frame_label(pane_label_text(&frame_label, frame_label_mark).into());
+    set_frame_label_mark(app, frame_label_mark);
     if let Some(lines) = changed_lines(
         app.get_frame_message_lines(),
         canvas.borrow().frame_refusal(),
@@ -2653,6 +2711,13 @@ fn push_overlay_controls(app: &AppWindow, controller: &AppController) {
     app.set_overlay_text(format!("{:.0}%", overlay.opacity * 100.0).into());
 }
 
+/// The cursor glyph's colour: the checkpoint's, transparent without one.
+fn glyph_color(colour: Option<[u8; 3]>) -> slint::Color {
+    colour.map_or(slint::Color::from_argb_u8(0, 0, 0, 0), |[r, g, b]| {
+        slint::Color::from_rgb_u8(r, g, b)
+    })
+}
+
 /// Pushes the brush cursor overlay's own view -- every repaint, since its
 /// extent also depends on the active tab's current zoom, which
 /// [`push_editor_toolbar`]'s own `EditorChanged` trigger does not cover.
@@ -2668,6 +2733,8 @@ fn push_brush_cursor(app: &AppWindow, controller: &AppController) {
     app.set_cursor_picking(view.picking);
     app.set_cursor_mode_tag(view.mode_tag.into());
     app.set_cursor_tag_origin(view.tag_origin);
+    app.set_cursor_checkpoint_source(view.checkpoint_colour.is_some());
+    app.set_cursor_glyph_color(glyph_color(view.checkpoint_colour));
     app.set_cursor_pick_color(slint::Color::from_rgb_u8(
         view.pick_color[0],
         view.pick_color[1],

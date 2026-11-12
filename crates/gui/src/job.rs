@@ -1827,6 +1827,15 @@ pub fn frame_refusal_lines(path: &Path) -> Vec<String> {
     ]
 }
 
+/// The left pane's text for a checkpoint it cannot show, in
+/// [`frame_refusal_lines`]' form: a heading, then the checkpoint's `label`.
+pub fn checkpoint_refusal_lines(label: &str) -> Vec<String> {
+    vec![
+        "Cannot show this checkpoint:".to_string(),
+        label.to_string(),
+    ]
+}
+
 /// What can go wrong opening a tab's editor state: its Z-Map, the composite
 /// it edits over or the source frames a stroke blends from.
 #[derive(Debug, thiserror::Error)]
@@ -1861,6 +1870,13 @@ fn sample_label(format: SampleFormat) -> &'static str {
 pub struct CheckpointSource {
     stack: Arc<TiffStack>,
     path: PathBuf,
+}
+
+impl CheckpointSource {
+    /// The scratch file the render lives in.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl Drop for CheckpointSource {
@@ -2446,6 +2462,11 @@ impl EditState {
     /// Whether checkpoint `id` is rendered and ready to paint from.
     pub fn has_checkpoint_source(&self, id: &str) -> bool {
         self.checkpoints.contains_key(id)
+    }
+
+    /// The scratch file checkpoint `id`'s render lives in, once it is ready.
+    pub fn checkpoint_source_path(&self, id: &str) -> Option<&Path> {
+        self.checkpoints.get(id).map(|source| source.path())
     }
 
     /// Takes `source` as checkpoint `id`'s render, replacing an earlier one.

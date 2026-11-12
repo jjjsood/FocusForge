@@ -26,7 +26,10 @@ export global ShellGeometry {
     out property <length> pane-placeholder-width: 220px;
     out property <length> pane-chrome-inset: 10px;
     out property <length> pane-label-width: 120px;
+    out property <length> pane-label-max-width: 300px;
     out property <length> pane-label-height: 22px;
+    // The colour square leading a frame label.
+    out property <length> pane-label-swatch-side: 10px;
     out property <length> undock-control-width: 26px;
     out property <length> undock-control-height: 22px;
 
@@ -270,4 +273,6 @@ export global ShellGeometry {
     out property <length> analytics-bar-height: 10px;
     // The brush cursor's mode chip: a square of this side.
     out property <length> brush-tag-side: 16px;
+    // The layers glyph centred in a checkpoint-source cursor.
+    out property <length> cursor-glyph-side: 10px;
 }
