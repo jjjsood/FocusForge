@@ -1479,7 +1479,7 @@ fn align_eta_text_follows_the_engine_estimate() {
     assert_eq!(eta_text(&RunState::Running, Some(&finished)), "ETA 0:40");
 }
 
-/// A snapshot of `stage` whose per-stage `eta` and `total_eta` differ.
+/// `snapshot` with its per-stage `eta` and `total_eta` replaced, in seconds.
 fn two_etas(
     snapshot: focusforge_core::job::JobProgress,
     eta: Option<u64>,
