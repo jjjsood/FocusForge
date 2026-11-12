@@ -19,7 +19,7 @@ use crate::algorithm::{AlgorithmError, TileOutput, TileReader};
 use crate::align::warp::WarpedTile;
 use crate::align::{AlignError, ECC_BACKEND_MIN_REGION_PX, Transform};
 use crate::sharp_areas::SHARPNESS_BACKEND_MIN_PIXEL_FRAMES;
-use crate::tile::{Rect, SampleFormat, Tile};
+use crate::tile::{Rect, SampleFormat, Tile, TilePlan};
 
 /// The adapter facts a [`TileBackend`] implementation was built on: plain
 /// `String`s, so no `wgpu` type crosses into `crates/core`. `crates/gpu`
@@ -262,6 +262,43 @@ pub trait SharpnessBackend: Send + Sync {
         read: Rect,
         samples_per_pixel: u32,
     ) -> Result<Option<Vec<f32>>, AlgorithmError>;
+
+    /// Opens a session that holds the per-pixel peak of the focus score over
+    /// the frames folded into each tile of `plan`, or `Ok(None)` to decline,
+    /// in which case the scale runs on the CPU. A session is declined as a
+    /// whole, never per frame. An error is handled as for
+    /// [`Self::score_tile`].
+    fn open_scale(
+        &self,
+        plan: &TilePlan,
+        samples_per_pixel: u32,
+    ) -> Result<Option<Box<dyn ScalePeaks + '_>>, AlgorithmError> {
+        let _ = (plan, samples_per_pixel);
+        Ok(None)
+    }
+}
+
+/// The per-pixel peaks of the focus score of one stack, held by a backend for
+/// every tile of the plan its session was opened with. The peaks stay where
+/// the backend keeps them until the scale is decided.
+pub trait ScalePeaks: Send + Sync {
+    /// Folds the focus score of `frame` over the read rect of tile `tile`
+    /// into that tile's peaks (a per-pixel maximum). Called concurrently
+    /// from the frame workers.
+    fn fold(
+        &self,
+        tile: usize,
+        reader: &dyn TileReader,
+        frame: usize,
+    ) -> Result<(), AlgorithmError>;
+
+    /// The count of every tile's interior peaks in each bin of
+    /// [`crate::sharpness_map::BINS`], as [`crate::sharpness_map::bin_peaks`]
+    /// counts them.
+    fn histogram(&mut self) -> Result<Vec<u64>, AlgorithmError>;
+
+    /// The interior peaks of tile `tile`, row-major.
+    fn interior_peaks(&self, tile: usize) -> Result<Vec<f32>, AlgorithmError>;
 }
 
 /// The rayon CPU twin of the self-check kernel every [`TileBackend`]

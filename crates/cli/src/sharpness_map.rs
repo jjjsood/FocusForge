@@ -11,7 +11,9 @@ use focusforge_core::io::{FrameReader, TiffSpec, TiffWriter, open_frame_set};
 use focusforge_core::job::JobControl;
 use focusforge_core::project::container::PartialFile;
 use focusforge_core::sharp_areas::SharpAreasError;
-use focusforge_core::sharpness_map::{SHARPNESS_PERCENTILE, sharpness_maps, stack_sharpness_scale};
+use focusforge_core::sharpness_map::{
+    SHARPNESS_PERCENTILE, sharpness_maps, stack_sharpness_scale_with_backend,
+};
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 use focusforge_core::tile::{HostBudget, TileControl};
 
@@ -133,15 +135,17 @@ fn build(
     if priority == Priority::Low {
         control.set_admission_cap(Some(1));
     }
-    let scale = stack_sharpness_scale(
+    let scale = stack_sharpness_scale_with_backend(
         reader,
         reader.len(),
         extent,
         spp,
         DEFAULT_TILE_SIZE,
         &*control,
+        crate::sharpness_backend(),
     )
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| err.to_string())?
+    .value;
 
     let frame_maps: Vec<Mapped> = paths
         .iter()

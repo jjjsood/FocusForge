@@ -239,6 +239,28 @@ pub(crate) fn score_frames_of_tile<A: Send>(
     rows: &mut [A],
     fold: impl Fn(&mut A, &[f32]) + Sync,
 ) -> Result<(), SharpAreasError> {
+    for_frames_of_tile(pool, gate, control, read, rows, |frame, row, samples| {
+        fold(
+            row,
+            &score_tile_on(backend, reader, frame, read, spp, samples)?,
+        );
+        Ok(())
+    })
+}
+
+/// Runs `op(frame, &mut rows[frame], samples)` for every frame of a tile
+/// reading `read`, the frames in parallel, with `samples` as the worker's
+/// reusable read buffer. `control` is asked to stop before each frame and told
+/// of each finished one; an error from `op` wins over the stop the other
+/// workers then see.
+pub(crate) fn for_frames_of_tile<A: Send>(
+    pool: &rayon::ThreadPool,
+    gate: &HostBudgetGate,
+    control: &dyn TileControl,
+    read: Rect,
+    rows: &mut [A],
+    op: impl Fn(usize, &mut A, &mut Vec<u16>) -> Result<(), SharpAreasError> + Sync,
+) -> Result<(), SharpAreasError> {
     let first_error: Mutex<Option<SharpAreasError>> = Mutex::new(None);
     let run: Result<(), ()> = pool.install(|| {
         rows.par_iter_mut().enumerate().try_for_each_init(
@@ -248,12 +270,9 @@ pub(crate) fn score_frames_of_tile<A: Send>(
                 if control.should_stop() {
                     return Err(());
                 }
-                match score_tile_on(backend, reader, frame, read, spp, samples) {
-                    Ok(scores) => fold(row, &scores),
-                    Err(error) => {
-                        first_error.lock().unwrap().get_or_insert(error);
-                        return Err(());
-                    }
+                if let Err(error) = op(frame, row, samples) {
+                    first_error.lock().unwrap().get_or_insert(error);
+                    return Err(());
                 }
                 control.unit_completed(u64::from(read.width) * u64::from(read.height));
                 Ok(())

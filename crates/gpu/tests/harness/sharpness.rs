@@ -10,16 +10,17 @@ use crate::full_frame_render_identity::core_common;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use focusforge_core::algorithm::{AlgorithmError, TileReader};
-use focusforge_core::gpu::SharpnessBackend;
+use focusforge_core::gpu::{ScalePeaks, SharpnessBackend};
 use focusforge_core::io::{TiffStack, frame_paths};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::sharp_areas::{
     SharpAreas, count_sharp_areas_reporting, count_sharp_areas_reporting_with_backend,
 };
 use focusforge_core::sharpness_map::{
-    sharpness_map_tile, sharpness_maps, sharpness_plan, stack_sharpness_scale,
+    BINS, PeakErrorBound, bin_peaks, fold_peaks, sharpness_map_tile, sharpness_maps,
+    sharpness_plan, stack_sharpness_scale, stack_sharpness_scale_with_backend,
 };
-use focusforge_core::tile::{NoControl, Rect};
+use focusforge_core::tile::{NoControl, PlannedTile, Rect, TilePlan};
 use focusforge_gpu::device::shared_device_or_skip;
 use focusforge_gpu::harness::{gpu_backend, sharpness_backend_for};
 
@@ -67,6 +68,14 @@ impl SharpnessBackend for Forced {
             self.served.fetch_add(1, Ordering::SeqCst);
         }
         Ok(scores)
+    }
+
+    fn open_scale(
+        &self,
+        plan: &TilePlan,
+        spp: u32,
+    ) -> Result<Option<Box<dyn ScalePeaks + '_>>, AlgorithmError> {
+        self.inner.open_scale(plan, spp)
     }
 }
 
@@ -565,4 +574,299 @@ fn reference_stack_sharpness_stage_speedup() {
             "{stage} stage: gpu {gpu:.2?} against cpu {cpu:.2?} is {ratio:.2}x, below 2.0x"
         );
     }
+}
+
+fn bits(values: &[f32]) -> Vec<u32> {
+    values.iter().map(|v| v.to_bits()).collect()
+}
+
+/// Runs `body(frame)` for every frame on the machine's threads.
+fn on_threads(frames: usize, body: impl Fn(usize) + Sync) {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(frames.max(1));
+    std::thread::scope(|scope| {
+        for first in 0..threads {
+            let body = &body;
+            scope.spawn(move || (first..frames).step_by(threads).for_each(body));
+        }
+    });
+}
+
+/// Folds every frame of every tile of the plan into `session`.
+fn fold_all(session: &dyn ScalePeaks, reader: &dyn TileReader, frames: usize, tiles: usize) {
+    for tile in 0..tiles {
+        on_threads(frames, |frame| {
+            session
+                .fold(tile, reader, frame)
+                .expect("the device folds the frame")
+        });
+    }
+}
+
+/// The exact CPU peaks of `planned`'s interior: the maximum over the frames
+/// of the shipped scores.
+fn exact_tile_peaks(
+    reader: &dyn TileReader,
+    frames: usize,
+    planned: &PlannedTile,
+    spp: u32,
+) -> Vec<f32> {
+    let interior = planned.interior();
+    let peaks = std::sync::Mutex::new(vec![0.0f32; (interior.width * interior.height) as usize]);
+    on_threads(frames, |frame| {
+        let map = sharpness_map_tile(reader, frame, planned, spp, 1.0).unwrap();
+        let mut peaks = peaks.lock().unwrap();
+        for (peak, value) in peaks.iter_mut().zip(&map) {
+            *peak = peak.max(*value);
+        }
+    });
+    peaks.into_inner().unwrap()
+}
+
+/// The device peaks of a folded `session` against the exact CPU peaks: how
+/// many lie farther than the error bound, and the largest `|g - c| / bound(c)`.
+fn peaks_against_exact(
+    session: &dyn ScalePeaks,
+    reader: &dyn TileReader,
+    frames: usize,
+    spp: u32,
+    plan: &TilePlan,
+) -> (u64, f64) {
+    let bound = PeakErrorBound::for_spp(spp);
+    let (mut outside, mut worst) = (0, 0.0f64);
+    for (index, planned) in plan.tiles().iter().enumerate() {
+        let device = session.interior_peaks(index).unwrap();
+        let exact = exact_tile_peaks(reader, frames, planned, spp);
+        assert_eq!(device.len(), exact.len());
+        for (g, c) in device.iter().zip(&exact) {
+            let ratio = f64::from((g - c).abs()) / bound.at(f64::from(*c));
+            outside += u64::from(ratio > 1.0);
+            worst = worst.max(ratio);
+        }
+    }
+    (outside, worst)
+}
+
+#[test]
+fn parity_sharpness_scale() {
+    let Some(backend) = device_backend() else {
+        return;
+    };
+    let stack = crate::common::open_stack();
+    let (frames, extent, spp) = (
+        stack.len(),
+        stack.dimensions(),
+        stack.header(0).samples_per_pixel,
+    );
+    for tile_size in [512, 200] {
+        let plan = sharpness_plan(extent, tile_size).unwrap();
+        let tiles = plan.tiles().len();
+        let mut session = backend
+            .open_scale(&plan, spp)
+            .unwrap()
+            .expect("the device holds the fixture's peaks");
+        fold_all(&*session, &stack, frames, tiles);
+
+        // The kernels against their twins on the device's own scores.
+        let mut twin_histogram = vec![0u64; BINS];
+        for (index, planned) in plan.tiles().iter().enumerate() {
+            let (read, interior) = (planned.read(), planned.interior());
+            let mut twin = vec![0.0f32; (interior.width * interior.height) as usize];
+            for frame in 0..frames {
+                let scores = backend
+                    .score_tile(&stack, frame, read, spp)
+                    .unwrap()
+                    .expect("the device scores the tile");
+                fold_peaks(&mut twin, &scores, read, interior);
+            }
+            let device = session.interior_peaks(index).unwrap();
+            assert_eq!(
+                bits(&device),
+                bits(&twin),
+                "tile {tile_size}, tile {index}: fold"
+            );
+            bin_peaks(&mut twin_histogram, &twin);
+        }
+        assert_eq!(
+            session.histogram().unwrap(),
+            twin_histogram,
+            "tile {tile_size}: bin"
+        );
+
+        // The device peaks against the exact CPU peaks.
+        let (outside, worst) = peaks_against_exact(&*session, &stack, frames, spp, &plan);
+        println!(
+            "tile {tile_size}: {outside} peaks outside ε, largest |g - c| / ε(c) = {worst:.4}"
+        );
+        assert_eq!(outside, 0, "tile {tile_size}: peaks outside ε");
+        drop(session);
+
+        // The scale through the backend against the shipped scale.
+        let shipped =
+            stack_sharpness_scale(&stack, frames, extent, spp, tile_size, &NoControl).unwrap();
+        let got = stack_sharpness_scale_with_backend(
+            &stack,
+            frames,
+            extent,
+            spp,
+            tile_size,
+            &NoControl,
+            Some(&backend),
+        )
+        .unwrap();
+        assert_eq!(
+            got.value.to_bits(),
+            shipped.to_bits(),
+            "tile {tile_size}: scale"
+        );
+        let recheck = got
+            .recheck
+            .expect("the device path settled the scale and did not fall back");
+        println!(
+            "tile {tile_size}: scale {:#010x}, iterations {}, candidates {:?}",
+            got.value.to_bits(),
+            recheck.iterations,
+            recheck.candidates
+        );
+    }
+}
+
+#[test]
+fn sharpness_scale_device_lost() {
+    let Some(backend) = device_backend() else {
+        return;
+    };
+    let stack = crate::common::open_stack();
+    let (frames, extent, spp) = (
+        stack.len(),
+        stack.dimensions(),
+        stack.header(0).samples_per_pixel,
+    );
+    let tile_size = 200;
+    let shipped =
+        stack_sharpness_scale(&stack, frames, extent, spp, tile_size, &NoControl).unwrap();
+    let got = stack_sharpness_scale_with_backend(
+        &stack,
+        frames,
+        extent,
+        spp,
+        tile_size,
+        &NoControl,
+        Some(&backend),
+    )
+    .unwrap();
+    assert!(
+        backend.device_lost(),
+        "FF_FORCE_DEVICE_LOST=3 destroys the device during the pass"
+    );
+    assert_eq!(got.value.to_bits(), shipped.to_bits());
+    assert!(got.recheck.is_none(), "the CPU pass produced the scale");
+}
+
+#[test]
+#[ignore = "reads the 16 GB reference stack"]
+fn reference_stack_sharpness_scale_matches_cpu() {
+    let Some(dir) = core_common::reference_stack_dir() else {
+        return;
+    };
+    let Some(_) = shared_device_or_skip() else {
+        return;
+    };
+    let backend = sharpness_backend_for(false, None).expect("the GPU is allowed");
+    let stack = open_reference_stack(&dir);
+    let (frames, extent, spp) = (
+        stack.len(),
+        stack.dimensions(),
+        stack.header(0).samples_per_pixel,
+    );
+    let tile_size = focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
+    let shipped =
+        stack_sharpness_scale(&stack, frames, extent, spp, tile_size, &NoControl).unwrap();
+    let got = stack_sharpness_scale_with_backend(
+        &stack,
+        frames,
+        extent,
+        spp,
+        tile_size,
+        &NoControl,
+        Some(backend),
+    )
+    .unwrap();
+    let recheck = got
+        .recheck
+        .expect("the device path ran and did not fall back");
+    println!(
+        "scale {:#010x}, shipped {:#010x}, iterations {}, candidates {:?}",
+        got.value.to_bits(),
+        shipped.to_bits(),
+        recheck.iterations,
+        recheck.candidates
+    );
+    assert_eq!(got.value.to_bits(), shipped.to_bits());
+
+    let plan = sharpness_plan(extent, tile_size).unwrap();
+    let session = SharpnessBackend::open_scale(backend, &plan, spp)
+        .unwrap()
+        .expect("the reference stack's peaks fit the device");
+    fold_all(&*session, &stack, frames, plan.tiles().len());
+    let (outside, worst) = peaks_against_exact(&*session, &stack, frames, spp, &plan);
+    println!("{outside} peaks outside ε, largest |g - c| / ε(c) = {worst:.4}");
+    assert_eq!(outside, 0);
+}
+
+#[test]
+#[ignore = "reads the 16 GB reference stack"]
+fn reference_stack_sharpness_scale_speedup() {
+    let Some(dir) = core_common::reference_stack_dir() else {
+        return;
+    };
+    let Some(_) = shared_device_or_skip() else {
+        return;
+    };
+    let backend = sharpness_backend_for(false, None).expect("the GPU is allowed");
+    let stack = open_reference_stack(&dir);
+    let (frames, extent, spp) = (
+        stack.len(),
+        stack.dimensions(),
+        stack.header(0).samples_per_pixel,
+    );
+    let tile_size = focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
+    let on_device = || {
+        stack_sharpness_scale_with_backend(
+            &stack,
+            frames,
+            extent,
+            spp,
+            tile_size,
+            &NoControl,
+            Some(backend),
+        )
+        .unwrap()
+    };
+    let on_cpu =
+        || stack_sharpness_scale(&stack, frames, extent, spp, tile_size, &NoControl).unwrap();
+    // One untimed pass of each, then the timed one.
+    on_device();
+    on_cpu();
+    let started = std::time::Instant::now();
+    let device = on_device();
+    let gpu_time = started.elapsed();
+    let started = std::time::Instant::now();
+    let cpu = on_cpu();
+    let cpu_time = started.elapsed();
+
+    let recheck = device
+        .recheck
+        .expect("the device path ran and did not fall back");
+    assert_eq!(device.value.to_bits(), cpu.to_bits());
+    let ratio = cpu_time.as_secs_f64() / gpu_time.as_secs_f64();
+    println!(
+        "scale: gpu {gpu_time:.2?}, cpu {cpu_time:.2?}, {ratio:.2}x, iterations {}, candidates {:?}",
+        recheck.iterations, recheck.candidates
+    );
+    assert!(
+        ratio >= 2.0,
+        "scale stage: gpu {gpu_time:.2?} against cpu {cpu_time:.2?} is {ratio:.2}x, below 2.0x"
+    );
 }
