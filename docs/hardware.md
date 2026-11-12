@@ -4,7 +4,7 @@ The free RAM a run needs depends on the kind of frames and their size, not on ho
 
 Free RAM per workload, in decimal GB, rounded up:
 
-| Frames | Run at all | Recommended | Scratch disk per frame |
+| Frames | Run at all | Recommended | Scratch disk per frame, if the frames do not fit in RAM |
 |---|---|---|---|
 | Camera RAW, 24–26 MP | 3.1 GB | 7.5 GB | 160 MB |
 | Camera RAW, 45–61 MP | 4.1–5.0 GB | 11.7–15.3 GB | 280–370 MB |
@@ -13,14 +13,14 @@ Free RAM per workload, in decimal GB, rounded up:
 | JPEG, 24–61 MP | 3.0–5.2 GB | 3.8–5.2 GB | none |
 
 - A retouch or edit session needs the same minimum as a stack run of the same frames. The window's preview buffers come on top. Exporting a retouched TIFF project held 24 MB beyond what the process holds anyway on a 4722 × 3100 result; a RAW project's export has not been measured.
-- Camera RAW is the hungriest because every frame is developed in memory before it is stored: the minimum is the free RAM for one frame's develop pass, and the recommended figure lets four frames develop at once. RAW frames are developed to scratch files of width × height × 6 bytes each (the figures above are for the developed size). Scratch disk grows linearly with the frame count: 10 frames of 5088 × 3392 take 1.04 GB.
-- Fewer frames cut scratch disk and run time but do not lower the free RAM one frame needs.
+- Camera RAW is the hungriest because every frame is developed in memory before it is stored: the minimum is the free RAM for one frame's develop pass, and the recommended figure lets four frames develop at once. A developed frame takes width × height × 6 bytes (the scratch figures above are for the developed size). When all the developed frames fit in the working memory beside what the run needs to develop and fuse, they stay in RAM, nothing is written to scratch and the stack runs faster. Otherwise every developed frame goes to a scratch file, and the scratch disk grows linearly with the frame count: 10 frames of 5088 × 3392 take 1.04 GB. The check of free disk space before a run counts the scratch files only in that case.
+- Fewer frames cut scratch disk and run time, and make it likelier that the developed frames stay in RAM, but they do not lower the free RAM one frame needs.
 - Rule of thumb for a camera not listed: free RAM ≈ 1.6 GB + (raw pixels × 30 B + file size) ÷ 0.65, about 1.6 GB + 53 MB per advertised megapixel + 1.5 × the file size. Sensors read out roughly 15 % more pixels than advertised; `focusforge-cli info` prints the exact `raw=` size.
 - Uncompressed TIFF is read in tiles and needs only a tile set (about 37 MB for 3-channel 16-bit frames) beyond the fixed part. A compressed TIFF needs its largest compressed block decoded; JPEG needs one frame decoded and widened. The recommended figures for these formats give the tiles in flight their full 1 GiB.
 
 ## Measured on one machine
 
-32 threads, 64 GB RAM, RTX 5070 Ti. Peak memory held is the peak of memory the system cannot reclaim; memory-mapped frames and the file cache come on top and are given back under pressure. Frame sizes are in pixels.
+32 threads, 64 GB RAM, RTX 5070 Ti. The RAW runs were measured with the developed frames on scratch files; frames that stay in RAM count in the peak memory held. Peak memory held is the peak of memory the system cannot reclaim; memory-mapped frames and the file cache come on top and are given back under pressure. Frame sizes are in pixels.
 
 | Run | Free RAM at start | Working memory | Peak memory held |
 |---|---|---|---|

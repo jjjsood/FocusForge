@@ -339,7 +339,7 @@ the Settings tab shows that project's settings.
 
 ## While a fuse is running
 
-![The window during a fuse: the toolbar shows Pause and Cancel, the Composite pane shows the card "Preparing frames", the bottom bar reads Aligning with a progress bar and an ETA, and the whole Settings tab in the dock is drawn faded.](../assets/manual/stacking/stacking-locked-during-run.png)
+![The window during a fuse: the toolbar shows Pause and Cancel, the Composite pane shows the card "Preparing frames", the bottom bar reads Aligning, 1 of 8, with a progress bar and an ETA, and the whole Settings tab in the dock is drawn faded.](../assets/manual/stacking/stacking-locked-during-run.png)
 
 *During a run the Settings tab is faded and locked.*
 
@@ -508,3 +508,19 @@ focusforge-cli stack path/to/frames/ --algorithm laplacian --json
 settings (with where each value came from), the tile geometry the run
 planned, and the project path written; see
 [`reference/cli.md`](../reference/cli.md#stack) for the full schema.
+
+While a run goes, the progress line of every stage ends in the time left in
+the whole run, as in the window:
+
+```
+align 8/8 frames eta 1:35
+fuse 12/64 tiles 18% eta 2:05
+```
+
+The time reads `--` until an estimate exists, `<1s` under a second, `Ns` under
+a minute and `M:SS` from a minute up. `--no-progress` turns the line off.
+
+To see what a run is predicted to take before it starts, add `--dry-run`. The
+summary then includes a line such as `predicted duration: 0.3 s (estimate for
+the reference machine, cold run)`, and `--dry-run --json` reports the estimate
+for each stage.

@@ -116,11 +116,11 @@ own view, and a Composite pane in its own window shows the same card. The
 inset is switched off under **Sharpness heatmap** in
 [Appearance](settings-window.md#appearance).
 
-![The window during a fuse, with the Frame pane showing 00.tif and the Composite pane showing the card "Preparing frames" with "Images appear here once alignment starts."; the bottom bar reads Aligning, 1 of 8, with a progress bar and an ETA.](../assets/manual/first-stack/fuse-running.png)
+![The window during a fuse, with the Frame pane showing 00.tif and the Composite pane showing the frame just aligned, labelled "Aligned · 04.tif"; the bottom bar reads Aligning, 2 of 8, with a progress bar and an ETA.](../assets/manual/first-stack/fuse-running.png)
 
-*A run in progress; the Composite pane shows its stage card, here
-"Preparing frames". The growing
-picture passes in a few seconds on a small stack and is not shown here.*
+*A run in progress; the Composite pane shows the frame just aligned. The
+growing picture passes in a few seconds on a small stack and is not shown
+here.*
 
 The two panes always show the same part of the picture at the same zoom: pan
 or zoom in one, and the other follows. That makes it easy to compare a
@@ -175,8 +175,8 @@ From left to right:
   nothing is happening, the current stage while a stack is fused (for example
   "Aligning"), and "fused" with the time once a run you kept has finished.
 - **Progress.** During a run: frames done (such as "3 of 8"), a progress bar
-  and an estimated time remaining ("ETA"). [Your first stack](first-stack.md)
-  explains the stages.
+  and the estimated time remaining for the whole run ("ETA"). [Your first
+  stack](first-stack.md) explains the stages.
 - **Overlay.** A switch and a strength slider for the Z-Map overlay; see
   [See where each pixel came from](#see-where-each-pixel-came-from).
 - **Zoom.** **Zoom out**, the zoom readout, **Zoom in**, and **Fit**; see the
