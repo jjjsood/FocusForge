@@ -35,6 +35,8 @@ pub struct Times {
     pub readback: AtomicU64,
     pub wait: AtomicU64,
     pub host: AtomicU64,
+    /// Edge re-check: candidate selection plus the exact CPU recompute.
+    pub recheck: AtomicU64,
 }
 
 impl Times {
@@ -50,24 +52,26 @@ impl Times {
             &self.readback,
             &self.wait,
             &self.host,
+            &self.recheck,
         ] {
             slot.store(0, Ordering::Relaxed);
         }
     }
 
-    /// Milliseconds per sub-stage as `read upload compute readback wait host`.
+    /// Milliseconds per sub-stage as `read upload compute readback wait host recheck`.
     pub fn line(&self) -> String {
         let ms = |slot: &AtomicU64| {
             Duration::from_nanos(slot.load(Ordering::Relaxed)).as_secs_f64() * 1e3
         };
         format!(
-            "read_ms={:.1} upload_ms={:.1} compute_ms={:.1} readback_ms={:.1} wait_ms={:.1} host_ms={:.1}",
+            "read_ms={:.1} upload_ms={:.1} compute_ms={:.1} readback_ms={:.1} wait_ms={:.1} host_ms={:.1} recheck_ms={:.1}",
             ms(&self.read),
             ms(&self.upload),
             ms(&self.compute),
             ms(&self.readback),
             ms(&self.wait),
-            ms(&self.host)
+            ms(&self.host),
+            ms(&self.recheck)
         )
     }
 }
@@ -557,8 +561,20 @@ fn frames_of_tile<A: Send>(
     })
 }
 
+/// The interior rows of a read rect's peaks, row-major.
+pub fn interior_peaks(all: &[f32], read: Rect, interior: Rect) -> Vec<f32> {
+    let mut inner = Vec::with_capacity(interior.width as usize * interior.height as usize);
+    for y in interior.y..interior.y + interior.height {
+        let start = ((y - read.y) * read.width + (interior.x - read.x)) as usize;
+        inner.extend_from_slice(&all[start..start + interior.width as usize]);
+    }
+    inner
+}
+
 /// Stage (a): histogram of per-pixel peaks over `frames` frames. `collect`
-/// receives each tile's interior peaks (host binning only).
+/// receives each tile's interior peaks (host binning only). `keep` receives
+/// each tile's peaks buffer in plan order instead of dropping it (device
+/// binning only).
 #[allow(clippy::too_many_arguments)]
 pub fn stage_a(
     gpu: &'static Gpu,
@@ -569,6 +585,7 @@ pub fn stage_a(
     pool: &rayon::ThreadPool,
     variant: Variant,
     mut collect: Option<&mut dyn FnMut(&PlannedTile, &[f32])>,
+    mut keep: Option<&mut Vec<wgpu::Buffer>>,
 ) -> Result<Vec<u64>, String> {
     let mut hist = vec![0u64; BINS];
     let device_hist = (variant == Variant::DeviceBin).then(|| gpu.hist_buffer());
@@ -585,12 +602,7 @@ pub fn stage_a(
             None => {
                 let all = gpu.download_peaks(&peaks, read);
                 let t = Instant::now();
-                let mut inner =
-                    Vec::with_capacity(interior.width as usize * interior.height as usize);
-                for y in interior.y..interior.y + interior.height {
-                    let start = ((y - read.y) * read.width + (interior.x - read.x)) as usize;
-                    inner.extend_from_slice(&all[start..start + interior.width as usize]);
-                }
+                let inner = interior_peaks(&all, read, interior);
                 for peak in &inner {
                     hist[(peak.to_bits() >> BIN_SHIFT) as usize] += 1;
                 }
@@ -599,6 +611,9 @@ pub fn stage_a(
                 }
                 Times::add(&gpu.times.host, t);
             }
+        }
+        if let Some(keep) = keep.as_deref_mut() {
+            keep.push(peaks);
         }
     }
     if let Some(device_hist) = device_hist {

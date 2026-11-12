@@ -2,7 +2,9 @@
 //! Times the three sharpness stages on the CPU as shipped against a GPU
 //! prototype, end to end, and checks the GPU result against the CPU twin.
 //!
-//! `sharpness-gpu <dir> [--crop x,y,w,h] [--frames N] [--iters N] [--stages a,b,c]`
+//! `sharpness-gpu <dir> [--crop x,y,w,h] [--frames N] [--iters N] [--stages a,b,c,e] [--eps-scale K]`
+//!
+//! Stage `e` is stage (a) with an exact CPU re-check at the deciding bin edges.
 
 mod gpu;
 
@@ -61,6 +63,7 @@ struct Args {
     iters: usize,
     stages: String,
     probe: bool,
+    eps_scale: f64,
 }
 
 fn parse() -> Result<Args, String> {
@@ -71,6 +74,7 @@ fn parse() -> Result<Args, String> {
         iters: 4,
         stages: "abc".into(),
         probe: false,
+        eps_scale: 1.0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -97,12 +101,17 @@ fn parse() -> Result<Args, String> {
             }
             "--stages" => args.stages = value("--stages")?,
             "--probe" => args.probe = true,
+            "--eps-scale" => {
+                args.eps_scale = value("--eps-scale")?
+                    .parse()
+                    .map_err(|_| "--eps-scale is a number")?
+            }
             _ => args.dir = PathBuf::from(arg),
         }
     }
     if args.dir.as_os_str().is_empty() {
         return Err(
-            "usage: sharpness-gpu <dir> [--crop x,y,w,h] [--frames N] [--iters N] [--stages abc]"
+            "usage: sharpness-gpu <dir> [--crop x,y,w,h] [--frames N] [--iters N] [--stages abce] [--eps-scale K]"
                 .into(),
         );
     }
@@ -242,6 +251,318 @@ fn cpu_tile_peaks(
             })
     })?;
     Ok(peaks.into_inner().unwrap())
+}
+
+// Rounding budget of the detail plane `base - expand(reduce(base))` for 16-bit input
+// (reduce is exact; every other operand is below 2^16, where an f32 ulp is 2^-8).
+const ULP_BELOW_2_16: f64 = 1.0 / 256.0;
+// One 1D expand: at most 5 roundings on the GPU (any contraction or reassociation, 1 ulp each),
+// 3 on the CPU (0.75 * mid and two adds, half an ulp each); two passes, then the subtraction.
+const EXPAND_ROUNDINGS_GPU: f64 = 5.0;
+const EXPAND_ROUNDINGS_CPU: f64 = 3.0;
+const DETAIL_GPU: f64 = (2.0 * EXPAND_ROUNDINGS_GPU + 1.0) * ULP_BELOW_2_16;
+const DETAIL_CPU: f64 = (2.0 * EXPAND_ROUNDINGS_CPU + 1.0) * ULP_BELOW_2_16 / 2.0;
+// The CPU rounds each |L| to a multiple of 2^-20 before summing.
+const CPU_QUANTIZATION: f64 = 1.0 / 2_097_152.0;
+// One f32 rounding is at most 2^-23 of its result (1 ulp, GPU adds); the CPU's single final
+// conversion is half of it.
+const ULP_RELATIVE: f64 = 1.0 / 8_388_608.0;
+const HALF_ULP_RELATIVE: f64 = ULP_RELATIVE / 2.0;
+
+/// `|GPU peak - CPU peak| <= a + b * (CPU peak)` for 16-bit input, scaled by `--eps-scale`.
+struct Bound {
+    a: f64,
+    b: f64,
+}
+
+impl Bound {
+    fn new(spp: u32, scale: f64) -> Self {
+        let side = f64::from(2 * SCORE_RADIUS + 1);
+        let samples = side * side * f64::from(spp);
+        // Row sum: side * spp terms; column sum: side terms; the first add of each is exact.
+        let adds = side * f64::from(spp) - 1.0 + (side - 1.0);
+        let gamma = adds * ULP_RELATIVE / (1.0 - adds * ULP_RELATIVE);
+        Self {
+            a: scale * samples * (DETAIL_GPU + DETAIL_CPU + CPU_QUANTIZATION) * (1.0 + gamma),
+            b: scale * (gamma * (1.0 + HALF_ULP_RELATIVE) + HALF_ULP_RELATIVE),
+        }
+    }
+
+    fn at(&self, v: f64) -> f64 {
+        self.a + self.b * v
+    }
+}
+
+/// `c` pushed by `delta` (a bound) as far as an f32 can go without leaving it.
+fn pushed(c: f32, delta: f64) -> f32 {
+    let target = f64::from(c) + delta;
+    if target <= 0.0 {
+        return 0.0;
+    }
+    let g = target as f32;
+    if (f64::from(g) - f64::from(c)).abs() <= delta.abs() {
+        g
+    } else if delta > 0.0 {
+        f32::from_bits(g.to_bits() - 1)
+    } else {
+        f32::from_bits(g.to_bits() + 1)
+    }
+}
+
+/// Read reach of a peak: detail reach 4 plus score radius 4.
+const PEAK_REACH: u32 = 8;
+
+/// Exact peaks of single pixels, recomputed on the CPU along the shipped path.
+struct Exact<'a> {
+    reader: &'a dyn TileReader,
+    frames: usize,
+    spp: u32,
+    extent: (u32, u32),
+    pool: &'a rayon::ThreadPool,
+}
+
+impl Exact<'_> {
+    fn peaks(&self, at: &[(u32, u32)]) -> Result<Vec<f32>, String> {
+        let (w, h) = self.extent;
+        self.pool.install(|| {
+            at.par_iter()
+                .map_init(Vec::new, |samples, &(x, y)| {
+                    // Even origin keeps the 2:1 decimation grid of the tiled path.
+                    let x0 = x.saturating_sub(PEAK_REACH) & !1;
+                    let y0 = y.saturating_sub(PEAK_REACH) & !1;
+                    let read = Rect {
+                        x: x0,
+                        y: y0,
+                        width: (x + PEAK_REACH + 1).min(w) - x0,
+                        height: (y + PEAK_REACH + 1).min(h) - y0,
+                    };
+                    let index = ((y - y0) * read.width + (x - x0)) as usize;
+                    let mut peak = 0.0f32;
+                    for frame in 0..self.frames {
+                        let scores =
+                            cpu_scores(self.reader, frame, read, self.spp, samples, false)?;
+                        peak = peak.max(scores[index]);
+                    }
+                    Ok(peak)
+                })
+                .collect()
+        })
+    }
+}
+
+struct Recheck {
+    scale: f32,
+    iterations: usize,
+    /// Candidates recomputed on each pass.
+    candidates: Vec<u64>,
+    /// Selection plus exact recompute, nanoseconds.
+    ns: u64,
+}
+
+const MAX_RECHECK_PASSES: usize = 64;
+
+/// The shipped scale decided from `hist`'s deciding bin, with every peak that `bound` leaves
+/// on either side of the bin's edges recomputed exactly. `peaks_of(tile)` gives a tile's
+/// interior peaks, one tile in memory at a time.
+fn recheck_scale(
+    hist: &[u64],
+    plan: &TilePlan,
+    pixels: u64,
+    bound: &Bound,
+    exact: &Exact,
+    peaks_of: &mut dyn FnMut(usize) -> Result<Vec<f32>, String>,
+) -> Result<Recheck, String> {
+    let rank = ((0.99 * pixels as f64).ceil() as u64).max(1);
+    let mut bin = scale_from_hist(hist, pixels).to_bits() >> BIN_SHIFT;
+    let mut out = Recheck {
+        scale: 0.0,
+        iterations: 0,
+        candidates: Vec::new(),
+        ns: 0,
+    };
+    for pass in 1..=MAX_RECHECK_PASSES {
+        let edge = |b: u32| f64::from(f32::from_bits(b << BIN_SHIFT));
+        let (lo, hi) = (edge(bin), edge(bin + 1));
+        let (lo_eps, hi_eps) = (bound.at(lo), bound.at(hi));
+        let (mut below_lo, mut below_hi) = (0u64, 0u64);
+        let mut unsure: Vec<(u32, u32)> = Vec::new();
+        for (index, tile) in plan.tiles().iter().enumerate() {
+            let peaks = peaks_of(index)?;
+            let t = Instant::now();
+            let interior = tile.interior();
+            for (k, &g) in peaks.iter().enumerate() {
+                let g = f64::from(g);
+                // Some(true): certainly below the edge; Some(false): certainly not.
+                let side = |e: f64, eps: f64| {
+                    (g < e - eps)
+                        .then_some(true)
+                        .or((g >= e + eps).then_some(false))
+                };
+                match (side(lo, lo_eps), side(hi, hi_eps)) {
+                    (Some(a), Some(b)) => {
+                        below_lo += u64::from(a);
+                        below_hi += u64::from(b);
+                    }
+                    _ => unsure.push((
+                        interior.x + k as u32 % interior.width,
+                        interior.y + k as u32 / interior.width,
+                    )),
+                }
+            }
+            out.ns += t.elapsed().as_nanos() as u64;
+        }
+        let t = Instant::now();
+        for c in exact.peaks(&unsure)? {
+            below_lo += u64::from(f64::from(c) < lo);
+            below_hi += u64::from(f64::from(c) < hi);
+        }
+        out.ns += t.elapsed().as_nanos() as u64;
+        out.iterations = pass;
+        out.candidates.push(unsure.len() as u64);
+        if below_lo >= rank {
+            bin = bin
+                .checked_sub(1)
+                .ok_or("the deciding bin moved below bin 0")?;
+        } else if below_hi < rank {
+            bin += 1;
+        } else {
+            out.scale = f32::from_bits(bin << BIN_SHIFT);
+            return Ok(out);
+        }
+    }
+    Err(format!(
+        "the deciding bin did not settle in {MAX_RECHECK_PASSES} passes"
+    ))
+}
+
+fn recheck_line(label: &str, r: &Recheck, shipped: f32, pixels: u64) -> String {
+    format!(
+        "PARITY e {label} scale={:#010x} shipped={:#010x} equal={} iterations={} candidates_per_pass={:?} candidates_total={} share_pct_first_pass={:.4}",
+        r.scale.to_bits(),
+        shipped.to_bits(),
+        r.scale.to_bits() == shipped.to_bits(),
+        r.iterations,
+        r.candidates,
+        r.candidates.iter().sum::<u64>(),
+        100.0 * r.candidates[0] as f64 / pixels as f64
+    )
+}
+
+/// Untimed checks of the edge re-check: the bound against exact CPU peaks, the small-window
+/// recompute, the `eps=0` run and the two extremes of the bound.
+fn parity_e(
+    gpu: &'static Gpu,
+    exact: &Exact,
+    plan: &TilePlan,
+    pixels: u64,
+    shipped: f32,
+    eps_scale: f64,
+) -> Result<(), String> {
+    let (reader, frames, spp, pool) = (exact.reader, exact.frames, exact.spp, exact.pool);
+    let mut kept = Vec::new();
+    let hist = gpu::stage_a(
+        gpu,
+        reader,
+        plan,
+        frames,
+        spp,
+        pool,
+        Variant::DeviceBin,
+        None,
+        Some(&mut kept),
+    )?;
+    let g_of = |i: usize| -> Result<Vec<f32>, String> {
+        let t = &plan.tiles()[i];
+        Ok(gpu::interior_peaks(
+            &gpu.download_peaks(&kept[i], t.read()),
+            t.read(),
+            t.interior(),
+        ))
+    };
+    let c_of = |i: usize| cpu_tile_peaks(pool, reader, &plan.tiles()[i], frames, spp, false);
+    let bound = Bound::new(spp, 1.0);
+
+    // The bound against the exact peaks, the bin flips, and the small-window recompute.
+    const WINDOW_STRIDE: usize = 1021;
+    let (mut flips, mut exceed, mut worst_ratio, mut worst_abs) = (0u64, 0u64, 0.0f64, 0.0f64);
+    let (mut sampled, mut mismatches) = (0u64, 0u64);
+    for (i, tile) in plan.tiles().iter().enumerate() {
+        let (g, c) = (g_of(i)?, c_of(i)?);
+        for (g, c) in g.iter().zip(&c) {
+            flips += u64::from(g.to_bits() >> BIN_SHIFT != c.to_bits() >> BIN_SHIFT);
+            let diff = f64::from((g - c).abs());
+            let eps = bound.at(f64::from(*c));
+            exceed += u64::from(diff > eps);
+            worst_ratio = worst_ratio.max(diff / eps);
+            worst_abs = worst_abs.max(diff);
+        }
+        let interior = tile.interior();
+        let at: Vec<(u32, u32)> = (0..c.len())
+            .step_by(WINDOW_STRIDE)
+            .map(|k| {
+                (
+                    interior.x + k as u32 % interior.width,
+                    interior.y + k as u32 / interior.width,
+                )
+            })
+            .collect();
+        let got = exact.peaks(&at)?;
+        sampled += at.len() as u64;
+        mismatches += got
+            .iter()
+            .enumerate()
+            .filter(|&(j, v)| v.to_bits() != c[j * WINDOW_STRIDE].to_bits())
+            .count() as u64;
+    }
+    println!(
+        "PARITY e bound kernel=f32 pixels={pixels} a={:.4} b={:.4e} peaks_exceeding_eps={exceed} largest_diff={worst_abs:.4} largest_diff_over_eps={worst_ratio:.4} window_check sampled={sampled} mismatches={mismatches}",
+        bound.a, bound.b
+    );
+
+    let timed = Bound::new(spp, eps_scale);
+    let gpu_run = recheck_scale(&hist, plan, pixels, &timed, exact, &mut |i| g_of(i))?;
+    println!(
+        "{}",
+        recheck_line(
+            &format!("gpu-peaks eps_scale={eps_scale}"),
+            &gpu_run,
+            shipped,
+            pixels
+        )
+    );
+    let none = Bound::new(spp, 0.0);
+    let zero = recheck_scale(&hist, plan, pixels, &none, exact, &mut |i| g_of(i))?;
+    println!(
+        "{} peaks_bin_flips={flips}",
+        recheck_line("eps=0 gpu-peaks", &zero, shipped, pixels)
+    );
+
+    for (label, sign) in [("perturb=+eps", 1.0), ("perturb=-eps", -1.0)] {
+        let push = |c: Vec<f32>| -> Vec<f32> {
+            c.into_iter()
+                .map(|v| pushed(v, sign * bound.at(f64::from(v))))
+                .collect()
+        };
+        let mut pushed_hist = vec![0u64; BINS];
+        for i in 0..plan.tiles().len() {
+            for g in push(c_of(i)?) {
+                pushed_hist[(g.to_bits() >> BIN_SHIFT) as usize] += 1;
+            }
+        }
+        let run = recheck_scale(&pushed_hist, plan, pixels, &bound, exact, &mut |i| {
+            Ok(push(c_of(i)?))
+        })?;
+        println!("{}", recheck_line(label, &run, shipped, pixels));
+        // Control: the same pushed peaks without the re-check.
+        let off = recheck_scale(&pushed_hist, plan, pixels, &none, exact, &mut |i| {
+            Ok(push(c_of(i)?))
+        })?;
+        println!(
+            "{}",
+            recheck_line(&format!("{label} recheck=off"), &off, shipped, pixels)
+        );
+    }
+    Ok(())
 }
 
 struct Cells {
@@ -413,7 +734,7 @@ fn run() -> Result<(), String> {
     let mut scale = 0.0f32;
     let want = |s: char| args.stages.contains(s);
 
-    if want('a') {
+    if want('a') || want('e') {
         bench("a-cpu", args.iters, None, || {
             scale =
                 stack_sharpness_scale(reader, frames, extent, spp, DEFAULT_TILE_SIZE, &*control)
@@ -421,6 +742,8 @@ fn run() -> Result<(), String> {
             Ok(())
         })?;
         println!("SCALE shipped bits={:#010x} value={scale}", scale.to_bits());
+    }
+    if want('a') {
         bench("a-cpu-read", args.iters, Some(&CPU), || {
             for tile in plan.tiles() {
                 cpu_tile_peaks(&pool, reader, tile, frames, spp, true)?;
@@ -486,7 +809,89 @@ fn run() -> Result<(), String> {
     };
     let cells = cells_of(extent);
     let tile0 = &plan.tiles()[0];
-    for fixed in [false, true] {
+    // The fixed-point kernel belongs to stages a-c; stage e measures the shipped f32 one only.
+    let kernels: &[bool] = if "abc".chars().any(want) {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    let exact = Exact {
+        reader,
+        frames,
+        spp,
+        extent,
+        pool: &pool,
+    };
+    if want('e') {
+        gpu.fixed.store(false, Ordering::Relaxed);
+        let bound = Bound::new(spp, args.eps_scale);
+        println!(
+            "EPS a={:.4} b={:.4e} eps_scale={} detail_gpu={DETAIL_GPU:.6} detail_cpu={DETAIL_CPU:.6} cpu_quantization={CPU_QUANTIZATION:.3e} window_samples={}",
+            bound.a,
+            bound.b,
+            args.eps_scale,
+            (2 * SCORE_RADIUS + 1).pow(2) * spp
+        );
+        let retained: u64 = plan
+            .tiles()
+            .iter()
+            .map(|t| u64::from(t.read().width) * u64::from(t.read().height) * 4)
+            .sum();
+        println!(
+            "RETAINED-PEAKS bytes={retained} tiles={} (sum of read rects x 4 B, held on the device between the histogram and the re-check)",
+            plan.tiles().len()
+        );
+        bench("a-gpu-devicebin", args.iters, Some(&gpu.times), || {
+            gpu::stage_a(
+                gpu,
+                reader,
+                &plan,
+                frames,
+                spp,
+                &pool,
+                Variant::DeviceBin,
+                None,
+                None,
+            )?;
+            Ok(())
+        })?;
+        let mut last = None;
+        bench("a-gpu-recheck", args.iters, Some(&gpu.times), || {
+            let mut kept = Vec::new();
+            let hist = gpu::stage_a(
+                gpu,
+                reader,
+                &plan,
+                frames,
+                spp,
+                &pool,
+                Variant::DeviceBin,
+                None,
+                Some(&mut kept),
+            )?;
+            let run = recheck_scale(&hist, &plan, pixels, &bound, &exact, &mut |i| {
+                let t = &plan.tiles()[i];
+                Ok(gpu::interior_peaks(
+                    &gpu.download_peaks(&kept[i], t.read()),
+                    t.read(),
+                    t.interior(),
+                ))
+            })?;
+            gpu.times.recheck.fetch_add(run.ns, Ordering::Relaxed);
+            last = Some(run);
+            Ok(())
+        })?;
+        let run = last.expect("the bench ran at least once");
+        println!(
+            "SCALE recheck bits={:#010x} value={} equal_shipped={} iterations={} candidates_per_pass={:?}",
+            run.scale.to_bits(),
+            run.scale,
+            run.scale.to_bits() == scale.to_bits(),
+            run.iterations,
+            run.candidates
+        );
+    }
+    for &fixed in kernels {
         gpu.fixed.store(fixed, Ordering::Relaxed);
         let sfx = if fixed { "-fixed" } else { "" };
         if want('a') {
@@ -499,7 +904,7 @@ fn run() -> Result<(), String> {
                     args.iters,
                     Some(&gpu.times),
                     || {
-                        gpu::stage_a(gpu, reader, &plan, frames, spp, &pool, variant, None)?;
+                        gpu::stage_a(gpu, reader, &plan, frames, spp, &pool, variant, None, None)?;
                         Ok(())
                     },
                 )?;
@@ -532,7 +937,7 @@ fn run() -> Result<(), String> {
     }
 
     // Parity, untimed.
-    for fixed in [false, true] {
+    for &fixed in kernels {
         gpu.fixed.store(fixed, Ordering::Relaxed);
         let label = if fixed { "fixed-point" } else { "f32" };
         {
@@ -596,6 +1001,7 @@ fn run() -> Result<(), String> {
                 &pool,
                 Variant::HostBin,
                 Some(&mut collect),
+                None,
             )?;
             if let Some(e) = failure {
                 return Err(e);
@@ -608,6 +1014,7 @@ fn run() -> Result<(), String> {
                 spp,
                 &pool,
                 Variant::DeviceBin,
+                None,
                 None,
             )?;
             let differ = |a: &[u64], b: &[u64]| a.iter().zip(b).filter(|(x, y)| x != y).count();
@@ -695,6 +1102,10 @@ fn run() -> Result<(), String> {
                 got.counts.iter().sum::<u32>()
             );
         }
+    }
+    if want('e') {
+        gpu.fixed.store(false, Ordering::Relaxed);
+        parity_e(gpu, &exact, &plan, pixels, scale, args.eps_scale)?;
     }
     Ok(())
 }
