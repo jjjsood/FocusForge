@@ -19,7 +19,7 @@ use crate::tile::plan::PlannedTile;
 use crate::timing::{Stage, StageTimings};
 
 use super::JobStage;
-use super::progress::{JobProgress, StagePlan, StageState, eta, live_eta};
+use super::progress::{JobProgress, StagePlan, StageState, eta, live_eta, stage_pace};
 
 const RUNNING: u8 = 0;
 const PAUSE_REQUESTED: u8 = 1;
@@ -48,6 +48,14 @@ struct Ledger {
     seeded: bool,
     stages: [StagePlan; STAGES],
     open: Option<Stage>,
+    /// Offset from [`JobControl::epoch`] at which the open stage was entered.
+    entered_nanos: u64,
+    /// [`JobControl::hold_nanos`] when the open stage was entered.
+    entered_hold_nanos: u64,
+    /// Observed over predicted seconds of the first develop or align that
+    /// credited every frame, at most 1; scales every estimate. `None` until
+    /// one closes.
+    pace: Option<f64>,
 }
 
 /// The three states one job's control flag can be in.
@@ -181,6 +189,9 @@ impl JobControl {
                     predicted: 0.0,
                 }; STAGES],
                 open: None,
+                entered_nanos: 0,
+                entered_hold_nanos: 0,
+                pace: None,
             }),
         })
     }
@@ -323,15 +334,41 @@ impl JobControl {
     /// Leaves the open stage and enters `stage`.
     pub(crate) fn enter_stage(&self, stage: Stage) {
         let mut ledger = self.ledger();
-        Self::close_open_stage(&mut ledger);
+        self.close_open_stage(&mut ledger);
         ledger.stages[stage as usize].state = StageState::Running;
         ledger.open = Some(stage);
+        ledger.entered_nanos = self.epoch.elapsed().as_nanos() as u64;
+        ledger.entered_hold_nanos = self.hold_nanos.load(Ordering::SeqCst);
     }
 
-    fn close_open_stage(ledger: &mut Ledger) {
-        if let Some(open) = ledger.open.take() {
-            ledger.stages[open as usize].state = StageState::Finished;
+    /// Finishes the open stage. The first develop or align that closes with
+    /// every frame credited sets the run's pace from its span, pauses
+    /// excluded.
+    fn close_open_stage(&self, ledger: &mut Ledger) {
+        let Some(open) = ledger.open.take() else {
+            return;
+        };
+        ledger.stages[open as usize].state = StageState::Finished;
+        let (done, total) = match open {
+            Stage::Develop => (&self.develop_done, &self.develop_total),
+            Stage::Align => (&self.align_done, &self.align_total),
+            _ => return,
+        };
+        let total = total.load(Ordering::SeqCst);
+        if ledger.pace.is_some() || total == 0 || done.load(Ordering::SeqCst) != total {
+            return;
         }
+        let held = self
+            .hold_nanos
+            .load(Ordering::SeqCst)
+            .saturating_sub(ledger.entered_hold_nanos);
+        let span = (self.epoch.elapsed().as_nanos() as u64)
+            .saturating_sub(ledger.entered_nanos)
+            .saturating_sub(held);
+        ledger.pace = stage_pace(
+            ledger.stages[open as usize].predicted,
+            Duration::from_nanos(span).as_secs_f64(),
+        );
     }
 
     /// Predicts `stage` zero seconds: its work turned out to be served from
@@ -344,7 +381,7 @@ impl JobControl {
     /// finished run has nothing left to estimate.
     pub(crate) fn finish_stages(&self) {
         let mut ledger = self.ledger();
-        Self::close_open_stage(&mut ledger);
+        self.close_open_stage(&mut ledger);
         for slot in &mut ledger.stages {
             if slot.state == StageState::Pending {
                 slot.predicted = 0.0;
@@ -441,7 +478,12 @@ impl JobControl {
                 Some(Stage::Fuse) => self.fuse_rate(running),
                 _ => (None, None),
             };
-            let live = live_eta(&ledger.stages, fraction, observed);
+            let live = live_eta(
+                &ledger.stages,
+                fraction,
+                observed,
+                ledger.pace.unwrap_or(1.0),
+            );
             (live.stage, Some(live.total))
         } else {
             let (_, observed) = match stage {
@@ -785,6 +827,174 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         control.enter_stage(Stage::Fuse);
         approx(control.progress().total_eta.unwrap().as_secs_f64(), 0.2398);
+
+        // An align that credits all its frames, but slower than predicted,
+        // has a pace clamped at 1.
+        let control = JobControl::new();
+        control.seed_prediction(&timings(0.00267, None, Some(0.0309), 0.2181, 0.0217));
+        control.enter_stage(Stage::Setup);
+        align_over(&control, 30, 30, 100);
+        control.enter_stage(Stage::Fuse);
+        assert_eq!(pace(&control), Some(1.0));
+        approx(total(&control), 0.2398);
+    }
+
+    fn pace(control: &JobControl) -> Option<f64> {
+        control.ledger().pace
+    }
+
+    fn total(control: &JobControl) -> f64 {
+        control.progress().total_eta.unwrap().as_secs_f64()
+    }
+
+    /// Enters align over `frames` frames, runs `millis` ms, then credits `credited` of them.
+    fn align_over(control: &JobControl, frames: usize, credited: usize, millis: u64) {
+        control.enter_stage(Stage::Align);
+        let counter = control.begin_align(frames);
+        std::thread::sleep(Duration::from_millis(millis));
+        counter.fetch_add(credited, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_completed_align_faster_than_predicted_scales_what_follows() {
+        let plan = plan_512();
+        let control = control_over(&plan, None);
+        control.seed_prediction(&timings(0.0, None, Some(0.1242), 0.9391, 0.0113));
+        control.enter_stage(Stage::Setup);
+        align_over(&control, 30, 30, 30);
+        let seeded = 0.9391 + 0.0113;
+        approx(total(&control), seeded);
+
+        control.enter_stage(Stage::Fuse);
+        let pace = pace(&control).expect("every frame was credited");
+        assert!((0.2..0.9).contains(&pace), "{pace}");
+        let mut previous = total(&control);
+        approx(previous, pace * seeded);
+        for tile in plan.tiles() {
+            control.unit_completed(tile);
+            let now = total(&control);
+            assert!(now < previous, "{now} after {previous}");
+            previous = now;
+        }
+    }
+
+    #[test]
+    fn the_develop_pace_holds_through_the_second_setup_and_align() {
+        let control = JobControl::new();
+        control.seed_prediction(&timings(0.0, Some(0.0940), Some(0.6900), 0.8819, 0.0287));
+        control.enter_stage(Stage::Setup);
+        control.enter_stage(Stage::Develop);
+        let counter = control.begin_develop(25);
+        std::thread::sleep(Duration::from_millis(21));
+        counter.fetch_add(25, Ordering::SeqCst);
+
+        control.enter_stage(Stage::Setup);
+        let held = pace(&control).expect("every frame was developed");
+        assert!((0.2..0.9).contains(&held), "{held}");
+        let ahead = 0.6900 + 0.8819 + 0.0287;
+        approx(total(&control), held * ahead);
+
+        std::thread::sleep(Duration::from_millis(25));
+        control.enter_stage(Stage::Align);
+        let _ = control.begin_align(25);
+        assert_eq!(pace(&control), Some(held));
+        approx(total(&control), held * ahead);
+    }
+
+    #[test]
+    fn a_stage_slower_than_predicted_leaves_the_prediction() {
+        let control = JobControl::new();
+        control.seed_prediction(&timings(0.0, None, Some(0.0134), 0.3389, 0.0112));
+        control.enter_stage(Stage::Setup);
+        align_over(&control, 30, 30, 20);
+        control.enter_stage(Stage::Fuse);
+        assert_eq!(pace(&control), Some(1.0));
+        approx(total(&control), 0.3389 + 0.0112);
+    }
+
+    #[test]
+    fn a_pause_inside_the_stage_does_not_count_toward_its_pace() {
+        let align_pace = |held: Duration| {
+            let control = JobControl::new();
+            control.seed_prediction(&timings(0.0, None, Some(1.0), 1.0, 0.1));
+            control.enter_stage(Stage::Align);
+            let counter = control.begin_align(4);
+            std::thread::sleep(Duration::from_millis(40));
+            control.add_hold(held);
+            counter.fetch_add(4, Ordering::SeqCst);
+            control.enter_stage(Stage::Fuse);
+            pace(&control).expect("every frame was credited")
+        };
+        assert!(align_pace(Duration::ZERO) >= 0.04);
+        assert!(align_pace(Duration::from_millis(35)) < 0.03);
+    }
+
+    #[test]
+    fn no_pace_without_every_frame_or_a_prediction() {
+        let seeded = |develop| {
+            let control = JobControl::new();
+            control.seed_prediction(&timings(0.001, develop, Some(1.0), 5.0, 0.5));
+            control.enter_stage(Stage::Setup);
+            control
+        };
+
+        let control = seeded(None);
+        align_over(&control, 30, 29, 10);
+        control.enter_stage(Stage::Fuse);
+        assert_eq!(pace(&control), None, "29 of 30 frames");
+        approx(total(&control), 5.5);
+
+        let control = seeded(None);
+        align_over(&control, 30, 30, 10);
+        control.drop_prediction(Stage::Align);
+        control.enter_stage(Stage::Fuse);
+        assert_eq!(pace(&control), None, "a dropped prediction");
+        approx(total(&control), 5.5);
+
+        let control = seeded(None);
+        let counter = control.begin_develop(5);
+        control.enter_stage(Stage::Develop);
+        counter.fetch_add(5, Ordering::SeqCst);
+        control.enter_stage(Stage::Setup);
+        assert_eq!(pace(&control), None, "a develop predicted zero");
+
+        let control = seeded(None);
+        std::thread::sleep(Duration::from_millis(10));
+        control.enter_stage(Stage::Fuse);
+        std::thread::sleep(Duration::from_millis(10));
+        control.enter_stage(Stage::Finalize);
+        assert_eq!(pace(&control), None, "only setup and fuse closed");
+        approx(total(&control), 1.5);
+    }
+
+    #[test]
+    fn a_fast_near_zero_align_lowers_what_follows() {
+        let control = JobControl::new();
+        control.seed_prediction(&timings(0.00267, None, Some(0.0309), 0.2181, 0.0217));
+        control.enter_stage(Stage::Setup);
+        std::thread::sleep(Duration::from_millis(25));
+        align_over(&control, 3, 3, 2);
+        control.enter_stage(Stage::Fuse);
+        let pace = pace(&control).expect("every frame was credited");
+        assert!(pace < 0.5, "{pace}");
+        approx(total(&control), pace * 0.2398);
+    }
+
+    #[test]
+    fn the_total_stays_positive_through_a_scaled_finalize() {
+        let control = JobControl::new();
+        control.seed_prediction(&timings(0.0, None, Some(1.0), 1.0, 0.4));
+        control.enter_stage(Stage::Setup);
+        align_over(&control, 30, 30, 20);
+        control.enter_stage(Stage::Fuse);
+        control.enter_stage(Stage::Finalize);
+        let pace = pace(&control).expect("every frame was credited");
+        assert!(pace < 0.5, "{pace}");
+        approx(total(&control), pace * 0.4);
+        assert!(control.progress().total_eta.unwrap() > Duration::ZERO);
+
+        control.finish_stages();
+        assert_eq!(control.progress().total_eta, Some(Duration::ZERO));
     }
 
     #[test]
