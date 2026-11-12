@@ -535,3 +535,20 @@ fn windows_build_has_no_console_window() {
         "the CLI must stay a console program"
     );
 }
+
+#[cfg(not(feature = "theme-sheet"))]
+#[test]
+fn theme_sheet_flag_is_refused_when_the_feature_is_compiled_out() {
+    let output = common::gui_bin("diagnostics_theme_sheet_refusal")
+        .arg("--theme-sheet")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("DISPLAY")
+        .output()
+        .expect("failed to run focusforge-gui");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("theme-sheet feature"),
+        "the refusal must name the theme-sheet feature, got: {stderr}"
+    );
+}

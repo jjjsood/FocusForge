@@ -24,6 +24,7 @@ use crate::canvas::{
     CanvasFeed, EditedView, OverlayDraw, Pane, PaneJob, PaneSource, Preparer, RepaintGate,
     truncate_pane_label, truncate_tail,
 };
+use crate::comparison::{self, ComparisonWindow};
 use crate::controller::{
     AppController, ChromeKey, DockTab, GroupingQuestion, GuardSecondary, JobView, LocateTarget,
     OpenAs, OpenOutcome, RefusalAction, SaveAsk, SettingsSection, ShellEvent, ShellMode,
@@ -47,11 +48,11 @@ use crate::settings_panel::{HeadingState, PanelModel, RowKind};
 use crate::viewport::{PaneDraw, PaneRect};
 use focusforge_ui::{
     AboutState, AnalyticsRowView, AppWindow, CalculatorFieldView,
-    CheckpointEntryView as GeneratedCheckpointEntry, ComparisonWindow, ExportRowView,
-    FFManifestRow, ImageRowView as GeneratedImageRow, NotificationRowView, PerformanceCap,
-    PerformanceState, ProjectCardView as GeneratedProjectCard, ProjectTabView,
-    RecentRowView as GeneratedRecentRow, SectionHeadView, SettingsRow as GeneratedSettingsRow,
-    StageTile, StoragePathState, StorageState, SummaryCell, Theme, UpdateControlsState,
+    CheckpointEntryView as GeneratedCheckpointEntry, ExportRowView, FFManifestRow,
+    ImageRowView as GeneratedImageRow, NotificationRowView, PerformanceCap, PerformanceState,
+    ProjectCardView as GeneratedProjectCard, ProjectTabView, RecentRowView as GeneratedRecentRow,
+    SectionHeadView, SettingsRow as GeneratedSettingsRow, StoragePathState, StorageState,
+    SummaryCell, Theme, UpdateControlsState,
 };
 
 /// `slint::platform::PointerEventButton` -> `input_map::Button` -- the only
@@ -1167,7 +1168,7 @@ fn open_comparison(
 ) -> Result<(), slint::PlatformError> {
     let window = Rc::new(ComparisonWindow::new()?);
     window
-        .global::<Theme>()
+        .global::<comparison::Theme>()
         .set_reduce_motion(controller.lock().unwrap().reduce_motion());
     window.on_dock_requested({
         let app_weak = app.as_weak();
@@ -1888,16 +1889,11 @@ pub fn push_job(app: &AppWindow, view: &JobView) {
     app.set_fuse_enabled(view.fuse_enabled);
 }
 
-/// The sharpness ramp the theme's colour tokens define.
-pub fn heat_ramp(theme: &Theme<'_>) -> job::HeatRamp {
-    let rgb = |c: slint::Color| [c.red(), c.green(), c.blue()];
-    job::HeatRamp::new([
-        rgb(theme.get_surface_canvas()),
-        rgb(theme.get_accent_subtle()),
-        rgb(theme.get_accent_pressed()),
-        rgb(theme.get_accent_default()),
-        rgb(theme.get_text_primary()),
-    ])
+/// The sharpness ramp from the theme's five colour tokens, darkest stop
+/// first: canvas surface, subtle accent, pressed accent, default accent,
+/// primary text.
+pub fn heat_ramp(stops: [slint::Color; 5]) -> job::HeatRamp {
+    job::HeatRamp::new(stops.map(|c| [c.red(), c.green(), c.blue()]))
 }
 
 /// [`push_stage_view`] once `show_panes` has run: a Composite pane that now
@@ -1933,12 +1929,23 @@ struct StageProps {
     source: slint::Image,
     heat: slint::Image,
     rect: (f32, f32, f32, f32),
-    tiles: Vec<StageTile>,
+    tiles: Vec<TileRect>,
 }
 
-/// Sets `$props` on `$target`, a window with the `stage-*` properties.
+/// One stage-view tile; each window's generated `StageTile` is built from it.
+#[derive(Clone)]
+struct TileRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    front: bool,
+}
+
+/// Sets `$props` on `$target`, a window with the `stage-*` properties, whose
+/// tile type is the generated `StageTile` named by the path `$tile`.
 macro_rules! apply_stage {
-    ($target:expr, $props:expr) => {{
+    ($target:expr, $props:expr, $($tile:ident)::+) => {{
         let (t, p) = (&$target, &$props);
         t.set_stage_card_title(p.card.0.into());
         t.set_stage_card_body(p.card.1.into());
@@ -1953,7 +1960,18 @@ macro_rules! apply_stage {
         t.set_stage_image_y(p.rect.1);
         t.set_stage_image_w(p.rect.2);
         t.set_stage_image_h(p.rect.3);
-        t.set_stage_tiles(slint::ModelRc::new(slint::VecModel::from(p.tiles.clone())));
+        let tiles: Vec<$($tile)::+> = p
+            .tiles
+            .iter()
+            .map(|r| $($tile)::+ {
+                x: r.x,
+                y: r.y,
+                width: r.width,
+                height: r.height,
+                front: r.front,
+            })
+            .collect();
+        t.set_stage_tiles(slint::ModelRc::new(slint::VecModel::from(tiles)));
     }};
 }
 
@@ -1990,7 +2008,7 @@ fn stage_props(controller: &AppController) -> StageProps {
                         let r = mark.rect;
                         let x0 = scale(r.x, x, w, extent.width);
                         let y0 = scale(r.y, y, h, extent.height);
-                        StageTile {
+                        TileRect {
                             x: x0,
                             y: y0,
                             width: scale(r.x + r.width, x, w, extent.width) - x0,
@@ -2019,12 +2037,12 @@ fn stage_props(controller: &AppController) -> StageProps {
 pub fn push_stage_view(app: &AppWindow, controller: &AppController) {
     let props = stage_props(controller);
     app.set_composite_label(props.label.as_str().into());
-    apply_stage!(app, props);
+    apply_stage!(app, props, focusforge_ui::StageTile);
     if controller.detached_pane() == Some(PaneSource::Composite) {
         COMPARISON_WINDOW.with(|slot| {
             if let Some(window) = slot.borrow().as_ref() {
                 window.set_pane_label(props.label.as_str().into());
-                apply_stage!(window, props);
+                apply_stage!(window, props, comparison::StageTile);
             }
         });
     }
@@ -3200,10 +3218,16 @@ pub fn install(
     toast_timer: Rc<RefCell<Option<slint::Timer>>>,
 ) -> Installed {
     TOAST_SLOT.with(|slot| *slot.borrow_mut() = Rc::downgrade(&toast_timer));
-    controller
-        .lock()
-        .unwrap()
-        .set_heat_ramp(heat_ramp(&app.global::<Theme>()));
+    controller.lock().unwrap().set_heat_ramp({
+        let theme = app.global::<Theme>();
+        heat_ramp([
+            theme.get_surface_canvas(),
+            theme.get_accent_subtle(),
+            theme.get_accent_pressed(),
+            theme.get_accent_default(),
+            theme.get_text_primary(),
+        ])
+    });
     let job_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
     let load_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
     let preview_timer = slint::Timer::default();
@@ -4067,7 +4091,7 @@ pub fn install(
             }
             COMPARISON_WINDOW.with(|slot| {
                 if let Some(window) = slot.borrow().as_ref() {
-                    window.global::<Theme>().set_reduce_motion(on);
+                    window.global::<comparison::Theme>().set_reduce_motion(on);
                 }
             });
         }
@@ -6198,19 +6222,33 @@ mod tests {
         let detached = super::COMPARISON_WINDOW
             .with(|slot| slot.borrow().as_ref().cloned())
             .expect("the detached window is kept");
-        let fade = || detached.global::<super::Theme>().get_motion_fast();
+        let fade = || {
+            detached
+                .global::<super::comparison::Theme>()
+                .get_motion_fast()
+        };
         assert!(
-            detached.global::<super::Theme>().get_reduce_motion(),
+            detached
+                .global::<super::comparison::Theme>()
+                .get_reduce_motion(),
             "a window opened under reduced motion starts with it"
         );
         assert_eq!(fade(), 0);
 
         rig.app.invoke_appearance_reduce_motion_toggled(false);
-        assert!(!detached.global::<super::Theme>().get_reduce_motion());
+        assert!(
+            !detached
+                .global::<super::comparison::Theme>()
+                .get_reduce_motion()
+        );
         assert_eq!(fade(), 150);
 
         rig.app.invoke_appearance_reduce_motion_toggled(true);
-        assert!(detached.global::<super::Theme>().get_reduce_motion());
+        assert!(
+            detached
+                .global::<super::comparison::Theme>()
+                .get_reduce_motion()
+        );
         assert!(rig.app.global::<super::Theme>().get_reduce_motion());
         assert!(rig.controller.lock().unwrap().reduce_motion());
         super::hide_comparison();
