@@ -47,6 +47,7 @@
 **Working through a whole session**
 - Use the desktop app, or script the same steps from the command line
 - Pause, cancel and pick up long runs later without starting over
+- See how long the whole run will take before it starts and how much is left while it runs, in the window and on the command-line progress line
 - Save your favourite settings as presets; re-run only the one stack you want to tweak
 - A summary after each batch shows which stacks worked, so nothing goes missing quietly
 - Problems and notices collect in one place, and reach you as a system notification while you're in another app

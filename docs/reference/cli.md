@@ -388,7 +388,15 @@ because this example passes `--cpu`; omit it on a default build with a
 usable adapter present and it instead names the adapter, for example `NVIDIA
 GeForce RTX 5070 Ti (backend=Vulkan, driver=NVIDIA, driver_info=595.84)`.)
 `--no-progress` suppresses only the ticking progress line — per-frame while
-brightness is prepared and alignment runs, per-tile once fusion starts. `stages`' `workers=?`/`peak=?` here mean `--no-align` never
+brightness is prepared and alignment runs, per-tile once fusion starts. Every
+stage's line ends in `eta <time>`: the time left in the whole run, not the
+current stage. It reads `--` until a prediction exists, `<1s` under a second,
+`Ns` under a minute and `M:SS` from a minute up, and it never rises while a
+stage runs. Once the first develop or align stage completes, the remaining
+estimate is scaled by that stage's pace against its prediction (a pace above 1
+counts as 1). The GUI bottom bar shows the same value as `ETA M:SS`
+(`ETA H:MM:SS` from an hour), `estimating` before one exists and `ETA —` while
+paused, cancelling or failed. `stages`' `workers=?`/`peak=?` here mean `--no-align` never
 entered the alignment stage at all — a real run reports numbers instead
 (see below).
 
