@@ -47,13 +47,13 @@ impl ProgressMode {
     }
 }
 
-/// `develop`/`prepare <done>/<total> frames eta <eta>` while that stage counts
-/// frames; `align <done>/<total> frames` while a computed align stage runs;
-/// otherwise `fuse <done>/<total> tiles <pct>% eta <eta>`. `<eta>` reads `--`
-/// until the first unit completes, and a sub-second estimate renders as `<1s`
-/// rather than a `0s` that would read as "finished" mid-run.
+/// `develop`/`prepare`/`align <done>/<total> frames eta <eta>` while that stage
+/// counts frames; otherwise `fuse <done>/<total> tiles <pct>% eta <eta>`.
+/// `<eta>` is the time left in the whole run, not just the current stage. It
+/// reads `--` only while no prediction exists, and a sub-second estimate
+/// renders as `<1s` rather than a `0s` that would read as "finished" mid-run.
 pub fn format_line(progress: &JobProgress) -> String {
-    let eta = eta_text(progress.eta);
+    let eta = eta_text(progress.total_eta);
     if progress.stage == JobStage::Develop && progress.develop_total > 0 {
         return format!(
             "develop {}/{} frames eta {eta}",
@@ -68,7 +68,7 @@ pub fn format_line(progress: &JobProgress) -> String {
     }
     if progress.stage == JobStage::Align && progress.align_total > 0 {
         return format!(
-            "align {}/{} frames",
+            "align {}/{} frames eta {eta}",
             progress.align_done, progress.align_total
         );
     }
@@ -89,7 +89,13 @@ pub fn format_line(progress: &JobProgress) -> String {
 fn eta_text(eta: Option<Duration>) -> String {
     match eta {
         Some(duration) if duration < Duration::from_secs(1) => "<1s".to_string(),
-        Some(duration) => format!("{}s", duration.as_secs()),
+        Some(duration) if duration < Duration::from_secs(60) => {
+            format!("{}s", duration.as_secs())
+        }
+        Some(duration) => {
+            let secs = duration.as_secs();
+            format!("{}:{:02}", secs / 60, secs % 60)
+        }
         None => "--".to_string(),
     }
 }
@@ -224,7 +230,11 @@ mod tests {
     use focusforge_core::job::JobStage;
     use std::time::Duration;
 
-    fn progress(units_done: usize, unit_total: usize, eta: Option<Duration>) -> JobProgress {
+    /// The per-stage value every fixture carries: a front end that read it
+    /// would print `12:57`, a token no assertion below expects.
+    const STAGE_ETA: Duration = Duration::from_secs(777);
+
+    fn progress(units_done: usize, unit_total: usize, total_eta: Option<Duration>) -> JobProgress {
         JobProgress {
             stage: JobStage::Fuse,
             units_done,
@@ -232,14 +242,14 @@ mod tests {
             pixels_done: units_done as u64,
             pixel_total: unit_total as u64,
             running: Duration::from_secs(1),
-            eta,
+            eta: Some(STAGE_ETA),
             align_done: 0,
             align_total: 0,
             prepare_done: 0,
             prepare_total: 0,
             develop_done: 0,
             develop_total: 0,
-            total_eta: None,
+            total_eta,
         }
     }
 
@@ -251,7 +261,7 @@ mod tests {
             pixels_done: 0,
             pixel_total: 0,
             running: Duration::from_secs(1),
-            eta: None,
+            eta: Some(STAGE_ETA),
             align_done,
             align_total,
             prepare_done: 0,
@@ -271,8 +281,11 @@ mod tests {
         }
     }
 
-    fn with_eta(progress: JobProgress, eta: Option<Duration>) -> JobProgress {
-        JobProgress { eta, ..progress }
+    fn with_eta(progress: JobProgress, total_eta: Option<Duration>) -> JobProgress {
+        JobProgress {
+            total_eta,
+            ..progress
+        }
     }
 
     fn develop_progress(develop_done: usize, develop_total: usize) -> JobProgress {
@@ -280,7 +293,6 @@ mod tests {
             stage: JobStage::Develop,
             develop_done,
             develop_total,
-            total_eta: None,
             ..progress(0, 0, None)
         }
     }
@@ -309,7 +321,7 @@ mod tests {
         );
         assert_eq!(
             at(5, 20, Some(Duration::from_secs(90))),
-            "develop 5/20 frames eta 90s"
+            "develop 5/20 frames eta 1:30"
         );
     }
 
@@ -345,8 +357,76 @@ mod tests {
 
     #[test]
     fn format_line_renders_the_align_frame_count() {
-        assert_eq!(format_line(&align_progress(3, 8)), "align 3/8 frames");
-        assert_eq!(format_line(&align_progress(61, 61)), "align 61/61 frames");
+        let at = |done, total, eta| format_line(&with_eta(align_progress(done, total), eta));
+        let secs = |s| Some(Duration::from_secs(s));
+        assert_eq!(at(3, 8, secs(42)), "align 3/8 frames eta 42s");
+        assert_eq!(at(8, 8, secs(95)), "align 8/8 frames eta 1:35");
+        assert_eq!(at(61, 61, secs(40)), "align 61/61 frames eta 40s");
+        assert_eq!(at(0, 8, None), "align 0/8 frames eta --");
+    }
+
+    #[test]
+    fn every_stage_line_renders_the_total_run_eta_over_the_stage_value() {
+        let total = Some(Duration::from_secs(125));
+        for (stage, base, expected) in [
+            (
+                "develop",
+                develop_progress(2, 9),
+                "develop 2/9 frames eta 2:05",
+            ),
+            (
+                "prepare",
+                prepare_progress(2, 9),
+                "prepare 2/9 frames eta 2:05",
+            ),
+            ("align", align_progress(3, 8), "align 3/8 frames eta 2:05"),
+            (
+                "fuse",
+                progress(12, 64, None),
+                "fuse 12/64 tiles 18% eta 2:05",
+            ),
+        ] {
+            assert_eq!(format_line(&with_eta(base, total)), expected, "{stage}");
+        }
+    }
+
+    #[test]
+    fn every_stage_line_without_a_total_reads_dashes_despite_a_stage_value() {
+        for (stage, base) in [
+            ("develop", develop_progress(2, 9)),
+            ("prepare", prepare_progress(2, 9)),
+            ("align", align_progress(3, 8)),
+            ("fuse", progress(12, 64, None)),
+        ] {
+            let unseeded = JobProgress {
+                eta: Some(Duration::from_secs(42)),
+                total_eta: None,
+                ..base
+            };
+            let line = format_line(&unseeded);
+            assert!(line.ends_with(" eta --"), "{stage}: {line}");
+        }
+    }
+
+    #[test]
+    fn eta_token_switches_to_minutes_at_sixty_seconds() {
+        for (millis, expected) in [
+            (850, "<1s"),
+            (1_000, "1s"),
+            (59_000, "59s"),
+            (59_999, "59s"),
+            (60_000, "1:00"),
+            (90_000, "1:30"),
+            (3_599_000, "59:59"),
+            (3_600_000, "60:00"),
+            (45_296_000, "754:56"),
+        ] {
+            let line = format_line(&progress(5, 64, Some(Duration::from_millis(millis))));
+            assert!(
+                line.ends_with(&format!(" eta {expected}")),
+                "{millis} ms: {line}"
+            );
+        }
     }
 
     #[test]

@@ -1431,10 +1431,9 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
                 frames,
                 source: AlignSource::Computed,
             } => renderer.stage(&format!("align {frames} frames")),
-            // A fuse-stage entry line, unconditional and immediate (`eta
-            // --`, since no unit has finished yet): it gives a script or a
-            // human watching a redirected log a fact the instant the job
-            // starts.
+            // A fuse-stage entry line, unconditional and immediate, carrying
+            // the whole run's remaining time: it gives a script or a human
+            // watching a redirected log a fact the instant the job starts.
             RunStage::Fuse => renderer.start(&self.control.progress()),
             RunStage::Seal => renderer.stage("seal project"),
             // The completion line's exact wording is what `job_cli.rs`
