@@ -252,6 +252,7 @@ tool_selftest "download selftest" python3 tools/lib/download.py --selftest
 tool_selftest "make-fixtures selftest" python3 tools/lib/make_fixtures.py --selftest
 run_gate "test bodies"      python3 tools/check-test-bodies.py
 tool_selftest "test bodies selftest" python3 tools/check-test-bodies.py --selftest
+tool_selftest "generated UI size selftest" python3 tools/check-ui-size.py --selftest
 tool_selftest "manual screenshot lists" python3 tools/manual-screenshots.py --selftest
 run_gate "manual coverage" python3 tools/check-manual-coverage.py
 tool_selftest "manual coverage selftest" python3 tools/check-manual-coverage.py --selftest
@@ -346,6 +347,14 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
   [ "$QUICK" -eq 1 ] || run_gate "theme sheet feature" tools/with-lock.sh build -- \
                               sh -c 'cargo clippy -p focusforge-gui --features theme-sheet --all-targets -- -D warnings \
                                 && cargo nextest run -p focusforge-gui --features theme-sheet --test theme'
+  # Asks cargo for the builds above (a no-op) and compares the generated Slint files with
+  # their budgets. Linux only: the sizes come from the .slint sources, not the OS.
+  if [ "$(uname -s)" = Linux ]; then
+    UI_SIZE_BUILDS="--build tests"
+    [ "$QUICK" -eq 1 ] || UI_SIZE_BUILDS="--build tests --build theme-sheet"
+    # shellcheck disable=SC2086
+    run_gate "generated UI size" tools/with-lock.sh build -- python3 tools/check-ui-size.py $UI_SIZE_BUILDS
+  fi
   [ "$QUICK" -eq 1 ] || run_gate "rustdoc"        tools/with-lock.sh build -- \
                               env RUSTDOCFLAGS="-D warnings" \
                               cargo doc --workspace --no-deps --document-private-items
