@@ -119,6 +119,21 @@ fn resolve_backend(
     }
 }
 
+/// The accelerator for the sharpness maps and the sharp-area count: the lazy
+/// GPU backend when the `gpu` feature is on, which logs its choice and prints
+/// nothing; otherwise `None`.
+fn sharpness_backend() -> Option<&'static dyn focusforge_core::gpu::SharpnessBackend> {
+    #[cfg(feature = "gpu")]
+    {
+        focusforge_gpu::harness::sharpness_backend_for(false, None)
+            .map(|backend| backend as &'static dyn focusforge_core::gpu::SharpnessBackend)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        None
+    }
+}
+
 /// Resolves whether the align stage takes the GPU path or the CPU one, as
 /// [`resolve_backend`] does for fusion: `#[cfg(feature = "gpu")]` delegates to
 /// [`gpu::resolve_align_backend`]; with the feature off, always

@@ -16,6 +16,7 @@
 pub mod convert;
 pub mod pyramid;
 pub mod select;
+pub(crate) mod sharpness;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;

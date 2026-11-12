@@ -5839,6 +5839,10 @@ impl AppController {
         let hold = self.analytics_hold;
         let tile_pause = self.analytics_tile_pause;
         let tile_size = self.analytics_tile_size;
+        let backend = focusforge_gpu::harness::sharpness_backend_for(
+            !self.performance.gpu,
+            self.performance.max_vram_bytes(),
+        );
         self.stop_analytics_count();
         let analytics = &mut self.state.analytics;
         analytics.tab = Some(id);
@@ -5872,15 +5876,20 @@ impl AppController {
             };
             // A stopped count parks nothing, so it cannot replace the
             // snapshot of the count that superseded it.
-            let result =
-                match analytics::count_frames(&frames, tile_size, &*control, &mut |counts| {
+            let result = match analytics::count_frames(
+                &frames,
+                tile_size,
+                &*control,
+                &mut |counts| {
                     park(AnalyticsSnapshot::Partial(counts.to_vec()));
                     std::thread::sleep(tile_pause);
-                }) {
-                    Ok(counts) => Ok(counts),
-                    Err(CountError::Failed(message)) => Err(message),
-                    Err(CountError::Stopped) => return,
-                };
+                },
+                backend,
+            ) {
+                Ok(counts) => Ok(counts),
+                Err(CountError::Failed(message)) => Err(message),
+                Err(CountError::Stopped) => return,
+            };
             park(AnalyticsSnapshot::Done(result));
         }));
         self.apply_analytics_priority();

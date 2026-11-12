@@ -6,9 +6,10 @@
 
 use std::path::PathBuf;
 
+use focusforge_core::gpu::SharpnessBackend;
 use focusforge_core::io::open_frame_set;
 use focusforge_core::params::ParamValues;
-use focusforge_core::sharp_areas::{SharpAreasError, count_sharp_areas_reporting};
+use focusforge_core::sharp_areas::{SharpAreasError, count_sharp_areas_reporting_with_backend};
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 use focusforge_core::tile::{HostBudget, TileControl};
 use focusforge_core::zmap::source_color;
@@ -104,12 +105,14 @@ pub(crate) fn pending_rows(frames: &[PathBuf]) -> Vec<AnalyticsRow> {
 /// The per-frame sharp-area counts of `frames`, by the same two core calls
 /// and defaults as the command line, read in tiles of `tile_size` (the
 /// command line's default when `None`);
-/// `on_tile` is given the counts so far after each tile.
-pub(crate) fn count_frames(
+/// `on_tile` is given the counts so far after each tile. `backend` scores the
+/// frame tiles when the stack is large enough for it.
+pub(crate) fn count_frames<B: SharpnessBackend>(
     frames: &[PathBuf],
     tile_size: Option<u32>,
     control: &dyn TileControl,
     on_tile: &mut dyn FnMut(&[u32]),
+    backend: Option<&B>,
 ) -> Result<Vec<u32>, CountError> {
     let set = open_frame_set(
         frames,
@@ -117,7 +120,7 @@ pub(crate) fn count_frames(
     )
     .map_err(|err| CountError::Failed(err.to_string()))?;
     let reader = set.reader.as_ref();
-    count_sharp_areas_reporting(
+    count_sharp_areas_reporting_with_backend(
         reader,
         reader.len(),
         reader.dimensions(),
@@ -126,6 +129,7 @@ pub(crate) fn count_frames(
         tile_size.unwrap_or(DEFAULT_TILE_SIZE),
         control,
         on_tile,
+        backend.map(|b| b as &dyn SharpnessBackend),
     )
     .map(|areas| areas.counts)
     .map_err(|err| match err {
@@ -136,6 +140,8 @@ pub(crate) fn count_frames(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     fn frames(n: usize) -> Vec<PathBuf> {
@@ -152,6 +158,74 @@ mod tests {
         assert_eq!(rows[1].name, "01.tif");
         assert_eq!(rows[2].chip, source_color(2, 3));
         assert!(rows.iter().all(|r| r.mm_text.is_empty()));
+    }
+
+    /// Declines every tile after counting the offer, so the count runs on the CPU.
+    #[derive(Default)]
+    struct Offers {
+        min_pixel_frames: Option<u64>,
+        calls: AtomicUsize,
+    }
+
+    impl SharpnessBackend for Offers {
+        fn min_pixel_frames(&self) -> u64 {
+            self.min_pixel_frames
+                .unwrap_or(focusforge_core::sharp_areas::SHARPNESS_BACKEND_MIN_PIXEL_FRAMES)
+        }
+
+        fn score_tile(
+            &self,
+            _: &dyn focusforge_core::algorithm::TileReader,
+            _: usize,
+            _: focusforge_core::tile::Rect,
+            _: u32,
+        ) -> Result<Option<Vec<f32>>, focusforge_core::algorithm::AlgorithmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+
+    fn mantis_frames(n: usize) -> Vec<PathBuf> {
+        (0..n)
+            .map(|i| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/mantis-512/frames")
+                    .join(format!("{i:02}.tif"))
+            })
+            .collect()
+    }
+
+    fn count_with(backend: Option<&Offers>) -> Vec<u32> {
+        count_frames(
+            &mantis_frames(3),
+            Some(200),
+            &focusforge_core::tile::NoControl,
+            &mut |_| {},
+            backend,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn analytics_gpu_offers_every_frame_tile_at_a_zero_threshold() {
+        let offers = Offers {
+            min_pixel_frames: Some(0),
+            ..Default::default()
+        };
+        let counts = count_with(Some(&offers));
+        assert_eq!(counts, count_with(None));
+        let tiles = focusforge_core::sharp_areas::sharpness_plan((512, 512), 200)
+            .unwrap()
+            .tiles()
+            .len();
+        assert_eq!(offers.calls.load(Ordering::SeqCst), 3 * tiles);
+    }
+
+    #[test]
+    fn analytics_gpu_offers_nothing_under_the_default_threshold() {
+        let offers = Offers::default();
+        assert_eq!(count_with(Some(&offers)), count_with(None));
+        assert_eq!(offers.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

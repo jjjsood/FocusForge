@@ -15,6 +15,7 @@ use crate::algorithm::{AlgorithmError, TileReader};
 use crate::fuse::PyramidError;
 use crate::fuse::laplacian::score_plane;
 use crate::fuse::sharpness::{DETAIL_REACH, detail_plane};
+use crate::gpu::SharpnessBackend;
 use crate::params::{self, ParamDesc, ParamError, ParamKind, ParamValue, ParamValues};
 use crate::tile::plan::TileSupport;
 use crate::tile::{
@@ -22,7 +23,12 @@ use crate::tile::{
 };
 
 /// Radius of the box the focus score sums over, the depth map's default.
-pub(crate) const SCORE_RADIUS: u32 = 4;
+pub const SCORE_RADIUS: u32 = 4;
+
+/// The run size, in pixel-frames, from which a [`SharpnessBackend`] is
+/// offered the tile scores: below it, starting a device costs more than it
+/// saves.
+pub const SHARPNESS_BACKEND_MIN_PIXEL_FRAMES: u64 = 100_000_000;
 
 /// The count's inputs, in the shape every front end reads.
 pub static SHARP_AREA_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
@@ -182,10 +188,45 @@ pub(crate) fn frame_workers() -> Result<(rayon::ThreadPool, HostBudgetGate), Til
     Ok((pool, gate))
 }
 
+/// `backend` when a run of `frames` frames of `extent` reaches its
+/// [`SharpnessBackend::min_pixel_frames`], else `None`.
+pub(crate) fn eligible_backend(
+    backend: Option<&dyn SharpnessBackend>,
+    frames: usize,
+    (width, height): (u32, u32),
+) -> Option<&dyn SharpnessBackend> {
+    let pixel_frames = frames as u64 * u64::from(width) * u64::from(height);
+    backend.filter(|backend| pixel_frames >= backend.min_pixel_frames())
+}
+
+/// The focus score of `frame` over `read`: from `backend` unless it declines,
+/// fails after a device loss, or has reported one, else on the CPU.
+fn score_tile_on(
+    backend: Option<&dyn SharpnessBackend>,
+    reader: &dyn TileReader,
+    frame: usize,
+    read: Rect,
+    spp: u32,
+    samples: &mut Vec<u16>,
+) -> Result<Vec<f32>, SharpAreasError> {
+    if let Some(backend) = backend.filter(|backend| !backend.device_lost()) {
+        match backend.score_tile(reader, frame, read, spp) {
+            Ok(Some(scores)) => return Ok(scores),
+            Ok(None) => {}
+            Err(error) if backend.device_lost() => {
+                tracing::info!(%error, "device lost; the sharpness scores finish on the CPU");
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    score_tile(reader, frame, read, spp, samples)
+}
+
 /// Scores `read` in every frame, the frames in parallel, and hands frame `i`'s
 /// scores to `fold` with `rows[i]`. `control` is asked to stop before each
 /// read and told of each finished one; a read or detail error wins over the
-/// stop the other workers then see.
+/// stop the other workers then see. `backend` scores the frame when given;
+/// see [`SharpnessBackend::score_tile`] for what falls back to the CPU.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn score_frames_of_tile<A: Send>(
     pool: &rayon::ThreadPool,
@@ -194,6 +235,7 @@ pub(crate) fn score_frames_of_tile<A: Send>(
     read: Rect,
     spp: u32,
     control: &dyn TileControl,
+    backend: Option<&dyn SharpnessBackend>,
     rows: &mut [A],
     fold: impl Fn(&mut A, &[f32]) + Sync,
 ) -> Result<(), SharpAreasError> {
@@ -206,7 +248,7 @@ pub(crate) fn score_frames_of_tile<A: Send>(
                 if control.should_stop() {
                     return Err(());
                 }
-                match score_tile(reader, frame, read, spp, samples) {
+                match score_tile_on(backend, reader, frame, read, spp, samples) {
                     Ok(scores) => fold(row, &scores),
                     Err(error) => {
                         first_error.lock().unwrap().get_or_insert(error);
@@ -264,13 +306,36 @@ pub fn count_sharp_areas(
 pub fn count_sharp_areas_reporting(
     reader: &dyn TileReader,
     frames: usize,
-    (width, height): (u32, u32),
+    extent: (u32, u32),
     spp: u32,
     values: &ParamValues,
     tile_size: u32,
     control: &dyn TileControl,
     on_tile: &mut dyn FnMut(&[u32]),
 ) -> Result<SharpAreas, SharpAreasError> {
+    count_sharp_areas_reporting_with_backend(
+        reader, frames, extent, spp, values, tile_size, control, on_tile, None,
+    )
+}
+
+/// [`count_sharp_areas_reporting`] with the frame tile scores computed by
+/// `backend` when the run reaches its [`SharpnessBackend::min_pixel_frames`];
+/// the per-cell sums and decisions stay on the host in `f64`, so the result
+/// differs from the CPU count only where a cell's score lies within the
+/// backend's score error of a decision rule.
+#[allow(clippy::too_many_arguments)]
+pub fn count_sharp_areas_reporting_with_backend(
+    reader: &dyn TileReader,
+    frames: usize,
+    (width, height): (u32, u32),
+    spp: u32,
+    values: &ParamValues,
+    tile_size: u32,
+    control: &dyn TileControl,
+    on_tile: &mut dyn FnMut(&[u32]),
+    backend: Option<&dyn SharpnessBackend>,
+) -> Result<SharpAreas, SharpAreasError> {
+    let backend = eligible_backend(backend, frames, (width, height));
     params::validate(&SHARP_AREA_PARAMS, values)?;
     let resolved = params::resolved_values(&params::resolve_in(
         &SHARP_AREA_PARAMS,
@@ -333,6 +398,7 @@ pub fn count_sharp_areas_reporting(
             read,
             spp,
             control,
+            backend,
             &mut sums,
             |frame_sums, scores| {
                 for y in interior.y..interior.y + interior.height {
@@ -380,6 +446,79 @@ pub fn count_sharp_areas_reporting(
         counts,
         overlaps,
     })
+}
+
+/// A [`crate::gpu::SharpnessBackend`] for tests: the CPU scores times
+/// `1 + 1e-6`, with scripted declines and failures, counting its calls.
+#[cfg(test)]
+pub(crate) mod double {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::gpu::SharpnessBackend;
+    use crate::io::{FrameError, TiffError};
+
+    pub(crate) const PERTURBATION: f32 = 1e-6;
+
+    #[derive(Default)]
+    pub(crate) struct Double {
+        pub(crate) min_pixel_frames: u64,
+        pub(crate) calls: AtomicUsize,
+        pub(crate) decline_every_second: bool,
+        /// From this call number (1-based) on, every call fails.
+        pub(crate) fail_from: Option<usize>,
+        /// Whether a failure also marks the device lost.
+        pub(crate) fail_loses_device: bool,
+        pub(crate) lost: AtomicBool,
+        pub(crate) calls_after_loss: AtomicUsize,
+    }
+
+    impl SharpnessBackend for Double {
+        fn min_pixel_frames(&self) -> u64 {
+            self.min_pixel_frames
+        }
+
+        fn device_lost(&self) -> bool {
+            self.lost.load(Ordering::SeqCst)
+        }
+
+        fn score_tile(
+            &self,
+            reader: &dyn TileReader,
+            frame: usize,
+            read: Rect,
+            spp: u32,
+        ) -> Result<Option<Vec<f32>>, AlgorithmError> {
+            if self.lost.load(Ordering::SeqCst) {
+                self.calls_after_loss.fetch_add(1, Ordering::SeqCst);
+            }
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_from.is_some_and(|from| call >= from) {
+                self.lost.store(self.fail_loses_device, Ordering::SeqCst);
+                return Err(AlgorithmError::Frame(FrameError::Tiff(
+                    TiffError::BufferSize {
+                        expected: 0,
+                        got: 1,
+                    },
+                )));
+            }
+            if self.decline_every_second && call.is_multiple_of(2) {
+                return Ok(None);
+            }
+            let scores = score_tile(reader, frame, read, spp, &mut Vec::new()).map_err(
+                |error| match error {
+                    SharpAreasError::Read(read) => read,
+                    other => panic!("the double reads a valid tile: {other}"),
+                },
+            )?;
+            Ok(Some(
+                scores
+                    .into_iter()
+                    .map(|score| score * (1.0 + PERTURBATION))
+                    .collect(),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -483,6 +622,101 @@ mod tests {
             TILE,
             &NoControl,
         )
+    }
+
+    fn counted(double: Option<&double::Double>) -> SharpAreas {
+        let reader = split_stack();
+        count_sharp_areas_reporting_with_backend(
+            &reader,
+            3,
+            (WIDTH, HEIGHT),
+            1,
+            &ParamValues::new(),
+            TILE,
+            &NoControl,
+            &mut |_| {},
+            double.map(|d| d as &dyn crate::gpu::SharpnessBackend),
+        )
+        .unwrap()
+    }
+
+    fn frame_tiles() -> usize {
+        3 * sharpness_plan((WIDTH, HEIGHT), TILE).unwrap().tiles().len()
+    }
+
+    #[test]
+    fn sharpness_backend_threshold_is_a_hundred_million_pixel_frames() {
+        assert_eq!(SHARPNESS_BACKEND_MIN_PIXEL_FRAMES, 100_000_000);
+    }
+
+    #[test]
+    fn sharpness_backend_is_not_offered_work_under_its_threshold() {
+        let double = double::Double {
+            min_pixel_frames: 3 * u64::from(WIDTH) * u64::from(HEIGHT) + 1,
+            ..Default::default()
+        };
+        assert_eq!(counted(Some(&double)), counted(None));
+        assert_eq!(double.calls.load(Ordering::SeqCst), 0);
+        let at_threshold = double::Double {
+            min_pixel_frames: 3 * u64::from(WIDTH) * u64::from(HEIGHT),
+            ..Default::default()
+        };
+        counted(Some(&at_threshold));
+        assert_eq!(at_threshold.calls.load(Ordering::SeqCst), frame_tiles());
+    }
+
+    #[test]
+    fn sharpness_backend_scores_give_the_cpu_counts() {
+        let double = double::Double::default();
+        assert_eq!(counted(Some(&double)), counted(None));
+        assert_eq!(double.calls.load(Ordering::SeqCst), frame_tiles());
+    }
+
+    #[test]
+    fn sharpness_backend_declines_and_losses_leave_the_cpu_result() {
+        let declining = double::Double {
+            decline_every_second: true,
+            ..Default::default()
+        };
+        assert_eq!(counted(Some(&declining)), counted(None));
+        assert_eq!(declining.calls.load(Ordering::SeqCst), frame_tiles());
+
+        let losing = double::Double {
+            fail_from: Some(3),
+            fail_loses_device: true,
+            ..Default::default()
+        };
+        assert_eq!(counted(Some(&losing)), counted(None));
+        assert_eq!(
+            losing.calls.load(Ordering::SeqCst),
+            3,
+            "no call after the loss"
+        );
+        assert_eq!(losing.calls_after_loss.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn sharpness_backend_error_without_a_loss_fails_the_count() {
+        let failing = double::Double {
+            fail_from: Some(3),
+            ..Default::default()
+        };
+        let reader = split_stack();
+        let result = count_sharp_areas_reporting_with_backend(
+            &reader,
+            3,
+            (WIDTH, HEIGHT),
+            1,
+            &ParamValues::new(),
+            TILE,
+            &NoControl,
+            &mut |_| {},
+            Some(&failing),
+        );
+        assert!(
+            matches!(result, Err(SharpAreasError::Read(_))),
+            "{result:?}"
+        );
     }
 
     #[test]

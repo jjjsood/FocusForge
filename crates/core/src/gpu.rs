@@ -18,6 +18,7 @@ use rayon::prelude::*;
 use crate::algorithm::{AlgorithmError, TileOutput, TileReader};
 use crate::align::warp::WarpedTile;
 use crate::align::{AlignError, ECC_BACKEND_MIN_REGION_PX, Transform};
+use crate::sharp_areas::SHARPNESS_BACKEND_MIN_PIXEL_FRAMES;
 use crate::tile::{Rect, SampleFormat, Tile};
 
 /// The adapter facts a [`TileBackend`] implementation was built on: plain
@@ -232,6 +233,35 @@ pub trait AlignBackend: Send + Sync {
         &self,
         request: &EccSessionRequest<'_>,
     ) -> Result<Option<Box<dyn EccMomentSession>>, AlgorithmError>;
+}
+
+/// An optional accelerator for the stack sharpness passes (the maps and the
+/// sharp-area count). Object-safe and `Send + Sync` for the same reason as
+/// [`TileBackend`].
+pub trait SharpnessBackend: Send + Sync {
+    /// The fewest pixel-frames (`frames × width × height`) of a run at which
+    /// the backend is offered its tiles; a smaller run never calls it.
+    fn min_pixel_frames(&self) -> u64 {
+        SHARPNESS_BACKEND_MIN_PIXEL_FRAMES
+    }
+
+    /// `true` once the backend's device has been lost; the run then finishes
+    /// on the CPU and the backend is not called again.
+    fn device_lost(&self) -> bool {
+        false
+    }
+
+    /// The focus score of `frame` over `read`, one value per pixel of `read`
+    /// (channels summed), or `Ok(None)` to decline the tile, which then runs
+    /// on the CPU. An error after which [`Self::device_lost`] is `true` also
+    /// leaves the tile to the CPU; any other error fails the run.
+    fn score_tile(
+        &self,
+        reader: &dyn TileReader,
+        frame: usize,
+        read: Rect,
+        samples_per_pixel: u32,
+    ) -> Result<Option<Vec<f32>>, AlgorithmError>;
 }
 
 /// The rayon CPU twin of the self-check kernel every [`TileBackend`]

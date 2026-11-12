@@ -13,14 +13,14 @@ use focusforge_core::algorithm::{AlgorithmError, TileOutput, TileReader};
 use focusforge_core::align::warp::WarpedTile;
 use focusforge_core::align::{AlignError, Transform};
 use focusforge_core::gpu::{
-    AlignBackend, BackendInfo, EccMomentSession, EccSessionRequest, TileBackend,
+    AlignBackend, BackendInfo, EccMomentSession, EccSessionRequest, SharpnessBackend, TileBackend,
 };
 use focusforge_core::tile::{Rect, SampleFormat, Tile};
 
 use crate::budget::{
     DeviceBudget, ProbeOutcome, VramBudget, buffer_limit_shortfalls, device_bytes_per_tile,
     dispatch_limit_shortfall, largest_buffer_bytes, max_tile_side, probe_budget,
-    tile_shortfall_message,
+    sharpness_bytes_per_tile, tile_shortfall_message,
 };
 use crate::device::{GpuError, SharedDevice, block_on, settled_device, shared_device};
 use crate::ecc::{self, EccState};
@@ -379,16 +379,8 @@ impl GpuBackend {
         );
         self.check_tile(rect.width, rect.height, samples_per_pixel, warped)?;
 
-        let _permit = self.budget.acquire(bytes);
-
-        // Both scopes are pushed and popped on this one rayon worker: wgpu
-        // routes an error to the innermost matching scope of the *raising*
-        // thread. One pair per tile, never per pyramid level -- a validation
-        // error names its kernel from the dispatch label instead.
-        let device = self.device.device();
-        let result = errors::with_validation_scope(device, || {
-            let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-            let result = crate::stack_tile::warp_fuse_tile_gpu::<O>(
+        self.scoped(bytes, || {
+            crate::stack_tile::warp_fuse_tile_gpu::<O>(
                 self.device,
                 &self.warp_pipelines,
                 &self.fuse_pipelines,
@@ -398,7 +390,27 @@ impl GpuBackend {
                 rect,
                 samples_per_pixel,
                 levels,
-            );
+            )
+        })
+    }
+
+    /// Runs one tile's device work under a budget permit of `bytes` and the
+    /// error scopes.
+    fn scoped<T>(
+        &self,
+        bytes: u64,
+        run: impl FnOnce() -> Result<T, AlgorithmError>,
+    ) -> Result<T, AlgorithmError> {
+        let _permit = self.budget.acquire(bytes);
+
+        // Both scopes are pushed and popped on this one rayon worker: wgpu
+        // routes an error to the innermost matching scope of the *raising*
+        // thread. One pair per tile, never per pyramid level -- a validation
+        // error names its kernel from the dispatch label instead.
+        let device = self.device.device();
+        let result = errors::with_validation_scope(device, || {
+            let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let result = run();
             let oom = block_on(scope.pop());
             match oom {
                 // `result`'s `Ok` value is discarded even if the dispatch
@@ -420,6 +432,41 @@ impl GpuBackend {
         forced_device_loss(self.device);
 
         result
+    }
+}
+
+impl SharpnessBackend for GpuBackend {
+    fn device_lost(&self) -> bool {
+        self.device.lost()
+    }
+
+    fn score_tile(
+        &self,
+        reader: &dyn TileReader,
+        frame: usize,
+        read: Rect,
+        samples_per_pixel: u32,
+    ) -> Result<Option<Vec<f32>>, AlgorithmError> {
+        let bytes = sharpness_bytes_per_tile(read.width, read.height, samples_per_pixel);
+        let fits = self
+            .check_tile(read.width, read.height, samples_per_pixel, false)
+            .map_err(|error| tracing::info!(%error, "sharpness tile declined"))
+            .is_ok()
+            && bytes <= self.device_budget.bytes();
+        if !fits {
+            return Ok(None);
+        }
+        self.scoped(bytes, || {
+            fuse::sharpness::score_tile(
+                self.device,
+                &self.fuse_pipelines,
+                reader,
+                frame,
+                read,
+                samples_per_pixel,
+            )
+        })
+        .map(Some)
     }
 }
 
@@ -526,6 +573,7 @@ pub fn settled_backend() -> Option<Result<&'static GpuBackend, &'static GpuError
 pub fn vram_cap_settled() -> bool {
     GPU_BACKEND.get().is_some()
         || LAZY_ALIGN_BACKEND.get().is_some()
+        || LAZY_SHARPNESS_BACKEND.get().is_some()
         || matches!(settled_device(), Some(Err(_)))
 }
 
@@ -581,7 +629,7 @@ impl LazyAlignBackend {
     /// Whether the device a level already opened is lost. `false` before any
     /// level has opened it: asking never brings the adapter up.
     pub fn lost(&self) -> bool {
-        matches!(self.selected.get(), Some(Some(backend)) if backend.device_lost())
+        matches!(self.selected.get(), Some(Some(backend)) if TileBackend::device_lost(*backend))
     }
 
     /// Brings the backend up on first call and reports the outcome to
@@ -649,6 +697,70 @@ pub fn align_backend_for(
         adapter: OnceLock::new(),
     });
     (Some(lazy), String::new())
+}
+
+/// The stack sharpness passes' accelerator, brought up on the first tile
+/// offered to it: a run below the eligibility threshold never touches the
+/// GPU. The outcome is logged once; a failed bring-up declines every tile.
+pub struct LazySharpnessBackend {
+    max_vram: Option<u64>,
+    selected: OnceLock<Option<&'static GpuBackend>>,
+}
+
+impl LazySharpnessBackend {
+    fn resolve(&self) -> Option<&'static GpuBackend> {
+        *self
+            .selected
+            .get_or_init(|| match compute_backend(self.max_vram) {
+                Ok(backend) => {
+                    tracing::info!(adapter = %backend.info(), "sharpness scores on the GPU");
+                    Some(backend)
+                }
+                Err(line) => {
+                    tracing::info!("{line}; sharpness scores on the CPU");
+                    None
+                }
+            })
+    }
+}
+
+impl SharpnessBackend for LazySharpnessBackend {
+    fn device_lost(&self) -> bool {
+        matches!(self.selected.get(), Some(Some(backend)) if SharpnessBackend::device_lost(*backend))
+    }
+
+    fn score_tile(
+        &self,
+        reader: &dyn TileReader,
+        frame: usize,
+        read: Rect,
+        samples_per_pixel: u32,
+    ) -> Result<Option<Vec<f32>>, AlgorithmError> {
+        match self.resolve() {
+            Some(backend) => {
+                SharpnessBackend::score_tile(backend, reader, frame, read, samples_per_pixel)
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+static LAZY_SHARPNESS_BACKEND: OnceLock<LazySharpnessBackend> = OnceLock::new();
+
+/// The accelerator for the stack sharpness passes, or `None` when `no_gpu`
+/// forces the CPU. No adapter is probed until the first tile of a run that
+/// reaches [`SharpnessBackend::min_pixel_frames`]. The first call's
+/// `max_vram` wins.
+pub fn sharpness_backend_for(
+    no_gpu: bool,
+    max_vram: Option<u64>,
+) -> Option<&'static LazySharpnessBackend> {
+    (!no_gpu).then(|| {
+        LAZY_SHARPNESS_BACKEND.get_or_init(|| LazySharpnessBackend {
+            max_vram,
+            selected: OnceLock::new(),
+        })
+    })
 }
 
 /// The backend a stack run computes on, or the one-line reason it computes on

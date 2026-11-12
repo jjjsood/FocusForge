@@ -7,9 +7,12 @@
 use std::sync::Mutex;
 
 use crate::algorithm::TileReader;
+use crate::gpu::SharpnessBackend;
 pub use crate::sharp_areas::sharpness_plan;
-use crate::sharp_areas::{SharpAreasError, frame_workers, score_frames_of_tile, score_tile};
-use crate::tile::{PlannedTile, TileControl};
+use crate::sharp_areas::{
+    SharpAreasError, eligible_backend, frame_workers, score_frames_of_tile, score_tile,
+};
+use crate::tile::{PlannedTile, Rect, TileControl};
 
 /// The share of pixels whose peak focus score lies at or below the scale.
 pub const SHARPNESS_PERCENTILE: f64 = 0.99;
@@ -52,6 +55,7 @@ pub fn stack_sharpness_scale(
             read,
             spp,
             control,
+            None,
             &mut vec![(); frames],
             |(), scores| {
                 let mut peaks = peaks.lock().unwrap();
@@ -96,6 +100,12 @@ pub fn sharpness_map_tile(
 ) -> Result<Vec<f32>, SharpAreasError> {
     let (read, interior) = (tile.read(), tile.interior());
     let scores = score_tile(reader, frame, read, spp, &mut Vec::new())?;
+    Ok(interior_map(&scores, read, interior, scale))
+}
+
+/// The scores over `interior`, which lies inside `read`, divided by `scale`
+/// (zeros for a `scale` that is not positive).
+fn interior_map(scores: &[f32], read: Rect, interior: Rect, scale: f32) -> Vec<f32> {
     let mut map = Vec::with_capacity(interior.width as usize * interior.height as usize);
     for y in interior.y..interior.y + interior.height {
         let start = ((y - read.y) * read.width + (interior.x - read.x)) as usize;
@@ -105,7 +115,49 @@ pub fn sharpness_map_tile(
                 .map(|score| if scale > 0.0 { score / scale } else { 0.0 }),
         );
     }
-    Ok(map)
+    map
+}
+
+/// The sharpness maps of `frames` frames of `extent` as [`sharpness_map_tile`]
+/// gives them, computed tile by tile of `tile_size`: the frames of one tile
+/// are scored in parallel (by `backend` when the run reaches its
+/// [`SharpnessBackend::min_pixel_frames`]) and `write(frame, interior, map)`
+/// is called for each frame in frame order before the next tile. `control`
+/// stops the run with [`SharpAreasError::Stopped`].
+#[allow(clippy::too_many_arguments)]
+pub fn sharpness_maps<E: From<SharpAreasError>>(
+    reader: &dyn TileReader,
+    frames: usize,
+    extent: (u32, u32),
+    spp: u32,
+    scale: f32,
+    tile_size: u32,
+    control: &dyn TileControl,
+    backend: Option<&dyn SharpnessBackend>,
+    mut write: impl FnMut(usize, Rect, &[f32]) -> Result<(), E>,
+) -> Result<(), E> {
+    let plan = sharpness_plan(extent, tile_size).map_err(SharpAreasError::from)?;
+    let backend = eligible_backend(backend, frames, extent);
+    let (pool, gate) = frame_workers().map_err(SharpAreasError::from)?;
+    let mut maps = vec![Vec::new(); frames];
+    for tile in plan.tiles() {
+        let (read, interior) = (tile.read(), tile.interior());
+        score_frames_of_tile(
+            &pool,
+            &gate,
+            reader,
+            read,
+            spp,
+            control,
+            backend,
+            &mut maps,
+            |map, scores| *map = interior_map(scores, read, interior, scale),
+        )?;
+        for (frame, map) in maps.iter().enumerate() {
+            write(frame, interior, map)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -118,6 +170,7 @@ mod tests {
     use crate::fuse::sharpness::DETAIL_REACH;
     use crate::fuse::sharpness::detail_plane;
     use crate::job::JobControl;
+    use crate::sharp_areas::double;
     use crate::sharp_areas::{SCORE_RADIUS, SharpAreasError};
     use crate::tile::{NoControl, Rect, TileControl};
 
@@ -258,6 +311,143 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `sharpness_maps` over `stack`, stitched per frame.
+    fn mapped(
+        stack: &Stack,
+        tile: u32,
+        scale: f32,
+        backend: Option<&dyn crate::gpu::SharpnessBackend>,
+    ) -> Result<Vec<Vec<f32>>, SharpAreasError> {
+        let (w, h) = (stack.width as usize, stack.height as usize);
+        let mut maps = vec![vec![f32::NAN; w * h]; stack.frames.len()];
+        sharpness_maps(
+            stack,
+            stack.frames.len(),
+            (stack.width, stack.height),
+            stack.spp,
+            scale,
+            tile,
+            &NoControl,
+            backend,
+            |frame, rect: Rect, values: &[f32]| -> Result<(), SharpAreasError> {
+                for (row, chunk) in values.chunks_exact(rect.width as usize).enumerate() {
+                    let start = (rect.y as usize + row) * w + rect.x as usize;
+                    maps[frame][start..start + chunk.len()].copy_from_slice(chunk);
+                }
+                Ok(())
+            },
+        )?;
+        Ok(maps)
+    }
+
+    fn frame_tiles(stack: &Stack, tile: u32) -> usize {
+        stack.frames.len()
+            * sharpness_plan((stack.width, stack.height), tile)
+                .unwrap()
+                .tiles()
+                .len()
+    }
+
+    fn assert_maps_close(got: &[Vec<f32>], want: &[Vec<f32>], at: &str) {
+        for (frame, (got, want)) in got.iter().zip(want).enumerate() {
+            for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 4e-6 * w.abs(),
+                    "{at}: frame {frame} value {i}: {g} vs {w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sharpness_backend_maps_match_the_per_tile_oracle() {
+        for spp in [1, 3] {
+            let stack = graded(3, 101, 67, spp);
+            let scale = scale_at(&stack, 80, &NoControl);
+            let want: Vec<Vec<f32>> = (0..3).map(|f| stitched(&stack, f, 80, scale)).collect();
+            let at = format!("spp {spp}");
+            assert_eq!(
+                mapped(&stack, 80, scale, None).unwrap(),
+                want,
+                "{at}: the CPU maps"
+            );
+            let double = double::Double::default();
+            let got = mapped(&stack, 80, scale, Some(&double)).unwrap();
+            assert_maps_close(&got, &want, &at);
+            assert_eq!(double.calls.load(Ordering::SeqCst), frame_tiles(&stack, 80));
+            let zero = mapped(&stack, 80, 0.0, Some(&double)).unwrap();
+            assert!(zero.iter().flatten().all(|v| *v == 0.0), "{at}: scale 0");
+        }
+    }
+
+    #[test]
+    fn sharpness_backend_maps_are_not_offered_work_under_its_threshold() {
+        let stack = graded(3, 101, 67, 1);
+        let scale = scale_at(&stack, 80, &NoControl);
+        let double = double::Double {
+            min_pixel_frames: 3 * 101 * 67 + 1,
+            ..Default::default()
+        };
+        let got = mapped(&stack, 80, scale, Some(&double)).unwrap();
+        assert_eq!(got, mapped(&stack, 80, scale, None).unwrap());
+        assert_eq!(double.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn sharpness_backend_maps_finish_on_the_cpu_after_declines_and_losses() {
+        for spp in [1, 3] {
+            let stack = graded(3, 101, 67, spp);
+            let scale = scale_at(&stack, 80, &NoControl);
+            let want = mapped(&stack, 80, scale, None).unwrap();
+            let declining = double::Double {
+                decline_every_second: true,
+                ..Default::default()
+            };
+            let got = mapped(&stack, 80, scale, Some(&declining)).unwrap();
+            assert_maps_close(&got, &want, "declining");
+            let losing = double::Double {
+                fail_from: Some(3),
+                fail_loses_device: true,
+                ..Default::default()
+            };
+            let got = mapped(&stack, 80, scale, Some(&losing)).unwrap();
+            assert_maps_close(&got, &want, "losing");
+            assert_eq!(losing.calls.load(Ordering::SeqCst), 3);
+            assert_eq!(losing.calls_after_loss.load(Ordering::SeqCst), 0);
+            let failing = double::Double {
+                fail_from: Some(3),
+                ..Default::default()
+            };
+            let result = mapped(&stack, 80, scale, Some(&failing));
+            assert!(
+                matches!(result, Err(SharpAreasError::Read(_))),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sharpness_backend_counts_on_three_channels_match_the_cpu() {
+        let stack = graded(3, 101, 67, 3);
+        let count = |backend: Option<&dyn crate::gpu::SharpnessBackend>| {
+            crate::sharp_areas::count_sharp_areas_reporting_with_backend(
+                &stack,
+                3,
+                (101, 67),
+                3,
+                &crate::params::ParamValues::new(),
+                80,
+                &NoControl,
+                &mut |_| {},
+                backend,
+            )
+            .unwrap()
+        };
+        let double = double::Double::default();
+        assert_eq!(count(Some(&double)), count(None));
+        assert_eq!(double.calls.load(Ordering::SeqCst), frame_tiles(&stack, 80));
     }
 
     #[test]
