@@ -21,9 +21,10 @@ use crate::tile::{PlannedTile, Rect, TileControl, TilePlan};
 /// The share of pixels whose peak focus score lies at or below the scale.
 pub const SHARPNESS_PERCENTILE: f64 = 0.99;
 
+const BIN_SHIFT: u32 = 12;
+
 /// Histogram bins over the bit patterns of finite non-negative `f32` scores
-/// (`to_bits() >> BIN_SHIFT`): a bin is 2^-11 wide relative to its value.
-pub const BIN_SHIFT: u32 = 12;
+/// (`to_bits() >> 12`): a bin is 2^-11 wide relative to its value.
 pub const BINS: usize = ((f32::MAX.to_bits() >> BIN_SHIFT) + 1) as usize;
 
 /// The most first-pass candidates, as a share of the pixels, that the exact
