@@ -318,7 +318,7 @@ mod tests {
         stack: &Stack,
         tile: u32,
         scale: f32,
-        backend: Option<&dyn crate::gpu::SharpnessBackend>,
+        backend: Option<&dyn SharpnessBackend>,
     ) -> Result<Vec<Vec<f32>>, SharpAreasError> {
         let (w, h) = (stack.width as usize, stack.height as usize);
         let mut maps = vec![vec![f32::NAN; w * h]; stack.frames.len()];
@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn sharpness_backend_counts_on_three_channels_match_the_cpu() {
         let stack = graded(3, 101, 67, 3);
-        let count = |backend: Option<&dyn crate::gpu::SharpnessBackend>| {
+        let count = |backend: Option<&dyn SharpnessBackend>| {
             crate::sharp_areas::count_sharp_areas_reporting_with_backend(
                 &stack,
                 3,

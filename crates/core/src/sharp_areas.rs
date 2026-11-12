@@ -448,14 +448,13 @@ pub fn count_sharp_areas_reporting_with_backend(
     })
 }
 
-/// A [`crate::gpu::SharpnessBackend`] for tests: the CPU scores times
+/// A [`SharpnessBackend`] for tests: the CPU scores times
 /// `1 + 1e-6`, with scripted declines and failures, counting its calls.
 #[cfg(test)]
 pub(crate) mod double {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
-    use crate::gpu::SharpnessBackend;
     use crate::io::{FrameError, TiffError};
 
     pub(crate) const PERTURBATION: f32 = 1e-6;
@@ -635,7 +634,7 @@ mod tests {
             TILE,
             &NoControl,
             &mut |_| {},
-            double.map(|d| d as &dyn crate::gpu::SharpnessBackend),
+            double.map(|d| d as &dyn SharpnessBackend),
         )
         .unwrap()
     }
