@@ -334,7 +334,7 @@ With the frames open:
 3. Watch the bottom bar. The window stays fully usable while the stack is
    being fused.
 
-![The window during a fuse: the toolbar shows Pause and Cancel, the tab carries a play mark, the Composite pane shows the card "Preparing frames", and the bottom bar shows the current stage (Aligning), the frames done (1 of 8), a progress bar and the estimated time remaining.](../assets/manual/first-stack/fuse-running.png)
+![The window during a fuse: the toolbar shows Pause and Cancel, the tab carries a play mark, the Frame pane shows 00.tif and the Composite pane shows the frame just aligned ("Aligned · 04.tif"), and the bottom bar shows the current stage (Aligning), the frames done (2 of 8), a progress bar and the estimated time remaining.](../assets/manual/first-stack/fuse-running.png)
 
 *A fuse in progress.*
 
@@ -355,8 +355,13 @@ For a camera RAW stack the bar reads **Developing** first, with the number of
 frames developed and the same time remaining. Each RAW frame is developed
 once, before the other stages, and they reuse the result.
 
-Next to the progress bar, the time remaining reads "estimating" until
-FocusForge has enough to go on, then "ETA 1:12" (minutes and seconds). Time
+Next to the progress bar, the time remaining is the time left in the whole
+run, not in the current stage. FocusForge predicts every stage from your
+frames and settings before the run starts and corrects the prediction as the
+first stages finish. The figure does not fall back to "estimating" when a
+stage ends and does not rise while a stage runs. It reads "ETA" followed by
+minutes and seconds (hours, minutes and seconds from an hour), or
+"estimating" while there is no estimate yet. Time
 spent paused is left out of the estimate. A stage is skipped when its
 setting is off; [Stacking settings](stacking.md) and
 [Alignment](alignment.md) say which.

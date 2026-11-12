@@ -343,7 +343,7 @@ closes at once.
 Otherwise FocusForge asks "Quit without saving?" ("Quitting FocusForge") and
 says how many projects would lose work, for example "2 projects have unsaved
 work. Quitting now loses all of it." A project counts when it holds an unsaved
-checkpoint, brush strokes, a deletion not yet saved, or a fused result still
+checkpoint, brush strokes, an unsaved deletion, or a fused result still
 waiting for your **Keep** or **Discard**.
 
 ![The quit question: "Quit without saving?", "Quitting FocusForge", "2 projects have unsaved work. Quitting now loses all of it." and the buttons Cancel, Save all and quit, and Quit without saving.](../assets/manual/close-and-quit/quit-question.png)

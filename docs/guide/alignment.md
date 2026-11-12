@@ -264,8 +264,9 @@ Each frame's row ends in the status its solve reached:
 
 - `converged`: the step size fell below `epsilon-px`.
 - `hit-cap`: `max-iterations` ran out while the steps were still shrinking.
-- `stalled`: `max-iterations` ran out with the steps flat or oscillating; the
-  best-correlation transform is kept. A middle pyramid level that loses
+- `stalled`: the last ten steps are flat or oscillating and either
+  `max-iterations` ran out or every one of those steps is below twice
+  `epsilon-px`; the best-correlation transform is kept. A middle pyramid level that loses
   correlation (typical of a defocused frame) also counts as `stalled`: it
   hands its best fit to the next finer level, which refines it.
 - `diverged(<reason>)`: the frame did not register. `validation-failed`
@@ -310,7 +311,8 @@ forces a recompute; [Batch runs from the command line](../reference/batch-runs.m
 describes the cache.
 
 Large pyramid levels run on the GPU when a usable adapter is present; the rest
-of the solve is on the CPU. `--cpu` keeps everything on the CPU and
+of the solve is on the CPU. A software adapter, as in a virtual machine, does
+not count: there the whole alignment runs on the CPU. `--cpu` keeps everything on the CPU and
 `--max-vram <SIZE>` lowers the device memory budget. `--max-host-memory
 <SIZE>` lowers the host-memory budget the alignment workers are sized from.
 If the device is lost mid-run, the whole alignment is redone on the CPU, so
