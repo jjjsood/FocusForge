@@ -4589,6 +4589,36 @@ mod dialog_close {
         );
     }
 
+    // tier: synthetic; layer: GUI view
+    #[test]
+    fn export_footer_buttons_dim_to_half_opacity_while_writing() {
+        let app = app_at(1440, 900);
+        let export = &INCLUDED[5];
+        (export.open)(&app);
+        // A button's computed opacity includes the footer's own dimming.
+        let opacities = |stage: &str| {
+            app.set_export_stage(stage.into());
+            let footer = dialog_root(&app, export.type_name)
+                .query_descendants()
+                .match_type_name("FFDialogFooter")
+                .find_first()
+                .expect("the export dialog shows its footer");
+            footer
+                .query_descendants()
+                .match_type_name("FFButton")
+                .find_all()
+                .iter()
+                .map(|button| button.computed_opacity())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(opacities("ready"), [1.0, 1.0], "cancel and export at ready");
+        assert_eq!(
+            opacities("writing"),
+            [0.5, 0.5],
+            "cancel and export at writing"
+        );
+    }
+
     #[test]
     fn dialog_close_button_sits_in_the_panel_corner() {
         const INSET: f32 = 16.0;

@@ -80,7 +80,8 @@ The [manual's hardware page](docs/hardware.md) has the recommended figures, a ru
 ### Build
 
 Rust, toolchain pinned to `1.95.0` (`rust-toolchain.toml`, picked up
-automatically by `rustup`). `crates/ui` and `crates/gui` link Slint with
+automatically by `rustup`). The UI crates (`crates/ui`, `crates/ui-comparison`,
+`crates/ui-theme-sheet`) and `crates/gui` link Slint with
 `renderer-femtovg-wgpu`, which has a hard dependency on fontconfig; on
 Debian/Ubuntu-family hosts install the dev package before building:
 

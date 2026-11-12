@@ -1,10 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The Slint window and its bindings come from `focusforge-ui`, re-exported
+//! The Slint windows and their bindings come from the UI crates, re-exported
 //! here: `AppWindow`, plus `Theme`, `TypeRole` and `ThemeProbe`, which the
-//! integration tests reach.
+//! integration tests reach, from `focusforge-ui`; `ComparisonWindow` as
+//! `comparison`; and, with the `theme-sheet` feature, `ThemeSheet` as
+//! `theme_sheet`. Each crate generates its own `Theme` and `StageTile`.
 
 pub use focusforge_ui::*;
+
+pub use comparison::ComparisonWindow;
+pub use focusforge_ui_comparison as comparison;
+
+#[cfg(feature = "theme-sheet")]
+pub use focusforge_ui_theme_sheet as theme_sheet;
+#[cfg(feature = "theme-sheet")]
+pub use theme_sheet::ThemeSheet;
 
 /// Plain-Rust shell state and the callback-forwarding seam -- no
 /// `use slint::` anywhere in it. Reachable from `cargo test` without a

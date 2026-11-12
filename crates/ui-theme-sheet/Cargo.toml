@@ -1,0 +1,29 @@
+[package]
+name = "focusforge-ui-theme-sheet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[features]
+# Without it the crate generates nothing and compiles to an empty library, so a
+# workspace build never type-checks the sheet's generated code.
+generate = []
+
+[dependencies]
+slint = { version = "~1.17", default-features = false, features = [
+    "std", "compat-1-2", "backend-winit", "renderer-femtovg-wgpu", "unstable-wgpu-29",
+    "unstable-winit-030",
+] }
+
+[build-dependencies]
+slint-build = "~1.17"
