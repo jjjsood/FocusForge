@@ -28,6 +28,9 @@
 # `build`'s GPU-enabled binary is written last, the one later stages use.
 # Cargo and direct binary runs go through tools/with-lock.sh build; clippy
 # stays out of --static because it compiles; RUSTFLAGS is never set here.
+# Every cargo stage runs with CARGO_BUILD_JOBS=min(24, cores) unless the caller
+# sets it (tools/lib/cargo-jobs.sh holds the cap). A cold
+# `cargo build --workspace --all-targets` at 24 jobs peaks at 13.0 GB.
 # `manual book` (mdBook build plus link check) runs only when mdbook is on PATH;
 # otherwise it prints a SKIP line.
 #
@@ -76,6 +79,11 @@ done
 case "$TAIL_LINES" in
   ''|*[!0-9]*) usage ;;
 esac
+
+# shellcheck source=lib/cargo-jobs.sh
+. "$REPO/tools/lib/cargo-jobs.sh"
+CARGO_BUILD_JOBS="$(cargo_jobs)"
+export CARGO_BUILD_JOBS
 
 # On a Linux desktop the test stages briefly saturate every core and push
 # memory into swap, which freezes the session. A building run therefore
@@ -236,6 +244,7 @@ tool_selftest "release smoke selftest" tools/smoke-release-selftest.sh
 run_gate "fixture manifest" tools/check-fixtures.sh
 tool_selftest "fixture manifest selftest" tools/check-fixtures-selftest.sh
 tool_selftest "lock directory selftest" tools/with-lock-selftest.sh
+tool_selftest "cargo jobs selftest" tools/cargo-jobs-selftest.sh
 tool_selftest "tiff-diff selftest" python3 tools/tiff-diff.py --selftest
 tool_selftest "image-metrics selftest" python3 tools/image-metrics.py --selftest
 tool_selftest "rawtiff selftest" python3 tools/lib/rawtiff.py --selftest
@@ -243,6 +252,7 @@ tool_selftest "download selftest" python3 tools/lib/download.py --selftest
 tool_selftest "make-fixtures selftest" python3 tools/lib/make_fixtures.py --selftest
 run_gate "test bodies"      python3 tools/check-test-bodies.py
 tool_selftest "test bodies selftest" python3 tools/check-test-bodies.py --selftest
+tool_selftest "generated UI size selftest" python3 tools/check-ui-size.py --selftest
 tool_selftest "manual screenshot lists" python3 tools/manual-screenshots.py --selftest
 run_gate "manual coverage" python3 tools/check-manual-coverage.py
 tool_selftest "manual coverage selftest" python3 tools/check-manual-coverage.py --selftest
@@ -250,17 +260,17 @@ tool_selftest "manual coverage selftest" python3 tools/check-manual-coverage.py 
 if [ "$STATIC_ONLY" -eq 0 ]; then
   # Build-only: proves the no-GPU path still compiles, test targets included.
   # Must run BEFORE `build` -- see the header comment above for why the order
-  # is load-bearing. `--exclude focusforge-gui --exclude focusforge-ui`: the
-  # Slint backend is wgpu-only by construction (crates/ui/Cargo.toml pins
+  # is load-bearing. `--exclude focusforge-gui --exclude 'focusforge-ui*'`: the
+  # Slint backend is wgpu-only by construction (the UI crates' Cargo.toml pin
   # `renderer-femtovg-wgpu` unconditionally, not behind the `gpu` feature),
-  # so these two crates always compile wgpu regardless of
+  # so these crates always compile wgpu regardless of
   # `--no-default-features` -- with them included this stage would still link
   # wgpu and would prove nothing about the no-GPU path.
   [ "$QUICK" -eq 1 ] || run_gate "build (no default features)" \
                              tools/with-lock.sh build -- \
                              cargo build --workspace --all-targets \
                              --no-default-features --exclude focusforge-gui \
-                             --exclude focusforge-ui
+                             --exclude 'focusforge-ui*'
 
   # Must come first among the GPU-enabled stages: it produces the binary the
   # background stage runs, and it holds the target/ lock the cargo gates below
@@ -332,6 +342,19 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
   # one real stack run over fixtures/mantis-512.
   [ "$QUICK" -eq 1 ] || run_gate "trace feature"  tools/with-lock.sh build -- \
                               cargo test -p focusforge-cli --features trace --test trace_cli
+  # The theme sheet is built out of the stages above; this one lints it and runs
+  # its tests.
+  [ "$QUICK" -eq 1 ] || run_gate "theme sheet feature" tools/with-lock.sh build -- \
+                              sh -c 'cargo clippy -p focusforge-gui --features theme-sheet --all-targets -- -D warnings \
+                                && cargo nextest run -p focusforge-gui --features theme-sheet --test theme'
+  # Asks cargo for the builds above (a no-op) and compares the generated Slint files with
+  # their budgets. Linux only: the sizes come from the .slint sources, not the OS.
+  if [ "$(uname -s)" = Linux ]; then
+    UI_SIZE_BUILDS="--build tests"
+    [ "$QUICK" -eq 1 ] || UI_SIZE_BUILDS="--build tests --build theme-sheet"
+    # shellcheck disable=SC2086
+    run_gate "generated UI size" tools/with-lock.sh build -- python3 tools/check-ui-size.py $UI_SIZE_BUILDS
+  fi
   [ "$QUICK" -eq 1 ] || run_gate "rustdoc"        tools/with-lock.sh build -- \
                               env RUSTDOCFLAGS="-D warnings" \
                               cargo doc --workspace --no-deps --document-private-items

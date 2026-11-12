@@ -58,16 +58,32 @@ fn expected(dir: &Path) -> SharpAreas {
 
 #[test]
 fn sharp_areas_prints_one_row_per_frame() {
-    let counts = expected(&frames_dir()).counts;
-    assert!(counts.iter().any(|&n| n > 0), "{counts:?}");
+    let expected = expected(&frames_dir());
+    assert!(expected.counts.iter().any(|&n| n > 0), "{expected:?}");
     let output = run("sharp_areas_text", &frames_dir(), &[]);
     assert!(output.status.success(), "{}", stderr(&output));
-    let rows: Vec<String> = counts
+    let mut rows: Vec<String> = expected
+        .counts
         .iter()
         .enumerate()
         .map(|(index, count)| format!("{index}  0{index}.tif  {count}"))
         .collect();
+    rows.extend(expected.overlaps.iter().enumerate().map(|(index, pair)| {
+        let share = pair.share().map_or("no data".to_string(), |share| {
+            format!("{:.1}%", share * 100.0)
+        });
+        format!("overlap  {}-{}  {share}", index + 1, index + 2)
+    }));
     assert_eq!(stdout(&output), format!("{}\n", rows.join("\n")));
+    assert!(
+        rows.contains(&"overlap  5-6  no data".to_string()),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&"overlap  7-8  100.0%".to_string()),
+        "{rows:?}"
+    );
+    assert!(rows.contains(&"overlap  1-2  0.0%".to_string()), "{rows:?}");
 }
 
 #[test]
@@ -78,6 +94,7 @@ fn sharp_areas_json_and_cell_size() {
     let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("one JSON object");
     assert_eq!(value["params"]["cell-size"], 64);
     assert_eq!(value["params"]["contrast"], 2.0);
+    assert_eq!(value["params"]["overlap-threshold"], 0.8);
     assert_eq!(value["cells"], 64);
     let frames = value["frames"].as_array().expect("a frames array");
     assert_eq!(frames.len(), 8);
@@ -86,6 +103,17 @@ fn sharp_areas_json_and_cell_size() {
         assert_eq!(frame["file"], format!("0{index}.tif"));
         assert_eq!(frame["count"], expected.counts[index]);
     }
+    let overlaps = value["overlaps"].as_array().expect("an overlaps array");
+    assert_eq!(overlaps.len(), 7);
+    for (index, (entry, pair)) in overlaps.iter().zip(&expected.overlaps).enumerate() {
+        assert_eq!(entry["pair"], format!("{}-{}", index + 1, index + 2));
+        match pair.share() {
+            Some(share) => assert_eq!(entry["share"], share),
+            None => assert!(entry["share"].is_null(), "{entry}"),
+        }
+    }
+    assert_eq!(overlaps[6]["share"], 1.0);
+    assert!(overlaps[4]["share"].is_null());
 
     let output = run(
         "sharp_areas_cell_size",
@@ -153,6 +181,14 @@ fn sharp_areas_refuses_bad_input_naming_it() {
             &["--set", "contrast=11"],
         ),
         "contrast: value 11 is outside the allowed range [1, 10]",
+    );
+    assert_refused(
+        &run(
+            "sharp_areas_overlap_threshold",
+            &frames_dir(),
+            &["--set", "overlap-threshold=1.5"],
+        ),
+        "overlap-threshold: value 1.5 is outside the allowed range [0.5, 1]",
     );
 }
 

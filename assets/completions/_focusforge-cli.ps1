@@ -32,6 +32,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('algorithms', 'algorithms', [CompletionResultType]::ParameterValue, 'List every registered algorithm, or print one named algorithm''s full parameter schema')
             [CompletionResult]::new('step-plan', 'step-plan', [CompletionResultType]::ParameterValue, 'Compute the focus step, frame count, duration and disk need of a focus stack')
             [CompletionResult]::new('sharp-areas', 'sharp-areas', [CompletionResultType]::ParameterValue, 'Count the areas of the image that are sharpest in each frame of a stack')
+            [CompletionResult]::new('sharpness-map', 'sharpness-map', [CompletionResultType]::ParameterValue, 'Write the focus score of every frame of a stack, and of a composite, as maps on one scale')
             [CompletionResult]::new('stack', 'stack', [CompletionResultType]::ParameterValue, 'Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run `focusforge-cli export` for that')
             [CompletionResult]::new('export', 'export', [CompletionResultType]::ParameterValue, 'Turn a project into an image file: the image with `-o`, the Z-Map with `--zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image')
             [CompletionResult]::new('retouch', 'retouch', [CompletionResultType]::ParameterValue, 'Append an op list to a project as new states, one per op, each the previous one''s child: on the current head, or on `--from` as a branch. `export --checkpoint` writes any of them')
@@ -77,6 +78,18 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('--set', '--set', [CompletionResultType]::ParameterName, 'Set a parameter: `--set key=value`, repeatable. A repeated key is last-wins')
             [CompletionResult]::new('--priority', '--priority', [CompletionResultType]::ParameterName, 'How many frames are read at once; the counts are the same at either value')
             [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print the counts as one JSON object')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail (repeatable)')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Log errors only')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Log errors only')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'focusforge-cli;sharpness-map' {
+            [CompletionResult]::new('--out', '--out', [CompletionResultType]::ParameterName, 'Directory the maps are written to; created if missing')
+            [CompletionResult]::new('--composite', '--composite', [CompletionResultType]::ParameterName, 'A composite image of the frames'' size to map on the frames'' scale')
+            [CompletionResult]::new('--priority', '--priority', [CompletionResultType]::ParameterName, 'How many frames are read at once; the maps are the same at either value')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print the scale and the written maps as one JSON object')
             [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail (repeatable)')
             [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Log errors only')
             [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Log errors only')
@@ -301,6 +314,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('algorithms', 'algorithms', [CompletionResultType]::ParameterValue, 'List every registered algorithm, or print one named algorithm''s full parameter schema')
             [CompletionResult]::new('step-plan', 'step-plan', [CompletionResultType]::ParameterValue, 'Compute the focus step, frame count, duration and disk need of a focus stack')
             [CompletionResult]::new('sharp-areas', 'sharp-areas', [CompletionResultType]::ParameterValue, 'Count the areas of the image that are sharpest in each frame of a stack')
+            [CompletionResult]::new('sharpness-map', 'sharpness-map', [CompletionResultType]::ParameterValue, 'Write the focus score of every frame of a stack, and of a composite, as maps on one scale')
             [CompletionResult]::new('stack', 'stack', [CompletionResultType]::ParameterValue, 'Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run `focusforge-cli export` for that')
             [CompletionResult]::new('export', 'export', [CompletionResultType]::ParameterValue, 'Turn a project into an image file: the image with `-o`, the Z-Map with `--zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image')
             [CompletionResult]::new('retouch', 'retouch', [CompletionResultType]::ParameterValue, 'Append an op list to a project as new states, one per op, each the previous one''s child: on the current head, or on `--from` as a branch. `export --checkpoint` writes any of them')
@@ -323,6 +337,9 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             break
         }
         'focusforge-cli;help;sharp-areas' {
+            break
+        }
+        'focusforge-cli;help;sharpness-map' {
             break
         }
         'focusforge-cli;help;stack' {
