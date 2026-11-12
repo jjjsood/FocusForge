@@ -26,8 +26,13 @@ crates/diagnostics/ the shared `tracing` subscriber (stderr sink, rotating
                recorder, the native-crash monitor process and the
                diagnostics bundle writer -- linked only by `crates/cli` and
                `crates/gui`, never by `crates/core` or `crates/gpu`
-crates/ui/     focusforge-ui: the `.slint` sources and their generated Rust
-               bindings, compiled once and depending on nothing but `slint`
+crates/ui/     focusforge-ui: the main window's `.slint` sources and their
+               generated Rust bindings (and the test-theme probe), compiled
+               once and depending on nothing but `slint`
+crates/ui-comparison/   focusforge-ui-comparison: the detached comparison
+               window, generated in its own crate
+crates/ui-theme-sheet/  focusforge-ui-theme-sheet: the developer theme sheet,
+               compiled only behind `focusforge-gui`'s `theme-sheet` feature
 crates/gui/    focusforge-gui: a Slint window shell (toolbar, dock, tab
                strip, projects overlay, settings modal), a wgpu-backed
                canvas that renders a composite/Z-Map pair and, in editor
@@ -262,6 +267,23 @@ Every image in `docs/assets/manual/` is generated, never hand-taken:
 A change to the window that moves a documented control or changes its text
 should come with the matching page edit and regenerated screenshots.
 
+## Building the UI
+
+The Slint UI is generated in three crates so no single compiler process holds
+all of it: `focusforge-ui`, `focusforge-ui-comparison` and
+`focusforge-ui-theme-sheet`. Each is `[lib] test/doctest/bench = false`, and
+the workspace dev profile sets `debug = false` and `incremental = false` on
+all three. A cold `cargo build --workspace --tests` at 24 jobs peaks near 6 GB
+and takes about two minutes.
+
+Slint's per-element debug info is emitted only behind the UI crates'
+`element-debug-info` feature. `focusforge-gui`'s `mcp` feature and its
+dev-dependencies turn it on; a default build leaves it off.
+
+The theme sheet is built with `cargo build -p focusforge-gui --features
+theme-sheet`. A default build given `--theme-sheet` exits with code 2 and a
+message naming the feature.
+
 ## Before you send a change
 
 Branch from `develop` and open the pull request against `develop`. `main` holds released versions only; a pull request from `develop` to `main` is a release.
@@ -278,6 +300,14 @@ while editing; `--log-dir DIR` writes the gate logs to `DIR` instead of
 Run this local gate before acceptance and merge. GitHub Actions calls the same
 gate on Linux, macOS and Windows as additional evidence; a green hosted run
 does not replace a required local run.
+Cargo's jobs are capped at min(24, cores) through `tools/lib/cargo-jobs.sh`
+unless `CARGO_BUILD_JOBS` is set. A full run also builds the theme sheet
+(`theme sheet feature` stage) and checks the size of each generated Slint
+source (`generated UI size` stage, `tools/check-ui-size.py`, which holds a
+byte budget per generated file: 17.4 MB main window, 1.1 MB comparison
+window, 20.7 MB theme sheet; the sheet is checked only in the full run).
+Raise a budget on purpose by editing its line in the `BUDGETS` table in that
+script.
 Read `tools/README.md` for what each script does before running cargo
 commands by hand.
 
