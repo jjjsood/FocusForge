@@ -1717,7 +1717,7 @@ fn delete_dialog_counts_the_strokes_that_use_it() {
         body_of(&mut controller, &child),
         used_body("2 brush strokes in another checkpoint", 2, 5)
     );
-    // A checkpoint no stroke uses keeps today's body.
+    // A checkpoint no stroke uses keeps the plain body.
     assert_eq!(
         body_of(&mut controller, &root),
         "The other 5 checkpoints are untouched, and the stack is not fused again."
