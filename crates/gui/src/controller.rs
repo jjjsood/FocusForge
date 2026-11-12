@@ -825,6 +825,30 @@ impl EditSlot {
     }
 }
 
+/// The checkpoint renders workers make for edit sessions: the tab id,
+/// session generation and checkpoint key of each running one and of each that
+/// failed, and where workers park the render or why it failed.
+#[derive(Default)]
+struct SourceSlot {
+    in_flight: Vec<(u64, u64, String)>,
+    failed: Vec<(u64, u64, String)>,
+    parked: Arc<Mutex<Vec<ParkedSource>>>,
+    /// Renders started so far; names the next scratch file.
+    renders: u64,
+}
+
+type ParkedSource = (u64, u64, String, Result<job::CheckpointSource, String>);
+
+impl SourceSlot {
+    /// Whether the render of `key` runs or failed for the tab's session.
+    fn knows(&self, tab_id: u64, generation: u64, key: &str) -> bool {
+        self.in_flight
+            .iter()
+            .chain(&self.failed)
+            .any(|(tab, started, k)| (*tab, *started, k.as_str()) == (tab_id, generation, key))
+    }
+}
+
 /// The origin readers being opened and where their workers park the results:
 /// tab id, the session generation each was started for, the checkpoint the
 /// worker renders into the plane cache (if any), and the readers or why they
@@ -1521,7 +1545,7 @@ impl ProjectTab {
         let mut ops = edit.drawn_ops();
         if let Some(stroke) = &edit.stroke {
             ops.push(job::Op::BrushStroke {
-                source: job::StrokeSource::Frame(stroke.source()),
+                source: stroke.source().clone(),
                 path: stroke.path_so_far(),
                 radius: stroke.radius(),
                 softness: stroke.softness(),
@@ -1542,6 +1566,17 @@ impl ProjectTab {
         self.edit.take().is_some()
     }
 
+    /// The checkpoints the session renders as brush sources: the chosen one
+    /// and every one a stroke of the session paints from.
+    fn wanted_sources(&self) -> BTreeSet<String> {
+        let Some(edit) = &self.edit else {
+            return BTreeSet::new();
+        };
+        let mut wanted = edit.stroke_checkpoints();
+        wanted.extend(self.listed_source());
+        wanted
+    }
+
     /// Whether the selected row is an in-memory entry holding ops.
     fn on_ops_row(&self) -> bool {
         self.selected_checkpoint
@@ -1559,11 +1594,18 @@ impl ProjectTab {
     /// Removes the files of every fused in-memory entry a project save would
     /// not write: deleted, not the current row and no written entry's parent.
     fn free_unneeded_held(&self) {
-        let kept = job::kept_entries(
-            &self.held,
-            &self.pending_deletes,
-            self.row_parent().as_ref(),
-        );
+        // The session's strokes are written as one more entry under the row.
+        let mut entries = self.held.clone();
+        if let Some(edit) = self.edit.as_ref().filter(|edit| edit.op_count() > 0) {
+            entries.push(job::InMemoryCheckpoint {
+                kind: job::InMemoryKind::Ops {
+                    ops: edit.ops().cloned().collect(),
+                    created_at: 0,
+                },
+                parent: self.row_parent(),
+            });
+        }
+        let kept = job::kept_entries(&entries, &self.pending_deletes, self.row_parent().as_ref());
         for (entry, kept) in self.held.iter().zip(kept) {
             if let (false, job::InMemoryKind::Fused(held)) = (kept, &entry.kind) {
                 remove_hold_dir_of(&held.composite);
@@ -1896,6 +1938,7 @@ struct ShellState {
     render: RenderSlot,
     thumbnails: ThumbnailSlot,
     edits: EditSlot,
+    sources: SourceSlot,
     origin: OriginSlot,
     /// The open export modal, if any -- [`AppController::checkpoint_export_requested`].
     export_dialog: Option<ExportDialog>,
@@ -2662,6 +2705,29 @@ impl AppController {
             .and_then(|index| checkpoints::stroke_chain(&tab.held, index))
             .unwrap_or_default();
         let (tab_id, generation) = (tab.id, tab.session_generation);
+        // The checkpoints the chain's strokes paint from are rendered before
+        // the chain is replayed.
+        let chain_sources: BTreeSet<String> = chain
+            .iter()
+            .filter_map(|op| match op {
+                job::Op::BrushStroke {
+                    source: job::StrokeSource::Checkpoint(id),
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let held = if chain_sources.is_empty() {
+            Vec::new()
+        } else {
+            tab.held.clone()
+        };
+        let project_path = match &tab.project {
+            GuiProject::Opened(project) => Some(project.path().to_path_buf()),
+            _ => None,
+        };
+        let memory_cap = self.performance.max_host_memory_bytes();
+        let source_dir = self.scratch_root().join("sources");
         let tile_size = self
             .resident_tile_size_for_test
             .unwrap_or(job::RESIDENT_TILE_SIZE);
@@ -2676,8 +2742,27 @@ impl AppController {
         slot.in_flight.push((tab_id, generation));
         slot.started = true;
         let parked = Arc::clone(&slot.parked);
+        let first_render = self.state.sources.renders;
+        self.state.sources.renders += chain_sources.len() as u64;
+        let wanted: Vec<(String, PathBuf)> = chain_sources
+            .into_iter()
+            .zip(first_render + 1..)
+            .map(|(id, n)| {
+                (
+                    id,
+                    source_dir.join(format!("{}-{n}.tif", std::process::id())),
+                )
+            })
+            .collect();
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let checkpoints = job::render_checkpoint_sources(
+                    &composite,
+                    project_path.as_deref(),
+                    &held,
+                    wanted,
+                    memory_cap,
+                );
                 job::open_edit_session(
                     zmap.as_deref(),
                     &composite,
@@ -2686,6 +2771,7 @@ impl AppController {
                     tile_size,
                     base_ops,
                     chain,
+                    checkpoints,
                 )
             }))
             .map_err(|_| "the session worker panicked".to_string())
@@ -2713,6 +2799,7 @@ impl AppController {
                 .lock()
                 .expect("no thread panicked while holding the parked sessions"),
         );
+        let mut installed = Vec::new();
         for (tab_id, generation, result) in parked {
             let started = (tab_id, generation);
             self.state.edits.in_flight.retain(|open| *open != started);
@@ -2728,6 +2815,7 @@ impl AppController {
                 Ok(mut edit) => {
                     edit.set_blender(self.blender.clone());
                     tab.edit = Some(edit);
+                    installed.push(index);
                     self.emit(ShellEvent::EditorChanged);
                 }
                 Err(reason) => {
@@ -2738,8 +2826,108 @@ impl AppController {
                 }
             }
         }
+        for index in installed {
+            self.ensure_checkpoint_sources(index);
+        }
+        self.settle_checkpoint_sources();
         self.reopen_frame_sets();
-        self.state.edits.in_flight.is_empty() && self.state.edits.reopening.is_empty()
+        self.state.edits.in_flight.is_empty()
+            && self.state.edits.reopening.is_empty()
+            && self.state.sources.in_flight.is_empty()
+    }
+
+    /// Keeps the checkpoint renders of tab `index`'s session equal to the
+    /// ones wanted: the chosen source and every checkpoint a stroke of the
+    /// session paints from. Drops the others, which removes their files, and
+    /// starts a worker for each wanted one that is neither rendered, running
+    /// nor failed.
+    fn ensure_checkpoint_sources(&mut self, index: usize) {
+        let dir = self.scratch_root().join("sources");
+        let memory_cap = self.performance.max_host_memory_bytes();
+        let Some(tab) = self.state.projects.get_mut(index) else {
+            return;
+        };
+        let wanted = tab.wanted_sources();
+        let (tab_id, generation) = (tab.id, tab.session_generation);
+        let project_path = match &tab.project {
+            GuiProject::Opened(project) => Some(project.path().to_path_buf()),
+            _ => None,
+        };
+        let Some(edit) = tab.edit.as_mut() else {
+            return;
+        };
+        edit.retain_checkpoint_sources(&wanted);
+        for key in wanted {
+            let slot = &mut self.state.sources;
+            if edit.has_checkpoint_source(&key) || slot.knows(tab_id, generation, &key) {
+                continue;
+            }
+            slot.renders += 1;
+            slot.in_flight.push((tab_id, generation, key.clone()));
+            self.state.edits.started = true;
+            let path = dir.join(format!("{}-{}.tif", std::process::id(), slot.renders));
+            let (held, base) = (tab.held.clone(), Arc::clone(&edit.base));
+            let (project_path, parked) = (project_path.clone(), Arc::clone(&slot.parked));
+            std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    job::render_checkpoint_source(
+                        project_path.as_deref(),
+                        &held,
+                        &key,
+                        &path,
+                        memory_cap,
+                        &base,
+                    )
+                }))
+                .map_err(|_| "the checkpoint render worker panicked".to_string())
+                .and_then(|rendered| rendered.map_err(|err| err.to_string()));
+                parked
+                    .lock()
+                    .expect("no thread panicked while holding the parked checkpoint renders")
+                    .push((tab_id, generation, key, result));
+            });
+        }
+    }
+
+    /// Installs the parked checkpoint renders into the sessions that still
+    /// want them; one nobody wants any more is dropped, and a failed one is
+    /// logged and remembered so the press refuses it.
+    fn settle_checkpoint_sources(&mut self) {
+        let parked = std::mem::take(
+            &mut *self
+                .state
+                .sources
+                .parked
+                .lock()
+                .expect("no thread panicked while holding the parked checkpoint renders"),
+        );
+        for (tab_id, generation, key, result) in parked {
+            let slot = &mut self.state.sources;
+            slot.in_flight
+                .retain(|(tab, started, k)| (*tab, *started, k) != (tab_id, generation, &key));
+            let Some(index) = self.tab_index(tab_id) else {
+                continue;
+            };
+            let tab = &mut self.state.projects[index];
+            if tab.session_generation != generation {
+                continue;
+            }
+            let wanted = tab.wanted_sources();
+            let Some(edit) = tab.edit.as_mut() else {
+                continue;
+            };
+            match result {
+                Ok(source) if wanted.contains(&key) => edit.set_checkpoint_source(key, source),
+                Ok(_) => {}
+                Err(reason) => {
+                    tracing::error!(
+                        error = %reason, checkpoint = %key,
+                        "the checkpoint could not be rendered as a brush source"
+                    );
+                    self.state.sources.failed.push((tab_id, generation, key));
+                }
+            }
+        }
     }
 
     /// Re-opens the frame set of every tab holding a session or origin
@@ -3192,6 +3380,22 @@ impl AppController {
     /// every call from `selected`; no field holds a copy.
     pub fn brush_source(&self) -> Option<u16> {
         u16::try_from(self.state.active()?.selected).ok()
+    }
+
+    /// What the next stroke paints from: the chosen checkpoint once the
+    /// session holds its render, else the selected frame. `None` while the
+    /// chosen checkpoint renders or could not be rendered.
+    pub fn stroke_source(&self) -> Option<job::StrokeSource> {
+        match self.source_checkpoint() {
+            Some(key) => self
+                .state
+                .active()?
+                .edit
+                .as_ref()?
+                .has_checkpoint_source(&key)
+                .then_some(job::StrokeSource::Checkpoint(key)),
+            None => self.brush_source().map(job::StrokeSource::Frame),
+        }
     }
 
     pub fn select_dock_tab(&mut self, tab: DockTab) {
@@ -4511,10 +4715,7 @@ impl AppController {
         let Some(rect) = self.pane_rect(pane) else {
             return;
         };
-        if self.source_checkpoint().is_some() {
-            return;
-        }
-        let Some(source) = self.brush_source() else {
+        let Some(source) = self.stroke_source() else {
             return;
         };
         let (radius, softness) = self.brush_radius_softness();
@@ -4578,7 +4779,7 @@ impl AppController {
             return;
         };
         let (radius, softness) = (stroke.radius(), stroke.softness());
-        let source = job::StrokeSource::Frame(stroke.source());
+        let source = stroke.source().clone();
         let (mode, opacity) = (stroke.mode(), stroke.opacity());
         let op = job::Op::BrushStroke {
             source: source.clone(),
@@ -4633,7 +4834,7 @@ impl AppController {
             return;
         };
         let op = job::Op::BrushStroke {
-            source: job::StrokeSource::Frame(stroke.source()),
+            source: stroke.source().clone(),
             path: stroke.finish(),
             radius: stroke.radius(),
             softness: stroke.softness(),
@@ -7121,7 +7322,17 @@ impl AppController {
                 let Some(tab) = self.state.active_mut() else {
                     return;
                 };
-                tab.source_checkpoint = row.key;
+                tab.source_checkpoint = row.key.clone();
+                let tab_id = tab.id;
+                if let Some(key) = row.key {
+                    self.state
+                        .sources
+                        .failed
+                        .retain(|(tab, _, failed)| (*tab, failed) != (tab_id, &key));
+                }
+                if let Some(index) = self.state.active {
+                    self.ensure_checkpoint_sources(index);
+                }
                 self.emit(ShellEvent::ImagesChanged);
             }
             images::RowKind::ResultsHeading => self.toggle_image_group(true),
@@ -7541,6 +7752,9 @@ impl AppController {
         }
         tab.selected = index;
         tab.source_checkpoint = None;
+        if let Some(index) = self.state.active {
+            self.ensure_checkpoint_sources(index);
+        }
         self.emit(ShellEvent::ImagesChanged);
     }
 
@@ -10893,6 +11107,8 @@ impl AppController {
             }
             remove_in_memory(&tab.held);
             tab.held.clear();
+            self.ensure_checkpoint_sources(index);
+            let tab = &mut self.state.projects[index];
             tab.compressing.clear();
             tab.pending_deletes.clear();
             if tab.edit.is_none() {

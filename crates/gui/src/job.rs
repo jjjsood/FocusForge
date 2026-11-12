@@ -8,6 +8,7 @@
 //! The one module in this crate besides `entry.rs`/`settings_panel.rs`/the
 //! canvas files allowed to name `focusforge_core`.
 
+use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -1854,6 +1855,119 @@ fn sample_label(format: SampleFormat) -> &'static str {
     }
 }
 
+/// A checkpoint rendered into a scratch TIFF holding the edited image's own
+/// samples, which region renders read their strokes' source pixels from. The
+/// file is removed when the last holder drops it.
+pub struct CheckpointSource {
+    stack: Arc<TiffStack>,
+    path: PathBuf,
+}
+
+impl Drop for CheckpointSource {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Why a checkpoint could not become a [`CheckpointSource`].
+#[derive(Debug, thiserror::Error)]
+pub enum CheckpointSourceError {
+    #[error(transparent)]
+    Render(#[from] ProjectError),
+    #[error(transparent)]
+    Open(#[from] focusforge_core::TiffError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("checkpoint {0} is saved, and no project is open")]
+    NoProject(String),
+    #[error("checkpoint {key} renders as {found}, the edited image is {expected}")]
+    Mismatch {
+        key: String,
+        found: String,
+        expected: String,
+    },
+}
+
+/// Renders checkpoint `key` -- a saved id of the project at `project_path`,
+/// or `held:<n>` of the unsaved list `held` -- to `path`, and opens it. The
+/// render must match `base` in sample type, size and samples per pixel; a
+/// failed or mismatching render leaves no file behind.
+pub fn render_checkpoint_source(
+    project_path: Option<&Path>,
+    held: &[InMemoryCheckpoint],
+    key: &str,
+    path: &Path,
+    memory_cap: Option<u64>,
+    base: &TiffStack,
+) -> Result<CheckpointSource, CheckpointSourceError> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut project = project_path.map(Project::open).transpose()?;
+    match project::held_index(key) {
+        Some(index) => {
+            project::render_unsaved_checkpoint(held, index, project.as_mut(), path, memory_cap)?
+        }
+        None => {
+            let project = project
+                .as_mut()
+                .ok_or_else(|| CheckpointSourceError::NoProject(key.to_string()))?;
+            project::render_checkpoint(project, key, path, memory_cap)?;
+        }
+    }
+    let source = CheckpointSource {
+        stack: Arc::new(TiffStack::open_staged(path)?),
+        path: path.to_path_buf(),
+    };
+    let describe = |stack: &TiffStack| {
+        let (width, height) = stack.dimensions();
+        format!(
+            "{width}x{height} px, {} samples a pixel, {}",
+            stack.header(0).samples_per_pixel,
+            sample_label(stack.sample_format())
+        )
+    };
+    let (found, expected) = (describe(&source.stack), describe(base));
+    if found != expected {
+        return Err(CheckpointSourceError::Mismatch {
+            key: key.to_string(),
+            found,
+            expected,
+        });
+    }
+    Ok(source)
+}
+
+/// Renders each `(key, path)` of `wanted` with [`render_checkpoint_source`]
+/// against the composite at `composite`. A checkpoint that cannot be rendered
+/// is logged and left out of the result.
+pub fn render_checkpoint_sources(
+    composite: &Path,
+    project_path: Option<&Path>,
+    held: &[InMemoryCheckpoint],
+    wanted: Vec<(String, PathBuf)>,
+    memory_cap: Option<u64>,
+) -> HashMap<String, CheckpointSource> {
+    if wanted.is_empty() {
+        return HashMap::new();
+    }
+    let Ok(base) = TiffStack::open_staged(composite) else {
+        return HashMap::new();
+    };
+    wanted
+        .into_iter()
+        .filter_map(|(key, path)| {
+            match render_checkpoint_source(project_path, held, &key, &path, memory_cap, &base) {
+                Ok(rendered) => Some((key, rendered)),
+                Err(error) => {
+                    tracing::error!(%error, checkpoint = %key, "the checkpoint could not be rendered as a brush source");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 /// What a region render starts from before its ops are blended over it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreImage {
@@ -1929,6 +2043,9 @@ pub struct EditState {
     /// The ops the row stacks over `base` before the pending ones, oldest
     /// first.
     chain: Vec<Op>,
+    /// The checkpoints the strokes may paint from, each rendered into a
+    /// scratch file that goes with the entry.
+    checkpoints: HashMap<String, Arc<CheckpointSource>>,
     pub tiles: crate::canvas::ResidentTiles,
     /// The blend kernel on the display device, while one is attached; a
     /// region renders on the CPU without it.
@@ -1963,6 +2080,7 @@ fn with_registered_sources<R>(
 /// What rendering a region reads, apart from the resident samples.
 struct RenderInput {
     base: Arc<TiffStack>,
+    checkpoints: HashMap<String, Arc<CheckpointSource>>,
     sources: Arc<dyn FrameReader>,
     registration: Registration,
     info: ZMapInfo,
@@ -2019,18 +2137,51 @@ fn render_region(
     rendered
 }
 
-/// `job`'s strokes with their footprints, the strokes that miss the map left out.
-fn placed_strokes(
+/// A job's strokes placed on their sources.
+struct Placed<'a> {
+    /// The strokes with their footprints, those that miss the map left out.
+    strokes: Vec<blend::PlacedStroke<'a>>,
+    /// The checkpoint behind each [`blend::PlacedSource::Rendered`] slot, one
+    /// per distinct id in order of first use.
+    slots: Vec<&'a str>,
+}
+
+/// `job`'s strokes placed on frames and on checkpoint slots. A checkpoint id
+/// for which `rendered` answers `false` is an error naming it.
+fn placed_strokes<'a>(
     info: ZMapInfo,
-    job: &RegionRender,
-) -> Result<Vec<blend::PlacedStroke<'_>>, String> {
-    let mut placed = Vec::new();
+    job: &'a RegionRender,
+    rendered: &dyn Fn(&str) -> bool,
+) -> Result<Placed<'a>, String> {
+    let mut placed = Placed {
+        strokes: Vec::new(),
+        slots: Vec::new(),
+    };
     for op in &job.ops {
-        let frame = blend::source_frame(op).map_err(|error| error.to_string())?;
+        let Op::BrushStroke { source, .. } = op else {
+            return Err(RetouchError::Unsupported.to_string());
+        };
+        let source = match source {
+            StrokeSource::Frame(frame) => blend::PlacedSource::Frame(usize::from(*frame)),
+            StrokeSource::Checkpoint(id) => {
+                if !rendered(id) {
+                    return Err(format!("checkpoint {id} has no rendered source"));
+                }
+                let slot = placed
+                    .slots
+                    .iter()
+                    .position(|slot| slot == id)
+                    .unwrap_or_else(|| {
+                        placed.slots.push(id);
+                        placed.slots.len() - 1
+                    });
+                blend::PlacedSource::Rendered(slot)
+            }
+        };
         if let Some(footprint) = blend::footprint(op, info).map_err(|error| error.to_string())? {
-            placed.push(blend::PlacedStroke {
+            placed.strokes.push(blend::PlacedStroke {
                 op,
-                source: blend::PlacedSource::Frame(usize::from(frame)),
+                source,
                 footprint,
             });
         }
@@ -2039,9 +2190,9 @@ fn placed_strokes(
 }
 
 /// The samples `job` reads: its region grown by the margin its Detail strokes need.
-fn read_extent_of(info: ZMapInfo, job: &RegionRender) -> Rect {
-    placed_strokes(info, job).map_or(job.region, |placed| {
-        blend::read_extent(info, &placed, job.region)
+fn read_extent_of(info: ZMapInfo, job: &RegionRender, rendered: &dyn Fn(&str) -> bool) -> Rect {
+    placed_strokes(info, job, rendered).map_or(job.region, |placed| {
+        blend::read_extent(info, &placed.strokes, job.region)
     })
 }
 
@@ -2063,7 +2214,10 @@ fn blend_region<S: Blend>(
 ) -> Result<Vec<S>, String> {
     let region = job.region;
     let spp = input.samples_per_pixel;
-    let placed = placed_strokes(input.info, job)?;
+    let Placed {
+        strokes: placed,
+        slots,
+    } = placed_strokes(input.info, job, &|id| input.checkpoints.contains_key(id))?;
     // A Detail stroke blurs samples past the region, so the ops run over the
     // extent that covers them and only `region` is kept.
     let extent = blend::read_extent(input.info, &placed, region);
@@ -2077,6 +2231,18 @@ fn blend_region<S: Blend>(
             snapshot.overlay_into(extent, &mut out);
         }
     }
+    // Each checkpoint source is read once over the extent, which holds every
+    // stroke's footprint grown by its read margin.
+    let rendered = slots
+        .iter()
+        .map(|id| {
+            let mut samples =
+                vec![S::default(); extent.width as usize * extent.height as usize * spp];
+            S::read_tile(&*input.checkpoints[*id].stack, 0, extent, &mut samples)
+                .map_err(|error| format!("checkpoint {id}: {error}"))?;
+            Ok((extent, samples))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     with_registered_sources(&*input.sources, &input.registration, |reader, origin| {
         blend::apply_strokes(
             input.info,
@@ -2086,7 +2252,7 @@ fn blend_region<S: Blend>(
             reader,
             origin,
             spp,
-            &[],
+            &rendered,
             &mut blend_stroke,
         )
     })
@@ -2187,6 +2353,7 @@ impl EditState {
     fn render_input(&self) -> RenderInput {
         RenderInput {
             base: Arc::clone(&self.base),
+            checkpoints: self.checkpoints.clone(),
             sources: Arc::clone(&self.sources),
             registration: self.registration.clone(),
             info: self.info(),
@@ -2242,6 +2409,53 @@ impl EditState {
                 *id = renamed;
             }
         }
+        let renames: Vec<(String, Option<String>)> = self
+            .checkpoints
+            .keys()
+            .map(|id| (id.clone(), to(id)))
+            .collect();
+        for (id, renamed) in renames {
+            let Some(renamed) = renamed else {
+                continue;
+            };
+            if let Some(source) = self.checkpoints.remove(&id)
+                && renamed != GONE_KEY
+            {
+                self.checkpoints.insert(renamed, source);
+            }
+        }
+    }
+
+    /// The checkpoints a stroke of the chain, the pending ops or the undone
+    /// ones paints from.
+    pub fn stroke_checkpoints(&self) -> BTreeSet<String> {
+        self.chain
+            .iter()
+            .chain(&self.pending)
+            .chain(&self.undone)
+            .filter_map(|op| match op {
+                Op::BrushStroke {
+                    source: StrokeSource::Checkpoint(id),
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether checkpoint `id` is rendered and ready to paint from.
+    pub fn has_checkpoint_source(&self, id: &str) -> bool {
+        self.checkpoints.contains_key(id)
+    }
+
+    /// Takes `source` as checkpoint `id`'s render, replacing an earlier one.
+    pub fn set_checkpoint_source(&mut self, id: String, source: CheckpointSource) {
+        self.checkpoints.insert(id, Arc::new(source));
+    }
+
+    /// Drops the render of every checkpoint `wanted` does not name.
+    pub fn retain_checkpoint_sources(&mut self, wanted: &BTreeSet<String>) {
+        self.checkpoints.retain(|id, _| wanted.contains(id));
     }
 
     /// Renders `job` on the calling thread straight into the resident tiles.
@@ -2336,7 +2550,7 @@ impl EditState {
         let input = self.render_input();
         let extents: Vec<Rect> = jobs
             .iter()
-            .map(|job| read_extent_of(input.info, job))
+            .map(|job| read_extent_of(input.info, job, &|id| input.checkpoints.contains_key(id)))
             .collect();
         let (mut local, mut snapshot) = (self.tiles.subset(&extents), self.snapshot.clone());
         let ends_drag = jobs.iter().any(|job| job.ends_drag);
@@ -2489,6 +2703,7 @@ impl OriginReaders {
 /// ops, oldest first) is replayed over it and kept as the state's chain. An
 /// op that cannot be applied ends the replay; a region that cannot be
 /// rendered is skipped.
+#[allow(clippy::too_many_arguments)]
 pub fn open_edit_session(
     zmap: Option<&Path>,
     composite: &Path,
@@ -2497,6 +2712,7 @@ pub fn open_edit_session(
     tile_size: u32,
     base_ops: Vec<Op>,
     chain: Vec<Op>,
+    checkpoints: HashMap<String, CheckpointSource>,
 ) -> Result<EditState, EditSessionError> {
     let pixel = Rect {
         x: 0,
@@ -2546,6 +2762,10 @@ pub fn open_edit_session(
         composite: composite.to_path_buf(),
         base_ops,
         chain: Vec::new(),
+        checkpoints: checkpoints
+            .into_iter()
+            .map(|(id, source)| (id, Arc::new(source)))
+            .collect(),
         snapshot: tiles.subset(&[]),
         tiles,
         blender: None,
@@ -2929,8 +3149,12 @@ mod placed_stroke_tests {
     }
 
     fn checkpoint_stroke(x: i32) -> Op {
+        stroke_from(CHECKPOINT, x)
+    }
+
+    fn stroke_from(id: &str, x: i32) -> Op {
         Op::BrushStroke {
-            source: StrokeSource::Checkpoint(CHECKPOINT.to_string()),
+            source: StrokeSource::Checkpoint(id.to_string()),
             path: dab(x),
             radius: 3.0,
             softness: 0.5,
@@ -2960,7 +3184,7 @@ mod placed_stroke_tests {
     #[test]
     fn a_frame_only_job_places_its_strokes_with_their_frames() {
         let job = job_of(vec![frame_stroke(5, 8), frame_stroke(2, 30)]);
-        let placed = placed_strokes(info(), &job).unwrap();
+        let placed = placed_strokes(info(), &job, &|_| false).unwrap().strokes;
         let sources: Vec<blend::PlacedSource> = placed.iter().map(|p| p.source).collect();
         assert_eq!(
             sources,
@@ -2969,21 +3193,34 @@ mod placed_stroke_tests {
     }
 
     #[test]
-    fn checkpoint_source_is_refused() {
-        let expected = RetouchError::CheckpointSource {
-            checkpoint: CHECKPOINT.to_string(),
-        }
-        .to_string();
-        for ops in [
-            vec![frame_stroke(3, 8), checkpoint_stroke(30)],
-            vec![checkpoint_stroke(30), frame_stroke(3, 8)],
-        ] {
-            let error = placed_strokes(info(), &job_of(ops))
-                .err()
-                .expect("a checkpoint source is refused");
-            assert_eq!(error, expected);
-            assert!(error.contains(CHECKPOINT), "{error}");
-        }
+    fn a_checkpoint_job_places_its_strokes_on_rendered_slots() {
+        const OTHER: &str = "0123456789abcdef0123456789abcdef";
+        let held = |id: &str| id == CHECKPOINT || id == OTHER;
+        let job = job_of(vec![
+            frame_stroke(3, 8),
+            checkpoint_stroke(30),
+            stroke_from(OTHER, 20),
+            checkpoint_stroke(12),
+        ]);
+        let placed = placed_strokes(info(), &job, &held).unwrap();
+        let sources: Vec<blend::PlacedSource> = placed.strokes.iter().map(|p| p.source).collect();
+        assert_eq!(
+            sources,
+            [
+                blend::PlacedSource::Frame(3),
+                blend::PlacedSource::Rendered(0),
+                blend::PlacedSource::Rendered(1),
+                blend::PlacedSource::Rendered(0),
+            ],
+            "one slot per distinct id, frames unchanged"
+        );
+        assert_eq!(placed.slots, [CHECKPOINT, OTHER]);
+
+        let error = placed_strokes(info(), &job, &|id: &str| id == OTHER)
+            .err()
+            .expect("an id with no rendered source is refused");
+        assert!(error.contains(CHECKPOINT), "{error}");
+        assert!(!error.contains(OTHER), "{error}");
     }
 
     #[test]

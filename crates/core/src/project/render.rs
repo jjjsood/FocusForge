@@ -1296,6 +1296,28 @@ pub fn render_checkpoint(
             &mut |sink| image.render(Some(&mut *project), image.full(), sink),
             path,
         ),
+        SampleFormat::F32 => write_tiff_f32(&image, Some(project), path),
+    }
+}
+
+/// [`render_checkpoint`] for entry `index` of the unsaved list `entries`
+/// ([`CheckpointImage::prepare_unsaved`]). `project` is needed when the entry
+/// hangs from a saved checkpoint.
+pub fn render_unsaved_checkpoint(
+    entries: &[InMemoryCheckpoint],
+    index: usize,
+    mut project: Option<&mut Project>,
+    path: &Path,
+    memory_cap: Option<u64>,
+) -> Result<(), ProjectError> {
+    let image = CheckpointImage::prepare_unsaved(entries, index, project.as_deref())?
+        .with_memory_cap(memory_cap);
+    match image.sample_format {
+        SampleFormat::U16 => write_tiff(
+            &image,
+            &mut |sink| image.render(project.as_deref_mut(), image.full(), sink),
+            path,
+        ),
         SampleFormat::F32 => write_tiff_f32(&image, project, path),
     }
 }
@@ -1304,7 +1326,7 @@ pub fn render_checkpoint(
 /// TIFF.
 fn write_tiff_f32(
     image: &CheckpointImage,
-    project: &mut Project,
+    project: Option<&mut Project>,
     path: &Path,
 ) -> Result<(), ProjectError> {
     write_via_partial(path, |partial| {
@@ -1318,7 +1340,7 @@ fn write_tiff_f32(
             },
         )
         .map_err(|err| ProjectError::container(partial, err))?;
-        image.render_f32(Some(project), image.full(), &mut |band, rect| {
+        image.render_f32(project, image.full(), &mut |band, rect| {
             writer
                 .write_tile_f32(rect, band)
                 .map_err(|err| ProjectError::container(path, err))
@@ -1394,6 +1416,7 @@ pub(super) fn write_via_partial(
 
 #[cfg(test)]
 mod tests {
+    use super::super::checkpoint::{BrushMode, Point};
     use super::*;
 
     fn tile(y: u32, height: u32) -> Rect {
@@ -1441,5 +1464,156 @@ mod tests {
         assert_eq!(chunks.len(), 47, "below one row, one row each");
 
         assert_eq!(fit_rows(tile(9, 1), 0, &cost), vec![tile(9, 1)]);
+    }
+
+    const SIZE: (u32, u32) = (23, 17);
+    const SPP: usize = 3;
+
+    fn whole() -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: SIZE.0,
+            height: SIZE.1,
+        }
+    }
+
+    fn write_image(dir: &Path, name: &str, wide: bool, seed: usize) -> PathBuf {
+        let path = dir.join(name);
+        let spec = TiffSpec {
+            width: SIZE.0,
+            height: SIZE.1,
+            samples_per_pixel: SPP as u32,
+            description: Some("held composite".to_string()),
+        };
+        let len = SIZE.0 as usize * SIZE.1 as usize * SPP;
+        if wide {
+            let samples: Vec<f32> = (0..len)
+                .map(|i| {
+                    (i * 37 * seed % 1000) as f32 + 0.25 + if i % 11 == 0 { 5000.0 } else { 0.0 }
+                })
+                .collect();
+            let mut writer = TiffWriter::create_f32(&path, spec).unwrap();
+            writer.write_tile_f32(whole(), &samples).unwrap();
+            writer.finish().unwrap();
+        } else {
+            let samples: Vec<u16> = (0..len).map(|i| (i * 977 * seed % 65_536) as u16).collect();
+            let mut writer = TiffWriter::create(&path, spec).unwrap();
+            writer.write_tile(whole(), &samples).unwrap();
+            writer.finish().unwrap();
+        }
+        path
+    }
+
+    /// A held fuse over one source frame, then a retouch held on it.
+    fn held_list(dir: &Path, wide: bool) -> Vec<InMemoryCheckpoint> {
+        let fuse = HeldCheckpoint {
+            composite: write_image(dir, "composite.tif", wide, 1),
+            zmap: dir.join("zmap.tif"),
+            width: SIZE.0,
+            height: SIZE.1,
+            sources: vec![write_image(dir, "frame.tif", false, 5)],
+            algorithm: "laplacian".to_string(),
+            params: Default::default(),
+            align: None,
+            registration: Registration::default(),
+            composite_description: "held composite".to_string(),
+            metrics: Default::default(),
+            created_at: 900,
+            compressed_composite: None,
+        };
+        let ops = vec![Op::BrushStroke {
+            source: StrokeSource::Frame(0),
+            path: vec![Point { x: 4, y: 5 }, Point { x: 17, y: 11 }],
+            radius: 5.0,
+            softness: 0.5,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
+        }];
+        vec![
+            InMemoryCheckpoint {
+                kind: InMemoryKind::Fused(fuse),
+                parent: None,
+            },
+            InMemoryCheckpoint {
+                kind: InMemoryKind::Ops {
+                    ops,
+                    created_at: 1_000,
+                },
+                parent: Some(ParentRef::Entry(0)),
+            },
+        ]
+    }
+
+    /// The samples `image` streams, in the sample type it holds.
+    fn streamed<S: Copy + Default>(
+        stream: impl FnOnce(&mut RenderSink<'_, S>) -> Result<(), ProjectError>,
+    ) -> Vec<S> {
+        let mut out = vec![S::default(); SIZE.0 as usize * SIZE.1 as usize * SPP];
+        stream(&mut |band: &[S], rect: Rect| {
+            let len = rect.width as usize * SPP;
+            for (r, line) in band.chunks_exact(len).enumerate() {
+                let at = (rect.y as usize + r) * SIZE.0 as usize + rect.x as usize;
+                out[at * SPP..at * SPP + len].copy_from_slice(line);
+            }
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    fn read_back<S: Sample + Default + Clone>(path: &Path) -> Vec<S> {
+        let stack = TiffStack::open_staged(path).unwrap();
+        let mut out = vec![S::default(); SIZE.0 as usize * SIZE.1 as usize * SPP];
+        S::read_tile(&stack, 0, whole(), &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn unsaved_checkpoint_tiff() {
+        for wide in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let entries = held_list(dir.path(), wide);
+            let mut written: Vec<Vec<u32>> = Vec::new();
+            for index in [0, 1] {
+                let name = format!("entry {index}, f32 {wide}");
+                let path = dir.path().join(format!("out-{index}.tif"));
+                render_unsaved_checkpoint(&entries, index, None, &path, None)
+                    .unwrap_or_else(|err| panic!("{name}: {err}"));
+                assert!(!partial_path(&path).exists(), "{name}: no partial left");
+
+                let image = CheckpointImage::prepare_unsaved(&entries, index, None).unwrap();
+                if wide {
+                    let want = streamed(|sink| image.render_f32(None, whole(), sink));
+                    assert!(read_back::<f32>(&path) == want, "{name}");
+                    written.push(
+                        read_back::<f32>(&path)
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect(),
+                    );
+                } else {
+                    let want = streamed(|sink| image.render(None, whole(), sink));
+                    assert!(read_back::<u16>(&path) == want, "{name}");
+                    written.push(
+                        read_back::<u16>(&path)
+                            .iter()
+                            .map(|&v| u32::from(v))
+                            .collect(),
+                    );
+                }
+            }
+            assert!(
+                written[0] != written[1],
+                "f32 {wide}: the retouch changes the image"
+            );
+
+            let absent = dir.path().join("absent.tif");
+            assert!(matches!(
+                render_unsaved_checkpoint(&entries, 2, None, &absent, None),
+                Err(ProjectError::Container { message, .. }) if message.contains("is not in the list")
+            ));
+            assert!(!absent.exists());
+        }
     }
 }

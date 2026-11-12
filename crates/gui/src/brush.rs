@@ -5,7 +5,7 @@
 //! release -- plus the brush cursor's `Path` geometry. Plain Rust, no Slint
 //! types.
 
-use focusforge_core::project::{BrushMode, Point};
+use focusforge_core::project::{BrushMode, Point, StrokeSource};
 use focusforge_core::tile::Rect;
 
 /// One freehand stroke while its drag is still live: the raw `f32` trace in
@@ -14,7 +14,7 @@ use focusforge_core::tile::Rect;
 /// pass's dilation).
 #[derive(Debug, Clone)]
 pub struct LiveStroke {
-    source: u16,
+    source: StrokeSource,
     radius: f32,
     softness: f32,
     mode: BrushMode,
@@ -32,7 +32,7 @@ impl LiveStroke {
     /// whole lifetime -- a wheel turned or a toolbar control changed
     /// mid-drag affects only the next stroke.
     pub fn new(
-        source: u16,
+        source: StrokeSource,
         radius: f32,
         softness: f32,
         mode: BrushMode,
@@ -52,8 +52,8 @@ impl LiveStroke {
         }
     }
 
-    pub fn source(&self) -> u16 {
-        self.source
+    pub fn source(&self) -> &StrokeSource {
+        &self.source
     }
 
     pub fn radius(&self) -> f32 {
@@ -299,7 +299,7 @@ fn rdp(points: &[(f32, f32)], epsilon: f32) -> Vec<(f32, f32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use focusforge_core::project::{BrushMode, Op};
+    use focusforge_core::project::{BrushMode, Op, StrokeSource};
     use focusforge_core::retouch::blend::alpha;
     use focusforge_core::zmap::ZMapInfo;
 
@@ -332,7 +332,15 @@ mod tests {
 
     #[test]
     fn take_segment_is_none_without_new_motion() {
-        let mut stroke = LiveStroke::new(1, 2.5, 0.4, BrushMode::Normal, 1.0, 5.0, 5.0);
+        let mut stroke = LiveStroke::new(
+            StrokeSource::Frame(1),
+            2.5,
+            0.4,
+            BrushMode::Normal,
+            1.0,
+            5.0,
+            5.0,
+        );
         assert_eq!(stroke.take_segment(), None, "a fresh stroke has no motion");
         stroke.push(3.0, 1.0);
         assert!(stroke.take_segment().is_some());
@@ -342,11 +350,27 @@ mod tests {
     #[test]
     fn segments_join_into_the_path_so_far_and_it_covers_each_segment() {
         let trace = deltas(60);
-        let fresh = LiveStroke::new(1, 2.5, 0.4, BrushMode::Normal, 1.0, 6.0, 20.0);
+        let fresh = LiveStroke::new(
+            StrokeSource::Frame(1),
+            2.5,
+            0.4,
+            BrushMode::Normal,
+            1.0,
+            6.0,
+            20.0,
+        );
         assert_eq!(fresh.path_so_far(), vec![Point { x: 6, y: 20 }]);
 
         for flushes in [1usize, 3, 17] {
-            let mut stroke = LiveStroke::new(1, 2.5, 0.4, BrushMode::Normal, 1.0, 6.0, 20.0);
+            let mut stroke = LiveStroke::new(
+                StrokeSource::Frame(1),
+                2.5,
+                0.4,
+                BrushMode::Normal,
+                1.0,
+                6.0,
+                20.0,
+            );
             let mut joined: Vec<Point> = Vec::new();
             for chunk in trace.chunks(trace.len().div_ceil(flushes)) {
                 for &(dx, dy) in chunk {
@@ -373,7 +397,15 @@ mod tests {
                     );
                 }
             }
-            let mut whole = LiveStroke::new(1, 2.5, 0.4, BrushMode::Normal, 1.0, 6.0, 20.0);
+            let mut whole = LiveStroke::new(
+                StrokeSource::Frame(1),
+                2.5,
+                0.4,
+                BrushMode::Normal,
+                1.0,
+                6.0,
+                20.0,
+            );
             for &(dx, dy) in &trace {
                 whole.push(dx, dy);
             }
@@ -385,7 +417,15 @@ mod tests {
     fn finish_resamples_and_simplifies() {
         // A straight run collapses to its two ends however many events it
         // arrived as.
-        let mut straight = LiveStroke::new(0, 8.0, 0.0, BrushMode::Normal, 1.0, 2.0, 3.0);
+        let mut straight = LiveStroke::new(
+            StrokeSource::Frame(0),
+            8.0,
+            0.0,
+            BrushMode::Normal,
+            1.0,
+            2.0,
+            3.0,
+        );
         for _ in 0..300 {
             straight.push(0.1, 0.05);
         }
@@ -395,7 +435,15 @@ mod tests {
         );
 
         // An L keeps its corner and nothing near it lies off the shape.
-        let mut corner = LiveStroke::new(0, 4.0, 0.0, BrushMode::Normal, 1.0, 0.0, 0.0);
+        let mut corner = LiveStroke::new(
+            StrokeSource::Frame(0),
+            4.0,
+            0.0,
+            BrushMode::Normal,
+            1.0,
+            0.0,
+            0.0,
+        );
         for _ in 0..200 {
             corner.push(0.1, 0.0);
         }
@@ -409,7 +457,15 @@ mod tests {
         assert!(path.len() <= 4, "{path:?}");
 
         // A press with no motion is a one-point path.
-        let dab = LiveStroke::new(0, 4.0, 0.0, BrushMode::Normal, 1.0, 7.4, 9.6);
+        let dab = LiveStroke::new(
+            StrokeSource::Frame(0),
+            4.0,
+            0.0,
+            BrushMode::Normal,
+            1.0,
+            7.4,
+            9.6,
+        );
         assert_eq!(dab.finish(), vec![Point { x: 7, y: 10 }]);
     }
 

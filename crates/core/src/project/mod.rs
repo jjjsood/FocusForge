@@ -82,7 +82,7 @@ pub use manifest::{
 };
 use manifest::{FORMAT_VERSION, FormatProbe};
 pub use pixel_grid::{GridMismatch, PixelGrid};
-pub use render::{CheckpointImage, PendingState, render_checkpoint};
+pub use render::{CheckpointImage, PendingState, render_checkpoint, render_unsaved_checkpoint};
 pub use review::ReviewMetrics;
 pub use seal::{
     GONE_KEY, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, SealRequest,
