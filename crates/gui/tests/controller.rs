@@ -328,6 +328,8 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("ff_menu.slint"), "key-pressed(event)")
             | (Some("ff_slider.slint"), "pointer-event(event)")
             | (Some("ff_slider.slint"), "key-pressed(event)")
+            | (Some("analytics_overlay.slint"), "changed open")
+            | (Some("analytics_overlay.slint"), "changed state")
             | (Some("ff_slider.slint"), "focus-changed-event(reason)")
             | (Some("ff_image_row.slint"), "pointer-event(event)")
             | (Some("ff_image_row.slint"), "moved")

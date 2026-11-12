@@ -402,12 +402,33 @@ fn motion_tokens(theme: &Theme<'_>) -> (i64, i64, i64) {
     )
 }
 
+/// The Analytics entry motion in milliseconds: wait, zoom, zoom stagger, zoom
+/// span, fill, fill stagger, fill span, then the loading band's fade and
+/// stagger.
+fn entry_tokens(theme: &Theme<'_>) -> [i64; 9] {
+    [
+        theme.get_entry_wait(),
+        theme.get_entry_zoom(),
+        theme.get_entry_zoom_stagger(),
+        theme.get_entry_zoom_span(),
+        theme.get_entry_fill(),
+        theme.get_entry_fill_stagger(),
+        theme.get_entry_fill_span(),
+        theme.get_sweep_fade(),
+        theme.get_sweep_stagger(),
+    ]
+}
+
 #[test]
 fn motion_tokens_are_zero_with_reduced_motion() {
     let probe = probe();
     let theme = Theme::get(&probe);
     assert!(!theme.get_reduce_motion());
     assert_eq!(motion_tokens(&theme), (150, 400, 150));
+    assert_eq!(
+        entry_tokens(&theme),
+        [150, 180, 40, 600, 350, 30, 500, 150, 15]
+    );
 
     theme.set_reduce_motion(true);
     assert_eq!(
@@ -415,9 +436,14 @@ fn motion_tokens_are_zero_with_reduced_motion() {
         (0, 0, 150),
         "reduced motion zeroes the fades and keeps the flash hold"
     );
+    assert_eq!(entry_tokens(&theme), [0; 9], "the entry motion is a cut");
 
     theme.set_reduce_motion(false);
     assert_eq!(motion_tokens(&theme), (150, 400, 150));
+    assert_eq!(
+        entry_tokens(&theme),
+        [150, 180, 40, 600, 350, 30, 500, 150, 15]
+    );
 }
 
 /// The sheet is generated only with the `theme-sheet` feature.
@@ -430,14 +456,14 @@ mod sheet {
     use i_slint_backend_testing::{ElementQuery, mock_elapsed_time};
     use slint::{ComponentHandle, Global};
 
-    /// `(spinner angle, sweep at the right)` at the current mock time.
-    fn motion_sample(theme: &Theme<'_>) -> (f32, bool) {
+    /// `(spinner angle, loading band pass)` at the current mock time.
+    fn motion_sample(theme: &Theme<'_>) -> (f32, f32) {
         slint::platform::update_timers_and_animations();
-        (theme.get_spinner_angle(), theme.get_sweep_right())
+        (theme.get_spinner_angle(), theme.get_sweep_progress())
     }
 
     /// The sample at 0 ms and at `at` ms later.
-    fn motion_samples(theme: &Theme<'_>, at: u64) -> ((f32, bool), (f32, bool)) {
+    fn motion_samples(theme: &Theme<'_>, at: u64) -> ((f32, f32), (f32, f32)) {
         let start = motion_sample(theme);
         mock_elapsed_time(Duration::from_millis(at));
         (start, motion_sample(theme))
@@ -480,17 +506,31 @@ mod sheet {
         assert!(!theme.get_reduce_motion());
         let drawn = spinners();
         assert!(drawn > 0, "the sheet draws no FFSpinner");
-        // 450 ms is no whole spinner turn; the sweep flips sides every 900 ms.
+        // 450 ms is no whole spinner turn.
         let (start, later) = motion_samples(&theme, 450);
         assert_ne!(start.0, later.0, "the spinner turns with motion on");
-        let (start, later) = motion_samples(&theme, 900);
-        assert_ne!(start.1, later.1, "the sweep changes sides with motion on");
+        // A pass takes 1600 ms, so three samples 400 ms apart each advance a
+        // quarter pass in the one direction (the pass wraps from 1 to 0).
+        let mut pass = vec![motion_sample(&theme).1];
+        for _ in 0..3 {
+            mock_elapsed_time(Duration::from_millis(400));
+            pass.push(motion_sample(&theme).1);
+        }
+        for step in pass.windows(2) {
+            let advance = (step[1] - step[0]).rem_euclid(1.0);
+            assert!(
+                (advance - 0.25).abs() < 1e-3,
+                "the band advances a quarter pass, not {advance}: {pass:?}"
+            );
+        }
 
         theme.set_reduce_motion(true);
         let (start, later) = motion_samples(&theme, 450);
         assert_eq!(start, later, "the spinner stands still");
-        let (start, later) = motion_samples(&theme, 900);
-        assert_eq!(start, later, "the sweep is a fixed segment");
-        assert_eq!(spinners(), drawn, "the spinner stays drawn");
+        let (start, later) = motion_samples(&theme, 400);
+        assert_eq!(start, later, "the band rests");
+        assert_eq!(later.1, 0.0, "at the left of its field");
+        // The sheet's looped count adds and drops row spinners as time passes.
+        assert!(spinners() > 0, "the spinner stays drawn");
     }
 }
