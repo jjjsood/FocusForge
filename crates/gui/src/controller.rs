@@ -1073,6 +1073,47 @@ fn stroke_count(ops: &[job::Op]) -> usize {
         .count()
 }
 
+/// The delete question's body for a checkpoint that strokes paint from:
+/// `stored` is `(strokes, checkpoints)` in other checkpoints, `live` the
+/// strokes of the open edit, `untouched` the sentence on the other rows.
+/// `None` when no stroke uses it.
+fn used_checkpoint_body(
+    (stored, containers): (usize, usize),
+    live: usize,
+    untouched: &str,
+) -> Option<String> {
+    let strokes = |n: usize| match n {
+        1 => "1 brush stroke".to_string(),
+        n => format!("{n} brush strokes"),
+    };
+    let places = match (stored, live) {
+        (0, 0) => return None,
+        (0, _) => format!("{} in the current edit", strokes(live)),
+        (_, 0) => format!("{} in {}", strokes(stored), other_checkpoints(containers)),
+        _ => format!(
+            "{} in {} and {live} in the current edit",
+            strokes(stored),
+            other_checkpoints(containers)
+        ),
+    };
+    let those = if stored + live == 1 {
+        "that stroke keeps its"
+    } else {
+        "those strokes keep their"
+    };
+    Some(format!(
+        "This checkpoint is the source of {places}.\n\nIt is hidden and kept in the project, so {those} pixels. {untouched}"
+    ))
+}
+
+/// "another checkpoint" or "N other checkpoints".
+fn other_checkpoints(n: usize) -> String {
+    match n {
+        1 => "another checkpoint".to_string(),
+        n => format!("{n} other checkpoints"),
+    }
+}
+
 /// A held checkpoint whose run diverged on `diverged`, by frame file name.
 struct ParkedRun {
     held: job::HeldCheckpoint,
@@ -1654,10 +1695,9 @@ impl ProjectTab {
         self.edit.as_ref().is_some_and(|edit| edit.op_count() > 0)
     }
 
-    /// Removes the files of every fused in-memory entry a project save would
-    /// not write: deleted, not the current row and no written entry's parent.
-    fn free_unneeded_held(&self) {
-        // The session's strokes are written as one more entry under the row.
+    /// The in-memory entries plus, when the session holds strokes, one more
+    /// entry for them under the current row: what a save would write.
+    fn held_and_live(&self) -> Vec<job::InMemoryCheckpoint> {
         let mut entries = self.held.clone();
         if let Some(edit) = self.edit.as_ref().filter(|edit| edit.op_count() > 0) {
             entries.push(job::InMemoryCheckpoint {
@@ -1668,6 +1708,51 @@ impl ProjectTab {
                 parent: self.row_parent(),
             });
         }
+        entries
+    }
+
+    /// The strokes that paint from checkpoint `key` (a saved id or an unsaved
+    /// entry's key): `(strokes, containers)` over the stored checkpoints and
+    /// the op entries a save would write, and the strokes of the session.
+    fn strokes_using(&self, key: &str) -> ((usize, usize), usize) {
+        let entries = self.held_and_live();
+        let kept = job::kept_entries(&entries, &self.pending_deletes, self.row_parent().as_ref());
+        fn ops_of(entry: &job::InMemoryCheckpoint) -> Option<&[job::Op]> {
+            match &entry.kind {
+                job::InMemoryKind::Ops { ops, .. } => Some(ops.as_slice()),
+                job::InMemoryKind::Fused(_) => None,
+            }
+        }
+        let history = match &self.project {
+            GuiProject::Opened(project) => Some(project.history()),
+            GuiProject::Unsaved(_) => None,
+        };
+        let held = self
+            .held
+            .iter()
+            .zip(&kept)
+            .filter_map(|(entry, kept)| ops_of(entry).filter(|_| *kept));
+        let queued = |id: &str| {
+            self.pending_deletes
+                .contains(&job::ParentRef::Saved(id.to_string()))
+        };
+        let stored = history
+            .into_iter()
+            .flat_map(|h| h.op_groups())
+            .filter(|(id, _)| !queued(id))
+            .map(|(_, ops)| ops);
+        let groups = stored.chain(held);
+        let live = entries
+            .get(self.held.len())
+            .and_then(ops_of)
+            .map_or(0, |ops| job::strokes_using_in(key, [ops]).0);
+        (job::strokes_using_in(key, groups), live)
+    }
+
+    /// Removes the files of every fused in-memory entry a project save would
+    /// not write: deleted, not the current row and no written entry's parent.
+    fn free_unneeded_held(&self) {
+        let entries = self.held_and_live();
         let kept = job::kept_entries(&entries, &self.pending_deletes, self.row_parent().as_ref());
         for (entry, kept) in self.held.iter().zip(kept) {
             if let (false, job::InMemoryKind::Fused(held)) = (kept, &entry.kind) {
@@ -10930,13 +11015,15 @@ impl AppController {
             .iter()
             .find(|entry| entry.id.as_deref() == Some(key.as_str()))?;
         let others = panel.row_count - 1;
-        let body = if others == 1 {
+        let untouched = if others == 1 {
             "The other checkpoint is untouched, and the stack is not fused again.".to_string()
         } else {
             format!(
                 "The other {others} checkpoints are untouched, and the stack is not fused again."
             )
         };
+        let (stored, live) = self.state.active()?.strokes_using(key);
+        let body = used_checkpoint_body(stored, live, &untouched).unwrap_or(untouched);
         Some((format!("{} · {}", row.algorithm, row.time_text), body))
     }
 

@@ -71,7 +71,9 @@ pub use blob::{
     FileStamp, Plane, StagedBlob, short_hash, source_hash, source_hash_change_checked,
     stack_fingerprint,
 };
-pub use checkpoint::{BrushMode, Checkpoint, FuseRecord, History, Op, Point, StrokeSource};
+pub use checkpoint::{
+    BrushMode, Checkpoint, FuseRecord, History, Op, Point, StrokeSource, strokes_using_in,
+};
 pub use container::partial_path;
 use container::{ContainerWriter, Index};
 pub use error::ProjectError;

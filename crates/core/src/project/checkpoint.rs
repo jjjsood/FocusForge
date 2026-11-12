@@ -582,12 +582,36 @@ impl History {
     /// How many strokes, across every stored checkpoint (hidden ones too),
     /// paint from the checkpoint `id`; 0 for an id nothing paints from.
     pub fn strokes_using(&self, id: &str) -> usize {
-        self.by_id
-            .values()
-            .flat_map(|c| c.ops.iter())
-            .filter(|op| op.checkpoint_source() == Some(id))
-            .count()
+        strokes_using_in(id, self.op_groups().map(|(_, ops)| ops)).0
     }
+
+    /// The id and ops of every stored checkpoint (hidden ones too), in no
+    /// particular order.
+    pub fn op_groups(&self) -> impl Iterator<Item = (&str, &[Op])> {
+        self.by_id
+            .iter()
+            .map(|(id, c)| (id.as_str(), c.ops.as_slice()))
+    }
+}
+
+/// How many strokes in `groups` paint from the checkpoint named `key`, and
+/// how many of the groups hold at least one of them: `(strokes, containers)`.
+/// A group is the ops of one checkpoint or of the live edit; `key` is a
+/// stored checkpoint's id or an unsaved one's `held:<index>` key, the form a
+/// stroke carries for its source (see [`Op::checkpoint_source`]).
+pub fn strokes_using_in<'a>(
+    key: &str,
+    groups: impl IntoIterator<Item = &'a [Op]>,
+) -> (usize, usize) {
+    groups
+        .into_iter()
+        .map(|ops| {
+            ops.iter()
+                .filter(|op| op.checkpoint_source() == Some(key))
+                .count()
+        })
+        .filter(|&n| n > 0)
+        .fold((0, 0), |(strokes, groups), n| (strokes + n, groups + 1))
 }
 
 #[cfg(test)]
@@ -763,6 +787,29 @@ mod tests {
             });
         }
         checkpoint
+    }
+
+    #[test]
+    fn strokes_using_in_counts_strokes_and_the_groups_holding_them() {
+        let stored = "0123456789abcdef0123456789abcdef";
+        let from = |sources: &[&str]| painting_from(bare("x", None, 1), sources).ops;
+        let frame = Op::frame_stroke(0, vec![Point { x: 0, y: 0 }], 1.0, 0.0);
+        let stored_group = from(&[stored, stored, "held:0"]);
+        let held_group = from(&["held:0", stored]);
+        let live_group = [from(&["held:0"]), vec![frame.clone()]].concat();
+        let none = from(&[]);
+
+        let count = |key: &str, groups: &[&[Op]]| strokes_using_in(key, groups.iter().copied());
+        let groups: [&[Op]; 4] = [&stored_group, &held_group, &live_group, &none];
+        assert_eq!(count(stored, &groups), (3, 2), "a stored id, two groups");
+        assert_eq!(count("held:0", &groups), (3, 3), "the held:<i> key form");
+        assert_eq!(count("held:1", &groups), (0, 0), "no stroke names it");
+        assert_eq!(
+            count(stored, &[&none, &[frame]]),
+            (0, 0),
+            "frames never use it"
+        );
+        assert_eq!(count(stored, &[]), (0, 0), "no groups");
     }
 
     fn build_err(checkpoints: Vec<Checkpoint>) -> ProjectError {
