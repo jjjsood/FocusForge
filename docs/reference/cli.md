@@ -496,7 +496,12 @@ before the first stage starts: `frame_count`, `frame_pixels` (one frame's
 width times height), `source_bits_per_sample` (8, 16, or 32 for developed
 RAW), `reader` (`mmap`, `decoded`, `raw` or `jpeg`, which names the input
 format), `gpu` (the planned backend; a mid-run fallback shows in
-`gpu_fallback`), `workers` (host worker threads), `algorithm`,
+`gpu_fallback`), `align_gpu` (`true` when the alignment stage is planned on a
+GPU accelerator: the aligner has a GPU path, the build offers one, and neither
+`--cpu` nor `--no-align` is given; it names the plan made before the run, so a
+GPU build on a host without an adapter still reads `true`, while the report's
+top-level `align_backend` names the adapter or `cpu` that actually ran),
+`workers` (host worker threads), `algorithm`,
 `align_cache_hit` and `resumed_units` (fuse tiles taken from a `--resume`
 ledger). `--dry-run --json` carries the same record for a cold run
 (`align_cache_hit` false, `resumed_units` 0) and lists `alignment cache` under
@@ -515,7 +520,8 @@ for a reference machine (a 4-core laptop CPU, or its integrated GPU):
 `warp_write` is always `null`, since `stack` never enters it),
 `total_seconds` (the sum of the stages) and `calibrated`. `calibrated` is
 `true` for uncompressed 16-bit TIFF frames read through `mmap` (with the
-`laplacian`, `depth-map` or `weighted-average` blend), for compressed or
+`laplacian` blend, or with `depth-map` or `weighted-average` on the align
+backend that `run_plan.align_gpu` names), for compressed or
 otherwise non-`mmap` TIFF frames and for JPEG frames (both with
 `laplacian`), and for Canon CR3 frames developed into memory or into a
 scratch file (with `laplacian`); every other input still gets an estimate,
@@ -525,7 +531,10 @@ camera wrote a CR3, whether the frames are a real focus stack rather than
 repeated frames, frame sizes far from the measured ones (0.26 and 15 Mpx
 TIFF, 17 Mpx CR3), a TIFF's compression, layout and bit depth (16-bit
 Deflate strips were measured), `--no-align` on compressed TIFF or JPEG
-frames, or the host budget of a scratch-file run (6 GiB was measured). The
+frames, or the host budget of a scratch-file run (6 GiB was measured). For
+`depth-map` and `weighted-average` the estimate reads the CPU or the GPU
+alignment row (one machine, one GPU, one stack each), so a host whose GPU
+align differs from it shifts the align stage. The
 field is `null` for a stack without frames or pixels.
 
 Before any frame is read for fusion, every `stack` run measures the free space

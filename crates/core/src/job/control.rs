@@ -444,7 +444,7 @@ impl JobControl {
     /// rate (pauses excluded) during Develop, Prepare and a computed Align,
     /// `None` once every align frame is done, and the cost or pixel rate
     /// otherwise; `total_eta` is `None`. Seeded, both come from
-    /// [`live_eta`] over the ledger's open stage.
+    /// `live_eta` over the ledger's open stage.
     pub fn progress(&self) -> JobProgress {
         let units_done = self.units_done.load(Ordering::SeqCst);
         let unit_total = self.unit_total.load(Ordering::SeqCst);

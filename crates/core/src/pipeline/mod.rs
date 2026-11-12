@@ -277,6 +277,10 @@ pub struct RunPlanFeatures {
     /// Whether the plan targets the GPU backend. A mid-run fallback to the
     /// host shows in the report's `gpu_fallback`, not here.
     pub gpu: bool,
+    /// Whether the align stage is planned on a GPU accelerator, as offered
+    /// before the run. What alignment actually used shows in the report's
+    /// `align_backend`.
+    pub align_gpu: bool,
     /// Host worker threads the develop, prepare and align stages use.
     pub workers: usize,
     /// The blend method's algorithm id.
@@ -296,6 +300,7 @@ impl RunPlanFeatures {
         reader: ReaderKind,
         source_bits_per_sample: u16,
         gpu: bool,
+        align_gpu: bool,
         algorithm: &str,
         admission_cap: usize,
     ) -> Self {
@@ -305,12 +310,34 @@ impl RunPlanFeatures {
             source_bits_per_sample,
             reader,
             gpu,
+            align_gpu,
             workers: host_workers(ctx.frame_count, admission_cap),
             algorithm: algorithm.to_string(),
             align_cache_hit: false,
             resumed_units: 0,
         }
     }
+}
+
+/// The cold-run plan of `request`. Its align stage is planned on a GPU
+/// accelerator when the request aligns and offers one.
+fn run_plan_for(
+    request: &FuseRequest,
+    ctx: &crate::params::StackContext,
+    reader: ReaderKind,
+    source_bits_per_sample: u16,
+    fuse_gpu: bool,
+    admission_cap: usize,
+) -> RunPlanFeatures {
+    RunPlanFeatures::new(
+        ctx,
+        reader,
+        source_bits_per_sample,
+        fuse_gpu,
+        request.align.is_some() && request.align_backend.is_some(),
+        request.algorithm.id(),
+        admission_cap,
+    )
 }
 
 /// One fused tile's size and wall duration, as noted when trace accounting
@@ -838,12 +865,12 @@ pub fn run(
     if let Some(first) = request.frames.first()
         && let Ok(bits) = source_bits_per_sample(opened.kind, first)
     {
-        let features = RunPlanFeatures::new(
+        let features = run_plan_for(
+            request,
             &stack_ctx,
             opened.kind,
             bits,
             request.backend.is_some() && cap_fallback.is_none(),
-            request.algorithm.id(),
             control.admission_cap(),
         );
         let raw = developed_store
@@ -2384,11 +2411,11 @@ mod tests {
     }
 
     fn plan_features(ctx: &crate::params::StackContext, cap: usize) -> RunPlanFeatures {
-        RunPlanFeatures::new(ctx, ReaderKind::Mmap, 16, false, "laplacian", cap)
+        RunPlanFeatures::new(ctx, ReaderKind::Mmap, 16, false, false, "laplacian", cap)
     }
 
     #[test]
-    fn run_plan_features_serialize_the_nine_stable_names() {
+    fn run_plan_features_serialize_the_ten_stable_names() {
         let ctx = crate::params::StackContext::new(3, 64, 48, 3);
         let value = serde_json::to_value(plan_features(&ctx, usize::MAX)).unwrap();
         let object = value.as_object().expect("a record serializes as an object");
@@ -2399,6 +2426,7 @@ mod tests {
             [
                 "algorithm",
                 "align_cache_hit",
+                "align_gpu",
                 "frame_count",
                 "frame_pixels",
                 "gpu",
@@ -2415,12 +2443,14 @@ mod tests {
     #[test]
     fn run_plan_features_start_cold_and_map_the_context() {
         let ctx = crate::params::StackContext::new(7, 100, 50, 3);
-        let features = RunPlanFeatures::new(&ctx, ReaderKind::Raw, 32, true, "pmax", usize::MAX);
+        let features =
+            RunPlanFeatures::new(&ctx, ReaderKind::Raw, 32, true, true, "pmax", usize::MAX);
         assert_eq!(features.frame_count, 7);
         assert_eq!(features.frame_pixels, 5000);
         assert_eq!(features.source_bits_per_sample, 32);
         assert_eq!(features.reader, ReaderKind::Raw);
         assert!(features.gpu);
+        assert!(features.align_gpu);
         assert_eq!(features.algorithm, "pmax");
         assert!(!features.align_cache_hit);
         assert_eq!(features.resumed_units, 0);
@@ -2442,5 +2472,70 @@ mod tests {
         assert_eq!(plan_features(&many, 1).workers, 1);
         let none = crate::params::StackContext::new(0, 8, 8, 1);
         assert_eq!(plan_features(&none, usize::MAX).workers, 1);
+    }
+
+    /// An align backend that offers an accelerator but opens no session.
+    struct OfferedAlign;
+
+    impl AlignBackend for OfferedAlign {
+        fn open_ecc(
+            &self,
+            _request: &crate::gpu::EccSessionRequest<'_>,
+        ) -> Result<Option<Box<dyn crate::gpu::EccMomentSession>>, AlgorithmError> {
+            Ok(None)
+        }
+    }
+
+    static OFFERED_ALIGN: OfferedAlign = OfferedAlign;
+
+    fn depth_map_request(aligned: bool, offered: bool) -> FuseRequest {
+        FuseRequest {
+            frames: Vec::new(),
+            output: FuseOutput::Seal(PathBuf::new()),
+            scratch_root: PathBuf::new(),
+            staging_key: String::new(),
+            algorithm: crate::registry::find_stack("depth-map").expect("depth-map is registered"),
+            explicit: ParamValues::new(),
+            align: aligned.then(|| AlignRequest {
+                algorithm: crate::registry::find_align("dummy-align")
+                    .expect("dummy-align is registered"),
+                explicit: ParamValues::new(),
+                lax: false,
+            }),
+            crop: false,
+            equalize: None,
+            tile_size: None,
+            max_host_memory: None,
+            backend: None,
+            align_backend: offered.then_some(&OFFERED_ALIGN as &'static dyn AlignBackend),
+            resume: false,
+            cache: true,
+            poll: Duration::from_millis(5),
+            free_space: None,
+        }
+    }
+
+    #[test]
+    fn the_prediction_seed_follows_the_requests_align_backend() {
+        let ctx = crate::params::StackContext::new(30, 5000, 3000, 3);
+        let plan = |aligned, offered| {
+            let request = depth_map_request(aligned, offered);
+            let features = run_plan_for(&request, &ctx, ReaderKind::Mmap, 16, false, usize::MAX);
+            let prediction = predict_run(&features, aligned, None).expect("frames and pixels");
+            (features, prediction)
+        };
+        let (offered, on_accelerator) = plan(true, true);
+        let (declined, on_cpu) = plan(true, false);
+        let (unaligned, without_align) = plan(false, true);
+        assert!(offered.align_gpu, "an offered accelerator with alignment");
+        assert!(!declined.align_gpu, "no accelerator offered");
+        assert!(!unaligned.align_gpu, "no alignment, whatever is offered");
+        assert!(on_accelerator.calibrated && on_cpu.calibrated);
+        let (fast, slow) = (on_accelerator.stages.align, on_cpu.stages.align);
+        assert!(
+            fast.zip(slow).is_some_and(|(fast, slow)| fast < slow),
+            "accelerated align {fast:?} must undercut the CPU align {slow:?}"
+        );
+        assert_eq!(without_align.stages.align, None);
     }
 }

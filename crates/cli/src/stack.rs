@@ -1091,6 +1091,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         opened.kind,
         source_bits,
         backend.is_some(),
+        align_choice.backend.is_some(),
         algo.id(),
         usize::MAX,
     );
@@ -1905,6 +1906,7 @@ mod tests {
                 &focusforge_core::params::StackContext::new(8, 512, 512, 3),
                 focusforge_core::io::ReaderKind::Mmap,
                 16,
+                false,
                 false,
                 "example-stack",
                 usize::MAX,

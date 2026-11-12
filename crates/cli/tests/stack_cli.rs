@@ -1967,6 +1967,7 @@ fn run_plan_matches_between_dry_run_and_run() {
         assert_eq!(run["run_plan"]["frame_count"], 3, "{fixture}");
         assert_eq!(run["run_plan"]["frame_pixels"], 64 * 64, "{fixture}");
         assert_eq!(run["run_plan"]["gpu"], false, "{fixture}");
+        assert_eq!(run["run_plan"]["align_gpu"], false, "{fixture}");
         assert_eq!(run["run_plan"]["algorithm"], "dummy-stack", "{fixture}");
         let not_computed = dry["not_computed"].as_array().expect("not_computed");
         assert!(
@@ -1974,6 +1975,57 @@ fn run_plan_matches_between_dry_run_and_run() {
             "the dry run names the alignment cache: {dry}"
         );
     }
+}
+
+/// `run_plan.align_gpu` of one aligned `stack --json` over the 16-bit
+/// fixture, as a dry run or a real run.
+fn align_gpu_of(
+    label: &str,
+    align_algorithm: &str,
+    dry: bool,
+    extra: &[&str],
+) -> serde_json::Value {
+    let frames = common::fixtures_dir().join("mantis-64").join("frames");
+    let cwd = tmp_dir(label);
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let mut args = vec![
+        "stack",
+        frames.to_str().unwrap(),
+        "-o",
+        out_dir.to_str().unwrap(),
+        "--algorithm",
+        "dummy-stack",
+        "--align-algorithm",
+        align_algorithm,
+        "--no-crop",
+        "--json",
+    ];
+    if dry {
+        args.push("--dry-run");
+    }
+    args.extend(extra);
+    let out = run_cli_in(&cwd, &args);
+    assert!(out.success, "stderr: {}", out.stderr);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+    report["run_plan"].clone()
+}
+
+#[test]
+fn run_plan_reports_the_planned_align_backend() {
+    let offered = cfg!(feature = "gpu");
+    let plan = align_gpu_of("align_gpu_ecc", "pyramidal-ecc", true, &[]);
+    assert_eq!(plan["align_gpu"], offered, "pyramidal-ecc: {plan}");
+    if offered {
+        let plan = align_gpu_of("align_gpu_ecc_cpu", "pyramidal-ecc", true, &["--cpu"]);
+        assert_eq!(plan["align_gpu"], false, "--cpu: {plan}");
+    }
+    let plan = align_gpu_of("align_gpu_none", "pyramidal-ecc", true, &["--no-align"]);
+    assert_eq!(plan["align_gpu"], false, "--no-align: {plan}");
+    let dry = align_gpu_of("align_gpu_dummy_dry", "dummy-align", true, &[]);
+    assert_eq!(dry["align_gpu"], false, "an aligner without a GPU path");
+    let run = align_gpu_of("align_gpu_dummy_run", "dummy-align", false, &[]);
+    assert_eq!(run, dry, "the run plans what the dry run planned");
 }
 
 /// One `stack --dry-run` over `fixtures/<fixture>/frames` with a computed

@@ -2,7 +2,7 @@
 
 //! [`JobProgress`], the plain snapshot [`super::JobControl::progress`]
 //! returns by value, and the ETA functions every snapshot consults: [`eta`]
-//! for a rate observed on one stage, [`live_eta`] to blend it with the
+//! for a rate observed on one stage, `live_eta` to blend it with the
 //! prediction. They are kept in one place so the policy is replaceable
 //! without touching the scheduler and unit-testable without one.
 

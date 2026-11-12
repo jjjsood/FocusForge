@@ -54,11 +54,12 @@
 //! (`laplacian`). Every other input still gets a prediction, from the first
 //! row of its family, with [`RunPrediction::calibrated`] false.
 //!
-//! The blends were fitted and held out on the uncompressed TIFF versions of
-//! those two stacks, over `--cpu` and GPU-backed alignment: −12.1 to +8.3 %
-//! for `depth-map`, −10.5 to +8.2 % for `weighted-average`. CR3 into a
-//! scratch file was fitted and held out on two disjoint 25-frame 17.3 Mpx
-//! stacks at a 6 GiB host budget: −8.0 to +1.2 %.
+//! Each blend has one row per planned align backend, fitted on a 30-frame
+//! 15.0 Mpx mantis subset and held out on a 32-frame beetle stack (16-bit
+//! TIFF, reference laptop). Held-out error, `--cpu` / GPU-backed align:
+//! `depth-map` −5.1 to −3.9 % / −3.7 to −0.3 %, `weighted-average`
+//! −4.1 to −3.4 % / −3.0 to +0.5 %. CR3 into a scratch file: two disjoint
+//! 25-frame 17.3 Mpx stacks, 6 GiB host budget, −8.0 to +1.2 %.
 //!
 //! `calibrated` reads only what the record and [`RawSource`] carry. It
 //! cannot see which camera wrote a CR3 (two disjoint 25-frame stacks of
@@ -71,9 +72,10 @@
 //! compression, layout or bit depth within the `decoded` reader (only
 //! 16-bit Deflate strips were measured), `--no-align` on decoded or JPEG
 //! frames (decode then falls in fuse), decoded frames beyond the frame
-//! cache, the align backend of a CPU-only blend (`--cpu` and GPU-backed
-//! were measured), the host budget of a scratch-file run (6 GiB), brightness
-//! equalization, or a cold GPU (6 to 19 % more fuse time than a warm one).
+//! cache, an align accelerator other than the measured integrated GPU, a
+//! host where the offered accelerator finds no adapter, the host budget of
+//! a scratch-file run (6 GiB), brightness equalization, or a cold GPU (6 to
+//! 19 % more fuse time than a warm one).
 //! Time outside the stages, up to 0.4 s warm, is not modelled.
 
 use serde::Serialize;
@@ -109,14 +111,17 @@ pub(crate) struct Calibration {
     pub(crate) raw_store: Option<DevelopStore>,
     /// Blend algorithm id.
     pub(crate) algorithm: &'static str,
+    /// `Some` keys the row to one planned align backend (`true` for a GPU
+    /// accelerator), `None` matches either.
+    pub(crate) align_gpu: Option<bool>,
     pub(crate) cpu: StageCost,
     pub(crate) gpu: StageCost,
 }
 
 /// The measured classes. A record matches a row exactly (reader, blend
-/// algorithm and, for RAW, extension and develop store) and is then
-/// `calibrated`; otherwise the first row of its family (RAW or not) is the
-/// fallback.
+/// algorithm, the planned align backend where the row sets one and, for RAW,
+/// extension and develop store) and is then `calibrated`; otherwise the first
+/// row of its family (RAW or not) is the fallback.
 ///
 /// - Uncompressed 16-bit TIFF, `mmap`, `laplacian`: least squares over 61-,
 ///   32- and 8-frame stacks of 15.0 and 0.26 Mpx frames on the reference
@@ -124,16 +129,20 @@ pub(crate) struct Calibration {
 /// - Canon CR3 into memory, `laplacian`: one 25-frame 17.3 Mpx stack on the
 ///   same machine, CPU and GPU (a second, disjoint 25-frame stack of the
 ///   same burst was held out). Setup is the TIFF fit's.
+/// - `depth-map` and `weighted-average`, `mmap`: one row per planned align
+///   backend, each a 30-frame 15.0 Mpx stack on the same machine, held out
+///   on a 32-frame stack of the same size.
 ///
 /// Setup is the `mmap` TIFF fit's in every row. The other rows' stacks and
-/// held-out errors are in the module docs. A CPU-only blend row repeats its
-/// `cpu` costs in `gpu`, which no plan with that blend reads.
+/// held-out errors are in the module docs. A blend row repeats its `cpu`
+/// costs in `gpu`, which no plan with that blend reads.
 pub(crate) const CALIBRATIONS: &[Calibration] = &[
     Calibration {
         reader: ReaderKind::Mmap,
         raw_extension: None,
         raw_store: None,
         algorithm: "laplacian",
+        align_gpu: None,
         cpu: StageCost {
             setup_fixed: 5.700_419_114_984_098e-5,
             setup_per_frame: 0.000_325_912_683_680_398_4,
@@ -156,6 +165,7 @@ pub(crate) const CALIBRATIONS: &[Calibration] = &[
         raw_extension: Some("cr3"),
         raw_store: Some(DevelopStore::Memory),
         algorithm: "laplacian",
+        align_gpu: None,
         cpu: StageCost {
             setup_fixed: 5.700_419_114_984_098e-5,
             setup_per_frame: 0.000_325_912_683_680_398_4,
@@ -178,6 +188,7 @@ pub(crate) const CALIBRATIONS: &[Calibration] = &[
         raw_extension: None,
         raw_store: None,
         algorithm: "laplacian",
+        align_gpu: None,
         cpu: StageCost {
             setup_fixed: 5.700_419_114_984_098e-5,
             setup_per_frame: 0.000_325_912_683_680_398_4,
@@ -200,6 +211,7 @@ pub(crate) const CALIBRATIONS: &[Calibration] = &[
         raw_extension: None,
         raw_store: None,
         algorithm: "laplacian",
+        align_gpu: None,
         cpu: StageCost {
             setup_fixed: 5.700_419_114_984_098e-5,
             setup_per_frame: 0.000_325_912_683_680_398_4,
@@ -222,21 +234,45 @@ pub(crate) const CALIBRATIONS: &[Calibration] = &[
         raw_extension: None,
         raw_store: None,
         algorithm: "depth-map",
+        align_gpu: Some(false),
         cpu: StageCost {
             setup_fixed: 5.700_419_114_984_098e-5,
             setup_per_frame: 0.000_325_912_683_680_398_4,
             develop: 0.0,
-            align: 0.023_540_205_053_520_478,
-            fuse: 0.061_480_628_592_013_434,
-            finalize: 0.073_810_028_807_361_94,
+            align: 0.028_970_981_528_786_313,
+            fuse: 0.063_053_574_996_851_91,
+            finalize: 0.074_010_086_961_996_7,
         },
         gpu: StageCost {
             setup_fixed: 5.700_419_114_984_098e-5,
             setup_per_frame: 0.000_325_912_683_680_398_4,
             develop: 0.0,
-            align: 0.023_540_205_053_520_478,
-            fuse: 0.061_480_628_592_013_434,
-            finalize: 0.073_810_028_807_361_94,
+            align: 0.028_970_981_528_786_313,
+            fuse: 0.063_053_574_996_851_91,
+            finalize: 0.074_010_086_961_996_7,
+        },
+    },
+    Calibration {
+        reader: ReaderKind::Mmap,
+        raw_extension: None,
+        raw_store: None,
+        algorithm: "depth-map",
+        align_gpu: Some(true),
+        cpu: StageCost {
+            setup_fixed: 5.700_419_114_984_098e-5,
+            setup_per_frame: 0.000_325_912_683_680_398_4,
+            develop: 0.0,
+            align: 0.018_109_428_578_254_646,
+            fuse: 0.059_907_682_187_174_96,
+            finalize: 0.073_609_970_652_727_22,
+        },
+        gpu: StageCost {
+            setup_fixed: 5.700_419_114_984_098e-5,
+            setup_per_frame: 0.000_325_912_683_680_398_4,
+            develop: 0.0,
+            align: 0.018_109_428_578_254_646,
+            fuse: 0.059_907_682_187_174_96,
+            finalize: 0.073_609_970_652_727_22,
         },
     },
     Calibration {
@@ -244,21 +280,45 @@ pub(crate) const CALIBRATIONS: &[Calibration] = &[
         raw_extension: None,
         raw_store: None,
         algorithm: "weighted-average",
+        align_gpu: Some(false),
         cpu: StageCost {
             setup_fixed: 5.700_419_114_984_098e-5,
             setup_per_frame: 0.000_325_912_683_680_398_4,
             develop: 0.0,
-            align: 0.023_504_347_290_559_897,
-            fuse: 0.069_038_485_145_826_39,
-            finalize: 0.074_691_010_137_518_2,
+            align: 0.028_792_422_211_439_517,
+            fuse: 0.070_604_818_618_745_08,
+            finalize: 0.074_370_095_865_356_7,
         },
         gpu: StageCost {
             setup_fixed: 5.700_419_114_984_098e-5,
             setup_per_frame: 0.000_325_912_683_680_398_4,
             develop: 0.0,
-            align: 0.023_504_347_290_559_897,
-            fuse: 0.069_038_485_145_826_39,
-            finalize: 0.074_691_010_137_518_2,
+            align: 0.028_792_422_211_439_517,
+            fuse: 0.070_604_818_618_745_08,
+            finalize: 0.074_370_095_865_356_7,
+        },
+    },
+    Calibration {
+        reader: ReaderKind::Mmap,
+        raw_extension: None,
+        raw_store: None,
+        algorithm: "weighted-average",
+        align_gpu: Some(true),
+        cpu: StageCost {
+            setup_fixed: 5.700_419_114_984_098e-5,
+            setup_per_frame: 0.000_325_912_683_680_398_4,
+            develop: 0.0,
+            align: 0.018_216_272_369_680_28,
+            fuse: 0.067_472_151_672_907_71,
+            finalize: 0.075_011_924_409_679_7,
+        },
+        gpu: StageCost {
+            setup_fixed: 5.700_419_114_984_098e-5,
+            setup_per_frame: 0.000_325_912_683_680_398_4,
+            develop: 0.0,
+            align: 0.018_216_272_369_680_28,
+            fuse: 0.067_472_151_672_907_71,
+            finalize: 0.075_011_924_409_679_7,
         },
     },
     Calibration {
@@ -266,6 +326,7 @@ pub(crate) const CALIBRATIONS: &[Calibration] = &[
         raw_extension: Some("cr3"),
         raw_store: Some(DevelopStore::ScratchFile),
         algorithm: "laplacian",
+        align_gpu: None,
         cpu: StageCost {
             setup_fixed: 5.700_419_114_984_098e-5,
             setup_per_frame: 0.000_325_912_683_680_398_4,
@@ -317,6 +378,7 @@ fn calibration<'t>(
     let exact = table.iter().find(|row| {
         row.reader == features.reader
             && row.algorithm == features.algorithm
+            && row.align_gpu.is_none_or(|gpu| gpu == features.align_gpu)
             && (!is_raw
                 || raw.is_some_and(|raw| {
                     row.raw_extension
@@ -435,6 +497,7 @@ mod tests {
             source_bits_per_sample: 16,
             reader,
             gpu,
+            align_gpu: false,
             workers: 4,
             algorithm: "laplacian".to_string(),
             align_cache_hit: false,
@@ -701,7 +764,7 @@ mod tests {
             extension: "cr3",
             store: DevelopStore::ScratchFile,
         });
-        // class, frames, pixels, reader, algorithm, raw, gpu,
+        // class, frames, pixels, reader, algorithm, raw, gpu, align_gpu,
         // [setup, develop, align, fuse, finalize], total
         type Row = (
             &'static str,
@@ -711,12 +774,13 @@ mod tests {
             &'static str,
             Option<RawSource<'static>>,
             bool,
+            bool,
             [Option<f64>; 5],
             f64,
         );
         let tiff = 14_997_654;
         let raw = 17_258_496;
-        let rows: [Row; 8] = [
+        let rows: [Row; 10] = [
             (
                 "decoded cpu",
                 32,
@@ -724,6 +788,7 @@ mod tests {
                 ReaderKind::Decoded,
                 "laplacian",
                 None,
+                false,
                 false,
                 [
                     Some(0.0105),
@@ -742,6 +807,7 @@ mod tests {
                 "laplacian",
                 None,
                 true,
+                false,
                 [
                     Some(0.0104),
                     None,
@@ -758,6 +824,7 @@ mod tests {
                 ReaderKind::Jpeg,
                 "laplacian",
                 None,
+                false,
                 false,
                 [
                     Some(0.0105),
@@ -776,6 +843,7 @@ mod tests {
                 "laplacian",
                 None,
                 true,
+                false,
                 [
                     Some(0.0104),
                     None,
@@ -786,38 +854,76 @@ mod tests {
                 60.656,
             ),
             (
-                "depth-map",
+                "depth-map cpu align",
                 32,
                 tiff,
                 ReaderKind::Mmap,
                 "depth-map",
                 None,
                 false,
+                false,
                 [
                     Some(0.0105),
                     None,
-                    Some(10.9445),
-                    Some(29.5061),
-                    Some(1.1070),
+                    Some(13.4694),
+                    Some(30.2610),
+                    Some(1.1100),
                 ],
-                41.568,
+                44.851,
             ),
             (
-                "weighted-average",
+                "depth-map gpu align",
+                32,
+                tiff,
+                ReaderKind::Mmap,
+                "depth-map",
+                None,
+                false,
+                true,
+                [
+                    Some(0.0105),
+                    None,
+                    Some(8.4196),
+                    Some(28.7512),
+                    Some(1.1040),
+                ],
+                38.285,
+            ),
+            (
+                "weighted-average cpu align",
                 32,
                 tiff,
                 ReaderKind::Mmap,
                 "weighted-average",
                 None,
                 false,
+                false,
                 [
                     Some(0.0105),
                     None,
-                    Some(10.9278),
-                    Some(33.1333),
-                    Some(1.1202),
+                    Some(13.3864),
+                    Some(33.8850),
+                    Some(1.1154),
                 ],
-                45.192,
+                48.397,
+            ),
+            (
+                "weighted-average gpu align",
+                32,
+                tiff,
+                ReaderKind::Mmap,
+                "weighted-average",
+                None,
+                false,
+                true,
+                [
+                    Some(0.0105),
+                    None,
+                    Some(8.4692),
+                    Some(32.3816),
+                    Some(1.1250),
+                ],
+                41.986,
             ),
             (
                 "cr3 scratch cpu",
@@ -826,6 +932,7 @@ mod tests {
                 ReaderKind::Raw,
                 "laplacian",
                 scratch,
+                false,
                 false,
                 [
                     Some(0.0082),
@@ -844,6 +951,7 @@ mod tests {
                 "laplacian",
                 scratch,
                 true,
+                false,
                 [
                     Some(0.0081),
                     Some(9.3298),
@@ -854,9 +962,11 @@ mod tests {
                 84.168,
             ),
         ];
-        for (class, frames, pixels, reader, algorithm, source, gpu, want, total) in rows {
+        for (class, frames, pixels, reader, algorithm, source, gpu, align_gpu, want, total) in rows
+        {
             let mut rec = record(reader, gpu, frames, pixels);
             rec.algorithm = algorithm.to_string();
+            rec.align_gpu = align_gpu;
             let p = predict_run(&rec, true, source).expect(class);
             assert!(p.calibrated, "{class}");
             let s = p.stages;
@@ -892,8 +1002,12 @@ mod tests {
             }
         }
         for reader in READERS {
-            let p = predict_run(&record(reader, true, 200, u64::MAX), true, CR3).unwrap();
-            assert!(p.total_seconds.is_finite() && p.total_seconds >= 0.0);
+            for align_gpu in [false, true] {
+                let mut rec = record(reader, true, 200, u64::MAX);
+                rec.align_gpu = align_gpu;
+                let p = predict_run(&rec, true, CR3).unwrap();
+                assert!(p.total_seconds.is_finite() && p.total_seconds >= 0.0);
+            }
         }
     }
 
@@ -945,6 +1059,10 @@ mod tests {
             r
         };
         let flag = |rec: &RunPlanFeatures, raw| predict_run(rec, true, raw).unwrap().calibrated;
+        let on_align = |mut rec: RunPlanFeatures, align_gpu| {
+            rec.align_gpu = align_gpu;
+            rec
+        };
 
         let scratch = DevelopStore::ScratchFile;
         for (reader, algorithm, raw) in [
@@ -960,11 +1078,13 @@ mod tests {
             // `raw` is ignored for a non-RAW reader.
             (ReaderKind::Mmap, "laplacian", cr3("dng", scratch)),
         ] {
-            assert!(
-                flag(&with(reader, algorithm), raw),
-                "{reader:?} {algorithm} {:?}",
-                raw.map(|r| (r.extension, r.store))
-            );
+            for align_gpu in [false, true] {
+                assert!(
+                    flag(&on_align(with(reader, algorithm), align_gpu), raw),
+                    "{reader:?} {algorithm} align_gpu {align_gpu} {:?}",
+                    raw.map(|r| (r.extension, r.store))
+                );
+            }
         }
 
         let uncalibrated = [
@@ -980,14 +1100,17 @@ mod tests {
             (with(ReaderKind::Raw, "depth-map"), cr3("cr3", mem)),
             (with(ReaderKind::Raw, "depth-map"), cr3("cr3", scratch)),
         ];
-        for (rec, raw) in &uncalibrated {
+        for ((rec, raw), align_gpu) in uncalibrated
+            .iter()
+            .flat_map(|row| [(row, false), (row, true)])
+        {
             let at = format!(
-                "{:?} {} {:?}",
+                "{:?} {} {:?} align_gpu {align_gpu}",
                 rec.reader,
                 rec.algorithm,
                 raw.map(|r| r.extension)
             );
-            let p = predict_run(rec, true, *raw).unwrap();
+            let p = predict_run(&on_align(rec.clone(), align_gpu), true, *raw).unwrap();
             assert!(!p.calibrated, "{at}");
             let family = if rec.reader == ReaderKind::Raw {
                 ReaderKind::Raw
@@ -1009,10 +1132,50 @@ mod tests {
             (ReaderKind::Raw, Some("cr3"), Some(mem), "laplacian")
         );
 
+        // Only the blend rows are keyed by align backend, and the two keys
+        // of each blend are both present.
+        for row in CALIBRATIONS {
+            assert_eq!(
+                row.align_gpu.is_some(),
+                row.algorithm != "laplacian",
+                "{}",
+                row.algorithm
+            );
+        }
+        for algorithm in ["depth-map", "weighted-average"] {
+            for key in [false, true] {
+                let rows = CALIBRATIONS
+                    .iter()
+                    .filter(|r| r.algorithm == algorithm && r.align_gpu == Some(key));
+                assert_eq!(rows.count(), 1, "{algorithm} {key}");
+            }
+        }
+
+        // A row without an align key predicts the same for either backend.
+        for row in CALIBRATIONS.iter().filter(|r| r.align_gpu.is_none()) {
+            let mut on = with(row.reader, row.algorithm);
+            on.align_gpu = true;
+            let mut off = on.clone();
+            off.align_gpu = false;
+            let raw = row
+                .raw_extension
+                .zip(row.raw_store)
+                .map(|(extension, store)| RawSource { extension, store });
+            assert_eq!(
+                predict_run(&on, true, raw).unwrap().stages,
+                predict_run(&off, true, raw).unwrap().stages,
+                "{}",
+                row.algorithm
+            );
+        }
+
         // A CPU-only blend is never planned on the GPU, so both costs agree.
         for row in CALIBRATIONS.iter().filter(|r| r.algorithm != "laplacian") {
             assert_eq!(row.gpu, row.cpu, "{}", row.algorithm);
             let mut on = with(row.reader, row.algorithm);
+            on.align_gpu = row
+                .align_gpu
+                .expect("a blend row is keyed by align backend");
             on.gpu = true;
             let mut off = on.clone();
             off.gpu = false;
