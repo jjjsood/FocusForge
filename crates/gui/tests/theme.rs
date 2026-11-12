@@ -443,8 +443,23 @@ mod sheet {
         (start, motion_sample(theme))
     }
 
+    /// The generated sheet is one large struct that debug builds move by value;
+    /// it does not fit the 2 MiB stack of a test thread, so the test runs on a
+    /// thread of its own.
     #[test]
     fn spinner_and_sweep_stand_still_with_reduced_motion() {
+        let finished = std::thread::Builder::new()
+            .stack_size(16 << 20)
+            .spawn(reduced_motion_body)
+            .unwrap()
+            .join();
+        assert!(
+            finished.is_ok(),
+            "the reduced-motion checks panicked on their thread; its message is above"
+        );
+    }
+
+    fn reduced_motion_body() {
         common::init_window_backend();
         let sheet = ThemeSheet::new().unwrap();
         // The element query skips what the window clips away, and the sheet is
