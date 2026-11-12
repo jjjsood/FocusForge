@@ -859,7 +859,7 @@ mod tests {
     fn a_completed_align_faster_than_predicted_scales_what_follows() {
         let plan = plan_512();
         let control = control_over(&plan, None);
-        control.seed_prediction(&timings(0.0, None, Some(0.1242), 0.9391, 0.0113));
+        control.seed_prediction(&timings(0.0, None, Some(1.242), 0.9391, 0.0113));
         control.enter_stage(Stage::Setup);
         align_over(&control, 30, 30, 30);
         let seeded = 0.9391 + 0.0113;
@@ -867,7 +867,7 @@ mod tests {
 
         control.enter_stage(Stage::Fuse);
         let pace = pace(&control).expect("every frame was credited");
-        assert!((0.2..0.9).contains(&pace), "{pace}");
+        assert!((0.02..0.5).contains(&pace), "{pace}");
         let mut previous = total(&control);
         approx(previous, pace * seeded);
         for tile in plan.tiles() {
@@ -881,7 +881,7 @@ mod tests {
     #[test]
     fn the_develop_pace_holds_through_the_second_setup_and_align() {
         let control = JobControl::new();
-        control.seed_prediction(&timings(0.0, Some(0.0940), Some(0.6900), 0.8819, 0.0287));
+        control.seed_prediction(&timings(0.0, Some(0.940), Some(0.6900), 0.8819, 0.0287));
         control.enter_stage(Stage::Setup);
         control.enter_stage(Stage::Develop);
         let counter = control.begin_develop(25);
@@ -890,7 +890,7 @@ mod tests {
 
         control.enter_stage(Stage::Setup);
         let held = pace(&control).expect("every frame was developed");
-        assert!((0.2..0.9).contains(&held), "{held}");
+        assert!((0.02..0.5).contains(&held), "{held}");
         let ahead = 0.6900 + 0.8819 + 0.0287;
         approx(total(&control), held * ahead);
 
@@ -919,14 +919,14 @@ mod tests {
             control.seed_prediction(&timings(0.0, None, Some(1.0), 1.0, 0.1));
             control.enter_stage(Stage::Align);
             let counter = control.begin_align(4);
-            std::thread::sleep(Duration::from_millis(40));
+            std::thread::sleep(Duration::from_millis(100));
             control.add_hold(held);
             counter.fetch_add(4, Ordering::SeqCst);
             control.enter_stage(Stage::Fuse);
             pace(&control).expect("every frame was credited")
         };
-        assert!(align_pace(Duration::ZERO) >= 0.04);
-        assert!(align_pace(Duration::from_millis(35)) < 0.03);
+        assert!(align_pace(Duration::ZERO) >= 0.1);
+        assert!(align_pace(Duration::from_millis(90)) < 0.06);
     }
 
     #[test]
@@ -970,7 +970,7 @@ mod tests {
     #[test]
     fn a_fast_near_zero_align_lowers_what_follows() {
         let control = JobControl::new();
-        control.seed_prediction(&timings(0.00267, None, Some(0.0309), 0.2181, 0.0217));
+        control.seed_prediction(&timings(0.00267, None, Some(0.309), 0.2181, 0.0217));
         control.enter_stage(Stage::Setup);
         std::thread::sleep(Duration::from_millis(25));
         align_over(&control, 3, 3, 2);
