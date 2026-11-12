@@ -16,7 +16,14 @@ trace = ["focusforge-diagnostics/trace"]
 gpu-tests = ["focusforge-gpu/gpu-tests"]
 # Development-only Slint UI inspection/control endpoint. The server is idle
 # unless its feature and `SLINT_MCP_PORT` are both set.
-mcp = ["slint/mcp", "focusforge-ui/element-debug-info"]
+mcp = [
+    "slint/mcp",
+    "focusforge-ui/element-debug-info",
+    "focusforge-ui-comparison/element-debug-info",
+]
+# The design-token specimen sheet behind `--theme-sheet`, generated only when
+# this feature is on.
+theme-sheet = ["dep:focusforge-ui-theme-sheet", "focusforge-ui-theme-sheet/generate"]
 
 [dependencies]
 slint = { version = "~1.17", default-features = false, features = [
@@ -28,6 +35,8 @@ png = "0.18"
 thiserror = "2.0.20"
 focusforge-core = { path = "../core" }
 focusforge-ui = { path = "../ui" }
+focusforge-ui-comparison = { path = "../ui-comparison" }
+focusforge-ui-theme-sheet = { path = "../ui-theme-sheet", optional = true }
 focusforge-diagnostics = { path = "../diagnostics" }
 focusforge-gpu = { path = "../gpu", features = ["gpu"] }
 toml = "1"
@@ -49,6 +58,7 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32
 focusforge-core = { path = "../core", features = ["test-algorithms"] }
 # The tests look elements up by id.
 focusforge-ui = { path = "../ui", features = ["element-debug-info"] }
+focusforge-ui-comparison = { path = "../ui-comparison", features = ["element-debug-info"] }
 i-slint-backend-testing = "~1.17"
 # Writing JPEG frames for the open and import tests.
 jpeg-encoder = "0.7.1"
