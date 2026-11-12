@@ -1163,6 +1163,7 @@ fn total_run_eta() {
     // the 300 px frame, one interior tile among eight edge tiles.
     request.tile_size = Some(160);
     request.poll = Duration::from_millis(1);
+    request.align = Some(dummy_align_request());
 
     let outcome = focusforge_core::pipeline::run(&request, &observer, Arc::clone(&control), None)
         .expect("the run must complete");
@@ -1196,6 +1197,15 @@ fn total_run_eta() {
             total >= tick.eta.unwrap_or_default(),
             "total {total:?} below stage ETA {:?}: {tick:?}",
             tick.eta
+        );
+    }
+    for pair in ticks.windows(2) {
+        let (before, after) = (pair[0].total_eta, pair[1].total_eta);
+        assert!(
+            after <= before,
+            "the total rose from {before:?} to {after:?}: {:?} then {:?}",
+            pair[0],
+            pair[1]
         );
     }
     let finalizing = observer.finalizing.lock().expect("no panic while logging");

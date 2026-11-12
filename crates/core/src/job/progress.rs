@@ -2,8 +2,8 @@
 
 //! [`JobProgress`], the plain snapshot [`super::JobControl::progress`]
 //! returns by value, and the ETA functions every snapshot consults: [`eta`]
-//! for a rate observed on one stage, `live_eta` to blend it with the
-//! prediction. They are kept in one place so the policy is replaceable
+//! for a rate observed on one stage, `live_eta` to count a stage's prediction
+//! down as its units are credited. They are kept in one place so the policy is replaceable
 //! without touching the scheduler and unit-testable without one.
 
 use std::time::Duration;
@@ -101,13 +101,11 @@ pub(crate) enum StageState {
     Finished,
 }
 
-/// One stage's predicted and observed wall seconds.
+/// One stage's predicted wall seconds.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct StagePlan {
     pub state: StageState,
     pub predicted: f64,
-    /// Seconds spent in the stage so far, holds excluded.
-    pub observed: f64,
 }
 
 /// The two estimates [`live_eta`] returns.
@@ -129,49 +127,33 @@ fn seconds(secs: f64) -> Duration {
     }
 }
 
-/// Blends each stage's prediction with what the run has observed. The speed
-/// factor (observed over predicted seconds of the finished stages that had a
-/// prediction, 1 before any) scales every predicted second to come. The
-/// running stage's remainder is `(1 - f)^2 * predicted * speed + f *
-/// observed_remaining` for progress fraction `f`; with no observation it is
-/// the scaled prediction, and a stage predicted zero reports its observation.
+/// The running stage's remainder is its unfinished share of its own
+/// prediction, `(1 - f) * predicted` for credited fraction `f` (0 without
+/// one), so it falls only when a unit is credited and never with wall time;
+/// a stage predicted zero reports `observed_remaining`. Every pending stage
+/// adds its plain prediction.
 pub(crate) fn live_eta(
     stages: &[StagePlan],
     fraction: Option<f64>,
     observed_remaining: Option<Duration>,
 ) -> LiveEta {
-    let (observed, predicted) = stages
-        .iter()
-        .filter(|s| s.state == StageState::Finished && s.predicted > 0.0)
-        .fold((0.0, 0.0), |(o, p), s| (o + s.observed, p + s.predicted));
-    let speed = if predicted > 0.0 {
-        observed / predicted
-    } else {
-        1.0
-    };
-
     let running = stages.iter().find(|s| s.state == StageState::Running);
+    // ponytail: a stage slower than its prediction under-reads until it ends;
+    // if that proves too coarse, latch a blend with the observation
+    // (`min(previous total, blend)`).
     let stage = match running {
-        Some(running) => {
-            let f = fraction.map(|f| f.clamp(0.0, 1.0));
-            let scaled = running.predicted * speed;
-            match (f, observed_remaining) {
-                (Some(f), Some(observed)) if running.predicted > 0.0 => Some(seconds(
-                    (1.0 - f) * (1.0 - f) * scaled + f * observed.as_secs_f64(),
-                )),
-                (_, Some(observed)) => Some(observed),
-                (Some(f), None) if running.predicted > 0.0 => Some(seconds((1.0 - f) * scaled)),
-                (None, None) if running.predicted > 0.0 => Some(seconds(scaled)),
-                _ => None,
-            }
+        Some(running) if running.predicted > 0.0 => {
+            let f = fraction.map_or(0.0, |f| f.clamp(0.0, 1.0));
+            Some(seconds((1.0 - f) * running.predicted))
         }
+        Some(_) => observed_remaining,
         None if stages.iter().all(|s| s.state != StageState::Pending) => Some(Duration::ZERO),
         None => None,
     };
     let ahead: f64 = stages
         .iter()
         .filter(|s| s.state == StageState::Pending)
-        .map(|s| s.predicted * speed)
+        .map(|s| s.predicted)
         .sum();
     LiveEta {
         stage,
@@ -228,50 +210,45 @@ mod tests {
         );
     }
 
-    fn plan(state: StageState, predicted: f64, observed: f64) -> StagePlan {
-        StagePlan {
-            state,
-            predicted,
-            observed,
-        }
+    fn plan(state: StageState, predicted: f64) -> StagePlan {
+        StagePlan { state, predicted }
     }
 
     /// Setup, develop, align, fuse, warp-write, finalize with `fuse` running.
-    fn running_fuse(finished: [(f64, f64); 3], fuse: f64, finalize: f64) -> [StagePlan; 6] {
-        let done = |(predicted, observed)| plan(StageState::Finished, predicted, observed);
+    fn running_fuse(finished: [f64; 3], fuse: f64, finalize: f64) -> [StagePlan; 6] {
+        let done = |predicted| plan(StageState::Finished, predicted);
         [
             done(finished[0]),
             done(finished[1]),
             done(finished[2]),
-            plan(StageState::Running, fuse, 0.0),
-            plan(StageState::Pending, 0.0, 0.0),
-            plan(StageState::Pending, finalize, 0.0),
+            plan(StageState::Running, fuse),
+            plan(StageState::Pending, 0.0),
+            plan(StageState::Pending, finalize),
         ]
     }
 
     #[test]
-    fn the_observation_weighs_nothing_at_the_start_and_everything_at_the_end() {
-        let stages = running_fuse([(0.0, 0.0); 3], 10.0, 0.0);
+    fn the_running_stage_is_its_unfinished_share_of_its_prediction() {
+        let stages = running_fuse([0.0; 3], 10.0, 0.0);
+        // The observation of 20 s does not enter a stage with a prediction.
         let observed = Some(Duration::from_secs(20));
-        // Predicted remainder is (1 - fraction) * 10 s; the blend is
-        // (1 - w) * that + w * 20 s with w = fraction.
-        for (fraction, expected) in [(0.0, 10.0), (0.3, 0.7 * 7.0 + 0.3 * 20.0), (1.0, 20.0)] {
+        for (fraction, expected) in [(0.0, 10.0), (0.3, 7.0), (1.0, 0.0)] {
             let live = live_eta(&stages, Some(fraction), observed);
             assert_secs(live.stage, expected);
         }
     }
 
     #[test]
-    fn without_an_observed_remainder_the_stage_is_its_scaled_predicted_remainder() {
-        let stages = running_fuse([(1.0, 3.0), (0.0, 0.0), (0.0, 0.0)], 10.0, 0.0);
-        assert_secs(live_eta(&stages, Some(0.0), None).stage, 30.0);
-        assert_secs(live_eta(&stages, Some(0.3), None).stage, 21.0);
-        assert_secs(live_eta(&stages, None, None).stage, 30.0);
+    fn without_an_observed_remainder_the_stage_is_its_predicted_remainder() {
+        let stages = running_fuse([1.0, 0.0, 0.0], 10.0, 0.0);
+        assert_secs(live_eta(&stages, Some(0.0), None).stage, 10.0);
+        assert_secs(live_eta(&stages, Some(0.3), None).stage, 7.0);
+        assert_secs(live_eta(&stages, None, None).stage, 10.0);
     }
 
     #[test]
     fn a_stage_predicted_zero_estimates_from_its_observation_alone() {
-        let stages = running_fuse([(0.0, 0.0); 3], 0.0, 0.0);
+        let stages = running_fuse([0.0; 3], 0.0, 0.0);
         assert_eq!(live_eta(&stages, Some(0.4), None).stage, None);
         assert_eq!(live_eta(&stages, None, None).stage, None);
         let observed = Some(Duration::from_secs(5));
@@ -279,36 +256,30 @@ mod tests {
     }
 
     #[test]
-    fn the_speed_factor_follows_a_slower_and_a_faster_machine() {
-        let total = |observed: f64| {
-            let stages = running_fuse([(1.0, observed), (0.0, 0.0), (0.0, 0.0)], 10.0, 1.0);
-            live_eta(&stages, Some(0.0), None)
-        };
-        let slow = total(2.0);
-        assert_secs(slow.stage, 20.0);
-        assert_secs(Some(slow.total), 22.0);
-        let fast = total(0.5);
-        assert_secs(fast.stage, 5.0);
-        assert_secs(Some(fast.total), 5.5);
-    }
-
-    #[test]
-    fn a_skipped_stage_leaves_the_speed_factor_alone() {
-        // Align was skipped: predicted zero, with whatever time it spent.
-        let stages = running_fuse([(1.0, 1.0), (0.0, 0.0), (0.0, 7.0)], 10.0, 0.0);
-        assert_secs(live_eta(&stages, Some(0.0), None).stage, 10.0);
+    fn a_stalled_fraction_does_not_raise_the_estimate() {
+        // `align_rate` gives `elapsed * (1 - f) / f` while the frame counter
+        // stalls; elapsed runs past the prediction.
+        for (predicted, fraction, expected) in [(20.0, 0.25, 15.0), (8.0, 0.5, 4.0)] {
+            let stages = running_fuse([0.0; 3], predicted, 0.0);
+            for step in 0..=20 {
+                let elapsed = f64::from(step) * predicted / 10.0;
+                let observed = Duration::from_secs_f64(elapsed * (1.0 - fraction) / fraction);
+                let live = live_eta(&stages, Some(fraction), Some(observed));
+                assert_secs(live.stage, expected);
+            }
+        }
     }
 
     #[test]
     fn nothing_predicted_gives_a_zero_total_without_dividing() {
-        let stages = running_fuse([(0.0, 2.0); 3], 0.0, 0.0);
+        let stages = running_fuse([0.0; 3], 0.0, 0.0);
         let live = live_eta(&stages, Some(0.5), None);
         assert_eq!((live.stage, live.total), (None, Duration::ZERO));
     }
 
     #[test]
     fn an_idle_run_has_either_nothing_left_or_only_stages_to_come() {
-        let finished = plan(StageState::Finished, 4.0, 4.0);
+        let finished = plan(StageState::Finished, 4.0);
         let done = live_eta(&[finished; 6], None, None);
         assert_eq!(
             (done.stage, done.total),
@@ -316,7 +287,7 @@ mod tests {
         );
 
         let mut ahead = [finished; 6];
-        ahead[3] = plan(StageState::Pending, 6.0, 0.0);
+        ahead[3] = plan(StageState::Pending, 6.0);
         let live = live_eta(&ahead, None, None);
         assert_eq!(live.stage, None);
         assert_secs(Some(live.total), 6.0);
@@ -324,7 +295,7 @@ mod tests {
 
     #[test]
     fn the_total_is_never_below_the_stage_estimate() {
-        let stages = running_fuse([(1.0, 2.0), (0.0, 0.0), (3.0, 1.0)], 10.0, 0.5);
+        let stages = running_fuse([1.0, 0.0, 3.0], 10.0, 0.5);
         for fraction in [0.0, 0.2, 0.9, 1.0] {
             let live = live_eta(&stages, Some(fraction), Some(Duration::from_secs(40)));
             assert!(live.total >= live.stage.expect("a fuse prediction exists"));

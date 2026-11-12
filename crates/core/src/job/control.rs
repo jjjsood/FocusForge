@@ -41,23 +41,13 @@ const STAGES: usize = 6;
 /// Fixed-point scale of the fuse tile costs, which are summed in atomics.
 const COST_SCALE: f64 = 1e6;
 
-/// The stage in progress, as the ledger tracks it.
-#[derive(Debug, Clone, Copy)]
-struct OpenStage {
-    stage: Stage,
-    /// Offset from [`JobControl::epoch`] at which the stage was entered.
-    entered_nanos: u64,
-    /// The job-wide hold total at that moment.
-    hold_at_entry: u64,
-}
-
-/// Per-stage predicted and observed seconds for the whole-run estimate.
+/// Per-stage predicted seconds for the whole-run estimate.
 #[derive(Debug)]
 struct Ledger {
     /// Whether a prediction was seeded; without one there is no total.
     seeded: bool,
     stages: [StagePlan; STAGES],
-    open: Option<OpenStage>,
+    open: Option<Stage>,
 }
 
 /// The three states one job's control flag can be in.
@@ -189,7 +179,6 @@ impl JobControl {
                 stages: [StagePlan {
                     state: StageState::Pending,
                     predicted: 0.0,
-                    observed: 0.0,
                 }; STAGES],
                 open: None,
             }),
@@ -331,33 +320,18 @@ impl JobControl {
         ledger.seeded = true;
     }
 
-    /// Leaves the open stage, crediting it the wall time since it was
-    /// entered less the holds in between, and enters `stage`. A stage entered
-    /// again keeps adding to its observed time.
+    /// Leaves the open stage and enters `stage`.
     pub(crate) fn enter_stage(&self, stage: Stage) {
         let mut ledger = self.ledger();
-        self.close_open_stage(&mut ledger);
+        Self::close_open_stage(&mut ledger);
         ledger.stages[stage as usize].state = StageState::Running;
-        ledger.open = Some(OpenStage {
-            stage,
-            entered_nanos: self.epoch.elapsed().as_nanos() as u64,
-            hold_at_entry: self.hold_nanos.load(Ordering::SeqCst),
-        });
+        ledger.open = Some(stage);
     }
 
-    fn close_open_stage(&self, ledger: &mut Ledger) {
-        let Some(open) = ledger.open.take() else {
-            return;
-        };
-        let now = self.epoch.elapsed().as_nanos() as u64;
-        let held = self
-            .hold_nanos
-            .load(Ordering::SeqCst)
-            .saturating_sub(open.hold_at_entry);
-        let span = now.saturating_sub(open.entered_nanos).saturating_sub(held);
-        let slot = &mut ledger.stages[open.stage as usize];
-        slot.observed += span as f64 / 1e9;
-        slot.state = StageState::Finished;
+    fn close_open_stage(ledger: &mut Ledger) {
+        if let Some(open) = ledger.open.take() {
+            ledger.stages[open as usize].state = StageState::Finished;
+        }
     }
 
     /// Predicts `stage` zero seconds: its work turned out to be served from
@@ -370,7 +344,7 @@ impl JobControl {
     /// finished run has nothing left to estimate.
     pub(crate) fn finish_stages(&self) {
         let mut ledger = self.ledger();
-        self.close_open_stage(&mut ledger);
+        Self::close_open_stage(&mut ledger);
         for slot in &mut ledger.stages {
             if slot.state == StageState::Pending {
                 slot.predicted = 0.0;
@@ -460,7 +434,7 @@ impl JobControl {
         let align_total = self.align_total.load(Ordering::SeqCst);
         let ledger = self.ledger();
         let (eta, total_eta) = if ledger.seeded {
-            let (fraction, observed) = match ledger.open.map(|open| open.stage) {
+            let (fraction, observed) = match ledger.open {
                 Some(Stage::Setup) if stage == JobStage::Prepare => self.prepare_rate(),
                 Some(Stage::Develop) => self.develop_rate(),
                 Some(Stage::Align) => self.align_rate(),
@@ -696,10 +670,6 @@ mod tests {
         control.fuse_rate(Duration::ZERO).0
     }
 
-    fn observed(control: &JobControl, stage: Stage) -> f64 {
-        control.ledger.lock().unwrap().stages[stage as usize].observed
-    }
-
     fn predicted(control: &JobControl, stage: Stage) -> f64 {
         control.ledger.lock().unwrap().stages[stage as usize].predicted
     }
@@ -729,38 +699,6 @@ mod tests {
     }
 
     #[test]
-    fn the_ledger_sums_two_setup_spans() {
-        let control = JobControl::new();
-        control.enter_stage(Stage::Setup);
-        std::thread::sleep(Duration::from_millis(20));
-        control.enter_stage(Stage::Develop);
-        std::thread::sleep(Duration::from_millis(5));
-        control.enter_stage(Stage::Setup);
-        std::thread::sleep(Duration::from_millis(20));
-        control.enter_stage(Stage::Fuse);
-        assert!(
-            observed(&control, Stage::Setup) >= 0.04,
-            "{}",
-            observed(&control, Stage::Setup)
-        );
-        assert!(observed(&control, Stage::Develop) >= 0.005);
-    }
-
-    #[test]
-    fn a_hold_is_not_part_of_the_open_stages_observed_time() {
-        let control = JobControl::new();
-        control.enter_stage(Stage::Fuse);
-        std::thread::sleep(Duration::from_millis(10));
-        control.add_hold(Duration::from_secs(3600));
-        control.enter_stage(Stage::Finalize);
-        assert_eq!(observed(&control, Stage::Fuse), 0.0);
-
-        std::thread::sleep(Duration::from_millis(10));
-        control.finish_stages();
-        assert!(observed(&control, Stage::Finalize) >= 0.01);
-    }
-
-    #[test]
     fn seeding_survives_a_restarted_develop() {
         let control = JobControl::new();
         control.seed_prediction(&timings(0.0, Some(8.0), None, 2.0, 1.0));
@@ -771,7 +709,7 @@ mod tests {
 
         assert_eq!(predicted(&control, Stage::Develop), 8.0);
         let p = control.progress();
-        assert_eq!(p.eta, Some(Duration::from_secs(8)), "the scaled prediction");
+        assert_eq!(p.eta, Some(Duration::from_secs(8)), "the prediction");
         assert_eq!(p.total_eta, Some(Duration::from_secs(11)));
     }
 
@@ -819,6 +757,34 @@ mod tests {
         let control = JobControl::new();
         control.enter_stage(Stage::Setup);
         assert_eq!(control.progress().total_eta, None);
+    }
+
+    #[test]
+    fn stages_to_come_keep_their_prediction() {
+        // Setup took 5x, then 1/10 of its prediction; the stages after it are
+        // priced as seeded either way.
+        for (setup_predicted, setup_slept_ms) in [(0.005, 25), (0.25, 25)] {
+            let control = JobControl::new();
+            control.seed_prediction(&timings(setup_predicted, None, Some(3.79), 24.94, 1.24));
+            control.enter_stage(Stage::Setup);
+            std::thread::sleep(Duration::from_millis(setup_slept_ms));
+            control.enter_stage(Stage::Align);
+            approx(control.progress().total_eta.unwrap().as_secs_f64(), 29.97);
+            control.enter_stage(Stage::Fuse);
+            approx(control.progress().total_eta.unwrap().as_secs_f64(), 26.18);
+        }
+    }
+
+    #[test]
+    fn short_run_fuse_entry_is_the_fuse_and_finalize_prediction() {
+        let control = JobControl::new();
+        control.seed_prediction(&timings(0.00267, None, Some(0.0309), 0.2181, 0.0217));
+        control.enter_stage(Stage::Setup);
+        std::thread::sleep(Duration::from_millis(50));
+        control.enter_stage(Stage::Align);
+        std::thread::sleep(Duration::from_millis(100));
+        control.enter_stage(Stage::Fuse);
+        approx(control.progress().total_eta.unwrap().as_secs_f64(), 0.2398);
     }
 
     #[test]
