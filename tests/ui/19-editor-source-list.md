@@ -18,7 +18,7 @@ Use a fresh settings directory, where the source presentation is Image list. The
 ## Save a stroke as a third result
 6. Drag across the Composite pane from its centre to window point 1000,400 (`FFCanvas::pane-right`).
    Expect: (within 120 s) `buttons AppWindow::editor-toolbar` lists **Save checkpoint** with enabled true.
-7. Click **Save checkpoint** (`AppWindow::editor-toolbar`).
+7. Click **Save checkpoint** (`AppWindow::editor-toolbar`, top right): drive it with `click "Save checkpoint"` alone, without the container id, which finds no button.
    Expect: the CHECKPOINTS list shows 3 rows; the list shows "Results" with the count "2"; the first result row reads "Details" and "· 1 stroke" with the pills "BASE" and "UNSAVED", the second reads "Details" with the pills "FUSION" and "UNSAVED", and the line "1 hidden: different alignment" is still under them.
 ## Collapse and expand "Results"
 8. Click the heading "Results" (`FFSectionHeading::root` 0).
@@ -64,7 +64,7 @@ Use a fresh settings directory, where the source presentation is Image list. The
 26. (human only) Hover the first result row (`FFImageRow::area` 0).
    Expect: a tooltip reads "Use as brush source"; the row shows no eye or trash icon.
 27. Click the second result row (`FFImageRow::area` 1).
-   Expect: Must not: a frame row stays selected, the CHECKPOINTS list selection moves off its top row, or the left pane label (`FFCanvas::pane-left`) changes; only the second result row is selected, drawn with a light wash and a bar at its left edge.
+   Expect: Must not: a frame row stays selected, or the CHECKPOINTS list selection moves off its top row; only the second result row is selected, drawn with a light wash and a bar at its left edge, and the left pane label (`FFCanvas::pane-left`) starts "Checkpoint · Details".
 28. Click the first frame row (`FFImageRow::area` 3).
    Expect: the left pane label (`FFCanvas::pane-left`) reads "00.tif"; the frame row is selected and no result row has a wash; the frame row shows no eye or trash icon.
 ## Step through one list
