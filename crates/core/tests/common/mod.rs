@@ -33,6 +33,26 @@ pub fn mantis_512_dir() -> PathBuf {
     fixtures_dir().join("mantis-512")
 }
 
+/// `path`'s first image: its width, height, samples per pixel and samples,
+/// a float file narrowed to `u16`.
+#[allow(dead_code)]
+pub fn read_tiff(path: &Path) -> (u32, u32, u32, Vec<u16>) {
+    use focusforge_core::io::{Rect, TiffStack};
+
+    let stack = TiffStack::open_staged(path).unwrap();
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let mut samples = vec![0u16; (width * height * spp) as usize];
+    let full = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    stack.read_tile_into(0, full, &mut samples).unwrap();
+    (width, height, spp, samples)
+}
+
 /// A fresh temporary directory under `CARGO_TARGET_TMPDIR`, removed on drop.
 #[allow(dead_code)]
 pub fn target_tmp() -> tempfile::TempDir {
