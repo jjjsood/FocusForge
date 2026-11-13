@@ -160,7 +160,7 @@ pad   = 8
 
 [[shot]]
 name  = "settings-about-newer"
-args  = ["--open", "fixtures/mantis-512/frames", "--settings-section", "about", "--update-notice-preview", "0.2.0"]
+args  = ["--open", "fixtures/mantis-512/frames", "--settings-section", "about", "--update-notice-preview", "0.3.0"]
 config = "seeds/updates/check-on.toml"
 steps = [
   ["wait-id", "AppWindow::settings-modal"],
@@ -176,7 +176,7 @@ pad   = 8
 
 [[shot]]
 name  = "update-notice"
-args  = ["--open", "fixtures/mantis-512/frames", "--update-notice-preview", "0.2.0"]
+args  = ["--open", "fixtures/mantis-512/frames", "--update-notice-preview", "0.3.0"]
 config = "seeds/updates/check-on.toml"
 steps = [["wait-id", "AppWindow::toast"], ["pause", "500"]]
 out   = "assets/manual/notifications/update-notice.png"
