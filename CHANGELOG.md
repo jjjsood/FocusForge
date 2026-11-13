@@ -6,6 +6,8 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-13
+
 ### Changed
 
 - The Details fusion method (`laplacian`) judges sharpness over a smaller area, so fine detail next to stronger detail is taken from the frame in which it is sharp. Fusing a stack again with Details can give a slightly different result and Z-Map than an earlier version.
