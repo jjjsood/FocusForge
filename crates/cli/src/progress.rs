@@ -482,7 +482,6 @@ mod tests {
 
     #[test]
     fn eta_display_enabled_only_for_exactly_one() {
-        use std::ffi::OsStr;
         assert!(eta_display_enabled(Some(OsStr::new("1"))));
         for value in ["", "0", "true", "yes", " 1", "1 ", "01"] {
             assert!(!eta_display_enabled(Some(OsStr::new(value))), "{value:?}");
