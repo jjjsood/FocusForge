@@ -333,6 +333,21 @@ pub fn spawn_after(
 mod stage_tests {
     use super::*;
 
+    #[test]
+    fn eta_display_enabled_only_for_exactly_one() {
+        use std::ffi::OsStr;
+        assert!(eta_display_enabled(Some(OsStr::new("1"))));
+        for value in ["", "0", "true", "yes", " 1", "1 ", "01"] {
+            assert!(!eta_display_enabled(Some(OsStr::new(value))), "{value:?}");
+        }
+        assert!(!eta_display_enabled(None));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(!eta_display_enabled(Some(OsStr::from_bytes(b"\xff"))));
+        }
+    }
+
     const EXTENT: Rect = Rect {
         x: 0,
         y: 0,
@@ -1428,11 +1443,20 @@ pub fn phase_line(state: &RunState, progress: Option<&JobProgress>) -> Option<St
     })
 }
 
+/// Whether the remaining-time estimate is shown: only for the exact
+/// environment value `1`. Unset, empty, `0` or anything else leaves it hidden.
+pub fn eta_display_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
 /// The time left in the whole run, not just the current stage: `estimating`
 /// while no total estimate exists, `ETA M:SS` while running with one (`ETA
 /// H:MM:SS` from an hour up), `ETA —` once paused, cancelling or failed --
-/// never a rendered zero.
-pub fn eta_text(state: &RunState, progress: Option<&JobProgress>) -> String {
+/// never a rendered zero. Empty when `shown` is false.
+pub fn eta_text(state: &RunState, progress: Option<&JobProgress>, shown: bool) -> String {
+    if !shown {
+        return String::new();
+    }
     match state {
         RunState::Paused | RunState::Cancelling | RunState::Failed(_) => "ETA —".to_string(),
         RunState::Idle | RunState::Fused { .. } | RunState::Queued { .. } => String::new(),

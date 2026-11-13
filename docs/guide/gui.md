@@ -174,8 +174,9 @@ From left to right:
 - **Status.** "No project open" on the **+** tab, "No job running" when
   nothing is happening, the current stage while a stack is fused (for example
   "Aligning"), and "fused" with the time once a run you kept has finished.
-- **Progress.** During a run: frames done (such as "3 of 8"), a progress bar
-  and an estimated time remaining ("ETA"). [Your first stack](first-stack.md)
+- **Progress.** During a run: frames done (such as "3 of 8") and a progress
+  bar. An estimated time remaining ("ETA") is shown only when FocusForge is
+  started with `FOCUSFORGE_SHOW_ETA=1`. [Your first stack](first-stack.md)
   explains the stages.
 - **Overlay.** A switch and a strength slider for the Z-Map overlay; see
   [See where each pixel came from](#see-where-each-pixel-came-from).

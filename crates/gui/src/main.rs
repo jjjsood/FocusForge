@@ -2164,6 +2164,9 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
     // needs the same renderer cell every other open path feeds.
     let mut controller_state = AppController::new();
     controller_state.set_analytics_background(true);
+    controller_state.set_eta_display(job::eta_display_enabled(
+        std::env::var_os("FOCUSFORGE_SHOW_ETA").as_deref(),
+    ));
     let controller = Arc::new(Mutex::new(controller_state));
     let canvas: Rc<RefCell<Canvas>> = Rc::new(RefCell::new(Canvas::default()));
     let app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>> = Rc::new(RefCell::new(None));

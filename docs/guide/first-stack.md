@@ -352,12 +352,14 @@ shows what the run is doing:
 | **Writing** | Stores the finished result | — |
 
 For a camera RAW stack the bar reads **Developing** first, with the number of
-frames developed and the same time remaining. Each RAW frame is developed
+frames developed. Each RAW frame is developed
 once, before the other stages, and they reuse the result.
 
-Next to the progress bar, the time remaining reads "estimating" until
-FocusForge has enough to go on, then "ETA 1:12" (minutes and seconds). Time
-spent paused is left out of the estimate. A stage is skipped when its
+The time remaining is hidden by default. When it is switched on (start
+FocusForge with the environment variable `FOCUSFORGE_SHOW_ETA=1`), it appears
+next to the progress bar and reads "estimating" until FocusForge has enough to
+go on, then "ETA 1:12" (minutes and seconds). Time spent paused is left out of
+the estimate. A stage is skipped when its
 setting is off; [Stacking settings](stacking.md) and
 [Alignment](alignment.md) say which.
 
@@ -422,8 +424,7 @@ You can stop a running fuse at any time from the toolbar.
 *A paused fuse: **Resume** takes the place of **Pause**.*
 
 - **Pause** holds the run at the next frame or step it finishes. The button
-  turns into **Resume**, the bottom bar reads "Paused" and the time remaining
-  reads "ETA —". A paused run keeps everything it has done so far.
+  turns into **Resume** and the bottom bar reads "Paused". A paused run keeps everything it has done so far.
 - **Resume** carries on where the run stopped.
 - **Cancel** stops the run, paused or not. A greyed-out **Cancelling…**
   button shows for a moment, then **Fuse stack** comes back. Nothing is

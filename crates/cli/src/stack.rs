@@ -1028,7 +1028,10 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     let _stack = tracing::debug_span!("stack", identity = %identity).entered();
     // Inside the span, so a forced crash carries this run's own context.
     focusforge_diagnostics::force_crash("stack");
-    let renderer = ProgressRenderer::new(ProgressMode::choose(job_opts.no_progress));
+    let renderer = ProgressRenderer::new(
+        ProgressMode::choose(job_opts.no_progress),
+        job_opts.show_eta,
+    );
     let status = StatusSink::new(preset_opts.status, identity, "stack");
     status.set_algorithm(algo.id());
 
