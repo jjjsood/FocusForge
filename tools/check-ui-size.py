@@ -31,7 +31,7 @@ from pathlib import Path
 BUDGETS: list[tuple[str, str, int, str]] = [
     ("focusforge-ui", "app.rs", 17400000, "tests"),
     ("focusforge-ui-comparison", "comparison_window.rs", 1100000, "tests"),
-    ("focusforge-ui-theme-sheet", "theme_sheet.rs", 20700000, "theme-sheet"),
+    ("focusforge-ui-theme-sheet", "theme_sheet.rs", 24400000, "theme-sheet"),
 ]
 
 BUILDS: dict[str, list[str]] = {

@@ -195,6 +195,21 @@ pub fn device_bytes_per_tile(
     per_frame + once
 }
 
+/// The device bytes of one frame tile's focus score at `width x height`:
+/// the packed upload, the base plane, the two reduce and the two expand
+/// passes, the detail plane, the score's row sums and scores, and the
+/// readback staging buffer.
+pub fn sharpness_bytes_per_tile(width: u32, height: u32, spp: u32) -> u64 {
+    let (w, h, s) = (u64::from(width), u64::from(height), u64::from(spp));
+    let (half_w, half_h) = (w.div_ceil(2), h.div_ceil(2));
+    packed(w, h, s)
+        + plane(w, h, s)
+        + plane(half_w, h, s)
+        + plane(half_w, half_h, s)
+        + 3 * plane(w, h, s)
+        + 3 * plane(w, h, 1)
+}
+
 /// The account of a `width x height` tile whose `bytes` exceed the device
 /// `budget` and so runs on the host; `None` when it fits.
 pub fn tile_shortfall_message(width: u32, height: u32, bytes: u64, budget: u64) -> Option<String> {
@@ -531,6 +546,17 @@ mod tests {
     use focusforge_core::fuse::laplacian::Laplacian;
     use focusforge_core::params::{ParamValue, ParamValues, Provenance};
     use focusforge_core::tile::TilePlan;
+
+    #[test]
+    fn sharpness_tile_bytes_sum_its_buffers() {
+        // 4x4, one channel: packed 32, base 64, reduce 32 + 16, expand and
+        // detail 3 x 64, row sums + scores + staging 3 x 64.
+        assert_eq!(
+            sharpness_bytes_per_tile(4, 4, 1),
+            32 + 64 + 32 + 16 + 192 + 192
+        );
+        assert!(sharpness_bytes_per_tile(512, 512, 3) > sharpness_bytes_per_tile(512, 512, 1));
+    }
 
     // --- DeviceBudget ---
 

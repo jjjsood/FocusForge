@@ -13,14 +13,16 @@ use focusforge_core::algorithm::{AlgorithmError, TileOutput, TileReader};
 use focusforge_core::align::warp::WarpedTile;
 use focusforge_core::align::{AlignError, Transform};
 use focusforge_core::gpu::{
-    AlignBackend, BackendInfo, EccMomentSession, EccSessionRequest, TileBackend,
+    AlignBackend, BackendInfo, EccMomentSession, EccSessionRequest, ScalePeaks, SharpnessBackend,
+    TileBackend,
 };
-use focusforge_core::tile::{Rect, SampleFormat, Tile};
+use focusforge_core::sharpness_map::BINS;
+use focusforge_core::tile::{Rect, SampleFormat, Tile, TilePlan};
 
 use crate::budget::{
-    DeviceBudget, ProbeOutcome, VramBudget, buffer_limit_shortfalls, device_bytes_per_tile,
-    dispatch_limit_shortfall, largest_buffer_bytes, max_tile_side, probe_budget,
-    tile_shortfall_message,
+    DeviceBudget, OwnedPermit, ProbeOutcome, VramBudget, buffer_limit_shortfalls,
+    device_bytes_per_tile, dispatch_limit_shortfall, largest_buffer_bytes, max_tile_side,
+    probe_budget, sharpness_bytes_per_tile, tile_shortfall_message,
 };
 use crate::device::{GpuError, SharedDevice, block_on, settled_device, shared_device};
 use crate::ecc::{self, EccState};
@@ -30,7 +32,7 @@ use crate::pack::{packed_len, unpack_samples};
 use crate::pipeline::{
     Pipeline, build_pipeline, run_pass, storage_entry, uniform_entry, upload_params,
 };
-use crate::transfer::{create_storage_buffer, download_buffer, upload_tile};
+use crate::transfer::{create_storage_buffer, download_buffer, download_f32, upload_tile};
 use crate::vram::WgpuAllocProbe;
 use crate::warp::{self, WarpPipelines};
 
@@ -379,16 +381,8 @@ impl GpuBackend {
         );
         self.check_tile(rect.width, rect.height, samples_per_pixel, warped)?;
 
-        let _permit = self.budget.acquire(bytes);
-
-        // Both scopes are pushed and popped on this one rayon worker: wgpu
-        // routes an error to the innermost matching scope of the *raising*
-        // thread. One pair per tile, never per pyramid level -- a validation
-        // error names its kernel from the dispatch label instead.
-        let device = self.device.device();
-        let result = errors::with_validation_scope(device, || {
-            let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-            let result = crate::stack_tile::warp_fuse_tile_gpu::<O>(
+        self.scoped(bytes, || {
+            crate::stack_tile::warp_fuse_tile_gpu::<O>(
                 self.device,
                 &self.warp_pipelines,
                 &self.fuse_pipelines,
@@ -398,7 +392,27 @@ impl GpuBackend {
                 rect,
                 samples_per_pixel,
                 levels,
-            );
+            )
+        })
+    }
+
+    /// Runs one tile's device work under a budget permit of `bytes` and the
+    /// error scopes.
+    fn scoped<T>(
+        &self,
+        bytes: u64,
+        run: impl FnOnce() -> Result<T, AlgorithmError>,
+    ) -> Result<T, AlgorithmError> {
+        let _permit = self.budget.acquire(bytes);
+
+        // Both scopes are pushed and popped on this one rayon worker: wgpu
+        // routes an error to the innermost matching scope of the *raising*
+        // thread. One pair per tile, never per pyramid level -- a validation
+        // error names its kernel from the dispatch label instead.
+        let device = self.device.device();
+        let result = errors::with_validation_scope(device, || {
+            let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let result = run();
             let oom = block_on(scope.pop());
             match oom {
                 // `result`'s `Ok` value is discarded even if the dispatch
@@ -420,6 +434,179 @@ impl GpuBackend {
         forced_device_loss(self.device);
 
         result
+    }
+}
+
+impl SharpnessBackend for GpuBackend {
+    fn device_lost(&self) -> bool {
+        self.device.lost()
+    }
+
+    fn score_tile(
+        &self,
+        reader: &dyn TileReader,
+        frame: usize,
+        read: Rect,
+        samples_per_pixel: u32,
+    ) -> Result<Option<Vec<f32>>, AlgorithmError> {
+        let bytes = sharpness_bytes_per_tile(read.width, read.height, samples_per_pixel);
+        let fits = self
+            .check_tile(read.width, read.height, samples_per_pixel, false)
+            .map_err(|error| tracing::info!(%error, "sharpness tile declined"))
+            .is_ok()
+            && bytes <= self.device_budget.bytes();
+        if !fits {
+            return Ok(None);
+        }
+        self.scoped(bytes, || {
+            fuse::sharpness::score_tile(
+                self.device,
+                &self.fuse_pipelines,
+                reader,
+                frame,
+                read,
+                samples_per_pixel,
+            )
+        })
+        .map(Some)
+    }
+
+    fn open_scale(
+        &self,
+        plan: &TilePlan,
+        samples_per_pixel: u32,
+    ) -> Result<Option<Box<dyn ScalePeaks + '_>>, AlgorithmError> {
+        let tiles: Vec<(Rect, Rect)> = plan
+            .tiles()
+            .iter()
+            .map(|tile| (tile.read(), tile.interior()))
+            .collect();
+        let peak_bytes = |read: &Rect| u64::from(read.width) * u64::from(read.height) * 4;
+        let retained =
+            tiles.iter().map(|(read, _)| peak_bytes(read)).sum::<u64>() + BINS as u64 * 4;
+        let pixels: u64 = tiles
+            .iter()
+            .map(|(_, interior)| u64::from(interior.width) * u64::from(interior.height))
+            .sum();
+        let widest = tiles.iter().map(|(read, _)| read.width).max().unwrap_or(0);
+        let tallest = tiles.iter().map(|(read, _)| read.height).max().unwrap_or(0);
+        let tile_bytes = sharpness_bytes_per_tile(widest, tallest, samples_per_pixel);
+        // The retained permit is one slot of the budget's count, so a fold
+        // needs a second.
+        let fits = pixels <= u64::from(u32::MAX)
+            && self
+                .check_tile(widest, tallest, samples_per_pixel, false)
+                .map_err(|error| tracing::info!(%error, "sharpness scale declined"))
+                .is_ok()
+            && retained + tile_bytes <= self.device_budget.bytes()
+            && self.budget.limit_for(tile_bytes) >= 2;
+        if !fits {
+            return Ok(None);
+        }
+        let peaks = self.scoped(retained, || {
+            Ok(tiles
+                .iter()
+                .map(|(read, _)| {
+                    create_storage_buffer(
+                        self.device.device(),
+                        peak_bytes(read),
+                        "focusforge-gpu-sharpness-peaks",
+                    )
+                })
+                .collect::<Vec<_>>())
+        })?;
+        Ok(Some(Box::new(ScaleSession {
+            backend: self,
+            spp: samples_per_pixel,
+            tiles,
+            peaks,
+            _retained: self.budget.acquire_owned(retained),
+        })))
+    }
+}
+
+/// The per-pixel peaks of one scale pass: a buffer per tile of the plan,
+/// zeroed when created and held on the device, and a budget permit for the
+/// session's life.
+struct ScaleSession<'a> {
+    backend: &'a GpuBackend,
+    spp: u32,
+    /// Each tile's read rect and interior.
+    tiles: Vec<(Rect, Rect)>,
+    peaks: Vec<wgpu::Buffer>,
+    _retained: OwnedPermit,
+}
+
+impl ScalePeaks for ScaleSession<'_> {
+    fn fold(
+        &self,
+        tile: usize,
+        reader: &dyn TileReader,
+        frame: usize,
+    ) -> Result<(), AlgorithmError> {
+        let read = self.tiles[tile].0;
+        let bytes = sharpness_bytes_per_tile(read.width, read.height, self.spp);
+        self.backend.scoped(bytes, || {
+            fuse::sharpness::fold_tile(
+                self.backend.device,
+                &self.backend.fuse_pipelines,
+                reader,
+                frame,
+                read,
+                self.spp,
+                &self.peaks[tile],
+            )
+        })
+    }
+
+    fn histogram(&mut self) -> Result<Vec<u64>, AlgorithmError> {
+        let backend = self.backend;
+        let (gpu, queue) = (backend.device.device(), backend.device.queue());
+        let bytes = BINS as u64 * 4;
+        backend.scoped(bytes, || {
+            let histogram = create_storage_buffer(gpu, bytes, "focusforge-gpu-sharpness-histogram");
+            let mut batch = fuse::TileBatch::new(gpu, queue);
+            for (peaks, &(read, interior)) in self.peaks.iter().zip(&self.tiles) {
+                fuse::sharpness::bin_tile(
+                    &mut batch,
+                    &backend.fuse_pipelines,
+                    peaks,
+                    &histogram,
+                    read,
+                    interior,
+                );
+            }
+            batch.submit();
+            let counts = download_buffer(gpu, queue, &histogram, bytes)?;
+            Ok(counts
+                .chunks_exact(4)
+                .map(|count| {
+                    u64::from(u32::from_le_bytes(
+                        count.try_into().expect("chunks_exact(4) yields 4 bytes"),
+                    ))
+                })
+                .collect())
+        })
+    }
+
+    fn interior_peaks(&self, tile: usize) -> Result<Vec<f32>, AlgorithmError> {
+        let (read, interior) = self.tiles[tile];
+        let backend = self.backend;
+        let pixels = read.width as usize * read.height as usize;
+        backend.scoped(pixels as u64 * 4, || {
+            let all = download_f32(
+                backend.device.device(),
+                backend.device.queue(),
+                &self.peaks[tile],
+                pixels,
+            )?;
+            let mut inner = Vec::with_capacity(interior.width as usize * interior.height as usize);
+            for y in interior.y..interior.y + interior.height {
+                let start = ((y - read.y) * read.width + (interior.x - read.x)) as usize;
+                inner.extend_from_slice(&all[start..start + interior.width as usize]);
+            }
+            Ok(inner)
+        })
     }
 }
 
@@ -526,6 +713,7 @@ pub fn settled_backend() -> Option<Result<&'static GpuBackend, &'static GpuError
 pub fn vram_cap_settled() -> bool {
     GPU_BACKEND.get().is_some()
         || LAZY_ALIGN_BACKEND.get().is_some()
+        || LAZY_SHARPNESS_BACKEND.get().is_some()
         || matches!(settled_device(), Some(Err(_)))
 }
 
@@ -581,7 +769,7 @@ impl LazyAlignBackend {
     /// Whether the device a level already opened is lost. `false` before any
     /// level has opened it: asking never brings the adapter up.
     pub fn lost(&self) -> bool {
-        matches!(self.selected.get(), Some(Some(backend)) if backend.device_lost())
+        matches!(self.selected.get(), Some(Some(backend)) if TileBackend::device_lost(*backend))
     }
 
     /// Brings the backend up on first call and reports the outcome to
@@ -649,6 +837,81 @@ pub fn align_backend_for(
         adapter: OnceLock::new(),
     });
     (Some(lazy), String::new())
+}
+
+/// The stack sharpness passes' accelerator, brought up on the first tile
+/// offered to it: a run below the eligibility threshold never touches the
+/// GPU. The outcome is logged once; a failed bring-up declines every tile.
+pub struct LazySharpnessBackend {
+    max_vram: Option<u64>,
+    selected: OnceLock<Option<&'static GpuBackend>>,
+}
+
+impl LazySharpnessBackend {
+    fn resolve(&self) -> Option<&'static GpuBackend> {
+        *self
+            .selected
+            .get_or_init(|| match compute_backend(self.max_vram) {
+                Ok(backend) => {
+                    tracing::info!(adapter = %backend.info(), "sharpness scores on the GPU");
+                    Some(backend)
+                }
+                Err(line) => {
+                    tracing::info!("{line}; sharpness scores on the CPU");
+                    None
+                }
+            })
+    }
+}
+
+impl SharpnessBackend for LazySharpnessBackend {
+    fn device_lost(&self) -> bool {
+        matches!(self.selected.get(), Some(Some(backend)) if SharpnessBackend::device_lost(*backend))
+    }
+
+    fn score_tile(
+        &self,
+        reader: &dyn TileReader,
+        frame: usize,
+        read: Rect,
+        samples_per_pixel: u32,
+    ) -> Result<Option<Vec<f32>>, AlgorithmError> {
+        match self.resolve() {
+            Some(backend) => {
+                SharpnessBackend::score_tile(backend, reader, frame, read, samples_per_pixel)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn open_scale(
+        &self,
+        plan: &TilePlan,
+        samples_per_pixel: u32,
+    ) -> Result<Option<Box<dyn ScalePeaks + '_>>, AlgorithmError> {
+        match self.resolve() {
+            Some(backend) => SharpnessBackend::open_scale(backend, plan, samples_per_pixel),
+            None => Ok(None),
+        }
+    }
+}
+
+static LAZY_SHARPNESS_BACKEND: OnceLock<LazySharpnessBackend> = OnceLock::new();
+
+/// The accelerator for the stack sharpness passes, or `None` when `no_gpu`
+/// forces the CPU. No adapter is probed until the first tile of a run that
+/// reaches [`SharpnessBackend::min_pixel_frames`]. The first call's
+/// `max_vram` wins.
+pub fn sharpness_backend_for(
+    no_gpu: bool,
+    max_vram: Option<u64>,
+) -> Option<&'static LazySharpnessBackend> {
+    (!no_gpu).then(|| {
+        LAZY_SHARPNESS_BACKEND.get_or_init(|| LazySharpnessBackend {
+            max_vram,
+            selected: OnceLock::new(),
+        })
+    })
 }
 
 /// The backend a stack run computes on, or the one-line reason it computes on

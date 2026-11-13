@@ -74,6 +74,9 @@ import { FFSummaryBand } from "components/ff_summary_band.slint";
 import { FFCalculatorLegend } from "components/ff_calculator_legend.slint";
 import { FFAnalyticsRow } from "components/ff_analytics_row.slint";
 import { FFStatusText } from "components/ff_status_text.slint";
+import { FFOverlapSegment } from "components/ff_overlap_segment.slint";
+import { FFOverlapBar, OverlapSegmentView } from "components/ff_overlap_bar.slint";
+import { FFOverlapLegend } from "components/ff_overlap_legend.slint";
 
 export { Theme }
 
@@ -132,6 +135,15 @@ component ColourSwatch inherits Rectangle {
 component GroupHeading inherits Text {
     color: Theme.text-secondary;
     font-weight: 600;
+}
+
+// A specimen with its caption beneath.
+component OverlapCell inherits VerticalLayout {
+    in property <string> caption;
+    spacing: Theme.space-1;
+    alignment: start;
+    @children
+    Text { text: root.caption; color: Theme.text-muted; font-size: Theme.text-body.size; }
 }
 
 component TypeSample inherits Rectangle {
@@ -224,6 +236,13 @@ component StagePane inherits Rectangle {
     }
 }
 
+struct DemoRow {
+    chip: color,
+    name: string,
+    fraction: float,
+    count: int,
+}
+
 export component ThemeSheet inherits Window {
     in property <image> stage-fusing;
     in property <image> stage-fusing-bare;
@@ -234,6 +253,29 @@ export component ThemeSheet inherits Window {
     in-out property <bool> demo-shown: true;
     in-out property <bool> demo-loop: true;
     in-out property <int> guard-clicks: 0;
+
+    // Specimen data for the overlap bars: 8 images, then 61.
+    property <[OverlapSegmentView]> overlap-short: [
+        { scale: 1.200, has-data: true, dimmed: false, percent: "8 %", tooltip: "Images 1 and 2 \u{00B7} 00.tif, 01.tif\n8 % of their sharp areas overlap" },
+        { scale: 0.600, has-data: true, dimmed: false, percent: "3 %", tooltip: "Images 2 and 3 \u{00B7} 01.tif, 02.tif\n3 % \u{2013} likely a gap in focus here" },
+        { scale: 1.667, has-data: true, dimmed: false, percent: "15 %", tooltip: "Images 3 and 4 \u{00B7} 02.tif, 03.tif\n15 % of their sharp areas overlap" },
+        { scale: 2.000, has-data: true, dimmed: false, percent: "25 %", tooltip: "Images 4 and 5 \u{00B7} 03.tif, 04.tif\n25 % of their sharp areas overlap" },
+        { scale: 1.467, has-data: true, dimmed: false, percent: "12 %", tooltip: "Images 5 and 6 \u{00B7} 04.tif, 05.tif\n12 % of their sharp areas overlap" },
+        { scale: 2.000, has-data: true, dimmed: true, percent: "70 %", tooltip: "Images 6 and 7 \u{00B7} 05.tif, 06.tif\n70 % \u{2013} too few sharp areas to be sure" },
+        { scale: 2.000, has-data: true, dimmed: false, percent: "100 %", tooltip: "Images 7 and 8 \u{00B7} 06.tif, 07.tif\n100 % of their sharp areas overlap" },
+    ];
+    property <[OverlapSegmentView]> overlap-long: [
+        { scale: 0.000, has-data: true, dimmed: false }, { scale: 1.667, has-data: true, dimmed: true }, { scale: 1.067, has-data: true, dimmed: false }, { scale: 0.600, has-data: true, dimmed: false }, { scale: 2.000, has-data: true, dimmed: true }, { scale: 0.400, has-data: true, dimmed: false },
+        { scale: 1.200, has-data: true, dimmed: false }, { scale: 1.467, has-data: true, dimmed: false }, { scale: 0.000, has-data: true, dimmed: false }, { scale: 1.667, has-data: true, dimmed: true }, { scale: 1.067, has-data: true, dimmed: false }, { scale: 0.600, has-data: true, dimmed: false },
+        { scale: 2.000, has-data: true, dimmed: false }, { scale: 0.400, has-data: true, dimmed: false }, { scale: 1.200, has-data: true, dimmed: false }, { scale: 1.467, has-data: true, dimmed: false }, { scale: 0.000, has-data: true, dimmed: false }, { scale: 1.667, has-data: true, dimmed: false },
+        { scale: 1.067, has-data: true, dimmed: false }, { scale: 0.0, has-data: false }, { scale: 2.000, has-data: true, dimmed: false }, { scale: 0.400, has-data: true, dimmed: false }, { scale: 1.200, has-data: true, dimmed: false }, { scale: 1.467, has-data: true, dimmed: true },
+        { scale: 0.000, has-data: true, dimmed: false }, { scale: 1.667, has-data: true, dimmed: false }, { scale: 1.067, has-data: true, dimmed: false }, { scale: 0.600, has-data: true, dimmed: false }, { scale: 2.000, has-data: true, dimmed: false }, { scale: 0.400, has-data: true, dimmed: false },
+        { scale: 1.200, has-data: true, dimmed: false }, { scale: 1.467, has-data: true, dimmed: false }, { scale: 0.000, has-data: true, dimmed: false }, { scale: 1.667, has-data: true, dimmed: true }, { scale: 1.467, has-data: true, dimmed: false, tooltip: "Images 35 and 36 \u{00B7} 34.tif, 35.tif\n12 % of their sharp areas overlap" }, { scale: 0.600, has-data: true, dimmed: false },
+        { scale: 2.000, has-data: true, dimmed: false }, { scale: 0.400, has-data: true, dimmed: false }, { scale: 1.200, has-data: true, dimmed: false }, { scale: 1.467, has-data: true, dimmed: false }, { scale: 0.000, has-data: true, dimmed: false }, { scale: 1.667, has-data: true, dimmed: false },
+        { scale: 1.067, has-data: true, dimmed: false }, { scale: 0.600, has-data: true, dimmed: false }, { scale: 2.000, has-data: true, dimmed: false }, { scale: 0.400, has-data: true, dimmed: true }, { scale: 1.200, has-data: true, dimmed: false }, { scale: 1.467, has-data: true, dimmed: false },
+        { scale: 0.000, has-data: true, dimmed: false }, { scale: 1.667, has-data: true, dimmed: false }, { scale: 1.067, has-data: true, dimmed: false }, { scale: 0.600, has-data: true, dimmed: false }, { scale: 2.000, has-data: true, dimmed: true }, { scale: 0.400, has-data: true, dimmed: false },
+        { scale: 1.200, has-data: true, dimmed: false }, { scale: 1.467, has-data: true, dimmed: false }, { scale: 0.000, has-data: true, dimmed: false }, { scale: 1.667, has-data: true, dimmed: false }, { scale: 1.067, has-data: true, dimmed: false }, { scale: 0.600, has-data: true, dimmed: false },
+    ];
 
     title: "FocusForge -- token sheet";
     preferred-width: 1100px;
@@ -256,6 +298,30 @@ export component ThemeSheet inherits Window {
         interval: 2s;
         running: root.demo-loop;
         triggered => { root.demo-shown = !root.demo-shown; }
+    }
+
+    // The count demo: counting while hidden; once shown, its entry starts
+    // after `entry-wait`, as in the Analytics overlay.
+    property <bool> demo-entered: false;
+    property <[DemoRow]> demo-rows: [
+        { chip: Theme.status-failure, name: "00.tif", fraction: 1.0, count: 58 },
+        { chip: Theme.status-warning, name: "01.tif", fraction: 0.6, count: 35 },
+        { chip: Theme.status-success, name: "02.tif", fraction: 0.3, count: 17 },
+        { chip: Theme.accent-default, name: "03.tif", fraction: 0.1, count: 6 },
+        { chip: Theme.status-failure, name: "04.tif", fraction: 0.8, count: 46 },
+        { chip: Theme.status-warning, name: "05.tif", fraction: 0.45, count: 26 },
+        { chip: Theme.status-success, name: "06.tif", fraction: 0.2, count: 12 },
+        { chip: Theme.accent-default, name: "07.tif", fraction: 0.05, count: 3 },
+    ];
+    changed demo-shown => {
+        if (!root.demo-shown) {
+            root.demo-entered = false;
+        }
+    }
+    Timer {
+        interval: Theme.entry-wait;
+        running: root.demo-shown && !root.demo-entered;
+        triggered => { root.demo-entered = true; }
     }
 
     Flickable {
@@ -346,6 +412,125 @@ export component ThemeSheet inherits Window {
             }
         }
 
+        GroupHeading { text: "Overlap segment: scale stops (share 0, 2.5, 5, 12.5, 20, 100 %), then every whole percent from 0 to 20 %"; }
+        Rectangle {
+            width: 892px;
+            height: 112px;
+            background: Theme.surface-canvas;
+            VerticalLayout {
+                padding: Theme.space-4;
+                spacing: Theme.space-4;
+                alignment: start;
+                HorizontalLayout {
+                    spacing: ShellGeometry.overlap-segment-gap;
+                    alignment: start;
+                    OverlapCell { caption: "share 0 %"; FFOverlapSegment { width: 122px; scale: 0.0000; percent: "0 %"; } }
+                    OverlapCell { caption: "share 2.5 %"; FFOverlapSegment { width: 122px; scale: 0.5000; percent: "3 %"; } }
+                    OverlapCell { caption: "share 5 %"; FFOverlapSegment { width: 122px; scale: 1.0000; percent: "5 %"; } }
+                    OverlapCell { caption: "share 12.5 %"; FFOverlapSegment { width: 122px; scale: 1.5000; percent: "13 %"; } }
+                    OverlapCell { caption: "share 20 %"; FFOverlapSegment { width: 122px; scale: 2.0000; percent: "20 %"; } }
+                    OverlapCell { caption: "share 100 %"; FFOverlapSegment { width: 122px; scale: 2.0000; percent: "100 %"; } }
+                }
+                HorizontalLayout {
+                    spacing: ShellGeometry.overlap-segment-gap;
+                    alignment: start;
+                    for i in 21: FFOverlapSegment { width: 40px; scale: i <= 5 ? i / 5.0 : 1.0 + (i - 5) / 15.0; }
+                }
+            }
+        }
+
+        GroupHeading { text: "Overlap segment states: no data (122, 24, 14 px), pending with its band, dimmed (70 %, 2 %), hovered, narrow"; }
+        Rectangle {
+            width: 892px;
+            height: 80px;
+            background: Theme.surface-canvas;
+            HorizontalLayout {
+                padding: Theme.space-4;
+                spacing: Theme.space-2;
+                alignment: start;
+                OverlapCell { caption: "no data"; FFOverlapSegment { width: 122px; has-data: false; } }
+                OverlapCell { caption: "24 px"; FFOverlapSegment { width: 24px; has-data: false; } }
+                OverlapCell { caption: "14 px"; FFOverlapSegment { width: 14px; has-data: false; } }
+                OverlapCell { caption: "pending"; FFOverlapSegment { width: 122px; pending: true; sweep-x: 40px; sweep-width: 60px; } }
+                OverlapCell { caption: "dimmed, 70 %"; FFOverlapSegment { width: 122px; scale: 2.0; dimmed: true; percent: "70 %"; } }
+                OverlapCell { caption: "dimmed, 2 %"; FFOverlapSegment { width: 122px; scale: 0.4; dimmed: true; percent: "2 %"; } }
+                OverlapCell { caption: "hovered, 25 %"; FFOverlapSegment { width: 122px; scale: 2.0; hovered: true; percent: "25 %"; } }
+                OverlapCell { caption: "13.35 px"; FFOverlapSegment { width: 13.35px; scale: 0.4; } }
+            }
+        }
+
+        GroupHeading { text: "Overlap bar: 8 images (hover a segment for its tooltip), 61 images, counting (pending with its sweeping band)"; }
+        Rectangle {
+            width: 892px;
+            height: 3 * (ShellGeometry.overlap-block-height - ShellGeometry.overlap-bar-y) + 4 * Theme.space-8;
+            background: Theme.surface-canvas;
+            FFOverlapBar { x: Theme.space-4; y: Theme.space-8 + Theme.space-6; width: 860px; segments: root.overlap-short; }
+            FFOverlapBar { x: Theme.space-4; y: 2 * Theme.space-8 + Theme.space-6 + (ShellGeometry.overlap-block-height - ShellGeometry.overlap-bar-y); width: 860px; segments: root.overlap-long; }
+            FFOverlapBar { x: Theme.space-4; y: 3 * Theme.space-8 + Theme.space-6 + 2 * (ShellGeometry.overlap-block-height - ShellGeometry.overlap-bar-y); width: 860px; segments: root.overlap-short; pending: true; }
+        }
+
+        GroupHeading { text: "Overlap tooltips (FFTooltip, 4 px above the segment, centred): plain, dimmed, red pair, no data"; }
+        Rectangle {
+            width: 892px;
+            height: 232px;
+            background: Theme.surface-canvas;
+            FFTooltip { x: 150px + (122px - self.width) / 2; y: 8px; text: "Images 4 and 5 \u{00B7} 03.tif, 04.tif\n25 % of their sharp areas overlap"; }
+            FFOverlapSegment { x: 150px; y: 62px; width: 122px; scale: 2.0; has-data: true; dimmed: false; percent: "25 %"; }
+            Text { x: 150px; y: 88px; text: "plain pair"; color: Theme.text-muted; font-size: Theme.text-body.size; }
+            FFTooltip { x: 570px + (122px - self.width) / 2; y: 8px; text: "Images 6 and 7 \u{00B7} 05.tif, 06.tif\n70 % \u{2013} too few sharp areas to be sure"; }
+            FFOverlapSegment { x: 570px; y: 62px; width: 122px; scale: 2.0; has-data: true; dimmed: true; percent: "70 %"; }
+            Text { x: 570px; y: 88px; text: "dimmed pair"; color: Theme.text-muted; font-size: Theme.text-body.size; }
+            FFTooltip { x: 150px + (122px - self.width) / 2; y: 128px; text: "Images 1 and 2 \u{00B7} 00.tif, 01.tif\n2 % \u{2013} likely a gap in focus here"; }
+            FFOverlapSegment { x: 150px; y: 182px; width: 122px; scale: 0.4; has-data: true; dimmed: false; percent: "2 %"; }
+            Text { x: 150px; y: 208px; text: "red pair (share below 5 %)"; color: Theme.text-muted; font-size: Theme.text-body.size; }
+            FFTooltip { x: 570px + (122px - self.width) / 2; y: 128px; text: "Images 5 and 6 \u{00B7} 04.tif, 05.tif\nNo sharp areas in either image"; }
+            FFOverlapSegment { x: 570px; y: 182px; width: 122px; scale: 0.0; has-data: false; dimmed: false; percent: ""; }
+            Text { x: 570px; y: 208px; text: "no data"; color: Theme.text-muted; font-size: Theme.text-body.size; }
+        }
+
+        GroupHeading { text: "Overlap bar block: heading, caption, legend, bar (1:1 geometry)"; }
+        Rectangle {
+            width: 892px;
+            height: ShellGeometry.overlap-block-height;
+            background: Theme.surface-canvas;
+            FFSectionHeading { x: Theme.space-4; y: 18px; width: 400px; flat: true; strong: true; label: "SHARPNESS OVERLAP"; }
+            FFStatusText { x: Theme.space-4; y: 34px; width: 500px; height: 16px; text: "Share of sharp areas that neighbouring images have in common"; }
+            FFOverlapLegend { x: parent.width - Theme.space-4 - self.width; y: 32px; }
+            FFOverlapBar { x: Theme.space-4; y: ShellGeometry.overlap-bar-y; width: 860px; segments: root.overlap-short; }
+        }
+
+        GroupHeading { text: "A count that ends, looped: one soft band crosses the bar and the rows, each row a little behind the one above; at the end the bands fade out, then the segments zoom in left to right while the row bars fill row after row"; }
+        Rectangle {
+            width: 892px;
+            height: 2 * Theme.space-4 + (ShellGeometry.overlap-block-height - ShellGeometry.overlap-bar-y) + 8 * ShellGeometry.analytics-row-height;
+            background: Theme.surface-canvas;
+            FFOverlapBar {
+                x: Theme.space-4;
+                y: Theme.space-4;
+                width: 860px;
+                segments: root.overlap-short;
+                pending: !root.demo-shown;
+                entered: root.demo-entered || !root.demo-shown;
+                sweep-offset: self.x;
+                sweep-span: parent.width;
+            }
+            VerticalLayout {
+                y: 2 * Theme.space-4 + (ShellGeometry.overlap-block-height - ShellGeometry.overlap-bar-y);
+                alignment: start;
+                for row[i] in root.demo-rows: FFAnalyticsRow {
+                    chip: row.chip;
+                    name: row.name;
+                    fraction: row.fraction;
+                    count: row.count;
+                    value-state: root.demo-shown ? "final" : "pending";
+                    entered: root.demo-entered || !root.demo-shown;
+                    sweep-lag: Theme.sweep-stagger * i;
+                    fill-delay: root.demo-entered ? Theme.entry-fill-stagger * i : 0ms;
+                    fill-duration: root.demo-entered ? Theme.entry-fill : Theme.motion-fast;
+                }
+            }
+        }
+
         GroupHeading { text: "Analytics messages, unframed: waiting (no stack), counting failed"; }
         Rectangle {
             width: 892px;
@@ -357,7 +542,7 @@ export component ThemeSheet inherits Window {
                 framed: false;
                 show-spinner: false;
                 title: "No stack loaded";
-                caption: "Load a stack to count its sharp areas.";
+                caption: "Load a stack to analyse it.";
             }
             FFLoadingPanel {
                 x: 0.75 * parent.width - self.width / 2;
@@ -365,7 +550,7 @@ export component ThemeSheet inherits Window {
                 framed: false;
                 show-spinner: false;
                 tone: "failed";
-                title: "Counting failed";
+                title: "Analysis failed";
                 caption: "could not read frame_003.tif";
             }
         }

@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use focusforge_core::io::open_frame_set;
 use focusforge_core::job::JobControl;
-use focusforge_core::sharp_areas::{SHARP_AREA_PARAMS, count_sharp_areas};
+use focusforge_core::sharp_areas::{SHARP_AREA_PARAMS, count_sharp_areas_reporting_with_backend};
 use focusforge_core::tile::HostBudget;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 
@@ -44,7 +44,7 @@ pub(crate) fn run(dir: &Path, set: &SetArgs, json: bool, priority: Priority) -> 
     if priority == Priority::Low {
         control.set_admission_cap(Some(1));
     }
-    let result = match count_sharp_areas(
+    let result = match count_sharp_areas_reporting_with_backend(
         reader,
         reader.len(),
         reader.dimensions(),
@@ -52,6 +52,8 @@ pub(crate) fn run(dir: &Path, set: &SetArgs, json: bool, priority: Priority) -> 
         &values,
         DEFAULT_TILE_SIZE,
         &*control,
+        &mut |_| {},
+        crate::sharpness_backend(),
     ) {
         Ok(result) => result,
         Err(err) => return crate::fail(err),

@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::analytics::{self, AnalyticsView, CountError, CountPriority, RowValue};
+use crate::analytics::{self, AnalyticsView, CountError, CountPriority, RowValue, SharpAreas};
 use crate::appearance_settings::{self, AppearanceSettings, SourcePresentation};
 use crate::brush;
 use crate::calculator::{Calculator, CalculatorView};
@@ -1449,7 +1449,7 @@ enum AnalyticsSnapshot {
     /// The counts after a finished tile.
     Partial(Vec<u32>),
     /// The finished count, or its error text.
-    Done(Result<Vec<u32>, String>),
+    Done(Result<SharpAreas, String>),
 }
 
 /// The latest snapshot and the generation it belongs to, parked for settle;
@@ -1471,7 +1471,7 @@ struct AnalyticsState {
     outcome: AnalyticsOutcome,
     worker: Option<std::thread::JoinHandle<()>>,
     /// Finished counts by tab id, with the frames they were counted over.
-    cache: HashMap<u64, (Vec<PathBuf>, Vec<u32>)>,
+    cache: HashMap<u64, (Vec<PathBuf>, SharpAreas)>,
 }
 
 /// The shell's state, carried `Send + Sync` so a worker thread inherits the
@@ -5798,14 +5798,14 @@ impl AppController {
                 AnalyticsSnapshot::Partial(counts) => AnalyticsView::Counting(
                     analytics::build_rows(&analytics.frames, &counts, RowValue::Partial),
                 ),
-                AnalyticsSnapshot::Done(Ok(counts)) => {
-                    let rows = analytics::build_rows(&analytics.frames, &counts, RowValue::Final);
+                AnalyticsSnapshot::Done(Ok(areas)) => {
+                    let view = analytics::finished_view(&analytics.frames, &areas);
                     if let Some(tab) = analytics.tab {
                         analytics
                             .cache
-                            .insert(tab, (analytics.frames.clone(), counts));
+                            .insert(tab, (analytics.frames.clone(), areas));
                     }
-                    AnalyticsView::Rows(rows)
+                    view
                 }
                 AnalyticsSnapshot::Done(Err(message)) => AnalyticsView::Failed(message),
             };
@@ -5841,6 +5841,10 @@ impl AppController {
         let hold = self.analytics_hold;
         let tile_pause = self.analytics_tile_pause;
         let tile_size = self.analytics_tile_size;
+        let backend = focusforge_gpu::harness::sharpness_backend_for(
+            !self.performance.gpu,
+            self.performance.max_vram_bytes(),
+        );
         self.stop_analytics_count();
         let analytics = &mut self.state.analytics;
         analytics.tab = Some(id);
@@ -5874,15 +5878,20 @@ impl AppController {
             };
             // A stopped count parks nothing, so it cannot replace the
             // snapshot of the count that superseded it.
-            let result =
-                match analytics::count_frames(&frames, tile_size, &*control, &mut |counts| {
+            let result = match analytics::count_frames(
+                &frames,
+                tile_size,
+                &*control,
+                &mut |counts| {
                     park(AnalyticsSnapshot::Partial(counts.to_vec()));
                     std::thread::sleep(tile_pause);
-                }) {
-                    Ok(counts) => Ok(counts),
-                    Err(CountError::Failed(message)) => Err(message),
-                    Err(CountError::Stopped) => return,
-                };
+                },
+                backend,
+            ) {
+                Ok(areas) => Ok(areas),
+                Err(CountError::Failed(message)) => Err(message),
+                Err(CountError::Stopped) => return,
+            };
             park(AnalyticsSnapshot::Done(result));
         }));
         self.apply_analytics_priority();
@@ -5915,17 +5924,17 @@ impl AppController {
             )
         {
             // The count in flight (or its failure) stands.
-        } else if let Some((_, counts)) = analytics
+        } else if let Some((_, areas)) = analytics
             .cache
             .get(&id)
             .filter(|(counted, _)| *counted == frames)
         {
-            let rows = analytics::build_rows(&frames, counts, RowValue::Final);
+            let view = analytics::finished_view(&frames, areas);
             self.stop_analytics_count();
             let analytics = &mut self.state.analytics;
             analytics.tab = Some(id);
             analytics.frames = frames;
-            analytics.view = AnalyticsView::Rows(rows);
+            analytics.view = view;
             self.emit(ShellEvent::AnalyticsChanged);
         } else {
             analytics.cache.remove(&id);

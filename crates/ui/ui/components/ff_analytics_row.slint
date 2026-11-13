@@ -17,9 +17,17 @@ export component FFAnalyticsRow inherits Rectangle {
     in property <string> mm-text: "";
     in property <float> fraction: 0.0;
     in property <int> count: 0;
-    // "pending" (no report yet: sweeping bar), "partial" (bar filled from the
-    // counts so far) or "final". Pending and partial rows carry the spinner.
+    // "pending" or "partial" (counts still running: sweeping bar, never a
+    // partial fill) or "final". Pending and partial rows carry the spinner.
     in property <string> value-state: "final";
+    // The bar draws empty until `entered`, then fills after `fill-delay`;
+    // leaving `entered` is a cut.
+    in property <bool> entered: true;
+    // The loading band crosses the row's whole width, so rows stacked under
+    // each other show one band; this row trails the pass by `sweep-lag`.
+    in property <duration> sweep-lag: 0ms;
+    in property <duration> fill-delay: 0ms;
+    in property <duration> fill-duration: Theme.motion-fast;
 
     property <length> name-x: ShellGeometry.analytics-row-inset + ShellGeometry.image-chip-size + Theme.space-2;
     property <length> bar-x: root.name-x + ShellGeometry.analytics-name-width + ShellGeometry.analytics-mm-width;
@@ -62,8 +70,13 @@ export component FFAnalyticsRow inherits Rectangle {
         width: root.width - root.bar-x - ShellGeometry.analytics-row-inset - ShellGeometry.analytics-count-width;
         thickness: ShellGeometry.analytics-bar-height;
         corner-radius: Theme.radius-xs;
-        fraction: root.fraction;
-        indeterminate: root.value-state == "pending";
+        fraction: root.entered ? root.fraction : 0.0;
+        fill-delay: root.entered ? root.fill-delay : 0ms;
+        fill-duration: root.entered ? root.fill-duration : 0ms;
+        indeterminate: root.value-state != "final";
+        sweep-offset: root.bar-x;
+        sweep-span: root.width;
+        sweep-lag: root.sweep-lag;
     }
     if root.value-state != "final": FFSpinner {
         x: root.width - ShellGeometry.analytics-row-inset - self.width;
