@@ -8385,7 +8385,6 @@ fn cut(plane: &[f32], region: Rect) -> Vec<f32> {
 #[test]
 fn raw_project_live_retouch_matches_saved_and_export() {
     use focusforge_core::project::export::{ExportOptions, MetadataOptions};
-    use focusforge_core::tile::Sample;
 
     let files = raw_files("raw_live_retouch");
     let whole = raw_whole();
@@ -8438,8 +8437,13 @@ fn raw_project_live_retouch_matches_saved_and_export() {
     let exported = focusforge_core::io::TiffStack::open_files(std::slice::from_ref(&out)).unwrap();
     let mut got = vec![0u16; live.len()];
     exported.read_tile_into(0, whole, &mut got).unwrap();
-    let narrowed: Vec<u16> = live.iter().map(|&s| u16::narrow(s)).collect();
-    assert_eq!(got, narrowed, "16-bit export");
+    let clip =
+        focusforge_core::io::raw::highlight_clip(&stroked.sources[0], stroked.registration.gains())
+            .unwrap()
+            .expect("a colour RAW source has a clip");
+    let mut clipped = vec![0u16; live.len()];
+    clip.narrow_band(&live, &mut clipped);
+    assert_eq!(got, clipped, "16-bit export");
 }
 
 fn raw_stroke_in(mode: BrushMode, source_id: u16, (x, y): (i32, i32), radius: f32) -> Op {

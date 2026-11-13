@@ -15,7 +15,7 @@ use focusforge_core::align::Registration;
 use focusforge_core::equalize::UNIT_GAIN;
 use focusforge_core::io::RawStack;
 use focusforge_core::io::TiffHeader;
-use focusforge_core::io::raw::{LookTransform, dng_colour, highlight_clip};
+use focusforge_core::io::raw::{HighlightClip, LookTransform, dng_colour, highlight_clip};
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::export::{
@@ -185,7 +185,7 @@ fn blob_kind(project: &Project, hash: &str) -> BlobKind {
 /// held result, a pending state with the stroke, and a saved root with the
 /// stroke appended.
 struct StrokedRaw {
-    _frames: Vec<tempfile::NamedTempFile>,
+    frames: Vec<tempfile::NamedTempFile>,
     width: u32,
     height: u32,
     held: HeldCheckpoint,
@@ -233,7 +233,7 @@ fn stroked_raw(name: &str) -> StrokedRaw {
         "the stroke's samples stay unclamped"
     );
     StrokedRaw {
-        _frames: frames,
+        frames,
         width,
         height,
         held,
@@ -280,15 +280,17 @@ fn read_png(path: &Path) -> (png::BitDepth, Vec<u8>) {
 }
 
 /// Exports through `export` in every format and checks each file against
-/// `wide` clipped once to 16 bits (and once more to 8).
+/// `wide` clipped once to 16 bits by `clip` (and once more to 8).
 fn check_exports(
     dir: &Path,
     label: &str,
+    clip: &HighlightClip,
     wide: &[f32],
     (width, height): (u32, u32),
     export: &mut dyn FnMut(&Path, &ExportOptions),
 ) {
-    let expect16 = narrowed(wide);
+    let mut expect16 = vec![0u16; wide.len()];
+    clip.narrow_band(wide, &mut expect16);
     let expect8: Vec<u8> = expect16.iter().map(|&v| to_8bit(v)).collect();
     assert!(
         expect16.contains(&65_535),
@@ -363,9 +365,12 @@ fn raw_exports_clip_once() {
         iptc: false,
     };
 
+    let clip = highlight_clip(&paths(&raw.frames)[0], &[])
+        .unwrap()
+        .expect("a colour RAW source has a clip");
     let staged = read_f32(&raw.held.composite);
     let held = raw.held.clone();
-    check_exports(&dir, "held", &staged, size, &mut |path, options| {
+    check_exports(&dir, "held", &clip, &staged, size, &mut |path, options| {
         project::export_held(&held, path, options, &meta).unwrap();
     });
 
@@ -376,13 +381,13 @@ fn raw_exports_clip_once() {
         full(size.0, size.1),
     );
     assert_eq!(bits(&wide), bits(&raw.edited_f32), "pending equals saved");
-    check_exports(&dir, "pending", &wide, size, &mut |path, options| {
+    check_exports(&dir, "pending", &clip, &wide, size, &mut |path, options| {
         project::export_pending(&pending, None, path, options, &meta).unwrap();
     });
 
     let wide = raw.edited_f32.clone();
     let edited = raw.edited.clone();
-    check_exports(&dir, "saved", &wide, size, &mut |path, options| {
+    check_exports(&dir, "saved", &clip, &wide, size, &mut |path, options| {
         project::export_checkpoint(&mut raw.project, &edited, path, options, &meta).unwrap();
     });
 }
@@ -452,10 +457,15 @@ fn raw_document_keeps_headroom() {
         let tile = full(width, height);
         let wide = render_f32(&image, Some(&mut project), tile);
         assert_eq!(bits(&wide), bits(&staged), "{label}: saved f32 render");
+        let clip = highlight_clip(&paths(&frames)[0], &[])
+            .unwrap()
+            .expect("a colour RAW source has a clip");
+        let mut clipped = vec![0u16; staged.len()];
+        clip.narrow_band(&staged, &mut clipped);
         assert_eq!(
             render_u16(&image, Some(&mut project), tile),
-            narrowed(&staged),
-            "{label}: the 16-bit render narrows the f32 one"
+            clipped,
+            "{label}: the 16-bit render clips the f32 one"
         );
     }
 }
@@ -1026,7 +1036,7 @@ fn dng_same_document_as_render() {
     let mut raw = stroked_raw("raw_document_dng_same");
     let dir = tmp_dir("raw_document_dng_same_out");
     let size = full(raw.width, raw.height);
-    let look = dng_colour(raw._frames[0].path()).unwrap().look;
+    let look = dng_colour(raw.frames[0].path()).unwrap().look;
     let meta = dng_meta(true);
 
     let held_path = dir.join("held.dng");
@@ -1079,7 +1089,7 @@ fn dng_same_document_as_render() {
 fn dng_keeps_highlights() {
     let raw = stroked_raw("raw_document_dng_highlights");
     let dir = tmp_dir("raw_document_dng_highlights_out");
-    let look = dng_colour(raw._frames[0].path()).unwrap().look;
+    let look = dng_colour(raw.frames[0].path()).unwrap().look;
     let path = dir.join("held.dng");
     project::export_held(&raw.held, &path, &ExportOptions::Dng, &dng_meta(true)).unwrap();
     let dng = read_dng(&path).samples();
@@ -1411,4 +1421,153 @@ fn raw_highlight_clip_context() {
 
     let missing = dir.join("absent.dng");
     assert!(highlight_clip(&missing, &[]).is_err(), "a missing RAW file");
+}
+
+fn tiff16() -> ExportOptions {
+    ExportOptions::Tiff {
+        bits: TiffBits::Sixteen,
+        compression: TiffCompression::None,
+    }
+}
+
+const NO_METADATA: MetadataOptions = MetadataOptions {
+    exif: false,
+    icc: false,
+    xmp: false,
+    iptc: false,
+};
+
+#[test]
+fn raw_exports_clip_highlight() {
+    let (width, height) = (37u32, 23u32);
+    let frames = patch_frames(3);
+    let dir = tmp_dir("raw_exports_clip_highlight");
+    let held = common::fuse_held(&paths(&frames), "weighted-average", false, &dir);
+    let staged = read_f32(&held.composite);
+    let plain = narrowed(&staged);
+    let out = dir.join("held.tif");
+    project::export_held(&held, &out, &tiff16(), &NO_METADATA).unwrap();
+    let exported = read_u16(&out);
+
+    let (mut inside, mut outside, mut tinted_by_clamp) = (0, 0, 0);
+    for y in 0..height {
+        for x in 0..width {
+            let at = ((y * width + x) * 3) as usize..((y * width + x) * 3 + 3) as usize;
+            if deep_in_patch(x, y) {
+                inside += 1;
+                assert!(is_neutral(&exported[at.clone()]), "({x}, {y})");
+                tinted_by_clamp += usize::from(!is_neutral(&plain[at]));
+            } else if far_from_patch(x, y, (width, height)) {
+                outside += 1;
+                assert_eq!(&exported[at.clone()], &plain[at], "({x}, {y})");
+            }
+        }
+    }
+    assert!(inside > 0 && outside > 0);
+    assert!(
+        tinted_by_clamp > 0,
+        "the per-channel clamp must leave a cast the clip removes"
+    );
+}
+
+/// What the observer keeps of a run: the last composite preview delivered.
+struct CompositePreviews(std::sync::Mutex<Option<focusforge_core::display::StagePreview>>);
+
+impl focusforge_core::pipeline::StageObserver for CompositePreviews {
+    fn preview_kinds(&self) -> focusforge_core::display::PreviewKinds {
+        focusforge_core::display::PreviewKinds {
+            composite: true,
+            ..Default::default()
+        }
+    }
+
+    fn preview(&self, preview: &focusforge_core::display::StagePreview) {
+        *self.0.lock().unwrap() = Some(preview.clone());
+    }
+}
+
+fn read_composite(project: &mut Project) -> Vec<u16> {
+    let mut samples = Vec::new();
+    project
+        .read_plane_into(project::Plane::Composite, &mut |band, _| {
+            samples.extend_from_slice(band);
+        })
+        .unwrap();
+    samples
+}
+
+#[test]
+fn raw_display_matches_export() {
+    let (width, height) = (37u32, 23u32);
+    let frames = patch_frames(3);
+    let dir = tmp_dir("raw_display_matches_export");
+    let observer = CompositePreviews(Default::default());
+    let held =
+        common::fuse_held_observed(&paths(&frames), "weighted-average", false, &dir, &observer);
+    let out = dir.join("held.tif");
+    project::export_held(&held, &out, &tiff16(), &NO_METADATA).unwrap();
+    let export16 = read_u16(&out);
+
+    let project_path = dir.join(format!("saved.{}", project::PROJECT_EXTENSION));
+    seal_held(&project_path, &held);
+    let mut project = Project::open(&project_path).unwrap();
+    assert_eq!(read_composite(&mut project), export16, "plane read");
+
+    let preview = observer
+        .0
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the run delivers a composite preview");
+    assert_eq!((preview.width, preview.height), (width, height), "1:1");
+    let mut neutral = 0;
+    for y in 0..height {
+        for x in 0..width {
+            let cell = (y * width + x) as usize;
+            let shown = &preview.rgba[cell * 4..cell * 4 + 3];
+            let expected: Vec<u8> = export16[cell * 3..cell * 3 + 3]
+                .iter()
+                .map(|&v| focusforge_core::display::reduce16to8(v, x, y))
+                .collect();
+            assert_eq!(shown, expected, "({x}, {y})");
+            if deep_in_patch(x, y) {
+                neutral += 1;
+                assert!(
+                    shown[0].abs_diff(shown[1]) <= 1 && shown[1].abs_diff(shown[2]) <= 1,
+                    "({x}, {y}): {shown:?}"
+                );
+            }
+        }
+    }
+    assert!(neutral > 0);
+}
+
+#[test]
+fn raw_reopened_project_clips_like_held() {
+    let frames = patch_frames(3);
+    let dir = tmp_dir("raw_reopened_project_clips_like_held");
+    let held = common::fuse_held(&paths(&frames), "weighted-average", false, &dir);
+    let plain = narrowed(&read_f32(&held.composite));
+    let out = dir.join("held.tif");
+    project::export_held(&held, &out, &tiff16(), &NO_METADATA).unwrap();
+    let clipped = read_u16(&out);
+    assert_ne!(clipped, plain, "the clip changes this document");
+
+    let project_path = dir.join(format!("saved.{}", project::PROJECT_EXTENSION));
+    let root = seal_held(&project_path, &held);
+    let check = |expected: &[u16], label: &str| {
+        let mut project = Project::open(&project_path).unwrap();
+        assert_eq!(
+            read_composite(&mut project),
+            expected,
+            "{label}: plane read"
+        );
+        let out = dir.join(format!("{label}.tif"));
+        project::export_checkpoint(&mut project, &root, &out, &tiff16(), &NO_METADATA).unwrap();
+        assert_eq!(read_u16(&out), expected, "{label}: export");
+    };
+    check(&clipped, "reopened");
+
+    drop(frames);
+    check(&plain, "sources gone");
 }

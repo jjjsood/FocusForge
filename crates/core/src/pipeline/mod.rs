@@ -32,6 +32,7 @@ use crate::fuse::consumer::written_rect;
 use crate::fuse::description::format_composite_description;
 use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
 use crate::gpu::{AlignBackend, TileBackend};
+use crate::io::raw::document_clip;
 use crate::io::tiff::writer::file_len;
 use crate::io::{
     COMPOSITE_FILENAME, DevelopStore, FrameDesc, FrameReader, ReaderKind, Rect, TiffStack,
@@ -1429,7 +1430,15 @@ pub fn run(
         }
     };
 
-    let sink = sink.with_preview(mosaic, heat);
+    let preview_clip = mosaic.as_ref().and_then(|_| {
+        document_clip(
+            request.frames.first().map(PathBuf::as_path),
+            prepared_gains,
+            gain_reader.sample_format(),
+            spp,
+        )
+    });
+    let sink = sink.with_preview(mosaic, preview_clip, heat);
 
     control.set_stage(JobStage::Fuse);
     control.set_fuse_costs(fuse_costs(

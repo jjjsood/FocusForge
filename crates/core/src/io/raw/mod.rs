@@ -1200,6 +1200,37 @@ pub fn highlight_clip(
     })
 }
 
+/// The clip a document narrows with: [`highlight_clip`] for a three-channel
+/// `F32` document, `None` for anything else, for a source whose clip cannot be
+/// built (missing, moved or unreadable) and when there is no source. A
+/// 16-bit document opens no file.
+pub(crate) fn document_clip(
+    first_frame: Option<&Path>,
+    gains: &[u32],
+    format: SampleFormat,
+    samples_per_pixel: u32,
+) -> Option<HighlightClip> {
+    if format != SampleFormat::F32 || samples_per_pixel != 3 {
+        return None;
+    }
+    highlight_clip(first_frame?, gains).ok().flatten()
+}
+
+/// Narrows an `f32` document band to `out`, resized to `band`'s length: with
+/// `clip` the highlights clip in camera space, without it each sample clamps
+/// onto the 16-bit scale. `clip` implies an interleaved RGB band.
+pub(crate) fn narrow_document_band(clip: Option<&HighlightClip>, band: &[f32], out: &mut Vec<u16>) {
+    out.resize(band.len(), 0);
+    match clip {
+        Some(clip) => clip.narrow_band(band, out),
+        None => {
+            for (narrowed, &sample) in out.iter_mut().zip(band) {
+                *narrowed = <u16 as Sample>::narrow(sample);
+            }
+        }
+    }
+}
+
 /// One of a camera's XYZ-to-camera matrices with the DNG light-source code of
 /// the illuminant it was measured under.
 #[derive(Debug, Clone, PartialEq)]
