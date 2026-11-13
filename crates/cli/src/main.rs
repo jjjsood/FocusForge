@@ -415,7 +415,7 @@ enum Command {
     /// text by default, a `--json` document on request, and an
     /// optional per-frame warped-TIFF dump for a visual check.
     Align {
-        /// Directory of TIFF frames to align (non-recursive, descending
+        /// Directory of TIFF, 8-bit JPEG or supported RAW frames to align (non-recursive, descending
         /// into `<dir>/frames` when that subdirectory exists).
         dir: PathBuf,
         /// Registered alignment algorithm id. Optional: defaults to the
