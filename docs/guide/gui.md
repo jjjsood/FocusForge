@@ -116,7 +116,7 @@ own view, and a Composite pane in its own window shows the same card. The
 inset is switched off under **Sharpness heatmap** in
 [Appearance](settings-window.md#appearance).
 
-![The window during a fuse, with the Frame pane showing 00.tif and the Composite pane showing the frame just aligned, labelled "Aligned · 04.tif"; the bottom bar reads Aligning, 2 of 8, with a progress bar and an ETA.](../assets/manual/first-stack/fuse-running.png)
+![The window during a fuse, with the Frame pane showing 00.tif and the Composite pane showing the frame just aligned, labelled "Aligned · 04.tif"; the bottom bar reads Aligning, 2 of 8, with a progress bar.](../assets/manual/first-stack/fuse-running.png)
 
 *A run in progress; the Composite pane shows the frame just aligned. The
 growing picture passes in a few seconds on a small stack and is not shown
@@ -165,7 +165,7 @@ project open (the **+** tab), the dock reads "No project open."
 
 ## The bottom bar
 
-![The bottom bar during a run: the stage Aligning with the frames done, a progress bar and the ETA, then the dimmed Overlay switch and slider at 65%, and the zoom controls with the readout 90.2 % and Fit.](../assets/manual/window/window-bottom-bar.png)
+![The bottom bar during a run: the stage Aligning with the frames done, a progress bar, then the dimmed Overlay switch and slider at 65%, and the zoom controls with the readout 90.2 % and Fit.](../assets/manual/window/window-bottom-bar.png)
 
 *The bottom bar while a stack is being aligned.*
 
@@ -174,9 +174,8 @@ From left to right:
 - **Status.** "No project open" on the **+** tab, "No job running" when
   nothing is happening, the current stage while a stack is fused (for example
   "Aligning"), and "fused" with the time once a run you kept has finished.
-- **Progress.** During a run: frames done (such as "3 of 8"), a progress bar
-  and the estimated time remaining for the whole run ("ETA"). [Your first
-  stack](first-stack.md) explains the stages.
+- **Progress.** During a run: frames done (such as "3 of 8") and a progress
+  bar. [Your first stack](first-stack.md) explains the stages.
 - **Overlay.** A switch and a strength slider for the Z-Map overlay; see
   [See where each pixel came from](#see-where-each-pixel-came-from).
 - **Zoom.** **Zoom out**, the zoom readout, **Zoom in**, and **Fit**; see the
@@ -453,7 +452,7 @@ The projects overview, closing a tab and quitting with unsaved work:
 
 ### Notifications
 
-The bell, the notification center, toasts and desktop banners:
+The bell, the notification center, pop-up messages and desktop banners:
 [Projects, notifications and quitting](batch-runs.md).
 
 ### The settings window
