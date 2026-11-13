@@ -2026,6 +2026,18 @@ mod tests {
         (0..160).map(|i| 0.5 * 1.05f32.powi(i))
     }
 
+    /// The amplitudes of [`amplitudes`] and, after them, four times as many
+    /// between them: a search whose qualifying level depends on the exact step
+    /// series of a platform's float math needs the denser grid on the platform
+    /// where the coarse one holds none.
+    fn dense_amplitudes() -> impl Iterator<Item = f32> {
+        amplitudes().chain(
+            (0..640)
+                .filter(|j| j % 4 != 0)
+                .map(|j| 0.5 * 1.05f32.powf(j as f32 / 4.0)),
+        )
+    }
+
     fn find_flat_floor() -> FlatFloor {
         amplitudes()
             .find_map(|amplitude| {
@@ -2079,7 +2091,7 @@ mod tests {
     /// below twice its own value, and with no earlier window below that floor.
     #[test]
     fn a_converging_step_wins_over_a_stall_eligible_window() {
-        let (amplitude, k, epsilon) = amplitudes()
+        let (amplitude, k, epsilon) = dense_amplitudes()
             .find_map(|amplitude| {
                 let (_, trace) = speckle_solve(amplitude, 1e-300, FLAT_FLOOR_CAP);
                 let steps = steps_of(&trace);
