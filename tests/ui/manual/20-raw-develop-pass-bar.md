@@ -1,5 +1,6 @@
 # Watch the progress bar while a camera-RAW stack is developed, then hand over to alignment
 Start: --open .scratch/develop-bar/frames
+The remaining-time text is hidden unless the window is launched with the environment variable `FOCUSFORGE_SHOW_ETA=1` (`FOCUSFORGE_SHOW_ETA=1 target/debug/focusforge-gui --open .scratch/develop-bar/frames`); this guide launches it that way so steps 7, 12 and 20 can read it.
 Before the first step, make a folder of 20 copies of one real camera RAW file (a Fujifilm X-S10 `.raf` of about 19 MB, about 380 MB in all; it is never part of the repository). Take the file from your local camera-sample folder, `$FOCUSFORGE_RAW_SAMPLES`:
 `mkdir -p .scratch/develop-bar/frames`
 `for i in $(seq -w 1 20); do cp "$FOCUSFORGE_RAW_SAMPLES/fujifilm-x-s10.raf" .scratch/develop-bar/frames/frame-$i.raf; done`
