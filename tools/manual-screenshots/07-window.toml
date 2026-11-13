@@ -35,7 +35,7 @@ crop  = "AppWindow::dock"
 name  = "window-bottom-bar"
 args  = ["--open", "fixtures/mantis-512/frames", "--fuse-tabs", "0", "--slow-run", "1"]
 steps = [
-  ["wait-text", "ETA", "240"],
+  ["wait-text", " of 8", "240"],
   ["pause", "1000"],
 ]
 out   = "assets/manual/window/window-bottom-bar.png"
