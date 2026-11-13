@@ -30,7 +30,7 @@
 **From shoot to sharp image**
 - Drop in a focus bracket straight from the camera, camera RAW, TIFF or JPEG, and get one image sharp from front to back
 - Shot several subjects in one session? FocusForge sorts the card into separate stacks for you; check the split before it runs
-- Long brackets of high-resolution frames run on an ordinary computer: the whole stack never has to fit in memory, only one frame's working memory does (see [Hardware](#hardware))
+- Long brackets of high-resolution frames run on an ordinary computer: the whole stack never has to fit in memory, only one frame's working memory does (see [What your computer needs](#what-your-computer-needs))
 - Shot handheld, or your lens breathes while focusing? Frames are lined up first and the edges trimmed to what every shot covers
 - Flickering light or exposure drift between shots is evened out
 - Three methods to choose from: Details as the all-rounder, Soft transitions for gentler blends between frames, Focus map for the most coherent source map to pick from
@@ -47,7 +47,7 @@
 **Working through a whole session**
 - Use the desktop app, or script the same steps from the command line
 - Pause, cancel and pick up long runs later without starting over
-- See how long the whole run will take before it starts and how much is left while it runs, in the window and on the command-line progress line
+- See how long a run will take before it starts: `focusforge-cli stack --dry-run` prints a predicted duration
 - Save your favourite settings as presets; re-run only the one stack you want to tweak
 - A summary after each batch shows which stacks worked, so nothing goes missing quietly
 - Problems and notices collect in one place, and reach you as a system notification while you're in another app
@@ -66,13 +66,11 @@ Linux: install the matching `.deb` or run its AppImage from [Releases](https://g
 macOS: open the matching `.dmg` from [Releases](https://github.com/jjjsood/FocusForge/releases) and drag it to Applications, or build from source.
 Windows: run the matching `.msi` from [Releases](https://github.com/jjjsood/FocusForge/releases), or build from source; no Visual C++ redistributable is needed. See [getting started](docs/getting-started.md) for paths.
 
-## Hardware
+## What your computer needs
 
-What a run needs depends on the kind of frames and their size, not on how many there are, and it is the **free** RAM that counts: FocusForge sets aside about 1.6 GB and plans with 65 % of the rest. With less than about 1.6 GB free nothing runs.
+What a run needs depends on the kind and size of the frames, not on how many there are, and it is the **free** RAM that counts: about 4 GB for TIFF, 5 GB for JPEG, 8 to 15 GB for camera RAW. A graphics card is optional and the result is the same without one.
 
-Free RAM to run at all, decimal GB: camera RAW 3.1 GB (24–26 MP) to 5.0 GB (61 MP); 16-bit TIFF 1.7 GB (more for a compressed frame stored as one single strip); JPEG 3.0–5.2 GB. RAW frames also need scratch disk, 160–370 MB per frame. A graphics card is optional and the result is the same without one.
-
-The [manual's hardware page](docs/hardware.md) has the recommended figures, a rule of thumb for other cameras, measured runs and what to do when a run is short of memory.
+The [installation chapter](docs/getting-started.md#what-your-computer-needs) lists what else a computer needs, and [Free RAM per kind of frame](docs/memory-needs.md) gives the figures for each kind of frame.
 
 ## Quick start
 
@@ -100,15 +98,9 @@ CPU and `--cpu` does not exist as a flag.
 
 ```bash
 target/release/focusforge-cli info path/to/frames/
-target/release/focusforge-cli info path/to/project.ffp
 ```
 
-For a project file, prints stored project facts after structural and head
-Z-Map validation without reading source frames. For a directory, prints one
-block per frame. TIFF entries show size, depth, byte order, compression and
-strip layout; RAW entries show decoder metadata without developing pixels. The
-report ends with a frame count, total size and a uniform-layout verdict. Add
-`--json` for the same report as machine-readable JSON.
+Prints one block per frame and a summary with the frame count and whether all frames share one layout. `info` also reads a `.ffp` project; add `--json` for machine-readable output.
 
 ### Stack a folder
 
@@ -157,8 +149,8 @@ demand.
 is in [`docs/`](docs/README.md). It covers focus stacking and shooting practice,
 [getting started](docs/getting-started.md), the window, stacking, alignment,
 retouching, checkpoints, export and settings, troubleshooting and a glossary.
-The appendix is the reference for every `focusforge-cli` subcommand, the project
-format and the TIFF layouts it reads and writes.
+The appendix has the free RAM each kind of frame needs and the reference for
+every `focusforge-cli` subcommand.
 
 ## Contributing
 
