@@ -882,7 +882,8 @@ frame where its score peaks, the lowest index on a tie, when that peak is
 more than `contrast` times the cell's lowest score over the stack; every
 other cell is counted in no frame, so the counts add up to at most the
 number of cells. A cell counts in the first or the last frame like any other.
-Frames are read tile by tile and counted as they are, without alignment. A
+Frames are read tile by tile and counted as they are, without alignment. A graphics card does the scoring when one is usable and the processor
+otherwise; the counts and overlaps are the same. A
 single frame, or a stack with no detail, gives a count of 0 for every frame.
 
 Neighbouring frames also get an overlap, which tells whether two focus steps
@@ -995,7 +996,8 @@ Each map is an `f32` TIFF of the frames' size with one sample per pixel,
 same way and divided by the frames' scale, giving `composite-sharpness.tif`:
 it shows the composite as it is, so a fusion that is sharper than any frame
 reads above 1. Frames are read tile by tile and mapped as they are, without
-alignment. The values do not depend on the tile size.
+alignment. The values do not depend on the tile size. A graphics card computes the
+maps when one is usable and the processor otherwise; the maps are the same.
 
 A composite whose size or samples per pixel differ from the frames', a
 directory without frames, a frame that cannot be read and an output directory

@@ -12,7 +12,8 @@ crates/core/   TIFF and RAW I/O, tiles, stacking and alignment algorithms, the
                composite, image export in TIFF, PNG and JPEG), the update check
                (`update`: version comparison and one HTTPS GET through `ureq`;
                tests and `FOCUSFORGE_RELEASE_URL` point it at a local server)
-crates/gpu/    the shared wgpu device, WGSL fusion/warp/blend kernels and the
+crates/gpu/    the shared wgpu device, WGSL fusion/warp/blend and sharpness (scale, map tiles, sharp-area and
+               overlap scoring) kernels, each with a CPU twin, and the
                tile-scheduler pipeline that runs them, behind the `gpu`
                feature (on by default). An allocate-and-back-off probe at
                startup discovers the device's usable VRAM budget, mirroring
