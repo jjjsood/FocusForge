@@ -27,7 +27,8 @@ before your first shoot, or whenever a result looks wrong and you want to know
 why.
 
 **[Part II — Using FocusForge](getting-started.md)** explains the program,
-window first. It starts with installing FocusForge and fusing your first stack,
+window first. It starts with installing FocusForge, what your computer needs
+and fusing your first stack,
 then tours the window, the Images panel and every stacking setting, the
 retouching editor, checkpoints and saving, exporting, working with several
 projects, and the settings window.
@@ -36,10 +37,9 @@ projects, and the settings window.
 what each one means and what to do about it, and a
 [glossary](glossary.md) of the terms the manual uses.
 
-**[Appendix](reference/cli.md)** is the reference material: every command and
-option of `focusforge-cli` for scripting the same steps from a terminal, batch
-runs from the command line, and the formats of the project file and of the
-TIFF files FocusForge reads and writes.
+**[Appendix](reference/cli.md)** holds the reference material: every command
+and option of `focusforge-cli` for scripting the same steps from a terminal,
+and batch runs from the command line.
 
 ## The quickest way in
 

@@ -38,7 +38,7 @@ use focusforge_core::pipeline::{
 };
 use focusforge_core::project::{self, Project};
 use focusforge_core::registry;
-use focusforge_core::tile::{Rect, SampleFormat, Tile, TileError};
+use focusforge_core::tile::{Rect, SampleFormat, Tile, TileError, TilePlan};
 use focusforge_core::zmap::ZMapReader;
 use raw_dng::{DngSpec, write_dng};
 
@@ -1052,8 +1052,8 @@ fn align_progress_carries_an_eta() {
     let ticks = observer.ticks.lock().expect("no panic while logging");
     let align: Vec<_> = ticks.iter().filter(|t| t.0 == JobStage::Align).collect();
     assert!(
-        align.iter().filter(|t| t.1 == 0).all(|t| t.2.is_none()),
-        "no ETA before a frame completes: {align:?}"
+        align.iter().filter(|t| t.1 == 0).all(|t| t.2.is_some()),
+        "before a frame completes the ETA is the scaled align prediction: {align:?}"
     );
     assert!(
         align.iter().any(|t| 0 < t.1 && t.1 < 5 && t.2.is_some()),
@@ -1115,6 +1115,111 @@ fn align_eta_excludes_a_pause() {
             "{eta:?} after the hold vs {eta_at_hold:?} before it"
         );
     }
+}
+
+/// Logs every tick's snapshot, and the snapshot at the moment the seal and
+/// the end of the run are announced.
+struct TotalEtaLog {
+    control: Arc<JobControl>,
+    ticks: Mutex<Vec<JobProgress>>,
+    finalizing: Mutex<Vec<JobProgress>>,
+}
+
+impl StageObserver for TotalEtaLog {
+    fn tick(&self, progress: &JobProgress) {
+        self.ticks
+            .lock()
+            .expect("no panic while logging")
+            .push(*progress);
+    }
+
+    fn stage(&self, stage: RunStage) {
+        if matches!(stage, RunStage::Seal | RunStage::Finished) {
+            self.finalizing
+                .lock()
+                .expect("no panic while logging")
+                .push(self.control.progress());
+        }
+    }
+}
+
+#[test]
+fn total_run_eta() {
+    let control = JobControl::new();
+    control.set_min_running(Duration::from_millis(150));
+    let observer = TotalEtaLog {
+        control: Arc::clone(&control),
+        ticks: Mutex::default(),
+        finalizing: Mutex::default(),
+    };
+    let mut explicit = ParamValues::new();
+    explicit.insert("levels".to_string(), ParamValue::Int(3));
+    let mut request = base_request(
+        "total_run_eta",
+        brightness_stack("total_run_eta", 1, &[1.0, 1.0, 1.0]),
+        explicit,
+    );
+    // The smallest tile size that plans at three levels: a 3 x 3 grid on
+    // the 300 px frame, one interior tile among eight edge tiles.
+    request.tile_size = Some(160);
+    request.poll = Duration::from_millis(1);
+    request.align = Some(dummy_align_request());
+
+    let outcome = focusforge_core::pipeline::run(&request, &observer, Arc::clone(&control), None)
+        .expect("the run must complete");
+    assert!(matches!(outcome, FuseOutcome::Completed(_)));
+
+    let plan = TilePlan::new(EQ_SIZE, EQ_SIZE, 160, 3).expect("the frame plans at tile size 160");
+    let edge_tiles = plan
+        .tiles()
+        .iter()
+        .filter(|tile| {
+            let i = tile.interior();
+            i.x == 0 || i.y == 0 || i.x + i.width == EQ_SIZE || i.y + i.height == EQ_SIZE
+        })
+        .count();
+    assert!(
+        edge_tiles > 0 && edge_tiles < plan.len(),
+        "{edge_tiles} of {} tiles touch an edge",
+        plan.len()
+    );
+
+    let ticks = observer.ticks.lock().expect("no panic while logging");
+    assert!(!ticks.is_empty(), "the slow-run hook must yield fuse ticks");
+    assert_eq!(
+        ticks.last().map(|tick| tick.unit_total),
+        Some(plan.len()),
+        "the run fused the planned grid"
+    );
+    for tick in ticks.iter() {
+        let total = tick.total_eta.expect("a seeded run reports a total");
+        assert!(
+            total >= tick.eta.unwrap_or_default(),
+            "total {total:?} below stage ETA {:?}: {tick:?}",
+            tick.eta
+        );
+    }
+    for pair in ticks.windows(2) {
+        let (before, after) = (pair[0].total_eta, pair[1].total_eta);
+        assert!(
+            after <= before,
+            "the total rose from {before:?} to {after:?}: {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+    let finalizing = observer.finalizing.lock().expect("no panic while logging");
+    assert!(!finalizing.is_empty(), "the seal must be announced");
+    for snapshot in finalizing.iter() {
+        assert_eq!(snapshot.pixels_done, snapshot.pixel_total);
+        assert!(
+            snapshot
+                .total_eta
+                .is_some_and(|total| total > Duration::ZERO),
+            "the total stays positive through finalize: {snapshot:?}"
+        );
+    }
+    assert_eq!(control.progress().total_eta, Some(Duration::ZERO));
 }
 
 /// Logs the Prepare-stage tally of every tick, and the control's tally at

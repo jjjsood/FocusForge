@@ -170,8 +170,6 @@ was saved, the window explains what is wrong and offers **Locate frames…** to
 point it at the frames' new folder. What each message means and what to do is
 in [Damaged or moved projects](first-stack.md#damaged-or-moved-projects) in *Your first stack*; the command-line side (accepting
 changed frames, exit codes) is in [Troubleshooting](../troubleshooting.md#source-frames-changed-since-this-project-was-written).
-How a project records its frames is described in
-[the project format](../reference/project-format.md#source-frames).
 
 ## From the command line
 

@@ -49,7 +49,7 @@ pub fn stack_sharpness_scale(
             &pool,
             &gate,
             reader,
-            read,
+            tile,
             spp,
             control,
             &mut vec![(); frames],
@@ -384,7 +384,7 @@ mod tests {
             self.done.load(Ordering::SeqCst) >= self.units
         }
 
-        fn unit_completed(&self, _: u64) {
+        fn unit_completed(&self, _: &crate::tile::plan::PlannedTile) {
             self.done.fetch_add(1, Ordering::SeqCst);
         }
 

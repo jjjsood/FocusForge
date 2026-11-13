@@ -2008,6 +2008,8 @@ pub struct AppController {
     /// A literal toolbar/bottom-bar view that [`AppController::job_view`]
     /// returns in place of the active run's, until the next run starts.
     toolbar_preview: Option<JobView>,
+    /// Whether the bottom bar shows the remaining-time estimate.
+    eta_display: bool,
     /// How long every folder or project load waits before it reads anything.
     open_hold: Duration,
     /// How long every Analytics count waits before it reads anything.
@@ -9389,7 +9391,7 @@ impl AppController {
             toolbar_run_state: job::toolbar_run_state(&run).to_string(),
             stage_word: job::stage_word(&run, progress.as_ref()),
             step_text: job::progress_text(&run, progress.as_ref()),
-            eta_text: job::eta_text(&run, progress.as_ref()),
+            eta_text: job::eta_text(&run, progress.as_ref(), self.eta_display),
             bar_tone: job::bar_tone(&run).to_string(),
             fraction: job::bar_fraction(progress.as_ref()),
             fuse_enabled: self.fuse_enabled(),
@@ -9485,6 +9487,12 @@ impl AppController {
         Some(view)
     }
 
+    /// Shows or hides the remaining-time estimate in [`Self::job_view`] and
+    /// in any toolbar preview set afterwards. Hidden by default.
+    pub fn set_eta_display(&mut self, shown: bool) {
+        self.eta_display = shown;
+    }
+
     /// Holds a literal transport view -- `state` is one of `idle`, `running`,
     /// `paused`, `cancelling` or `failed` -- that [`Self::job_view`] returns
     /// until the next run starts; `fuse_enabled` still follows the active
@@ -9524,7 +9532,11 @@ impl AppController {
             toolbar_run_state: state.to_string(),
             stage_word: stage_word.to_string(),
             step_text: step_text.to_string(),
-            eta_text: eta.to_string(),
+            eta_text: if self.eta_display {
+                eta.to_string()
+            } else {
+                String::new()
+            },
             bar_tone: tone.to_string(),
             fraction,
             fuse_enabled: self.fuse_enabled(),

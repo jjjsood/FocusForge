@@ -16,7 +16,7 @@ use crate::fuse::PyramidError;
 use crate::fuse::laplacian::score_plane;
 use crate::fuse::sharpness::{DETAIL_REACH, detail_plane};
 use crate::params::{self, ParamDesc, ParamError, ParamKind, ParamValue, ParamValues};
-use crate::tile::plan::TileSupport;
+use crate::tile::plan::{PlannedTile, TileSupport};
 use crate::tile::{
     HostBudget, HostBudgetGate, HostSources, Rect, TileControl, TileError, TilePlan,
 };
@@ -191,12 +191,13 @@ pub(crate) fn score_frames_of_tile<A: Send>(
     pool: &rayon::ThreadPool,
     gate: &HostBudgetGate,
     reader: &dyn TileReader,
-    read: Rect,
+    tile: &PlannedTile,
     spp: u32,
     control: &dyn TileControl,
     rows: &mut [A],
     fold: impl Fn(&mut A, &[f32]) + Sync,
 ) -> Result<(), SharpAreasError> {
+    let read = tile.read();
     let first_error: Mutex<Option<SharpAreasError>> = Mutex::new(None);
     let run: Result<(), ()> = pool.install(|| {
         rows.par_iter_mut().enumerate().try_for_each_init(
@@ -213,7 +214,7 @@ pub(crate) fn score_frames_of_tile<A: Send>(
                         return Err(());
                     }
                 }
-                control.unit_completed(u64::from(read.width) * u64::from(read.height));
+                control.unit_completed(tile);
                 Ok(())
             },
         )
@@ -330,7 +331,7 @@ pub fn count_sharp_areas_reporting(
             &pool,
             &gate,
             reader,
-            read,
+            tile,
             spp,
             control,
             &mut sums,
@@ -565,8 +566,12 @@ mod tests {
             self.pixels.lock().unwrap().len() >= self.stop_after
         }
 
-        fn unit_completed(&self, pixels: u64) {
-            self.pixels.lock().unwrap().push(pixels);
+        fn unit_completed(&self, tile: &crate::tile::plan::PlannedTile) {
+            let read = tile.read();
+            self.pixels
+                .lock()
+                .unwrap()
+                .push(u64::from(read.width) * u64::from(read.height));
         }
 
         fn admission_cap(&self) -> usize {
