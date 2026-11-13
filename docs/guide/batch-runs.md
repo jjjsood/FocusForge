@@ -103,7 +103,7 @@ where there is something to do, a button.
 
 | Headline | Second line on the card | What happened | Button |
 |---|---|---|---|
-| Did not stack | FAILED WHILE PREPARING (or the stage it failed in) | The last fuse of this project failed. The card shows the error. | **Run again** |
+| Did not stack | FAILED WHILE ALIGNING (or the stage it failed in) | The last fuse of this project failed. The card shows the error. | **Run again** |
 | Cancelled | STOPPED WHILE FUSING (or the stage you stopped in) | You cancelled the fuse: "You stopped this one. Nothing was written." | **Run again** |
 | Sources missing | NOTHING TO SHOW | The saved project cannot find its frames: "A project remembers its frames by path. 3 of 3 cannot be found in this location." | **Locate frames…** |
 | Not a project | LEFT ALONE | A folder that holds no stack, such as a subfolder with notes in it: "This folder holds something else. Nothing was read and nothing was changed." | none |
@@ -215,7 +215,7 @@ title and a context line: where it came from ("Import", "Save" or "Startup";
 nothing for a fuse), the project, the frame or file it concerns, and the time,
 for example "Import · 00:19".
 
-![The notification center with two rows: a selected "Preparing failed" row for the project open-rejected showing its full error message, and a "Some images were skipped" row from Import.](../assets/manual/notifications/center.png)
+![The notification center with two rows: a selected "Alignment failed" row for the project open-rejected showing its full error message, and a "Some images were skipped" row from Import.](../assets/manual/notifications/center.png)
 
 *The notification center, newest first, with the selected row showing its full message.*
 
@@ -256,7 +256,7 @@ line "Startup · `<time>`" and the message "FocusForge `<version>` has been
 released. Download page: `<link>`". It also appears as a pop-up message with the link
 **Open download page**:
 
-![The pop-up message "FocusForge 0.2.0 is available" with an information icon, the link Open download page and a close icon](../assets/manual/notifications/update-notice.png)
+![The pop-up message "FocusForge 0.3.0 is available" with an information icon, the link Open download page and a close icon](../assets/manual/notifications/update-notice.png)
 
 *The update notice as a pop-up message.*
 
