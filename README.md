@@ -152,8 +152,7 @@ demand.
 is in [`docs/`](docs/README.md). It covers focus stacking and shooting practice,
 [getting started](docs/getting-started.md), the window, stacking, alignment,
 retouching, checkpoints, export and settings, troubleshooting and a glossary.
-The appendix has the free RAM each kind of frame needs and the reference for
-every `focusforge-cli` subcommand.
+The appendix has the reference for every `focusforge-cli` subcommand.
 
 ## Contributing
 
