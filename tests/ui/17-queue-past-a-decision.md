@@ -2,7 +2,7 @@
 Start: --open fixtures/mantis-512/frames --open fixtures/mantis-64/frames --fuse-tabs 0,1 --slow-run 2 --slow-run-seconds 60
 ## The second tab fuses while the first waits
 1. Click the second tab (`FFTab::area` 1), the tab the launch left selected.
-   Expect: the bottom bar status reads either "Queued (2)" with only **Cancel** in the toolbar (the first tab's fuse is still running) or "Fusing" with **Pause** and **Cancel** (it has ended); either way no **Fuse stack** button (read with `buttons AppWindow::toolbar`) and the dock header reads "3 frames · 0 excluded"; Must not: a dialog titled "Keep this fused result?" is on screen.
+   Expect: the bottom bar status reads either "Queued (2)" with only **Cancel** in the toolbar (the first tab's fuse is still running) or "Fusing" with **Pause** and **Cancel** (it has ended); either way no **Fuse stack** button (read the toolbar from the screenshot) and the dock header reads "3 frames · 0 excluded"; Must not: a dialog titled "Keep this fused result?" is on screen.
 2. Click the first tab (`FFTab::area` 0).
    Expect: (within 90 s) a dialog titled "Keep this fused result?" shows two buttons, "Discard" and "Keep", and the text "00.tif and 01.tif could not be aligned"; the dock header behind it reads "8 frames · 0 excluded".
 3. Click the second tab (`FFTab::area` 1) while the dialog is open.

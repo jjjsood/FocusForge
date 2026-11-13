@@ -11,9 +11,9 @@ With only PREPARE's More... open, the sliders in the dock are `FFSlider::drag-ar
 
 ## Empty center
 1. Click **Notifications** (`FFIconBar::bell`).
-   Expect: the center opens to the right of the icon bar reading "Notifications", "0 notifications · this session", "No notifications yet" and "Messages will remain here for this session."; the bell shows no number.
+   Expect: (within 1 s) the center opens to the right of the icon bar reading "Notifications", "0 notifications · this session", "No notifications yet" and "Messages will remain here for this session."; the bell shows no number.
 2. Click **Notifications** (`FFIconBar::bell`).
-   Expect: the center is gone and **Fuse stack** is visible in the toolbar again.
+   Expect: (within 1 s) the center is gone and **Fuse stack** is visible in the toolbar again.
 
 ## Raise the brightness warnings
 3. Click **More...** under PREPARE (`FFMoreToggle::header-area`, instance 0).

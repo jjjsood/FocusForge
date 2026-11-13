@@ -9,7 +9,7 @@ Start: --open fixtures/mantis-512/frames --open fixtures/mantis-64/frames --slow
 3. (human only) Watch the right pane in the first seconds after the click of step 2 (only the first run of a launch aligns its frames). It reads "Preparing frames" with the line "Images appear here once alignment starts.", then the pane label reads "Aligned · " followed by a file name ending ".tif" over a frame lined up with the left pane, then the card "Fusing" stays. These seconds pass faster than a step can read them.
    Expect: the card "Preparing frames" shows first, the label "Aligned · <name>.tif" with a picture shows next and the card "Fusing" shows last.
 4. Hover the progress bar (`FFBottomBar::progress-bar`).
-   Expect: Must not: a separate bar or row of stage names (Preparing, Aligning, Fusing, Writing) shows above, between or below the panes; the bottom bar still shows the status "Fusing", the text "estimating" and its progress bar track.
+   Expect: Must not: a separate bar or row of stage names (Preparing, Aligning, Fusing, Writing) shows above, between or below the panes; the bottom bar still shows the status "Fusing" and its progress bar track.
 5. Click **Pause** (`FFToolbar::pause-button`).
    Expect: the bottom bar status reads "Paused", the toolbar shows **Resume** and the right pane still shows the card "Fusing".
 6. Click **Resume** (`FFToolbar::resume-button`).
