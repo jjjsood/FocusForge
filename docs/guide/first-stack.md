@@ -336,7 +336,7 @@ With the frames open:
 3. Watch the bottom bar. The window stays fully usable while the stack is
    being fused.
 
-![The window during a fuse: the toolbar shows Pause and Cancel, the tab carries a play mark, the Frame pane shows 00.tif and the Composite pane shows the frame just aligned ("Aligned · 04.tif"), and the bottom bar shows the current stage (Aligning), the frames done (2 of 8) and a progress bar.](../assets/manual/first-stack/fuse-running.png)
+![The window during a fuse: the toolbar shows Pause and Cancel, the tab carries a play mark, the Frame pane shows 00.tif and the Composite pane shows the card "Preparing frames", and the bottom bar shows the current stage (Aligning), the frames done (1 of 8) and a progress bar.](../assets/manual/first-stack/fuse-running.png)
 
 *A fuse in progress.*
 
@@ -463,7 +463,7 @@ stops and says so:
   with a sentence naming the unreadable file, for example "02.tif could not
   be read. It may be damaged, or it changed after the folder was opened.",
   followed by the reason on the next line. The project's card reads, for
-  example, "FAILED WHILE PREPARING". The notification
+  example, "FAILED WHILE ALIGNING". The notification
   shows as a short pop-up message while the window is in front, and stays in
   the notification center behind the bell, where its full message names the
   file and the reason.

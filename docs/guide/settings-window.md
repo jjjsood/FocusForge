@@ -23,7 +23,7 @@ Everything you change here is saved at once in the
 3. To close it, click **Close settings** (the × in its top-right corner) or
    press Esc, from any section, also right after typing in one of its fields.
 
-![The main window with mantis-512 open and the settings window in front of it, showing the Performance section; the gear icon is at the bottom-left corner of the main window](../assets/manual/settings-window/settings-window.png)
+![The main window with a project open and the settings window in front of it, showing the Performance section; the gear icon is at the bottom-left corner of the main window](../assets/manual/settings-window/settings-window.png)
 
 *The settings window in front of the main window. The gear that opens it is
 at the bottom-left corner.*
@@ -134,7 +134,7 @@ in the menu beside it.
   amount FocusForge works out for itself again.
 - The number accepts digits only, so a unit cannot be left half-typed.
 
-![The Performance section after 99999 was confirmed in the Host memory row: the row shows FocusForge's own amount again (17 GiB) and a red line under it reads "Max 17.5 GiB possible."](../assets/manual/settings-window/settings-cap-over-maximum.png)
+![The Performance section after 99999 was confirmed in the Host memory row: the row shows FocusForge's own amount again and a red line under it reads "Max <size> possible."](../assets/manual/settings-window/settings-cap-over-maximum.png)
 
 *A number above what the computer can give stores no limit and names the maximum; the figure is that of the computer the picture was taken on.*
 
@@ -274,7 +274,7 @@ folder path and user name, and never any image data) are in
 
 **About** shows which FocusForge you are running and under which terms.
 
-![The About section: under FOCUSFORGE the rows Version 0.1.0 and License GPL-3.0; under UPDATES the switch Check for updates at start, turned on, and the Check now button; under NOTICE the copyright line, the GNU General Public License paragraph, the no-warranty sentence and the row Source with github.com/jjjsood/FocusForge](../assets/manual/settings-window/settings-about.png)
+![The About section: under FOCUSFORGE the rows Version 0.2.1 and License GPL-3.0; under UPDATES the switch Check for updates at start, turned on, and the Check now button; under NOTICE the copyright line, the GNU General Public License paragraph, the no-warranty sentence and the row Source with github.com/jjjsood/FocusForge](../assets/manual/settings-window/settings-about.png)
 
 *About. The version number depends on the build you installed.*
 
@@ -309,7 +309,7 @@ downloads or installs anything: it only reports the newest final release
   (skipped)." A later release is announced again. **Check now** still shows a
   skipped version.
 
-![The About section after Check now found a newer release: the line "FocusForge 0.2.0 is available.", the link Open download page and the button Skip this version under the Check now button](../assets/manual/settings-window/settings-about-newer.png)
+![The About section after Check now found a newer release: the line "FocusForge 0.3.0 is available.", the link Open download page and the button Skip this version under the Check now button](../assets/manual/settings-window/settings-about-newer.png)
 
 *The result of **Check now** for a newer release.*
 

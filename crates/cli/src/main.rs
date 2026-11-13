@@ -1819,10 +1819,10 @@ mod tests {
             let (synopsis, documented, commands) = if depth == 0 {
                 let root_end = reference.find("\n## ").unwrap_or(reference.len());
                 let root = &reference[..root_end];
-                let globals = section(reference, "## Global options").unwrap_or("");
+                let globals = section(reference, "## Options every command takes").unwrap_or("");
                 (
                     first_code_block(root),
-                    documented_tokens(&table_rows(globals, "| flag | meaning |")),
+                    documented_tokens(&table_rows(globals, "| option | meaning |")),
                     table_rows(root, "| command | does |"),
                 )
             } else {
@@ -1837,7 +1837,7 @@ mod tests {
                 };
                 (
                     first_code_block(body),
-                    documented_tokens(&table_rows(body, "| flag | meaning |")),
+                    documented_tokens(&table_rows(body, "| option | meaning |")),
                     table_rows(body, "| subcommand | does |"),
                 )
             };
@@ -2013,8 +2013,8 @@ mod tests {
         let reference = cli_reference();
         assert_eq!(
             table_rows(
-                "| flag | meaning |\n|---|---|\n| `--format <on\\|off>` | value |",
-                "| flag | meaning |"
+                "| option | meaning |\n|---|---|\n| `--format <on\\|off>` | value |",
+                "| option | meaning |"
             ),
             ["--format <on|off>"]
         );
@@ -2080,15 +2080,15 @@ mod tests {
             )
         });
         let hidden_stack_reference = reference.replacen(
-            "| `--algorithm <ALGO>` | registered stacking algorithm id; required unless a `--preset` supplies `algo` (see `algorithms` below for the list) |",
-            "| `--hidden-stack-reference-check` | hidden |\n| `--algorithm <ALGO>` | registered stacking algorithm id; required unless a `--preset` supplies `algo` (see `algorithms` below for the list) |",
+            "| `--algorithm <ALGO>` | stacking method; required unless a preset names one. `focusforge-cli algorithms` lists them |",
+            "| `--hidden-stack-reference-check` | hidden |\n| `--algorithm <ALGO>` | stacking method; required unless a preset names one. `focusforge-cli algorithms` lists them |",
             1,
         );
         assert!(check_cli_reference(&hidden_stack, &reference).is_empty());
         assert!(check_cli_reference(&hidden_stack, &hidden_stack_reference).is_empty());
 
         let missing_root_verbosity = reference.replacen(
-            "| `-v` | increase log detail; repeat it for more detail |\n",
+            "| `-v` | more detail on stderr; repeat it for still more |\n",
             "",
             1,
         );
@@ -2097,14 +2097,15 @@ mod tests {
                 .join("\n")
                 .contains("focusforge-cli: undocumented argument `-v`")
         );
-        let missing_root_quiet = reference.replacen("| `-q, --quiet` | log errors only |\n", "", 1);
+        let missing_root_quiet =
+            reference.replacen("| `-q, --quiet` | errors only; wins over `-v` |\n", "", 1);
         let quiet_errors = check_cli_reference(&command, &missing_root_quiet).join("\n");
         assert!(quiet_errors.contains("focusforge-cli: undocumented argument `-q`"));
         assert!(quiet_errors.contains("focusforge-cli: undocumented argument `--quiet`"));
 
         let missing_cache_json = reference.replacen(
-            "| `--json` | emit the JSON report instead of human-readable text |",
-            "",
+            "focusforge-cli cache [OPTIONS] <COMMAND>\n```\n\n| option | meaning |\n|---|---|\n| `--json` | print the result as JSON |",
+            "focusforge-cli cache [OPTIONS] <COMMAND>\n```\n\n| option | meaning |\n|---|---|",
             1,
         );
         assert!(
@@ -2113,8 +2114,8 @@ mod tests {
                 .contains("focusforge-cli cache: undocumented argument `--json`")
         );
         let without_inherited_cache_json = reference.replacen(
-            "### `cache clear`\n\n```\nfocusforge-cli cache clear [OPTIONS]\n```\n\n| flag | meaning |\n|---|---|\n| `--json` | emit the JSON report instead of human-readable text |",
-            "### `cache clear`\n\n```\nfocusforge-cli cache clear [OPTIONS]\n```\n\n| flag | meaning |\n|---|---|",
+            "### `cache clear`\n\n```\nfocusforge-cli cache clear [OPTIONS]\n```\n\n| option | meaning |\n|---|---|\n| `--json` | print the result as JSON |",
+            "### `cache clear`\n\n```\nfocusforge-cli cache clear [OPTIONS]\n```\n\n| option | meaning |\n|---|---|",
             1,
         );
         assert!(check_cli_reference(&command, &without_inherited_cache_json).is_empty());
@@ -2123,15 +2124,15 @@ mod tests {
             reference.replacen("| `-v` |", "| `--help` | generated |\n| `-v` |", 1);
         assert!(check_cli_reference(&command, &generated_reference).is_empty());
 
-        let without_inherited = reference.replacen(
-            "| `-q, --quiet` | log errors only; results and required warnings remain visible |\n",
-            "",
+        let local_inherited = reference.replacen(
+            "| `--dry-run` |",
+            "| `-q, --quiet` | errors only |\n| `--dry-run` |",
             1,
         );
-        assert!(check_cli_reference(&command, &without_inherited).is_empty());
+        assert!(check_cli_reference(&command, &local_inherited).is_empty());
 
         let missing_local_override = reference.replacen(
-            "| `--accept-changed-sources` | accept changed source frames and print their warning instead of refusing |\n",
+            "| `--accept-changed-sources` | go ahead with a warning when a source frame has changed since the project was written (see exit code `9`) |\n",
             "",
             1,
         );
@@ -2143,8 +2144,8 @@ mod tests {
                 )
         );
         let parent_override = reference.replacen(
-            "| flag | meaning |\n|---|---|\n\n### `history list`",
-            "| flag | meaning |\n|---|---|\n| `--accept-changed-sources` | misplaced |\n\n### `history list`",
+            "| `-h, --help` | print help |\n\n| subcommand | does |",
+            "| `-h, --help` | print help |\n| `--accept-changed-sources` | misplaced |\n\n| subcommand | does |",
             1,
         );
         assert!(
@@ -2153,8 +2154,8 @@ mod tests {
                 .contains("focusforge-cli history: documented argument `--accept-changed-sources` is absent")
         );
         let compact_override = reference.replacen(
-            "### `history compact`\n\n```\nfocusforge-cli history compact [OPTIONS] <PROJECT>\n```\n\n| flag | meaning |\n|---|---|",
-            "### `history compact`\n\n```\nfocusforge-cli history compact [OPTIONS] <PROJECT>\n```\n\n| flag | meaning |\n|---|---|\n| `--accept-changed-sources` | misplaced |",
+            "### `history compact`\n\n```\nfocusforge-cli history compact [OPTIONS] <PROJECT>\n```\n\n| option | meaning |\n|---|---|",
+            "### `history compact`\n\n```\nfocusforge-cli history compact [OPTIONS] <PROJECT>\n```\n\n| option | meaning |\n|---|---|\n| `--accept-changed-sources` | misplaced |",
             1,
         );
         assert!(
@@ -2169,8 +2170,8 @@ mod tests {
         assert!(invented_errors.contains("documented section `frob` is absent"));
 
         let drifted_child = reference.replacen(
-            "| `list <PROJECT> [--json] [--accept-changed-sources]` |",
-            "| `entries <PROJECT> [--json] [--accept-changed-sources]` |",
+            "| [`list`](#history-list) |",
+            "| [`entries`](#history-list) |",
             1,
         );
         let child_errors = check_cli_reference(&command, &drifted_child).join("\n");
