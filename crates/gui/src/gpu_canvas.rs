@@ -324,6 +324,7 @@ mod tests {
             checkpoint_colors: Arc::default(),
             alpha: focusforge_core::display::alpha_from_opacity(0.65),
             origin: None,
+            checkpoint_sources: Default::default(),
         };
         assert!(
             planes_and_frame

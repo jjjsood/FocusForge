@@ -27,7 +27,7 @@ use crate::analytics::{self, AnalyticsView, CountError, CountPriority, RowValue}
 use crate::appearance_settings::{self, AppearanceSettings, SourcePresentation};
 use crate::brush;
 use crate::calculator::{Calculator, CalculatorView};
-use crate::canvas::{FrameView, OverlayDraw, PaneSource, SharedOrigin};
+use crate::canvas::{FrameView, OverlayDraw, PaneSource, SharedCheckpointSources, SharedOrigin};
 use crate::checkpoints;
 use crate::diagnostics::{
     DiagnosticsEntryView, DiagnosticsScan, DiagnosticsScanEntry, DiagnosticsStatus,
@@ -724,6 +724,10 @@ struct ProjectTab {
     /// The readers that tell where this tab's Lighten and Darken strokes act,
     /// once opened for the current row and frames.
     origin: Option<Arc<job::OriginReaders>>,
+    /// The checkpoint renders the strokes of a row opened without a session
+    /// are decided against; the session's own map takes over once it is
+    /// installed.
+    origin_sources: HashMap<String, Arc<job::CheckpointSource>>,
     /// Whether opening or reading [`Self::origin`] failed for the current
     /// row and frames; they are not opened again until those change.
     origin_failed: bool,
@@ -1182,6 +1186,7 @@ impl ProjectTab {
             request: None,
             edit: None,
             origin: None,
+            origin_sources: HashMap::new(),
             origin_failed: false,
             session_generation: 0,
             frames_cap: None,
@@ -1666,19 +1671,43 @@ impl ProjectTab {
     fn drop_session(&mut self) -> bool {
         self.session_generation += 1;
         self.origin = None;
+        self.origin_sources.clear();
         self.origin_failed = false;
         self.edit.take().is_some()
     }
 
-    /// The checkpoints the session renders as brush sources: the chosen one
-    /// and every one a stroke of the session paints from.
+    /// The checkpoints rendered as brush sources: with a session, the chosen
+    /// one and every one a stroke of the session paints from, base ops
+    /// included; with none, every one a stroke the open origin readers decide
+    /// paints from.
     fn wanted_sources(&self) -> BTreeSet<String> {
         let Some(edit) = &self.edit else {
-            return BTreeSet::new();
+            if self.origin.is_none() {
+                return BTreeSet::new();
+            }
+            return self
+                .overlay_ops()
+                .iter()
+                .filter_map(|op| match op {
+                    job::Op::BrushStroke {
+                        source: job::StrokeSource::Checkpoint(id),
+                        ..
+                    } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect();
         };
         let mut wanted = edit.stroke_checkpoints();
         wanted.extend(self.listed_source());
         wanted
+    }
+
+    /// The checkpoint renders strokes are decided against: the session's, or
+    /// the row's own with no session.
+    fn checkpoint_sources(&self) -> &HashMap<String, Arc<job::CheckpointSource>> {
+        self.edit
+            .as_ref()
+            .map_or(&self.origin_sources, job::EditState::checkpoint_sources)
     }
 
     /// Whether the selected row is an in-memory entry holding ops.
@@ -2962,6 +2991,7 @@ impl AppController {
             match result {
                 Ok(mut edit) => {
                     edit.set_blender(self.blender.clone());
+                    edit.adopt_checkpoint_sources(std::mem::take(&mut tab.origin_sources));
                     tab.edit = Some(edit);
                     installed.push(index);
                     self.emit(ShellEvent::EditorChanged);
@@ -2984,9 +3014,9 @@ impl AppController {
             && self.state.sources.in_flight.is_empty()
     }
 
-    /// Keeps the checkpoint renders of tab `index`'s session equal to the
-    /// ones wanted: the chosen source and every checkpoint a stroke of the
-    /// session paints from. Drops the others, which removes their files, and
+    /// Keeps the checkpoint renders of tab `index` equal to the ones wanted
+    /// (see [`ProjectTab::wanted_sources`]), in the session or, with none, in
+    /// the row's own map. Drops the others, which removes their files, and
     /// starts a worker for each wanted one that is neither rendered, running
     /// nor failed.
     fn ensure_checkpoint_sources(&mut self, index: usize) {
@@ -3001,20 +3031,25 @@ impl AppController {
             GuiProject::Opened(project) => Some(project.path().to_path_buf()),
             _ => None,
         };
-        let Some(edit) = tab.edit.as_mut() else {
-            return;
+        let base = match (&tab.edit, &tab.origin) {
+            (Some(edit), _) => Arc::clone(&edit.base),
+            (None, Some(origin)) => Arc::clone(origin.ancestor()),
+            (None, None) => return,
         };
-        edit.retain_checkpoint_sources(&wanted);
+        match tab.edit.as_mut() {
+            Some(edit) => edit.retain_checkpoint_sources(&wanted),
+            None => tab.origin_sources.retain(|id, _| wanted.contains(id)),
+        }
         for key in wanted {
             let slot = &mut self.state.sources;
-            if edit.has_checkpoint_source(&key) || slot.knows(tab_id, generation, &key) {
+            if tab.checkpoint_sources().contains_key(&key) || slot.knows(tab_id, generation, &key) {
                 continue;
             }
             slot.renders += 1;
             slot.in_flight.push((tab_id, generation, key.clone()));
             self.state.edits.started = true;
             let path = dir.join(format!("{}-{}.tif", std::process::id(), slot.renders));
-            let (held, base) = (tab.held.clone(), Arc::clone(&edit.base));
+            let (held, base) = (tab.held.clone(), Arc::clone(&base));
             let (project_path, parked) = (project_path.clone(), Arc::clone(&slot.parked));
             std::thread::spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3061,11 +3096,13 @@ impl AppController {
                 continue;
             }
             let wanted = tab.wanted_sources();
-            let Some(edit) = tab.edit.as_mut() else {
-                continue;
-            };
             match result {
-                Ok(source) if wanted.contains(&key) => edit.set_checkpoint_source(key, source),
+                Ok(source) if wanted.contains(&key) => match tab.edit.as_mut() {
+                    Some(edit) => edit.set_checkpoint_source(key, source),
+                    None => {
+                        tab.origin_sources.insert(key, Arc::new(source));
+                    }
+                },
                 Ok(_) => {}
                 Err(reason) => {
                     tracing::error!(
@@ -3390,6 +3427,7 @@ impl AppController {
                         tab.note_viewed(&scratch_root, id);
                     }
                     tab.origin = Some(readers);
+                    self.ensure_checkpoint_sources(index);
                 }
                 Err(reason) => {
                     tracing::warn!(error = %reason, "the origin readers could not be opened");
@@ -3509,6 +3547,7 @@ impl AppController {
             .into();
         draw.ops = ops.into();
         draw.origin = tab.origin.clone().map(SharedOrigin);
+        draw.checkpoint_sources = SharedCheckpointSources(tab.checkpoint_sources().clone());
         Some(draw)
     }
 
@@ -4816,9 +4855,18 @@ impl AppController {
             height: 1,
         };
         let conditions = if job::needs_mode_conditions(&ops, info, pixel) {
+            let renders = tab.checkpoint_sources();
+            let unrendered = ops.iter().any(|op| {
+                matches!(op, job::Op::BrushStroke {
+                    source: job::StrokeSource::Checkpoint(id),
+                    ..
+                } if !renders.contains_key(id))
+                    && job::footprint(op, info)
+                        .is_ok_and(|fp| fp.is_some_and(|fp| fp.intersect(pixel).is_some()))
+            });
             match (&tab.origin, tab.origin_failed) {
-                (Some(origin), false) => {
-                    origin.conditions(&ops, info, pixel, std::num::NonZeroU32::MIN)?
+                (Some(origin), false) if !unrendered => {
+                    origin.conditions(&ops, info, pixel, std::num::NonZeroU32::MIN, renders)?
                 }
                 _ => return Ok(None),
             }

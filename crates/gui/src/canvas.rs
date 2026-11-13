@@ -1013,6 +1013,33 @@ pub struct OverlayDraw {
     /// The readers that tell where a Lighten or Darken stroke acts; `None`
     /// until they are open.
     pub origin: Option<SharedOrigin>,
+    /// The checkpoint renders a Lighten or Darken stroke from a checkpoint
+    /// compares against; a checkpoint missing here leaves its strokes showing
+    /// what lies beneath.
+    pub checkpoint_sources: SharedCheckpointSources,
+}
+
+/// The tab's checkpoint renders, compared by key and render identity so that
+/// a render's arrival changes the draw.
+#[derive(Clone, Default)]
+pub struct SharedCheckpointSources(pub HashMap<String, Arc<crate::job::CheckpointSource>>);
+
+impl PartialEq for SharedCheckpointSources {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self.0.iter().all(|(id, source)| {
+                other
+                    .0
+                    .get(id)
+                    .is_some_and(|theirs| Arc::ptr_eq(source, theirs))
+            })
+    }
+}
+
+impl std::fmt::Debug for SharedCheckpointSources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.0.keys()).finish()
+    }
 }
 
 /// The tab's open origin readers, compared by identity so that their arrival
@@ -1042,14 +1069,17 @@ impl OverlayDraw {
             checkpoint_colors: Arc::default(),
             alpha: alpha_from_opacity(opacity),
             origin: None,
+            checkpoint_sources: SharedCheckpointSources::default(),
         }
     }
 
     /// The colour of each texel of the `step` lattice of `rect`, from its
     /// stored Z-Map index in `indices`. A Lighten or Darken stroke shows its
-    /// source only where the readers say it acts; without them, when a read
-    /// fails, the stored colour stays. A stroke painted from a checkpoint
-    /// shows that checkpoint's colour from `checkpoint_colors`.
+    /// source only where the readers say it acts, against the checkpoint's
+    /// render in `checkpoint_sources` for a checkpoint source; without the
+    /// readers or a render, or when a read fails, the stored colour stays. A
+    /// stroke painted from a checkpoint shows that checkpoint's colour from
+    /// `checkpoint_colors`.
     pub fn colors(
         &self,
         info: ZMapInfo,
@@ -1064,7 +1094,7 @@ impl OverlayDraw {
             .and_then(|origin| {
                 origin
                     .0
-                    .conditions(&self.ops, info, rect, step)
+                    .conditions(&self.ops, info, rect, step, &self.checkpoint_sources.0)
                     .inspect_err(|error| {
                         tracing::warn!(%error, "the overlay's stroke conditions could not be read");
                     })

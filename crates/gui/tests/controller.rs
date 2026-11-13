@@ -4971,6 +4971,7 @@ fn overlay_for(sources: u32, opacity: f32) -> OverlayDraw {
         checkpoint_colors: Arc::default(),
         alpha: focusforge_core::display::alpha_from_opacity(opacity),
         origin: None,
+        checkpoint_sources: Default::default(),
     }
 }
 
@@ -5092,6 +5093,7 @@ fn overlay_controls_match_the_render_parameters() {
             checkpoint_colors: Arc::default(),
             alpha: focusforge_core::display::alpha_from_opacity(0.3),
             origin: None,
+            checkpoint_sources: Default::default(),
         }),
         "matches display::overlay_cpu's own blend, with no solo source"
     );
@@ -12321,4 +12323,280 @@ fn checkpoint_source_view_eyedropper_follows_the_core_resolution() {
     alt_click_at(&mut c, patch_a);
     assert_eq!(c.source_checkpoint(), None, "the pick leaves the source");
     assert_eq!(c.brush_source(), Some(2));
+}
+
+/// A hard Lighten dab from checkpoint `key` over the editor's image, with
+/// pixels deep inside it where the checkpoint's render is brighter than the
+/// image (the dab acts) and where it is not, each over a stored source.
+struct CheckpointDab {
+    op: Op,
+    centre: (u32, u32),
+    acts: (u32, u32),
+    idle: (u32, u32),
+}
+
+fn checkpoint_lighten_dab(c: &mut AppController, key: &str, opacity: f32) -> CheckpointDab {
+    const RADIUS: f32 = 10.0;
+    let map = map_rect(c);
+    let image = session_view(c);
+    let render = read_plane(
+        c.edit_session()
+            .unwrap()
+            .checkpoint_source_path(key)
+            .expect("the checkpoint is rendered"),
+        map,
+    );
+    let (_, zmap) = c.materialize_active_tab_planes().unwrap();
+    let stored = read_whole_zmap(&zmap);
+    let sum =
+        |plane: &[u16], p| -> u32 { (0..3).map(|k| u32::from(plane[map_index(p) * 3 + k])).sum() };
+    for centre in [(16, 18), (29, 30), (42, 42), (20, 44), (44, 16)] {
+        let (mut acts, mut idle) = (None, None);
+        for p in map_pixels() {
+            if !deep_inside(centre, RADIUS, 2.0, p) || stored[map_index(p)] == NO_SOURCE {
+                continue;
+            }
+            let slot = if sum(&render, p) > sum(&image, p) {
+                &mut acts
+            } else {
+                &mut idle
+            };
+            slot.get_or_insert(p);
+        }
+        if let Some((acts, idle)) = acts.zip(idle) {
+            let op = Op::BrushStroke {
+                source: StrokeSource::Checkpoint(key.to_string()),
+                path: vec![Point {
+                    x: centre.0 as i32,
+                    y: centre.1 as i32,
+                }],
+                radius: RADIUS,
+                softness: 0.0,
+                mode: BrushMode::Lighten,
+                opacity,
+            };
+            return CheckpointDab {
+                op,
+                centre,
+                acts,
+                idle,
+            };
+        }
+    }
+    panic!("no Lighten dab from {key} acts at some of its pixels and not at others");
+}
+
+#[test]
+fn overlay_and_pipette_apply_lighten_to_a_checkpoint_source() {
+    let mut c = editor_over_several_checkpoints("lighten_from_checkpoint");
+    let key = checkpoint_keys(&c).pop().expect("a listed checkpoint");
+    select_checkpoint_source(&mut c, &key);
+    let case = checkpoint_lighten_dab(&mut c, &key, 1.0);
+    let (_, zmap) = c.materialize_active_tab_planes().unwrap();
+    let stored = read_whole_zmap(&zmap);
+    let frames = c.frame_count().unwrap();
+    common::paint(&mut c, case.op.clone());
+    common::settle_region_renders(&mut c);
+    c.set_overlay_on(true);
+    settle_origin_readers(&mut c);
+
+    let table = focusforge_core::zmap::overlay_table(frames, None);
+    let chip = results_row(&c, &key).chip;
+    let pixels = overlay_pixels(&c, &zmap);
+    let stored_at = |p: (u32, u32)| stored[map_index(p)];
+    assert_eq!(
+        pixels[map_index(case.acts)],
+        chip,
+        "the overlay where it acts"
+    );
+    assert_eq!(
+        pixels[map_index(case.idle)],
+        table[usize::from(stored_at(case.idle))],
+        "the overlay where it does not"
+    );
+
+    c.select_frame(frame_other_than(&[stored_at(case.idle)]));
+    alt_click_at(&mut c, case.acts);
+    assert_eq!(
+        c.source_checkpoint().as_deref(),
+        Some(key.as_str()),
+        "Alt + click where it acts"
+    );
+    c.select_frame(frame_other_than(&[stored_at(case.idle)]));
+    alt_click_at(&mut c, case.idle);
+    assert_eq!(c.source_checkpoint(), None, "Alt + click where it does not");
+    assert_eq!(c.brush_source(), Some(stored_at(case.idle)));
+
+    c.toggle_pipette();
+    for (p, want) in [
+        (case.acts, chip),
+        (case.idle, job::source_color(stored_at(case.idle), frames)),
+    ] {
+        let (sx, sy) = at(p.0 as f32, p.1 as f32);
+        c.pointer(PointerKind::Move, Button::Left, sx, sy, NO_MODS);
+        assert_eq!(
+            c.brush_cursor_view().unwrap().pick_color,
+            want,
+            "the armed cursor at {p:?}"
+        );
+    }
+}
+
+/// Paints a hard Lighten dab from a frame through the editor, at the first of
+/// `centres` and frame where it changes some pixels deep inside it and leaves
+/// others alone; returns one of each and the frame.
+fn frame_lighten_dab(
+    c: &mut AppController,
+    centres: &[(u32, u32)],
+) -> ((u32, u32), (u32, u32), u16) {
+    let (_, zmap) = c.materialize_active_tab_planes().unwrap();
+    let stored = read_whole_zmap(&zmap);
+    set_size(c, 20.0);
+    c.set_brush_softness_fraction(0.0);
+    set_look(c, BrushMode::Lighten, 100);
+    for (centre, source) in centres
+        .iter()
+        .flat_map(|&centre| (0..3u16).map(move |source| (centre, source)))
+    {
+        c.select_frame(usize::from(source));
+        let before = session_view(c);
+        drag(c, &[(centre.0 as f32, centre.1 as f32)]);
+        common::settle_region_renders(c);
+        let after = session_view(c);
+        let radius = match ops(c).last() {
+            Some(Op::BrushStroke { radius, .. }) => *radius,
+            other => panic!("a brush stroke, got {other:?}"),
+        };
+        let (mut acts, mut idle) = (None, None);
+        for p in map_pixels() {
+            let i = map_index(p);
+            if !deep_inside(centre, radius, 2.0, p) || stored[i] == NO_SOURCE {
+                continue;
+            }
+            let slot = if before[i * 3..i * 3 + 3] != after[i * 3..i * 3 + 3] {
+                &mut acts
+            } else {
+                &mut idle
+            };
+            slot.get_or_insert(p);
+        }
+        if let Some((acts, idle)) = acts.zip(idle) {
+            return (acts, idle, source);
+        }
+        c.undo();
+        common::settle_region_renders(c);
+    }
+    panic!("no frame Lighten dab at {centres:?} acts at some of its pixels and not at others");
+}
+
+#[test]
+fn checkpoint_origin_keeps_stored_colour_when_source_read_fails() {
+    let mut c = editor_over_several_checkpoints("lighten_ckpt_read_fails");
+    let key = checkpoint_keys(&c).pop().expect("a listed checkpoint");
+    assert_eq!(key, "held:0", "the oldest fuse");
+    select_checkpoint_source(&mut c, &key);
+    let case = checkpoint_lighten_dab(&mut c, &key, 1.0);
+    common::paint(&mut c, case.op.clone());
+    common::settle_region_renders(&mut c);
+    let far: Vec<(u32, u32)> = [(14u32, 44u32), (44, 14), (46, 46), (12, 12), (30, 50)]
+        .into_iter()
+        .filter(|&(x, y)| x.abs_diff(case.centre.0).max(y.abs_diff(case.centre.1)) > 20)
+        .collect();
+    let (frame_acts, frame_idle, frame) = frame_lighten_dab(&mut c, &far);
+    let (_, zmap) = c.materialize_active_tab_planes().unwrap();
+    let stored = read_whole_zmap(&zmap);
+    let frames = c.frame_count().unwrap();
+    assert!(c.save_checkpoint());
+    let target = c.held_checkpoints().first().expect("a held fuse").clone();
+    fs::remove_file(&target.composite).unwrap();
+
+    // A new session renders the strokes' checkpoints again; the removed
+    // composite makes the stroke's render fail.
+    let ids = common::panel_ids(&c);
+    let (row, other) = (ids[0].clone(), ids[1].clone());
+    common::select_panel_row(&mut c, &other);
+    common::settle_session(&mut c);
+    common::select_panel_row(&mut c, &row);
+    common::settle_session(&mut c);
+    assert!(
+        !c.edit_session().unwrap().has_checkpoint_source(&key),
+        "the render failed"
+    );
+    c.set_overlay_on(true);
+    settle_origin_readers(&mut c);
+
+    let table = focusforge_core::zmap::overlay_table(frames, None);
+    let pixels = overlay_pixels(&c, &zmap);
+    let stored_colour = |p: (u32, u32)| table[usize::from(stored[map_index(p)])];
+    for p in [case.acts, case.idle, frame_idle] {
+        assert_eq!(pixels[map_index(p)], stored_colour(p), "stored at {p:?}");
+    }
+    assert_eq!(
+        pixels[map_index(frame_acts)],
+        table[usize::from(frame)],
+        "the frame stroke keeps its origin"
+    );
+
+    let start = frame_other_than(&[frame, stored[map_index(case.acts)]]);
+    c.select_frame(start);
+    alt_click_at(&mut c, case.acts);
+    assert_eq!(
+        c.brush_source(),
+        Some(start as u16),
+        "the pick leaves the source"
+    );
+    assert_eq!(c.source_checkpoint(), None);
+    alt_click_at(&mut c, frame_acts);
+    assert_eq!(
+        c.brush_source(),
+        Some(frame),
+        "the frame stroke still picks"
+    );
+}
+
+#[test]
+fn checkpoint_origin_covers_a_row_without_a_session() {
+    let mut c = editor_over_several_checkpoints("lighten_ckpt_no_session");
+    let key = checkpoint_keys(&c).pop().expect("a listed checkpoint");
+    select_checkpoint_source(&mut c, &key);
+    let case = checkpoint_lighten_dab(&mut c, &key, 1.0);
+    common::paint(&mut c, case.op.clone());
+    common::settle_region_renders(&mut c);
+    let path = save_to_proposed(&mut c);
+
+    let mut c = reopen(&path, "lighten_ckpt_no_session_reopened");
+    assert!(c.edit_session().is_none(), "no editor session");
+    c.set_overlay_on(true);
+    let _ = c.materialize_active_tab_planes();
+    common::settle_render(&mut c);
+    let (_, zmap) = c.materialize_active_tab_planes().unwrap();
+    let stored = read_whole_zmap(&zmap);
+    let table = focusforge_core::zmap::overlay_table(3, None);
+    settle_origin_readers(&mut c);
+    let stored_colour = |p: (u32, u32)| table[usize::from(stored[map_index(p)])];
+
+    let before = overlay_pixels(&c, &zmap);
+    for p in [case.acts, case.idle] {
+        assert_eq!(
+            before[map_index(p)],
+            stored_colour(p),
+            "before it lands: {p:?}"
+        );
+    }
+    common::settle_session(&mut c);
+    assert!(c.edit_session().is_none(), "still no editor session");
+    let chip = *c
+        .overlay_draw()
+        .expect("the overlay is on")
+        .checkpoint_colors
+        .values()
+        .next()
+        .expect("the stroke's checkpoint has a colour");
+    let after = overlay_pixels(&c, &zmap);
+    assert_eq!(after[map_index(case.acts)], chip, "where it acts");
+    assert_eq!(
+        after[map_index(case.idle)],
+        stored_colour(case.idle),
+        "where it does not"
+    );
 }

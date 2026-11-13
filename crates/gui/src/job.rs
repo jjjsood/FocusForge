@@ -2443,11 +2443,12 @@ impl EditState {
         }
     }
 
-    /// The checkpoints a stroke of the chain, the pending ops or the undone
-    /// ones paints from.
+    /// The checkpoints a stroke of the base ops, the chain, the pending ops or
+    /// the undone ones paints from.
     pub fn stroke_checkpoints(&self) -> BTreeSet<String> {
-        self.chain
+        self.base_ops
             .iter()
+            .chain(&self.chain)
             .chain(&self.pending)
             .chain(&self.undone)
             .filter_map(|op| match op {
@@ -2458,6 +2459,22 @@ impl EditState {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The checkpoints rendered so far, by id.
+    pub(crate) fn checkpoint_sources(&self) -> &HashMap<String, Arc<CheckpointSource>> {
+        &self.checkpoints
+    }
+
+    /// Takes over renders made before the session opened, keeping the
+    /// session's own where both hold one.
+    pub(crate) fn adopt_checkpoint_sources(
+        &mut self,
+        sources: HashMap<String, Arc<CheckpointSource>>,
+    ) {
+        for (id, source) in sources {
+            self.checkpoints.entry(id).or_insert(source);
+        }
     }
 
     /// Whether checkpoint `id` is rendered and ready to paint from.
@@ -2686,6 +2703,12 @@ impl OriginReaders {
         &self.sources
     }
 
+    /// The composite the strokes were drawn over, the base a checkpoint
+    /// render is checked against.
+    pub fn ancestor(&self) -> &Arc<TiffStack> {
+        &self.ancestor
+    }
+
     /// These readers over `sources`, a re-opened set of the same frame files.
     pub fn with_sources(&self, sources: Arc<dyn FrameReader>) -> Self {
         Self {
@@ -2696,24 +2719,32 @@ impl OriginReaders {
     }
 
     /// Replays `ops` over the ancestor composite and returns where each
-    /// Lighten or Darken stroke acts on the `step` lattice of `rect`.
+    /// Lighten or Darken stroke acts on the `step` lattice of `rect`. A stroke
+    /// painted from a checkpoint compares against that checkpoint's entry in
+    /// `checkpoints`; one without an entry acts nowhere.
     pub fn conditions(
         &self,
         ops: &[Op],
         info: ZMapInfo,
         rect: Rect,
         step: NonZeroU32,
+        checkpoints: &HashMap<String, Arc<CheckpointSource>>,
     ) -> Result<ModeConditions, RetouchError> {
         let spp = self.sources.frame(0).samples_per_pixel as usize;
+        let render = |id: &str| {
+            checkpoints
+                .get(id)
+                .map(|source| &*source.stack as &dyn TileReader)
+        };
         with_registered_sources(&*self.sources, &self.registration, |frames, origin| {
             let base = &*self.ancestor;
             match self.ancestor.sample_format() {
-                SampleFormat::U16 => {
-                    replay_mode_conditions::<u16>(ops, info, rect, step, base, frames, origin, spp)
-                }
-                SampleFormat::F32 => {
-                    replay_mode_conditions::<f32>(ops, info, rect, step, base, frames, origin, spp)
-                }
+                SampleFormat::U16 => replay_mode_conditions::<u16>(
+                    ops, info, rect, step, base, frames, origin, spp, &render,
+                ),
+                SampleFormat::F32 => replay_mode_conditions::<f32>(
+                    ops, info, rect, step, base, frames, origin, spp, &render,
+                ),
             }
         })
     }
@@ -3272,6 +3303,80 @@ mod placed_stroke_tests {
                 framed,
                 "the checkpoint stroke is skipped, the frame stroke beside it still recolours"
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement: one overlay refresh over fixtures/mantis-512 with a checkpoint and a frame Lighten stroke"]
+    fn overlay_refresh_time_with_checkpoint_lighten() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/mantis-512");
+        let reference = fixtures.join("reference.tif");
+        let frames: Vec<PathBuf> = (0..3)
+            .map(|i| fixtures.join(format!("frames/{i:02}.tif")))
+            .collect();
+        let scratch =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.scratch/overlay-refresh-time");
+        std::fs::create_dir_all(&scratch).expect("the scratch directory is created");
+        let copy = scratch.join("checkpoint.tif");
+        std::fs::copy(&reference, &copy).expect("the reference is copied");
+        let source = CheckpointSource {
+            stack: Arc::new(TiffStack::open_staged(&copy).expect("the copy opens")),
+            path: copy,
+        };
+        let readers = OriginReaders::open(
+            &reference,
+            FrameSource::Open {
+                frames,
+                budget: host_budget(),
+            },
+            Registration::default(),
+        )
+        .expect("the readers open");
+        let (width, height) = readers.ancestor().dimensions();
+        let info = ZMapInfo::new(width, height, 3).expect("a valid map");
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let lighten = |source: StrokeSource| Op::BrushStroke {
+            source,
+            path: vec![Point {
+                x: width as i32 / 2,
+                y: height as i32 / 2,
+            }],
+            radius: width.max(height) as f32,
+            softness: 0.0,
+            mode: BrushMode::Lighten,
+            opacity: 1.0,
+        };
+        let indices = vec![0u16; (width * height) as usize];
+        let mut draw = OverlayDraw::for_opacity(3, 0.5);
+        draw.origin = Some(crate::canvas::SharedOrigin(Arc::new(readers)));
+        draw.checkpoint_colors = Arc::new(std::collections::BTreeMap::from([(
+            CHECKPOINT.to_string(),
+            [250, 190, 10],
+        )]));
+        draw.checkpoint_sources = crate::canvas::SharedCheckpointSources(HashMap::from([(
+            CHECKPOINT.to_string(),
+            Arc::new(source),
+        )]));
+        for (what, source) in [
+            ("frame", StrokeSource::Frame(1)),
+            (
+                "checkpoint",
+                StrokeSource::Checkpoint(CHECKPOINT.to_string()),
+            ),
+        ] {
+            draw.ops = Arc::from([lighten(source)]);
+            let started = std::time::Instant::now();
+            let colors = draw.colors(info, whole, NonZeroU32::MIN, &indices);
+            println!(
+                "overlay refresh over {width}x{height} with a viewport-filling Lighten stroke from a {what}: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(colors.len(), indices.len());
         }
     }
 }

@@ -48,11 +48,6 @@ pub fn source_frame(op: &Op) -> Result<u16, RetouchError> {
     }
 }
 
-/// [`source_frame`] for an op the caller has already checked.
-fn checked_frame(op: &Op) -> u16 {
-    source_frame(op).expect("every source was checked to be a frame")
-}
-
 /// Refuses, in order: an empty path; a frame source with
 /// `source_id >= info.frame_count()` (a checkpoint source passes as
 /// geometry); a non-finite or non-positive radius; a softness outside
@@ -707,13 +702,9 @@ impl ModeConditions {
     }
 }
 
-/// The part of `rect` a valid Lighten or Darken stroke painted from a frame
-/// can reach. A stroke painted from a checkpoint reaches nothing: it shows no
-/// origin, so it is never replayed.
+/// The part of `rect` a valid Lighten or Darken stroke, painted from a frame or
+/// a checkpoint, can reach.
 fn light_dark_reach(op: &Op, info: ZMapInfo, rect: Rect) -> Option<Rect> {
-    if op.checkpoint_source().is_some() {
-        return None;
-    }
     let stroke = validate(op, info).ok()?;
     if !matches!(stroke.mode, BrushMode::Lighten | BrushMode::Darken) {
         return None;
@@ -731,13 +722,14 @@ pub fn needs_mode_conditions(ops: &[Op], info: ZMapInfo, rect: Rect) -> bool {
 
 /// The [`ModeConditions`] for the `step` lattice of `rect`. `base` is the
 /// composite the ops apply to (frame 0, map coordinates), `frames` the source
-/// frames and `origin` the offset to frame coordinates, as in
-/// [`apply_strokes`]. Each Lighten or Darken stroke is decided on the result
-/// of the strokes before it. A failed read is returned, never a partial result,
-/// and a stroke painted from a checkpoint anywhere in `ops` is refused with
-/// [`RetouchError::CheckpointSource`].
+/// frames and `origin` their offset, as in [`apply_strokes`]. `checkpoints`
+/// answers a reader whose frame 0 is a checkpoint's render in map coordinates;
+/// a checkpoint stroke compares against it, as the blend does. A failed read is
+/// returned, never a partial result. A stroke whose own render `checkpoints`
+/// lacks, or that lies over an earlier checkpoint stroke lacking one, is not
+/// replayed and never holds.
 #[allow(clippy::too_many_arguments)]
-pub fn replay_mode_conditions<S: Blend>(
+pub fn replay_mode_conditions<'r, S: Blend>(
     ops: &[Op],
     info: ZMapInfo,
     rect: Rect,
@@ -746,10 +738,8 @@ pub fn replay_mode_conditions<S: Blend>(
     frames: &dyn TileReader,
     origin: (u32, u32),
     spp: usize,
+    checkpoints: &dyn Fn(&str) -> Option<&'r dyn TileReader>,
 ) -> Result<ModeConditions, RetouchError> {
-    for op in ops {
-        source_frame(op)?;
-    }
     let step = step.get();
     let samples = |r: Rect| r.width as usize * r.height as usize * spp;
     let mut held = Vec::new();
@@ -760,8 +750,16 @@ pub fn replay_mode_conditions<S: Blend>(
         let Some(reach) = light_dark_reach(op, info, rect) else {
             continue;
         };
-        let Op::BrushStroke { mode, .. } = op;
-        let frame = checked_frame(op);
+        let Op::BrushStroke {
+            mode, source: own, ..
+        } = op;
+        let own_render = match own {
+            StrokeSource::Frame(_) => None,
+            StrokeSource::Checkpoint(id) => match checkpoints(id) {
+                Some(reader) => Some(reader),
+                None => continue,
+            },
+        };
         // Lattice samples inside `reach`: sample `i` sits at `rect.x + i * step`.
         let first = |at: u32, from: u32| (from - at).div_ceil(step);
         let (i0, i1) = (first(rect.x, reach.x), first(rect.x, reach.x + reach.width));
@@ -779,20 +777,58 @@ pub fn replay_mode_conditions<S: Blend>(
             width: (columns - 1) * step + 1,
             height: (rows - 1) * step + 1,
         };
+        // One slot per distinct checkpoint among the earlier strokes.
+        let mut slots: Vec<(&str, Option<&'r dyn TileReader>)> = Vec::new();
         let placed: Vec<PlacedStroke> = ops[..op_index]
             .iter()
             .filter_map(|earlier| {
                 let footprint = footprint(earlier, info).ok().flatten()?;
+                let Op::BrushStroke { source, .. } = earlier;
+                let source = match source {
+                    StrokeSource::Frame(frame) => PlacedSource::Frame(usize::from(*frame)),
+                    StrokeSource::Checkpoint(id) => {
+                        let slot = slots
+                            .iter()
+                            .position(|(known, _)| known == id)
+                            .unwrap_or_else(|| {
+                                slots.push((id, checkpoints(id)));
+                                slots.len() - 1
+                            });
+                        PlacedSource::Rendered(slot)
+                    }
+                };
                 Some(PlacedStroke {
                     op: earlier,
-                    source: PlacedSource::Frame(usize::from(checked_frame(earlier))),
+                    source,
                     footprint,
                 })
             })
             .collect();
         let extent = read_extent(info, &placed, lattice);
+        let used = |slot: usize| {
+            placed.iter().any(|stroke| {
+                stroke.source == PlacedSource::Rendered(slot)
+                    && stroke.footprint.intersect(extent).is_some()
+            })
+        };
+        if slots
+            .iter()
+            .enumerate()
+            .any(|(slot, (_, reader))| reader.is_none() && used(slot))
+        {
+            continue;
+        }
         let mut result = vec![S::default(); samples(extent)];
         S::read_tile(base, 0, extent, &mut result)?;
+        let mut rendered = Vec::with_capacity(slots.len());
+        for (slot, (_, reader)) in slots.iter().enumerate() {
+            let mut buffer = Vec::new();
+            if let (Some(reader), true) = (reader, used(slot)) {
+                buffer = vec![S::default(); samples(extent)];
+                S::read_tile(*reader, 0, extent, &mut buffer)?;
+            }
+            rendered.push((extent, buffer));
+        }
         apply_strokes(
             info,
             extent,
@@ -801,16 +837,24 @@ pub fn replay_mode_conditions<S: Blend>(
             frames,
             origin,
             spp,
-            &[],
+            &rendered,
             apply::<S>,
         )?;
         let mut source = vec![S::default(); samples(lattice)];
-        let at_frame = Rect {
-            x: lattice.x + origin.0,
-            y: lattice.y + origin.1,
-            ..lattice
-        };
-        S::read_tile(frames, usize::from(frame), at_frame, &mut source)?;
+        match (own, own_render) {
+            (_, Some(reader)) => S::read_tile(reader, 0, lattice, &mut source)?,
+            (StrokeSource::Frame(frame), None) => {
+                let at_frame = Rect {
+                    x: lattice.x + origin.0,
+                    y: lattice.y + origin.1,
+                    ..lattice
+                };
+                S::read_tile(frames, usize::from(*frame), at_frame, &mut source)?;
+            }
+            (StrokeSource::Checkpoint(_), None) => {
+                unreachable!("a checkpoint stroke without a render was skipped")
+            }
+        }
         let pixel = |r: Rect, x: u32, y: u32| {
             ((y - r.y) as usize * r.width as usize + (x - r.x) as usize) * spp
         };
@@ -858,9 +902,9 @@ fn table_color(table: &[[u8; 3]], index: u16) -> [u8; 3] {
 
 /// The source of the latest valid stroke in `ops` that is the origin of
 /// `(x, y)`: its opacity-scaled alpha there exceeds half of full coverage and,
-/// for Lighten and Darken, `conditions` holds. `None` when no stroke is. A
-/// stroke painted from a checkpoint is skipped unless `checkpoint_color` knows
-/// its id, and a Lighten or Darken one never holds, so it shows no origin.
+/// for Lighten and Darken, `conditions` holds (for a checkpoint source,
+/// against the checkpoint's rendered pixel). `None` when no stroke is. A stroke
+/// painted from a checkpoint is skipped unless `checkpoint_color` knows its id.
 pub fn top_source<'a>(
     ops: &'a [Op],
     info: ZMapInfo,
@@ -889,9 +933,10 @@ pub fn top_source<'a>(
 /// (clamped to the last entry), then, per valid stroke of `ops` in order, the
 /// stroke source's colour wherever the stroke is the origin (the rule of
 /// [`top_source`], with the same `conditions`): `table`'s colour for a frame,
-/// `checkpoint_color`'s for a checkpoint id. A stroke painted from a checkpoint
-/// `checkpoint_color` returns `None` for is skipped. Cost follows the samples
-/// near each path.
+/// `checkpoint_color`'s for a checkpoint id; a Lighten or Darken stroke from a
+/// checkpoint colours only where `conditions` holds against the checkpoint's
+/// rendered pixel. A stroke painted from a checkpoint `checkpoint_color`
+/// returns `None` for is skipped. Cost follows the samples near each path.
 #[allow(clippy::too_many_arguments)]
 pub fn overlay_colors(
     ops: &[Op],
@@ -3050,8 +3095,10 @@ mod tests {
                 }
             }
         }
-        top_source_follows_replayed_overlay::<u16>(false);
-        top_source_follows_replayed_overlay::<f32>(true);
+        for ops in [mixed_ops(), mixed_checkpoint_ops()] {
+            top_source_follows_replayed_overlay::<u16>(false, &ops);
+            top_source_follows_replayed_overlay::<f32>(true, &ops);
+        }
     }
 
     fn mode_op(
@@ -3147,12 +3194,23 @@ mod tests {
         }
     }
 
-    /// The frame-0 base and the source frames the origin tests replay over.
+    /// The frame-0 base, the source frames and the checkpoint renders the
+    /// origin tests replay over.
     struct Scene {
         map: ZMapInfo,
         spp: usize,
         base: Planes,
         frames: Planes,
+        /// Each known checkpoint's render: map-sized, frame 0, no origin shift.
+        checkpoints: Vec<(&'static str, Planes)>,
+    }
+
+    impl Scene {
+        fn checkpoint(&self, id: &str) -> Option<&Planes> {
+            self.checkpoints
+                .iter()
+                .find_map(|(known, planes)| (*known == id).then_some(planes))
+        }
     }
 
     /// The frames sit at this offset in their planes, as a cropped stack does.
@@ -3208,6 +3266,20 @@ mod tests {
                     .map(|f| plane(f, (w + ORIGIN.0, h + ORIGIN.1), ORIGIN))
                     .collect(),
             },
+            // Frame indices past the four source frames: values no frame holds.
+            checkpoints: [("amber", 4), ("teal", 5)]
+                .map(|(id, frame)| {
+                    let planes = vec![plane(frame, (w, h), (0, 0))];
+                    (
+                        id,
+                        Planes {
+                            width: w,
+                            spp,
+                            planes,
+                        },
+                    )
+                })
+                .into(),
         }
     }
 
@@ -3233,7 +3305,9 @@ mod tests {
     /// Per op, the map pixels (row-major) where the stroke changed or would
     /// change the result: scaled alpha above half, and for Lighten and Darken
     /// the channel-sum comparison against the result of the ops before it,
-    /// each op rendered whole-map with `apply`.
+    /// each op rendered whole-map with `apply`. A stroke from a checkpoint the
+    /// scene does not hold is not applied and never acts, nor does a Lighten or
+    /// Darken stroke whose footprint such an earlier stroke covers whole.
     fn acting_pixels<S: Blend>(ops: &[Op], scene: &Scene) -> Vec<Vec<bool>> {
         let (w, h) = (scene.map.width(), scene.map.height());
         let whole = rect(0, 0, w, h);
@@ -3242,14 +3316,33 @@ mod tests {
         S::read_tile(&scene.base, 0, whole, &mut result).unwrap();
         let sum = |pixel: &[S]| pixel.iter().map(|s| f64::from(s.widen())).sum::<f64>();
         let mut acts = Vec::new();
+        let mut missing: Vec<Rect> = Vec::new();
         for op in ops {
-            let Op::BrushStroke { mode, opacity, .. } = op;
+            let Op::BrushStroke {
+                source,
+                mode,
+                opacity,
+                ..
+            } = op;
             let mut hit = vec![false; (w * h) as usize];
-            if validate(op, scene.map).is_ok() {
-                let mut src = vec![S::default(); result.len()];
-                let at_frame = rect(ORIGIN.0, ORIGIN.1, w, h);
-                let frame = usize::from(source_frame(op).unwrap());
-                S::read_tile(&scene.frames, frame, at_frame, &mut src).unwrap();
+            let Ok(Some(own)) = footprint(op, scene.map) else {
+                acts.push(hit);
+                continue;
+            };
+            let mut src = vec![S::default(); result.len()];
+            let readable = match source {
+                StrokeSource::Frame(n) => {
+                    let at_frame = rect(ORIGIN.0, ORIGIN.1, w, h);
+                    S::read_tile(&scene.frames, usize::from(*n), at_frame, &mut src).unwrap();
+                    true
+                }
+                StrokeSource::Checkpoint(id) => scene.checkpoint(id).is_some_and(|planes| {
+                    S::read_tile(planes, 0, whole, &mut src).unwrap();
+                    true
+                }),
+            };
+            if readable {
+                let covered = missing.iter().any(|m| m.intersect(own) == Some(own));
                 let q = u64::from(super::opacity_q16(*opacity));
                 for y in 0..h {
                     for x in 0..w {
@@ -3262,10 +3355,13 @@ mod tests {
                             BrushMode::Darken => sum(s) < sum(r),
                             _ => true,
                         };
-                        hit[(y * w + x) as usize] = strong && condition;
+                        let light_dark = matches!(mode, BrushMode::Lighten | BrushMode::Darken);
+                        hit[(y * w + x) as usize] = strong && condition && !(covered && light_dark);
                     }
                 }
                 apply(op, scene.map, whole, &mut result, whole, &src, spp).unwrap();
+            } else {
+                missing.push(own);
             }
             acts.push(hit);
         }
@@ -3287,32 +3383,51 @@ mod tests {
             &scene.frames,
             ORIGIN,
             scene.spp,
+            &|id| scene.checkpoint(id).map(|planes| planes as &dyn TileReader),
         )
     }
 
-    fn colors_match_where_each_mode_acts<S: Blend>(wide: bool) {
-        let scene = scene(wide);
-        let ops = mixed_ops();
-        let acts = acting_pixels::<S>(&ops, &scene);
+    /// The overlay over `ops` colours each sample with the latest stroke that
+    /// acts there, checked against `acting_pixels`. `light_dark` are the ops
+    /// that must act somewhere; returns how many covered Lighten and Darken
+    /// samples were declined.
+    fn colors_match_where_each_mode_acts<S: Blend>(
+        scene: Scene,
+        ops: &[Op],
+        light_dark: &[usize],
+    ) -> usize {
+        let acts = acting_pixels::<S>(ops, &scene);
         let table = palette();
         let last = table.len() - 1;
         let (mut acting, mut declined) = (0, 0);
-        // The second rect lies under a Detail stroke, whose read margin the replay widens by.
+        // The third rect lies under a Detail stroke, whose read margin the replay widens by.
         for (area, step) in [
             (rect(3, 2, 40, 31), 1u32),
             (rect(3, 2, 40, 31), 3),
             (rect(22, 14, 10, 8), 1),
         ] {
-            let conditions = replay_for::<S>(&ops, &scene, area, step).unwrap();
+            let conditions = replay_for::<S>(ops, &scene, area, step).unwrap();
             let indices = stored(samples(area, step));
-            let out = colors_with(&ops, scene.map, area, step, &conditions, &indices);
+            let out = colors_known(
+                ops,
+                scene.map,
+                area,
+                step,
+                &conditions,
+                &known_checkpoints,
+                &indices,
+            );
             for (at, x, y) in lattice(area, step) {
                 let pixel = (y * 48 + x) as usize;
                 let mut expected = table[usize::from(indices[at]).min(last)];
                 for (op, hit) in ops.iter().zip(&acts) {
-                    let Op::BrushStroke { mode, .. } = op;
+                    let Op::BrushStroke { source, mode, .. } = op;
                     if hit[pixel] {
-                        expected = table[usize::from(source_frame(op).unwrap()).min(last)];
+                        expected = match source {
+                            StrokeSource::Frame(n) => table[usize::from(*n).min(last)],
+                            StrokeSource::Checkpoint(id) => known_checkpoints(id)
+                                .expect("an unknown checkpoint stroke never acts"),
+                        };
                     } else if step == 1
                         && matches!(mode, BrushMode::Lighten | BrushMode::Darken)
                         && alpha(op, scene.map, x, y).is_ok_and(|a| a == OPAQUE)
@@ -3323,17 +3438,179 @@ mod tests {
                 assert_eq!(out[at], expected, "step {step} at ({x}, {y})");
             }
         }
-        for k in [2, 3, 6] {
+        for &k in light_dark {
             acting += acts[k].iter().filter(|&&hit| hit).count();
         }
         assert!(acting > 40, "Lighten and Darken strokes act somewhere");
-        assert!(declined > 20, "and decline at covered pixels: {declined}");
+        declined
     }
 
     #[test]
     fn overlay_colors_match_where_each_mode_acts() {
-        colors_match_where_each_mode_acts::<u16>(false);
-        colors_match_where_each_mode_acts::<f32>(true);
+        for declined in [
+            colors_match_where_each_mode_acts::<u16>(scene(false), &mixed_ops(), &[2, 3, 6]),
+            colors_match_where_each_mode_acts::<f32>(scene(true), &mixed_ops(), &[2, 3, 6]),
+        ] {
+            assert!(declined > 20, "and decline at covered pixels: {declined}");
+        }
+    }
+
+    /// Frame and checkpoint sources crossed with every mode: Detail under a
+    /// Lighten stroke, strokes that cannot reach half coverage, a checkpoint
+    /// the lookup does not hold with a Lighten stroke of a known one lying
+    /// wholly under its footprint, and one with a Lighten stroke of its own.
+    fn mixed_checkpoint_ops() -> Vec<Op> {
+        use BrushMode::{Darken, Detail, Lighten, Normal};
+        let ckpt = |id: &str| StrokeSource::Checkpoint(id.to_string());
+        vec![
+            mode_op(1, Normal, 1.0, vec![pt(6, 6), pt(40, 24)], 9.0, 0.6),
+            source_stroke(
+                ckpt("amber"),
+                Detail,
+                0.6,
+                vec![pt(10, 28), pt(36, 10)],
+                8.0,
+                0.5,
+            ),
+            source_stroke(
+                ckpt("amber"),
+                Lighten,
+                0.6,
+                vec![pt(12, 20), pt(34, 16)],
+                9.0,
+                0.7,
+            ),
+            source_stroke(
+                ckpt("teal"),
+                Darken,
+                1.0,
+                vec![pt(5, 18), pt(42, 30)],
+                7.0,
+                0.5,
+            ),
+            mode_op(2, Normal, 0.5, vec![pt(20, 30)], 8.0, 0.5),
+            source_stroke(
+                ckpt("teal"),
+                Lighten,
+                0.3,
+                vec![pt(30, 8), pt(18, 12)],
+                8.0,
+                0.5,
+            ),
+            source_stroke(
+                ckpt("amber"),
+                Lighten,
+                1.0,
+                vec![pt(24, 18), pt(26, 19)],
+                6.0,
+                0.5,
+            ),
+            mode_op(3, Darken, 0.5, vec![pt(14, 10)], 8.0, 0.5),
+            source_stroke(
+                ckpt("teal"),
+                Detail,
+                1.0,
+                vec![pt(40, 6), pt(44, 10)],
+                6.0,
+                0.5,
+            ),
+            source_stroke(
+                ckpt("teal"),
+                Normal,
+                0.8,
+                vec![pt(20, 14), pt(30, 26)],
+                6.0,
+                0.5,
+            ),
+            mode_op(1, Lighten, 1.0, vec![pt(22, 22)], 6.0, 0.5),
+            source_stroke(ckpt("ghost"), Normal, 1.0, vec![pt(24, 18)], 14.0, 0.5),
+            source_stroke(ckpt("amber"), Lighten, 1.0, vec![pt(24, 18)], 5.0, 0.5),
+            source_stroke(ckpt("ghost"), Lighten, 1.0, vec![pt(4, 32)], 3.0, 0.5),
+        ]
+    }
+
+    #[test]
+    fn checkpoint_lighten_darken_origin_matches_blend() {
+        // Lighten and Darken strokes from a held checkpoint, apart from the two
+        // the lookup cannot serve (12 lies under the missing render, 13 has none).
+        let acting = [2, 3, 6];
+        for declined in [
+            colors_match_where_each_mode_acts::<u16>(
+                scene(false),
+                &mixed_checkpoint_ops(),
+                &acting,
+            ),
+            colors_match_where_each_mode_acts::<f32>(scene(true), &mixed_checkpoint_ops(), &acting),
+        ] {
+            assert!(declined > 20, "and decline at covered pixels: {declined}");
+        }
+        for wide in [false, true] {
+            let scene = scene(wide);
+            let ops = mixed_checkpoint_ops();
+            let area = rect(3, 2, 40, 31);
+            let conditions = if wide {
+                replay_for::<f32>(&ops, &scene, area, 1)
+            } else {
+                replay_for::<u16>(&ops, &scene, area, 1)
+            }
+            .unwrap();
+            for k in [12, 13] {
+                let held = lattice(area, 1).any(|(_, x, y)| conditions.holds(k, x, y));
+                assert!(
+                    !held,
+                    "op {k} shows no origin without a render (wide {wide})"
+                );
+            }
+        }
+        // Without the missing render, op 12 does act somewhere.
+        let mut without = mixed_checkpoint_ops();
+        without.remove(11);
+        let acts = acting_pixels::<u16>(&without, &scene(false));
+        assert!(acts[11].iter().any(|&hit| hit), "op 12 would act uncovered");
+    }
+
+    /// `scene` with sample ties planted: on every third diagonal both
+    /// checkpoints hold the base pixel with its channels rotated (equal sum,
+    /// not gray), on the next a gray pixel the base shares (equal sum, gray).
+    fn with_ties(mut scene: Scene) -> Scene {
+        let (w, spp) = (scene.map.width(), scene.spp);
+        let base = &mut scene.base.planes[0];
+        for (_, planes) in &mut scene.checkpoints {
+            let plane = &mut planes.planes[0];
+            for (at, pixel) in plane.chunks_exact_mut(spp).enumerate() {
+                let (x, y) = (at as u32 % w, at as u32 / w);
+                let own = &mut base[at * spp..(at + 1) * spp];
+                match (x + y) % 3 {
+                    0 => {
+                        pixel.copy_from_slice(own);
+                        pixel.rotate_left(1);
+                    }
+                    1 => {
+                        own.fill(own[0]);
+                        pixel.fill(own[0]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        scene
+    }
+
+    #[test]
+    fn checkpoint_equal_sums_are_not_origins() {
+        use BrushMode::{Darken, Lighten};
+        let ckpt = |id: &str| StrokeSource::Checkpoint(id.to_string());
+        // Disjoint footprints, so the pre-stroke result under each is the base.
+        let ops = vec![
+            source_stroke(ckpt("amber"), Lighten, 1.0, vec![pt(12, 12)], 10.0, 0.5),
+            source_stroke(ckpt("teal"), Darken, 1.0, vec![pt(36, 24)], 10.0, 0.5),
+        ];
+        for declined in [
+            colors_match_where_each_mode_acts::<u16>(with_ties(scene(false)), &ops, &[0, 1]),
+            colors_match_where_each_mode_acts::<f32>(with_ties(scene(true)), &ops, &[0, 1]),
+        ] {
+            assert!(declined > 100, "ties and misses are declined: {declined}");
+        }
     }
 
     #[test]
@@ -3430,6 +3707,7 @@ mod tests {
                 &frames,
                 (0, 0),
                 3,
+                &|_| None,
             )
             .unwrap();
             let indices = [0u16; 6];
@@ -3488,6 +3766,7 @@ mod tests {
                 &Failing,
                 (0, 0),
                 1,
+                &|_| None,
             );
             assert_eq!(u16s.unwrap(), none, "no frame or base read");
             let f32s = replay_mode_conditions::<f32>(
@@ -3499,6 +3778,7 @@ mod tests {
                 &Failing,
                 (0, 0),
                 3,
+                &|_| None,
             );
             assert_eq!(f32s.unwrap(), none);
             let indices = stored(samples(area, step));
@@ -3541,21 +3821,24 @@ mod tests {
         assert!(!needs_mode_conditions(&refused, map, area));
     }
 
-    fn replay_error<S: Blend>(base: &dyn TileReader, frames: &dyn TileReader) -> RetouchError {
-        let map = info(40, 30);
-        let ops = [
-            mode_op(1, BrushMode::Normal, 1.0, vec![pt(10, 10)], 6.0, 0.5),
-            mode_op(2, BrushMode::Lighten, 1.0, vec![pt(12, 10)], 6.0, 0.5),
-        ];
+    /// The error of replaying `ops` over a 40 x 30 map whose base, frames and
+    /// checkpoint `amber` are served by the given readers.
+    fn replay_error<S: Blend>(
+        ops: &[Op],
+        base: &dyn TileReader,
+        frames: &dyn TileReader,
+        amber: &dyn TileReader,
+    ) -> RetouchError {
         replay_mode_conditions::<S>(
-            &ops,
-            map,
+            ops,
+            info(40, 30),
             rect(0, 0, 40, 30),
             NonZeroU32::MIN,
             base,
             frames,
             (0, 0),
             1,
+            &|id| (id == "amber").then_some(amber),
         )
         .unwrap_err()
     }
@@ -3567,17 +3850,34 @@ mod tests {
             spp: 1,
             planes: vec![vec![7.0; 40 * 30]; 4],
         };
-        for (what, base, frames) in [
-            (
-                "base",
-                &Failing as &dyn TileReader,
-                &good as &dyn TileReader,
-            ),
-            ("frames", &good, &Failing),
+        let frame_ops = [
+            mode_op(1, BrushMode::Normal, 1.0, vec![pt(10, 10)], 6.0, 0.5),
+            mode_op(2, BrushMode::Lighten, 1.0, vec![pt(12, 10)], 6.0, 0.5),
+        ];
+        let from_amber = |mode| {
+            source_stroke(
+                StrokeSource::Checkpoint("amber".into()),
+                mode,
+                1.0,
+                vec![pt(12, 10)],
+                6.0,
+                0.5,
+            )
+        };
+        // An earlier checkpoint stroke the Lighten stroke replays over, and a
+        // Lighten stroke whose own checkpoint source is read.
+        let earlier = [from_amber(BrushMode::Normal), frame_ops[1].clone()];
+        let own = [frame_ops[0].clone(), from_amber(BrushMode::Lighten)];
+        let (bad, ok) = (&Failing as &dyn TileReader, &good as &dyn TileReader);
+        for (what, ops, base, frames, amber) in [
+            ("base", &frame_ops, bad, ok, ok),
+            ("frames", &frame_ops, ok, bad, ok),
+            ("an earlier checkpoint stroke", &earlier, ok, ok, bad),
+            ("a checkpoint source", &own, ok, ok, bad),
         ] {
             for err in [
-                replay_error::<u16>(base, frames),
-                replay_error::<f32>(base, frames),
+                replay_error::<u16>(ops, base, frames, amber),
+                replay_error::<f32>(ops, base, frames, amber),
             ] {
                 assert!(
                     matches!(
@@ -3686,126 +3986,37 @@ mod tests {
         }
     }
 
-    #[test]
-    fn checkpoint_lighten_darken_strokes_show_no_origin() {
-        let map = info(60, 30);
-        let table = palette();
-        let none = ModeConditions::default();
-        let area = rect(0, 0, 60, 30);
-        let from = |mode, opacity| {
-            source_stroke(
-                StrokeSource::Checkpoint("amber".to_string()),
-                mode,
-                opacity,
-                vec![pt(10, 15)],
-                10.0,
-                1.0,
-            )
-        };
-        let indices = vec![3u16; 60 * 30];
-        fn origin_of(ops: &[Op], map: ZMapInfo, x: u32) -> Option<&StrokeSource> {
-            top_source(
-                ops,
-                map,
-                x,
-                15,
-                &ModeConditions::default(),
-                &known_checkpoints,
-            )
-        }
-        for mode in [BrushMode::Normal, BrushMode::Detail] {
-            for opacity in [1.0f32, 0.5] {
-                let ops = vec![from(mode, opacity)];
-                let mut origins = 0;
-                for x in 0..45 {
-                    let product =
-                        f64::from(alpha(&ops[0], map, x, 15).unwrap()) * f64::from(opacity);
-                    let got = origin_of(&ops, map, x);
-                    if product >= 32769.0 {
-                        assert_eq!(got, Some(&StrokeSource::Checkpoint("amber".into())));
-                    } else if product <= 32767.0 {
-                        assert_eq!(got, None, "{mode:?} {opacity} at {x}");
-                    }
-                    origins += usize::from(got.is_some());
-                }
-                assert_eq!(
-                    origins > 0,
-                    opacity == 1.0,
-                    "{mode:?} at {opacity}: {origins}"
-                );
-                let colors = colors_known(&ops, map, area, 1, &none, &known_checkpoints, &indices);
-                for x in 0..45u32 {
-                    let want = if origin_of(&ops, map, x).is_some() {
-                        AMBER
-                    } else {
-                        table[3]
-                    };
-                    assert_eq!(
-                        colors[15 * 60 + x as usize],
-                        want,
-                        "{mode:?} {opacity} at {x}"
-                    );
-                }
-            }
-        }
-
-        // A Lighten or Darken checkpoint stroke is passed over to what lies beneath.
-        let beneath = stroke_op(1, vec![pt(10, 15)], 10.0, 1.0);
-        for mode in [BrushMode::Lighten, BrushMode::Darken] {
-            let over = from(mode, 1.0);
-            for ops in [vec![over.clone()], vec![beneath.clone(), over.clone()]] {
-                assert!(!needs_mode_conditions(&ops, map, area), "{mode:?}");
-                let want = (ops.len() == 2).then_some(&StrokeSource::Frame(1));
-                assert_eq!(origin_of(&ops, map, 10), want, "{mode:?}");
-                let colors = colors_known(&ops, map, area, 1, &none, &known_checkpoints, &indices);
-                let under = if want.is_some() { table[1] } else { table[3] };
-                assert_eq!(colors[15 * 60 + 10], under, "{mode:?}");
-
-                let planes = Planes {
-                    width: 60,
-                    spp: 1,
-                    planes: vec![vec![7.0; 60 * 30]; 4],
-                };
-                let replay = replay_mode_conditions::<f32>(
-                    &ops,
-                    map,
-                    area,
-                    NonZeroU32::MIN,
-                    &planes,
-                    &planes,
-                    (0, 0),
-                    1,
-                );
-                assert!(
-                    matches!(&replay, Err(RetouchError::CheckpointSource { checkpoint }) if checkpoint == "amber"),
-                    "{replay:?}"
-                );
-            }
-        }
-        // A frame Lighten stroke is still asked for.
-        let frame_lighten = mode_op(1, BrushMode::Lighten, 1.0, vec![pt(10, 15)], 10.0, 1.0);
-        assert!(needs_mode_conditions(&[frame_lighten], map, area));
-    }
-
-    /// For mixed-mode ops, `top_source` with the one-pixel replay of each
-    /// lattice sample names the frame the lattice overlay paints there.
-    fn top_source_follows_replayed_overlay<S: Blend>(wide: bool) {
+    /// For mixed-mode `ops`, `top_source` with the one-pixel replay of each
+    /// lattice sample names the source the lattice overlay paints there.
+    fn top_source_follows_replayed_overlay<S: Blend>(wide: bool, ops: &[Op]) {
         let scene = scene(wide);
-        let ops = mixed_ops();
         let table = palette();
         let last = table.len() - 1;
         let area = rect(3, 2, 40, 31);
         for step in [1u32, 4] {
-            let conditions = replay_for::<S>(&ops, &scene, area, step).unwrap();
+            let conditions = replay_for::<S>(ops, &scene, area, step).unwrap();
             let indices = stored(samples(area, step));
-            let out = colors_with(&ops, scene.map, area, step, &conditions, &indices);
+            let out = colors_known(
+                ops,
+                scene.map,
+                area,
+                step,
+                &conditions,
+                &known_checkpoints,
+                &indices,
+            );
             let mut shown = 0;
             for (at, x, y) in lattice(area, step) {
-                let one = replay_for::<S>(&ops, &scene, rect(x, y, 1, 1), 1).unwrap();
-                let expected = match top_frame(&ops, scene.map, x, y, &one) {
+                let one = replay_for::<S>(ops, &scene, rect(x, y, 1, 1), 1).unwrap();
+                let expected = match top_source(ops, scene.map, x, y, &one, &known_checkpoints) {
                     Some(source) => {
                         shown += 1;
-                        table[usize::from(source).min(last)]
+                        match source {
+                            StrokeSource::Frame(n) => table[usize::from(*n).min(last)],
+                            StrokeSource::Checkpoint(id) => {
+                                known_checkpoints(id).expect("only a known checkpoint is returned")
+                            }
+                        }
                     }
                     None => table[usize::from(indices[at]).min(last)],
                 };
@@ -3813,6 +4024,128 @@ mod tests {
             }
             assert!(shown > 20, "strokes act at step {step}");
         }
+    }
+
+    /// A reader that records the rects it is asked for.
+    struct Recording<'a> {
+        inner: &'a Planes,
+        reads: std::sync::Mutex<Vec<Rect>>,
+    }
+
+    impl<'a> Recording<'a> {
+        fn new(inner: &'a Planes) -> Self {
+            Self {
+                inner,
+                reads: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn reads(&self) -> Vec<Rect> {
+            self.reads.lock().unwrap().clone()
+        }
+    }
+
+    impl TileReader for Recording<'_> {
+        fn read_tile_into(
+            &self,
+            frame: usize,
+            rect: Rect,
+            out: &mut [u16],
+        ) -> Result<(), AlgorithmError> {
+            self.reads.lock().unwrap().push(rect);
+            self.inner.read_tile_into(frame, rect, out)
+        }
+
+        fn read_tile_f32_into(
+            &self,
+            frame: usize,
+            rect: Rect,
+            out: &mut [f32],
+        ) -> Result<(), AlgorithmError> {
+            self.reads.lock().unwrap().push(rect);
+            self.inner.read_tile_f32_into(frame, rect, out)
+        }
+
+        fn sample_format(&self) -> crate::tile::SampleFormat {
+            self.inner.sample_format()
+        }
+    }
+
+    #[test]
+    fn checkpoint_origin_reads_samples_only_for_lighten_darken() {
+        use BrushMode::{Detail, Lighten, Normal};
+        let scene = scene(false);
+        let ckpt = |id: &str| StrokeSource::Checkpoint(id.to_string());
+        let whole = rect(0, 0, 48, 36);
+        let amber_at = |mode, at| source_stroke(ckpt("amber"), mode, 1.0, vec![at], 6.0, 0.5);
+        let teal_at = |mode, at| source_stroke(ckpt("teal"), mode, 1.0, vec![at], 4.0, 0.5);
+        let recorded = || {
+            (
+                Recording::new(scene.checkpoint("amber").unwrap()),
+                Recording::new(scene.checkpoint("teal").unwrap()),
+            )
+        };
+        let replay = |ops: &[Op], area: Rect, (amber, teal): &(Recording, Recording)| {
+            replay_mode_conditions::<u16>(
+                ops,
+                scene.map,
+                area,
+                NonZeroU32::MIN,
+                &scene.base,
+                &scene.frames,
+                ORIGIN,
+                scene.spp,
+                &|id| match id {
+                    "amber" => Some(amber as &dyn TileReader),
+                    "teal" => Some(teal as &dyn TileReader),
+                    _ => None,
+                },
+            )
+            .unwrap()
+        };
+
+        // Normal and Detail checkpoint strokes alone: nothing is replayed or read.
+        let readers = recorded();
+        let plain = [amber_at(Normal, pt(10, 10)), teal_at(Detail, pt(30, 20))];
+        assert!(!needs_mode_conditions(&plain, scene.map, whole));
+        assert_eq!(replay(&plain, whole, &readers), ModeConditions::default());
+        assert!(readers.0.reads().is_empty() && readers.1.reads().is_empty());
+
+        // A frame Lighten stroke over a Normal checkpoint stroke it meets, and
+        // another far from it: only the first is read, over the Lighten footprint.
+        let frame_lighten = mode_op(1, Lighten, 1.0, vec![pt(12, 10)], 5.0, 0.5);
+        let reach = footprint(&frame_lighten, scene.map).unwrap().unwrap();
+        let ops = [
+            amber_at(Normal, pt(10, 10)),
+            teal_at(Normal, pt(40, 30)),
+            frame_lighten,
+        ];
+        let readers = recorded();
+        replay(&ops, whole, &readers);
+        assert_eq!(readers.0.reads(), [reach]);
+        assert!(readers.1.reads().is_empty(), "a stroke outside the extent");
+
+        // A queried rect inside the footprint bounds the read.
+        let inside = rect(11, 9, 3, 3);
+        replay(&ops, inside, &readers);
+        assert_eq!(readers.0.reads()[1..], [inside]);
+
+        // A Lighten stroke reads its own checkpoint once over its footprint, and
+        // a Detail stroke under it widens the read by the Detail margin only.
+        let readers = recorded();
+        let detail = amber_at(Detail, pt(18, 18));
+        let lighten = teal_at(Lighten, pt(20, 18));
+        let reach = footprint(&lighten, scene.map).unwrap().unwrap();
+        let margin = read_margin(&detail, scene.map).unwrap();
+        replay(&[detail, lighten], whole, &readers);
+        assert_eq!(readers.1.reads(), [reach], "its own source");
+        let reads = readers.0.reads();
+        assert_eq!(reads.len(), 1, "{reads:?}");
+        assert_eq!(
+            reads[0].intersect(grow(reach, margin, scene.map)),
+            Some(reads[0])
+        );
+        assert_ne!(reads[0], reach, "the Detail margin widens the read");
     }
 
     #[test]
@@ -3841,6 +4174,7 @@ mod tests {
             &frames,
             (0, 0),
             spp,
+            &|_| None,
         )
         .unwrap();
         let elapsed = started.elapsed();
