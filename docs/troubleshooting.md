@@ -77,7 +77,7 @@ error: <path>: is a RAW project saved by an older version, which stored a clippe
 
 **Fix:** open the RAW frames and fuse again; that makes a project in the
 current form. Exit status 1.
-See: [Refusals](reference/project-format.md#refusals).
+See: ["This project cannot be opened"](guide/first-stack.md#this-project-cannot-be-opened).
 
 ### "The frames are no longer there"
 
@@ -169,7 +169,7 @@ and [The Images panel](guide/images-panel.md#leave-a-frame-out-of-the-next-fuse)
 
 ### "Failed": "Setup failed", "Alignment failed", "Preparing failed" or "Fusing failed"
 
-![The window after a failed fuse: the toolbar shows Retry, the bottom bar reads Failed in red with "ETA —", the bell in the left bar shows the number 1, and the frame 02.tif in the Images list reads "Preview unavailable".](assets/manual/first-stack/fuse-failed.png)
+![The window after a failed fuse: the toolbar shows Retry, the bottom bar reads Failed in red, the bell in the left bar shows the number 1, and the frame 02.tif in the Images list reads "Preview unavailable".](assets/manual/first-stack/fuse-failed.png)
 
 *A failed fuse: **Retry** in the toolbar, "Failed" in the bottom bar, one notification on the bell.*
 
@@ -220,30 +220,31 @@ See: [When a fuse fails](guide/first-stack.md#when-a-fuse-fails).
 <file>: needs 1 MB of working memory, but the memory limit allows 0 MB for it. Raise the memory limit to at least 1 MB or close other programs.
 ```
 
-**Cause:** FocusForge reads a frame through a working memory that comes out of
-the memory free when the run starts, or out of the memory limit you set, and
-the frame named needs more than that. Camera RAW and JPEG frames, and TIFF
-frames that are compressed, need a whole frame or block decoded at once. The
-first sentence says the free RAM is too low and by how much; the second says
-your memory limit is. When the free memory is too low to start at all, the
-sentence names the free RAM needed in all ("about N MB of free RAM in all").
-On the command line the line follows `error:` and the exit status is 1; in the
-window it is the message of the failed run, see
+**Cause:** the frame named needs more free memory than the computer has
+available now (first message) or than the **Host memory** limit you set allows
+(second message). Camera RAW, JPEG and compressed TIFF frames are decoded
+whole, so they need the most. On the command line the line follows `error:`
+and the exit status is 1; in the window it is the message of the failed run,
+see
 ["Failed"](#failed-setup-failed-alignment-failed-preparing-failed-or-fusing-failed).
 
-**Fix:** close other programs, raise or remove the memory limit
-(**Host memory** under [Memory caps and budgets](guide/settings-window.md#memory-caps-and-budgets),
-or `--max-host-memory`), or, for camera RAW and JPEG frames, convert the
-frames to TIFF. [Hardware](hardware.md) lists the free RAM each kind of frame
-needs.
+**Fix:**
+
+1. Close other programs and start the fuse again. The first message says how
+   much more free RAM it needs.
+2. For the second message, raise or remove the limit: **Host memory** under
+   [Limit the memory a fuse may use](guide/settings-window.md#limit-the-memory-a-fuse-may-use),
+   or `--max-host-memory` on the command line.
+3. For camera RAW or JPEG frames, convert them to TIFF, which needs the least.
+
+The [free RAM table](memory-needs.md) lists what each kind of frame needs.
 
 ### "Keep this fused result?"
 
 > 00.tif and 02.tif could not be aligned and were fused as they are.
 
 **Cause:** the fuse finished, but some frames could not be
-[aligned](glossary.md#alignment) and were used unmoved (an
-[identity fallback](glossary.md#identity-fallback)). Very blurred frames at
+[aligned](glossary.md#alignment) and were used unmoved. Very blurred frames at
 the ends of a stack often cannot be aligned and contribute little anyway.
 
 **Fix:** look at the result. If it shows no doubled edges or smeared
@@ -282,11 +283,11 @@ See: [When a frame needs more than the limit](guide/stacking.md#when-a-frame-nee
 A record, not an error: the fuse had to take another route and still
 finished normally. The message says which, for example that alignment or
 fusing moved from the graphics card to the processor (a card with too little
-memory, or one that failed during the run), or that the
-[stage cache](glossary.md#stage-cache) could not be written, so the next fuse
-of these frames aligns them afresh. The result is the same; only the time it
-took changes. If such notices keep coming, see
-[The Backend line reads "cpu — …"](#the-backend-line-reads-cpu--) below.
+memory, or one that failed during the run), or that the alignment kept for
+fusing again could not be written, so the next fuse of these frames aligns
+them afresh. The result is the same; only the time it took changes. If such
+notices keep coming, see
+[The graphics card is not used](#the-graphics-card-is-not-used-cpu--) below.
 
 ### **Fuse stack** waits and **Levels** reads "Allowed range 1 to N"
 
@@ -318,11 +319,12 @@ happens again, update the graphics driver and make a
 See: [When a fuse fails](guide/first-stack.md#when-a-fuse-fails) and
 [Diagnostics and crash reports](guide/diagnostics.md).
 
-### The Backend line reads "cpu — …"
+### The graphics card is not used ("cpu — …")
 
 The **Backend** line in the settings window's **Performance** section says
-what the last fuse ran on. A fuse on the processor gives the same result as
-one on the graphics card, only more slowly.
+what the last fuse ran on, `gpu` (the graphics card) or `cpu` (the processor).
+A fuse on the processor gives the same result as one on the graphics card,
+only more slowly.
 
 | Backend line | Cause and fix |
 |---|---|
@@ -332,7 +334,7 @@ one on the graphics card, only more slowly.
 
 When no usable graphics card is found at all, the **VRAM** row reads "Unavailable" and the switch cannot be changed for the session.
 
-See: [GPU processing and the Backend line](guide/settings-window.md#gpu-processing-and-the-backend-line).
+See: [Use the graphics card](guide/settings-window.md#use-the-graphics-card).
 
 ### "STOPPED WHILE DEVELOPING" and "FAILED WHILE DEVELOPING"
 
@@ -423,13 +425,13 @@ See: [When an export is refused](guide/export.md#when-an-export-is-refused).
 > Max 17.4 GiB possible.
 
 **Cause:** the number you confirmed in **Host memory** (or **VRAM**) is above
-what the computer can give, so FocusForge stored no cap and shows its own
-budget again.
+what the computer can give, so FocusForge stored no limit and shows its own
+amount again.
 
 **Fix:** enter a number at or below the maximum the line names, or leave the
 row as it is.
 
-See: [Set a cap](guide/settings-window.md#set-a-cap).
+See: [Set a limit](guide/settings-window.md#set-a-limit).
 
 ### "Could not check for updates: …"
 
@@ -455,10 +457,10 @@ See: [When FocusForge refuses your bindings](guide/settings-window.md#when-focus
 
 ### "Could not clear the cache: …" or "A run is active."
 
-**Clear cache** cannot run while a fuse uses the
-[stage cache](glossary.md#stage-cache) ("A run is active."); wait for the
-fuse to finish. "Could not clear the cache: …" gives the system's reason.
-See: [Clear the stage cache](guide/settings-window.md#clear-the-stage-cache).
+**Clear cache** in **Storage** cannot run while a fuse is using the results
+it would delete ("A run is active."); wait for the fuse to finish. "Could not
+clear the cache: …" gives the system's reason.
+See: [Free disk space used by earlier runs](guide/settings-window.md#free-disk-space-used-by-earlier-runs).
 
 ### "Could not write the bundle. Nothing was written."
 
@@ -527,7 +529,7 @@ checkpoints. `export` prints the same message and exits 1.
 
 **Fix:** pass the right `.ffp` file, or stack the frames again to make a new
 project. See [`history`](reference/cli.md#history) and
-[Refusals](reference/project-format.md#refusals).
+[Damaged or moved projects](guide/first-stack.md#damaged-or-moved-projects).
 
 ### `source frame(s) changed since this project was written`
 
@@ -560,7 +562,7 @@ warning: N source frame(s) unresolved -- the history and Z-Map are intact; viewi
 **Cause:** the project's frames are not at their recorded paths. This is a
 warning only: the command runs and exits 0. Fused checkpoints export
 normally; a retouched checkpoint needs the frames back.
-See: [Source frames](reference/project-format.md#source-frames).
+See: [Damaged or moved projects](guide/first-stack.md#damaged-or-moved-projects).
 
 ### Unsupported TIFF layouts
 
@@ -571,18 +573,12 @@ error: <path>: BigTIFF (magic 43) is not supported, only classic TIFF (magic 42)
 error: <path>: Compression=7 is not supported by the decoded TIFF reader
 ```
 
-`info` shows the reason without refusing, for example for a TIFF compressed
-with JPEG (`Compression=7, only uncompressed (1) is supported`) or for an
-8-bit frame, which is read through the compatible path:
-
-```
-mmap fast path: no — BitsPerSample=[8, 8, 8], only 16-bit is supported
-```
+`info` shows the reason without refusing, for example `Compression=7, only
+uncompressed (1) is supported` for a TIFF compressed with JPEG.
 
 **Fix:** export the frames from your raw converter as TIFF (classic, not
 BigTIFF; uncompressed, LZW or Deflate), or stack the RAW files directly.
-See [Which files can FocusForge read?](#which-files-can-focusforge-read) and
-[TIFF fast path](reference/tiff-fast-path.md#what-the-reader-accepts).
+See [Which files can FocusForge read?](#which-files-can-focusforge-read).
 
 ### DNG export refusals
 
@@ -632,8 +628,8 @@ See: [Using the GPU](guide/stacking.md#using-the-gpu).
 ### The graphics device is lost during a run
 
 If the graphics card stops working partway through a `stack` run (a driver
-reset, for example), the tiles still to do run on the processor instead and
-the run completes; the log records the loss. See
+reset, for example), the rest of the run continues on the processor and the
+run completes; the log records the loss. See
 [Using the GPU](guide/stacking.md#using-the-gpu) and
 [The log](guide/diagnostics.md#the-log).
 
@@ -647,7 +643,7 @@ Some frames could not be [aligned](glossary.md#alignment) and were fused
 unmoved, the command-line counterpart of the window's **Keep this fused
 result?** question. Check the result for doubled edges. Pass `--strict` to
 make the run fail instead. See
-[Registration failures use identity fallback](guide/alignment.md#registration-failures-use-identity-fallback).
+[A frame that does not line up](guide/alignment.md#a-frame-that-does-not-line-up).
 
 ### `--algorithm is required`
 
@@ -694,8 +690,8 @@ See: [`diagnostics`](reference/cli.md#diagnostics) and
   [Write the file](guide/export.md#write-the-file).
 - **Command line:** `stack` writes each project beside its frames, or into
   the folder named with `-o`. See [`stack`](reference/cli.md#stack).
-- **Working files** (the [stage cache](glossary.md#stage-cache)) go to the
-  scratch folder shown under **Storage** in the settings window.
+- **Temporary files** (including the alignments kept for fusing again) go to
+  the scratch folder shown under **Storage** in the settings window.
 
 ### Why is the result smaller than my frames?
 
@@ -716,23 +712,21 @@ content, editing a frame afterwards makes the project ask about it (see
 
 ### Do the GPU and the processor give the same result?
 
-Yes, to within one step of the 16-bit scale, which you cannot see. The
-graphics card only makes a fuse faster. Only **Details** has a GPU version;
-**Soft transitions** and **Focus map** always run on the processor. See
-[GPU processing and the Backend line](guide/settings-window.md#gpu-processing-and-the-backend-line)
+Yes. The graphics card only makes a fuse faster. Only **Details** has a GPU
+version; **Soft transitions** and **Focus map** always run on the processor.
+See [Use the graphics card](guide/settings-window.md#use-the-graphics-card)
 and [Using the GPU](guide/stacking.md#using-the-gpu).
 
 ### How many frames can I stack, and how much memory does it need?
 
-There is no practical limit on the number of frames. FocusForge works
-through a stack in pieces and holds only as many in memory as its
-[budget](glossary.md#budget) allows: by default 65 % of the memory free when
-a fuse starts, after about 1.6 GB set aside for the run itself. More frames take longer; the budget stays the same. To keep memory free
-for other programs, set a [cap](glossary.md#cap). How many frames a subject
-needs is worked out in [Count the frames](stacking/shooting-practice.md#count-the-frames).
-Plan disk space too: a 16-bit TIFF from a 45-megapixel camera is about
-270 MB. How much free memory each kind of frame needs is in
-[Hardware](hardware.md).
+There is no practical limit on the number of frames, and more frames take
+longer rather than more memory. What a stack needs depends on the kind of
+frames and their size: see the [free RAM table](memory-needs.md). To keep
+memory free for other programs, set a lower limit under **Host memory** (see
+[Limit the memory a fuse may use](guide/settings-window.md#limit-the-memory-a-fuse-may-use)).
+How many frames a subject needs is worked out in
+[Count the frames](stacking/shooting-practice.md#count-the-frames). Plan disk
+space too: a 16-bit TIFF from a 45-megapixel camera is about 270 MB.
 
 ### Which files can FocusForge read?
 
