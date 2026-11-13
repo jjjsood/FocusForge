@@ -6,9 +6,24 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-13
+
+### Changed
+
+- The Details fusion method (`laplacian`) judges sharpness over a smaller area, so fine detail next to stronger detail is taken from the frame in which it is sharp. Fusing a stack again with Details can give a slightly different result and Z-Map than an earlier version.
+- Alignment is faster, most on a processor with several cores: with the default Chain reference policy, several frames are compared with their neighbours at once. An alignment that stops improving now ends as `stalled` before Max Iterations run out, so a frame's position can differ slightly from an earlier version.
+- Camera RAW stacks fuse faster, most of all on a computer with little free RAM, and give the same result as before. When the developed frames fit in the memory a fuse may use, they stay in memory and the run writes no temporary files for them.
+- Long stacks of compressed TIFF frames that store one row per strip fuse faster.
+- With no Host memory limit set, a fuse on a computer with plenty of free RAM may use more of it than before. A camera RAW stack is refused only when the memory a fuse may use cannot hold one of its frames.
+- When a frame does not fit in the memory a fuse may use, the message names the file, gives the sizes in MB, says whether free RAM or the Host memory limit is too low, how much more is needed and what to do. With very little free RAM it says how much free RAM the run needs in all.
+- The window's bottom bar and the progress lines of `focusforge-cli` no longer show an estimated time remaining.
+- Long frame names in the Images panel and in Analytics are shortened at their start, so frames whose names differ only at the end stay apart, and the last row of Analytics and of the notification center no longer sits against the edge.
+
 ### Fixed
 
 - On a machine without a hardware GPU (a virtual machine, a Remote Desktop session), stacking runs on the CPU instead of a slow software graphics adapter.
+- On large frames, alignment on the graphics card finds the same positions as alignment on the processor; before, it could use up Max Iterations and stop a fraction of a pixel away.
+- `focusforge-cli align` reads folders of JPEG and camera RAW frames as `stack` does; before, it found only TIFF frames.
 
 ## [0.2.0] - 2026-11-09
 

@@ -264,7 +264,7 @@ _arguments "${_arguments_options[@]}" : \
 '--quiet[Log errors only]' \
 '-h[Print help]' \
 '--help[Print help]' \
-':dir -- Directory of TIFF frames to align (non-recursive, descending into `<dir>/frames` when that subdirectory exists):_files' \
+':dir -- Directory of TIFF, 8-bit JPEG or supported RAW frames to align (non-recursive, descending into `<dir>/frames` when that subdirectory exists):_files' \
 && ret=0
 ;;
 (review)
