@@ -172,7 +172,7 @@ impl TimingCounter {
 }
 
 /// The bounded accounting summary for one process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct TimingSnapshot {
     pub admitted: u64,
     pub exhausted: u64,

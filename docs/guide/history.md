@@ -69,7 +69,7 @@ are not in a checkpoint yet, and greyed out otherwise. See
 3. The dialog "Delete this checkpoint?" names the checkpoint by fusion method
    and time and says what stays. Click **Delete**.
 
-![The dialog "Delete this checkpoint?" with the line "Retouch on Details · 17:14:55", the sentence "The other checkpoint is untouched, and the stack is not fused again." and the buttons Cancel and Delete](../assets/manual/checkpoints/checkpoints-delete-question.png)
+![The dialog "Delete this checkpoint?" with the line "Retouch on Details" followed by its time, the sentence "The other checkpoint is untouched, and the stack is not fused again." and the buttons Cancel and Delete](../assets/manual/checkpoints/checkpoints-delete-question.png)
 
 *Deleting one of two checkpoints. Cancel, the close button at the top right and Escape all delete nothing.*
 
@@ -108,10 +108,10 @@ strokes would be lost.
 ### Choosing another checkpoint: "Save this state first?"
 
 You clicked another row of the CHECKPOINTS list while strokes were unsaved.
-The question names the checkpoint you clicked ("Restoring Details ·
-17:14:03") and how many strokes have happened since the last checkpoint.
+The question names the checkpoint you clicked ("Restoring Details" and
+its time) and how many strokes have happened since the last checkpoint.
 
-![The dialog "Save this state first?" with the line "Restoring Details · 17:14:03", text explaining that 1 brush stroke belongs to no saved state, and the buttons Cancel, Save first, then restore and Discard and restore](../assets/manual/checkpoints/checkpoints-restore-question.png)
+![The dialog "Save this state first?" with the line "Restoring Details" followed by its time, text explaining that 1 brush stroke belongs to no saved state, and the buttons Cancel, Save first, then restore and Discard and restore](../assets/manual/checkpoints/checkpoints-restore-question.png)
 
 *The question before going back to an older checkpoint over one unsaved stroke.*
 
@@ -170,8 +170,6 @@ was saved, the window explains what is wrong and offers **Locate frames…** to
 point it at the frames' new folder. What each message means and what to do is
 in [Damaged or moved projects](first-stack.md#damaged-or-moved-projects) in *Your first stack*; the command-line side (accepting
 changed frames, exit codes) is in [Troubleshooting](../troubleshooting.md#source-frames-changed-since-this-project-was-written).
-How a project records its frames is described in
-[the project format](../reference/project-format.md#source-frames).
 
 ## From the command line
 

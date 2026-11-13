@@ -29,9 +29,12 @@ pub mod test_frames;
 pub(crate) mod tiff;
 
 pub use crate::tile::{Rect, Tile};
+pub(crate) use error::cache_refusal_message;
 pub use error::{Refusal, TiffError};
-pub use frame::{FrameDesc, FrameError, FrameReader, RawIdentity};
-pub use frame_set::{FrameSet, ReaderKind, classify_header, open_frame_set};
+pub use frame::{DevelopStore, FrameDesc, FrameError, FrameReader, RawIdentity};
+pub use frame_set::{
+    FrameSet, ReaderKind, classify_header, open_frame_set, source_bits_per_sample,
+};
 pub use grouping::{
     CaptureTime, GROUP_GAP, Group, GroupSignal, Proposal, capture_time, one_group, propose,
     propose_with_progress,

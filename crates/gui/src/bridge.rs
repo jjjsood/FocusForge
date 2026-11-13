@@ -19,9 +19,10 @@ use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowId;
 
 use crate::analytics::{AnalyticsView, RowValue};
+use crate::appearance_settings::SourcePresentation;
 use crate::canvas::{
     CanvasFeed, EditedView, OverlayDraw, Pane, PaneJob, PaneSource, Preparer, RepaintGate,
-    truncate_pane_label,
+    truncate_pane_label, truncate_tail,
 };
 use crate::controller::{
     AppController, ChromeKey, DockTab, GroupingQuestion, GuardSecondary, JobView, LocateTarget,
@@ -36,14 +37,6 @@ use crate::diagnostics::{
 use crate::diagnostics::{
     TimingCounter, measurement_scope, measurement_scope_with_fields, record_timing,
 };
-use crate::generated::{
-    AboutState, AnalyticsRowView, AppWindow, CalculatorFieldView,
-    CheckpointEntryView as GeneratedCheckpointEntry, ComparisonWindow, ExportRowView,
-    FFManifestRow, ImageRowView as GeneratedImageRow, NotificationRowView, PerformanceCap,
-    PerformanceState, ProjectCardView as GeneratedProjectCard, ProjectTabView,
-    RecentRowView as GeneratedRecentRow, SectionHeadView, SettingsRow as GeneratedSettingsRow,
-    StageTile, StoragePathState, StorageState, SummaryCell, Theme, UpdateControlsState,
-};
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
 use crate::job;
@@ -52,6 +45,14 @@ use crate::overlay::{Thumbnail, grouping_body};
 use crate::picker::{self, DialogAnswer, DialogRequest};
 use crate::settings_panel::{HeadingState, PanelModel, RowKind};
 use crate::viewport::{PaneDraw, PaneRect};
+use focusforge_ui::{
+    AboutState, AnalyticsRowView, AppWindow, CalculatorFieldView,
+    CheckpointEntryView as GeneratedCheckpointEntry, ComparisonWindow, ExportRowView,
+    FFManifestRow, ImageRowView as GeneratedImageRow, NotificationRowView, PerformanceCap,
+    PerformanceState, ProjectCardView as GeneratedProjectCard, ProjectTabView,
+    RecentRowView as GeneratedRecentRow, SectionHeadView, SettingsRow as GeneratedSettingsRow,
+    StageTile, StoragePathState, StorageState, SummaryCell, Theme, UpdateControlsState,
+};
 
 /// `slint::platform::PointerEventButton` -> `input_map::Button` -- the only
 /// place in the crate that names the Slint type.
@@ -1294,6 +1295,15 @@ pub fn comparison_snapshot()
         .transpose()
 }
 
+/// The detached pane's physical size and scale factor, when it is open.
+pub fn comparison_window_size() -> Option<(slint::PhysicalSize, f32)> {
+    COMPARISON_WINDOW.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|window| (window.window().size(), window.window().scale_factor()))
+    })
+}
+
 /// Uses the detached pane's own dock control path for timed inspection.
 pub fn dock_comparison_for_inspection() {
     let window = COMPARISON_WINDOW.with(|slot| slot.borrow().as_ref().cloned());
@@ -1626,7 +1636,7 @@ pub fn push_projects(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
         None => app.set_checkpoint_delete_open(false),
     }
     // The dock's own gate for the tab row, the settings panel and the
-    // "No project open." note (`ui/shell/dock.slint`) -- otherwise stuck at
+    // "No project open." note (`crates/ui/ui/shell/dock.slint`) -- otherwise stuck at
     // whatever a canvas gesture (`repaint`, above) last set it to, since a
     // tab switch or close never fires one of its own.
     app.set_project_loaded(controller.active_project().is_some());
@@ -2307,6 +2317,18 @@ pub fn push_settings_scroll(app: &AppWindow, panel: &PanelModel) {
     });
 }
 
+/// Characters of a name the dock's name column holds: about 142 px in the
+/// list and large views, 88 px in the image list, at roughly 6 px a character.
+fn image_row_name_max_chars(presentation: SourcePresentation) -> usize {
+    match presentation {
+        SourcePresentation::List | SourcePresentation::Large => 21,
+        SourcePresentation::ImageList => 13,
+    }
+}
+
+/// Characters of a name the Analytics row's 112 px name column holds.
+const ANALYTICS_NAME_MAX_CHARS: usize = 16;
+
 /// Pushes the `Images` panel's whole state -- [`push_settings_panel`]'s
 /// twin.
 pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
@@ -2314,6 +2336,7 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
     prune_source_preview_images();
     app.set_editor_enabled(controller.editor_enabled());
     let panel = controller.images_panel();
+    let name_max = image_row_name_max_chars(controller.source_presentation());
     let mut native_previews = std::collections::HashSet::new();
     let mut native_preview_bytes = 0_u64;
     let rows: Vec<GeneratedImageRow> = panel
@@ -2333,7 +2356,8 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
             }
             GeneratedImageRow {
                 chip: slint::Color::from_rgb_u8(row.chip[0], row.chip[1], row.chip[2]),
-                name: row.name.clone().into(),
+                name: truncate_tail(&row.name, name_max).into(),
+                full_name: row.name.clone().into(),
                 time_text: row.trailing_text.clone().into(),
                 capture_stamp: row.capture_stamp.clone().into(),
                 excluded: row.excluded,
@@ -2639,7 +2663,7 @@ pub fn push_analytics(app: &AppWindow, controller: &AppController) {
         rows.iter()
             .map(|row| AnalyticsRowView {
                 chip: slint::Color::from_rgb_u8(row.chip[0], row.chip[1], row.chip[2]),
-                name: row.name.as_str().into(),
+                name: truncate_tail(&row.name, ANALYTICS_NAME_MAX_CHARS).into(),
                 mm_text: row.mm_text.as_str().into(),
                 fraction: row.fraction,
                 count: i32::try_from(row.count).unwrap_or(i32::MAX),
@@ -3597,7 +3621,7 @@ pub fn install(
         move |btn, kind, x, y, ctrl, shift, alt| {
             dispatch_coalesced(&controller, &canvas, &app_weak, &gate, |controller| {
                 let mods = modifiers(controller, ctrl, shift, alt);
-                // `kind` is `ui/shell/canvas.slint`'s fold of `PointerEventKind`:
+                // `kind` is `crates/ui/ui/shell/canvas.slint`'s fold of `PointerEventKind`:
                 // 0 = Down, 1 = Up or Cancel, 2 = Move. `Move` fires on every
                 // mouse movement over the area, before `moved`, and carries no
                 // motion of its own -- forwarded as `PointerKind::Move` rather
@@ -4525,7 +4549,7 @@ pub fn install(
         let controller = controller.clone();
         move |kind, y| {
             record_settings_input();
-            // `ui/components/ff_scrollbar.slint`'s own fold of
+            // `crates/ui/ui/components/ff_scrollbar.slint`'s own fold of
             // `PointerEventKind`, the same convention as `canvas.slint`'s:
             // 0 = Down, 1 = Up or Cancel, 2 = Move.
             let kind = match kind {
@@ -5280,7 +5304,7 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             // builtin (shadowable) `Window.maximized`: native window state
             // needs `app.window()` while chrome state the shell *draws
             // from* needs a custom property. This is
-            // what the maximize glyph binding (`ui/shell/tab_strip.slint`)
+            // what the maximize glyph binding (`crates/ui/ui/shell/tab_strip.slint`)
             // reads to swap `square.svg` for `copy.svg`.
             app.set_window_maximized(maximized);
         }

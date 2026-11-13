@@ -11,8 +11,9 @@
 mod common;
 
 use common::align::{
-    FramesReader, XorShift32, corner_error, default_region, frame_3_tile, full_rect, open_fixture,
-    resolved_defaults, similarity_about, two_frame_reader,
+    Drift, FramesReader, XorShift32, blurred_scene, corner_error, default_region,
+    drifting_focus_stack, frame_3_tile, full_rect, open_fixture, resolved_defaults,
+    shifted_frame_3, similarity_about, two_frame_reader, value_noise,
 };
 
 use focusforge_core::algorithm::{
@@ -208,17 +209,14 @@ fn rotation_scale_mode_returns_a_similarity() {
 
 #[test]
 fn an_80px_shift_with_a_clean_border_converges_through_the_pyramid() {
-    let (tile, width, height, spp) = frame_3_tile();
-    let rect = full_rect(width, height);
+    let (warped_samples, tile, width, height, spp) = shifted_frame_3(80.0);
     let w_true = Transform::translation(80.0, 0.0);
-    let warped = warp_from_tile(&tile, (width, height), rect, &w_true)
-        .expect("80px translation stays well inside the frame");
 
     // The warp zero-fills columns 432..512. A zero step edge inside the solve
     // region bleeds through the level-0 smoothing, whereas real frames are
     // edge-repeated at the frame boundary, so column 431 is repeated instead.
     let (w, s) = (width as usize, spp as usize);
-    let mut filled = warped.tile.samples;
+    let mut filled = warped_samples;
     for row in filled.chunks_exact_mut(w * s) {
         let (content, border) = row.split_at_mut(432 * s);
         let edge = &content[431 * s..];
@@ -643,53 +641,6 @@ fn a_periodic_scene_never_reports_a_wrong_converged_fit() {
     }
 }
 
-/// Hashes a lattice point to `[-1, 1]`.
-fn lattice(ix: i64, iy: i64, seed: u32) -> f64 {
-    let mut h = (ix as u32).wrapping_mul(0x9E37_79B1)
-        ^ (iy as u32).wrapping_mul(0x85EB_CA77)
-        ^ seed.wrapping_mul(0xC2B2_AE3D);
-    h ^= h >> 15;
-    h = h.wrapping_mul(0x2C1B_3C6D);
-    h ^= h >> 12;
-    h = h.wrapping_mul(0x297A_2D39);
-    h ^= h >> 15;
-    f64::from(h) / f64::from(u32::MAX) * 2.0 - 1.0
-}
-
-/// Smooth value noise of wavelength `period` px, in `[-1, 1]`, defined at
-/// every real coordinate.
-fn value_noise(x: f64, y: f64, period: f64, seed: u32) -> f64 {
-    let (u, v) = (x / period, y / period);
-    let (iu, iv) = (u.floor(), v.floor());
-    let fade = |t: f64| t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
-    let (fu, fv) = (fade(u - iu), fade(v - iv));
-    let (ix, iy) = (iu as i64, iv as i64);
-    let top = lattice(ix, iy, seed) * (1.0 - fu) + lattice(ix + 1, iy, seed) * fu;
-    let bottom = lattice(ix, iy + 1, seed) * (1.0 - fu) + lattice(ix + 1, iy + 1, seed) * fu;
-    top * (1.0 - fv) + bottom * fv
-}
-
-/// A multi-scale texture with detail at every pyramid level, in `[-1, 1]`,
-/// as a camera focused `sigma` px off the surface sees it: each octave of
-/// wavelength `p` keeps the share `exp(-2 pi^2 sigma^2 / p^2)` of its amplitude.
-fn blurred_scene(x: f64, y: f64, sigma: f64) -> f64 {
-    [
-        (256.0, 1.0),
-        (96.0, 0.8),
-        (40.0, 0.6),
-        (18.0, 0.4),
-        (9.0, 0.25),
-    ]
-    .iter()
-    .enumerate()
-    .map(|(i, &(period, weight))| {
-        let kept = (-2.0 * std::f64::consts::PI.powi(2) * sigma * sigma / (period * period)).exp();
-        weight * kept * value_noise(x, y, period, 11 + i as u32)
-    })
-    .sum::<f64>()
-        / 2.2
-}
-
 fn textured_scene(x: f64, y: f64) -> f64 {
     blurred_scene(x, y, 0.0)
 }
@@ -934,66 +885,6 @@ fn contradictory_outer_content_still_fails_the_off_centre_check() {
         AlignStatus::Diverged(DivergenceReason::ValidationFailed),
         "no single similarity holds at the off-centre patches: {frame:?}"
     );
-}
-
-/// How far frame `i` of a drifting stack has moved from the reference.
-struct Drift {
-    shift: (f64, f64),
-    scale: f64,
-}
-
-/// `count` one-sample frames of a scene whose depth ramps from left to right;
-/// frame `i` is focused on the column `i / (count - 1)` of the way across and
-/// blurred in proportion to each column's distance from it. Each frame is
-/// magnified and shifted by `drift` for every step it lies from the middle
-/// frame. Returns the frames and, per frame, the transform that maps the
-/// middle frame onto it.
-fn drifting_focus_stack(
-    (width, height): (u32, u32),
-    count: usize,
-    drift: &Drift,
-    blur_px: f64,
-) -> (FramesReader, Vec<Transform>) {
-    let middle = (count - 1) / 2;
-    let (cx, cy) = (f64::from(width) / 2.0, f64::from(height) / 2.0);
-    let truth: Vec<Transform> = (0..count)
-        .map(|i| {
-            let steps = i as f64 - middle as f64;
-            Transform::translation(drift.shift.0 * steps, drift.shift.1 * steps)
-                .compose(&similarity_about(1.0 + drift.scale * steps, 0.0, cx, cy))
-        })
-        .collect();
-    let mut rng = XorShift32(0xF0C5_0001);
-    let frames = truth
-        .iter()
-        .enumerate()
-        .map(|(i, w)| {
-            let inverse = w.inverse().expect("a similarity is invertible");
-            let focus = i as f64 / (count - 1) as f64;
-            let mut samples = Vec::with_capacity((width * height) as usize);
-            for y in 0..height {
-                for x in 0..width {
-                    let (sx, sy) = inverse
-                        .map_point(f64::from(x), f64::from(y))
-                        .expect("a similarity maps every pixel");
-                    let sigma = blur_px * (sx / f64::from(width) - focus).abs();
-                    let noise = f64::from(rng.next() % 321) - 160.0;
-                    let value = 0.5 + 0.4 * blurred_scene(sx, sy, sigma);
-                    samples.push((value * 65_535.0 + noise).clamp(0.0, 65_535.0) as u16);
-                }
-            }
-            samples
-        })
-        .collect();
-    (
-        FramesReader {
-            width,
-            height,
-            spp: 1,
-            frames,
-        },
-        truth,
-    )
 }
 
 /// Measured with `-- --nocapture`: the anchor policy leaves 11 of the 30

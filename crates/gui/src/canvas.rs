@@ -306,19 +306,23 @@ pub fn draw_rect_fits(frame: (u32, u32), src: (u32, u32, u32, u32)) -> bool {
 /// characters edge to edge.
 const PANE_LABEL_MAX_CHARS: usize = 16;
 
-/// Fits `label` inside `FFPaneLabel`'s pill by keeping its tail: a label
+/// Fits `label` into `max_chars` characters by keeping its tail: a label
 /// short enough already passes through unchanged; a longer one is cut down
-/// to a fixed character budget with a leading `…` standing in for the
-/// dropped head, since a long filename's distinguishing part is its end,
-/// not its shared prefix.
-pub fn truncate_pane_label(label: &str) -> String {
-    let chars: Vec<char> = label.chars().collect();
-    if chars.len() <= PANE_LABEL_MAX_CHARS {
+/// to `max_chars` with a leading `…` standing in for the dropped head, since
+/// a long filename's distinguishing part is its end, not its shared prefix.
+pub fn truncate_tail(label: &str, max_chars: usize) -> String {
+    let count = label.chars().count();
+    if count <= max_chars {
         return label.to_string();
     }
-    let kept = PANE_LABEL_MAX_CHARS - 1;
-    let tail: String = chars[chars.len() - kept..].iter().collect();
+    let kept = max_chars.saturating_sub(1);
+    let tail: String = label.chars().skip(count - kept).collect();
     format!("\u{2026}{tail}")
+}
+
+/// Fits `label` inside `FFPaneLabel`'s pill; see [`truncate_tail`].
+pub fn truncate_pane_label(label: &str) -> String {
+    truncate_tail(label, PANE_LABEL_MAX_CHARS)
 }
 
 /// Grows `scratch` to at least `len` elements, recording [`SampleBytes`]

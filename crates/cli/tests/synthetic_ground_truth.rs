@@ -29,12 +29,54 @@ use focusforge_core::tile::Rect;
 /// different interpolation kernel, a changed pyramid depth, a new
 /// `epsilon-px` default) crossing this budget is the INTENDED failure mode:
 /// the correct response is a deliberate re-tuning that records the new
-/// measurement here, never a quiet loosening of the constant.
+/// measurement here, never a quiet loosening of the constant. The same rule
+/// holds for the pinned regression row below: it is re-recorded only
+/// together with a deliberate solver change.
 const BUDGET_BASE_PX: f64 = 0.04; // |d| = 0
 const BUDGET_PER_STEP_PX: f64 = 0.03; // per step away from the reference
 
 fn budget_px(d: i64) -> f64 {
     BUDGET_BASE_PX + BUDGET_PER_STEP_PX * d.abs() as f64
+}
+
+/// The regression tier: each frame's full-frame corner error in
+/// `rotation-scale` mode may exceed its pinned error by at most this much per
+/// step away from the reference. The pinned row is the measurement of the
+/// 8-frame, reference-3, seed-11 run, each value rounded up at 1e-6 px; the
+/// reference frame is the identity and is pinned at exactly 0.
+const REGRESSION_PER_STEP_PX: f64 = 0.005;
+const PINNED_FRAME_COUNT: u64 = 8;
+const PINNED_REFERENCE: u64 = 3;
+const PINNED_SEED: u64 = 11;
+const PINNED_ERROR_PX: [f64; 8] = [
+    0.029374, 0.013808, 0.017744, 0.0, 0.007854, 0.012238, 0.019719, 0.041188,
+];
+
+/// The per-frame regression budgets, or an error naming the generator field
+/// that the pinned row does not cover.
+fn regression_budgets_px(m: &serde_json::Value) -> Result<Vec<f64>, String> {
+    let g = &m["generator"];
+    for (field, pinned) in [
+        ("frame_count", PINNED_FRAME_COUNT),
+        ("reference", PINNED_REFERENCE),
+        ("seed", PINNED_SEED),
+    ] {
+        if g[field].as_u64() != Some(pinned) {
+            return Err(format!(
+                "generator.{field} is {} but the pinned errors were recorded for {pinned}; \
+                 re-record PINNED_ERROR_PX together with the solver change that moved them",
+                g[field]
+            ));
+        }
+    }
+    Ok(PINNED_ERROR_PX
+        .iter()
+        .enumerate()
+        .map(|(k, &pinned)| {
+            let d = k as i64 - PINNED_REFERENCE as i64;
+            pinned + REGRESSION_PER_STEP_PX * d.abs() as f64
+        })
+        .collect())
 }
 
 /// The maximum, over `region`'s four corners, of the Euclidean distance
@@ -248,10 +290,11 @@ fn recovered_transforms_stay_inside_the_per_frame_budget() {
     let region = solve_region_rect(rect);
     let reference = reference_index(&m);
     let good = &m["runs"]["rotation-scale"];
+    let regression = regression_budgets_px(&m).unwrap_or_else(|e| panic!("{e}"));
 
     println!(
-        "{:<6}{:>5}{:>16}{:>16}{:>12}",
-        "frame", "d", "full-rect px", "384-rect px", "budget px"
+        "{:<6}{:>5}{:>16}{:>16}{:>12}{:>14}",
+        "frame", "d", "full-rect px", "384-rect px", "budget px", "regression px"
     );
     for t in m["truth"].as_array().unwrap() {
         let frame = t["frame"].as_u64().unwrap() as usize;
@@ -267,12 +310,49 @@ fn recovered_transforms_stay_inside_the_per_frame_budget() {
         let full = corner_error(&truth_t, &recovered, rect);
         let sub = corner_error(&truth_t, &recovered, region);
         let budget = budget_px(d);
-        println!("{frame:<6}{d:>5}{full:>16.4}{sub:>16.4}{budget:>12.4}");
+        let pinned_budget = regression[frame];
+        println!("{frame:<6}{d:>5}{full:>16.4}{sub:>16.4}{budget:>12.4}{pinned_budget:>14.6}");
         assert!(
             full <= budget,
             "frame {frame} (d={d}): corner error {full:.4}px exceeds budget {budget:.4}px"
         );
+        assert!(
+            full <= pinned_budget,
+            "frame {frame} (d={d}): corner error {full:.6}px exceeds its pinned error plus \
+             {REGRESSION_PER_STEP_PX} px per step ({pinned_budget:.6}px)"
+        );
     }
+}
+
+/// The regression tier refuses a measurement the pinned row was not recorded
+/// for, naming the re-record rule, and covers the reference frame exactly.
+#[test]
+fn regression_tier_refuses_a_measurement_the_pin_does_not_cover() {
+    let covering = |count: u64, reference: u64, seed: u64| {
+        serde_json::json!({ "generator": {
+            "frame_count": count, "reference": reference, "seed": seed,
+        }})
+    };
+    for (what, m) in [
+        ("frame_count", covering(5, PINNED_REFERENCE, PINNED_SEED)),
+        ("reference", covering(PINNED_FRAME_COUNT, 2, PINNED_SEED)),
+        ("seed", covering(PINNED_FRAME_COUNT, PINNED_REFERENCE, 3)),
+    ] {
+        let err = regression_budgets_px(&m).unwrap_err();
+        assert!(
+            err.contains("re-record") && err.contains(what),
+            "a changed {what} must name the field and the re-record rule, got: {err}"
+        );
+    }
+    let budgets =
+        regression_budgets_px(&covering(PINNED_FRAME_COUNT, PINNED_REFERENCE, PINNED_SEED))
+            .expect("covered");
+    assert_eq!(budgets.len(), PINNED_ERROR_PX.len());
+    assert_eq!(budgets[PINNED_REFERENCE as usize], 0.0);
+    assert_eq!(
+        budgets[(PINNED_REFERENCE + 1) as usize],
+        PINNED_ERROR_PX[(PINNED_REFERENCE + 1) as usize] + REGRESSION_PER_STEP_PX
+    );
 }
 
 /// The claim's separation case: the identity (no-alignment) baseline is at

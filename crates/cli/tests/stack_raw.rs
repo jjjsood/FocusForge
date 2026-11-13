@@ -37,10 +37,145 @@ fn without_date_time(mut tiff: Vec<u8>) -> Vec<u8> {
 
 fn run(dir: &std::path::Path, args: &[String]) -> std::process::Output {
     common::cli_bin("stack_raw")
+        .env("FOCUSFORGE_SHOW_ETA", "1")
         .current_dir(dir)
         .args(args)
         .output()
         .expect("run CLI")
+}
+
+#[test]
+fn cache_refusal_message_states_the_limit_in_mb() {
+    let cwd = common::tmp_dir("stack_raw_cache_refusal");
+    let mut args = vec![
+        "stack".to_string(),
+        common::fixtures_dir()
+            .join("blackmagic-micro-dng")
+            .display()
+            .to_string(),
+        "-o".to_string(),
+        cwd.display().to_string(),
+        "--algorithm".to_string(),
+        "laplacian".to_string(),
+        "--no-align".to_string(),
+        "--no-crop".to_string(),
+        "--max-host-memory".to_string(),
+        "1".to_string(),
+    ];
+    if cfg!(feature = "gpu") {
+        args.push("--cpu".to_string());
+    }
+    let output = run(&cwd, &args);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("frame.dng"), "{stderr}");
+    assert!(stderr.contains("MB of working memory"), "{stderr}");
+    assert!(stderr.contains("memory limit allows 0 MB"), "{stderr}");
+    assert!(
+        stderr.contains("Raise the memory limit to at least"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("bytes"), "{stderr}");
+    assert!(!stderr.contains("cache bound"), "{stderr}");
+}
+
+#[test]
+fn raw_dry_run_reports_the_run_budget() {
+    let input = common::tmp_dir("stack_raw_dry_run_budget");
+    let cwd = common::tmp_dir("stack_raw_dry_run_budget_cwd");
+    let source = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![512; 64]),
+        false,
+    );
+    for index in 0..2 {
+        std::fs::copy(source.path(), input.join(format!("{index:02}.dng")))
+            .expect("copy RAW frame");
+    }
+    let reservation = 8 * 8 * 30 + std::fs::metadata(source.path()).expect("DNG size").len();
+    let dry_run = |budget: u64| {
+        let mut args = vec![
+            "stack".to_string(),
+            input.display().to_string(),
+            "-o".to_string(),
+            cwd.display().to_string(),
+            "--algorithm".to_string(),
+            "laplacian".to_string(),
+            "--no-align".to_string(),
+            "--no-crop".to_string(),
+            "--dry-run".to_string(),
+            "--json".to_string(),
+            "--max-host-memory".to_string(),
+            budget.to_string(),
+        ];
+        if cfg!(feature = "gpu") {
+            args.push("--cpu".to_string());
+        }
+        run(&cwd, &args)
+    };
+
+    let budget = 2 * reservation;
+    let output = dry_run(budget);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("the dry run prints JSON");
+    assert_eq!(plan["max_bytes_in_flight"], budget, "{plan}");
+
+    let refused = dry_run(reservation - 1);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("MB of working memory"), "{stderr}");
+    assert!(stderr.contains(".dng"), "{stderr}");
+}
+
+#[test]
+fn raw_dry_run_predicts_develop() {
+    let input = common::tmp_dir("stack_raw_dry_run_prediction");
+    let cwd = common::tmp_dir("stack_raw_dry_run_prediction_cwd");
+    let source = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![512; 64]),
+        false,
+    );
+    for index in 0..2 {
+        std::fs::copy(source.path(), input.join(format!("{index:02}.dng")))
+            .expect("copy RAW frame");
+    }
+    let mut args = vec![
+        "stack".to_string(),
+        input.display().to_string(),
+        "-o".to_string(),
+        cwd.display().to_string(),
+        "--algorithm".to_string(),
+        "laplacian".to_string(),
+        "--no-align".to_string(),
+        "--no-crop".to_string(),
+        "--dry-run".to_string(),
+        "--json".to_string(),
+    ];
+    if cfg!(feature = "gpu") {
+        args.push("--cpu".to_string());
+    }
+    let output = run(&cwd, &args);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("the dry run prints JSON");
+    assert_eq!(plan["run_plan"]["reader"], "raw", "{plan}");
+    let prediction = &plan["prediction"];
+    let develop = prediction["stages"]["develop"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("a RAW run develops: {prediction}"));
+    assert!(develop > 0.0, "{prediction}");
+    assert_eq!(
+        prediction["calibrated"], false,
+        "DNG is not the measured format: {prediction}"
+    );
 }
 
 #[test]
@@ -357,7 +492,16 @@ fn raw_stack_reports_the_develop_stage() {
                 .unwrap_or_else(|| panic!("no {needle:?} in: {stderr}"))
         };
         let entry = position(&format!("develop {count} frames (RAW)"));
-        let first = position(&format!("develop 0/{count} frames eta --"));
+        let develop_start = format!("develop 0/{count} frames eta ");
+        let first = position(&develop_start);
+        let estimate = stderr[first + develop_start.len()..]
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        assert!(
+            !estimate.is_empty() && estimate != "--",
+            "the develop line at 0 frames carries a seeded estimate: {stderr}"
+        );
         assert!(entry < first, "entry line precedes the count: {stderr}");
         assert!(
             first < position("fuse "),
@@ -808,5 +952,235 @@ fn corpus_frame_stacks_on_default_backend() {
     assert!(!low_memory.status.success());
     let low_memory_stderr = String::from_utf8_lossy(&low_memory.stderr);
     eprintln!("corpus low_memory_refusal={low_memory_stderr}");
-    assert!(low_memory_stderr.contains("RAW cache bound"));
+    assert!(
+        low_memory_stderr.contains("memory limit"),
+        "{low_memory_stderr}"
+    );
+}
+
+/// Three 256 x 256 RAW frames in `<cwd>/input`, with their decode reservation
+/// and the bytes they take developed.
+fn gradient_raw_stack(cwd: &std::path::Path) -> (std::path::PathBuf, u64, u64) {
+    let input = cwd.join("input");
+    std::fs::create_dir(&input).expect("input directory");
+    let mut spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], Vec::new());
+    spec.width = 256;
+    spec.height = 256;
+    spec.samples = (0..256u32 * 256)
+        .map(|i| (((i % 256) + (i / 256)) * 8 % 4000) as u16)
+        .collect();
+    let source = write_dng(&spec, false);
+    for index in 0..3 {
+        std::fs::copy(source.path(), input.join(format!("{index:02}.dng"))).expect("copy frame");
+    }
+    let raw = RawStack::open_files(&[input.join("00.dng")]).expect("source RAW");
+    let metadata = raw.metadata(0).expect("frame 0 metadata");
+    let reservation = u64::from(metadata.raw_width) * u64::from(metadata.raw_height) * 30
+        + std::fs::metadata(source.path()).expect("DNG size").len();
+    (input, reservation, 3 * 256 * 256 * 6)
+}
+
+const SMALL_TILES: [&str; 4] = ["--tile-size", "160", "--set", "levels=3"];
+
+fn json_of(output: &std::process::Output) -> serde_json::Value {
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("JSON document")
+}
+
+#[test]
+fn raw_in_ram_frames_narrow_the_scheduler_budget() {
+    let cwd = common::tmp_dir("stack_raw_in_ram_budget");
+    let (input, reservation, frames) = gradient_raw_stack(&cwd);
+    let ceiling = 1u64 << 30;
+    let roomy = ceiling.to_string();
+    // Room for a decode, not for the frames beside it.
+    let tight = (reservation + frames / 2).to_string();
+    let args = |output: &str, ceiling: &str, extra: &[&str]| {
+        let output = cwd.join(output);
+        std::fs::create_dir(&output).expect("output directory");
+        let mut args = vec!["--max-host-memory", ceiling];
+        args.extend(SMALL_TILES);
+        args.extend(extra);
+        stack_json_args(&input, &output, &args)
+    };
+
+    let stacked = json_of(&run(&cwd, &args("ram", &roomy, &[])));
+    let dry = json_of(&run(&cwd, &args("ram-dry", &roomy, &["--dry-run"])));
+    for (what, report) in [("run", &stacked), ("dry run", &dry)] {
+        assert_eq!(report["developed_store"], "memory", "{what}: {report}");
+        assert_eq!(
+            report["max_bytes_in_flight"],
+            ceiling - frames,
+            "{what}: {report}"
+        );
+    }
+    assert!(stacked["band_columns"].is_null(), "{stacked}");
+
+    let stacked = json_of(&run(&cwd, &args("disk", &tight, &[])));
+    let dry = json_of(&run(&cwd, &args("disk-dry", &tight, &["--dry-run"])));
+    for (what, report) in [("run", &stacked), ("dry run", &dry)] {
+        assert_eq!(
+            report["developed_store"], "scratch_file",
+            "{what}: {report}"
+        );
+        assert_eq!(
+            report["max_bytes_in_flight"],
+            reservation + frames / 2,
+            "{what}: {report}"
+        );
+    }
+
+    let tiff = cwd.join("tiff");
+    std::fs::create_dir(&tiff).expect("output directory");
+    let frames = common::fixtures_dir().join("mantis-64").join("frames");
+    let stacked = json_of(&run(&cwd, &stack_json_args(&frames, &tiff, &[])));
+    assert!(stacked["developed_store"].is_null(), "{stacked}");
+}
+
+#[test]
+fn raw_run_and_dry_run_report_working_set_and_bound() {
+    let cwd = common::tmp_dir("stack_raw_working_set_and_bound");
+    let (input, reservation, frames) = gradient_raw_stack(&cwd);
+    let roomy = (1u64 << 30).to_string();
+    let tight = (reservation + frames / 2).to_string();
+    let args = |output: &str, ceiling: &str, extra: &[&str]| {
+        let output = cwd.join(output);
+        std::fs::create_dir(&output).expect("output directory");
+        let mut args = vec!["--max-host-memory", ceiling];
+        args.extend(SMALL_TILES);
+        args.extend(extra);
+        stack_json_args(&input, &output, &args)
+    };
+
+    // (store, working set one tile's reads keep hot across all frames)
+    for (name, ceiling, store, working_set) in [
+        ("ram", &roomy, "memory", serde_json::Value::Null),
+        ("disk", &tight, "scratch_file", serde_json::json!(frames)),
+    ] {
+        let stacked = json_of(&run(&cwd, &args(name, ceiling, &[])));
+        let dry = json_of(&run(
+            &cwd,
+            &args(&format!("{name}-dry"), ceiling, &["--dry-run"]),
+        ));
+        for (what, report) in [("run", &stacked), ("dry run", &dry)] {
+            assert_eq!(report["developed_store"], store, "{name} {what}: {report}");
+            assert_eq!(
+                report["page_cache_bytes_per_tile"], working_set,
+                "{name} {what}: {report}"
+            );
+        }
+        assert_eq!(
+            dry["in_flight_bound"], stacked["in_flight_bound"],
+            "{name}: plan and run name the same bound"
+        );
+        // The thread cap binds exactly when the budget would allow more tiles
+        // than the limit, whatever the core count.
+        let limit = stacked["in_flight_limit"].as_u64().expect("limit");
+        let per_tile = stacked["accounted_bytes_in_flight"]
+            .as_u64()
+            .expect("bytes")
+            / limit;
+        let allowed = stacked["max_bytes_in_flight"].as_u64().expect("budget") / per_tile;
+        let bound = if allowed > limit {
+            "thread_cap"
+        } else {
+            "host_budget"
+        };
+        assert_eq!(stacked["in_flight_bound"], bound, "{name}: {stacked}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_stack_output_is_identical_in_ram_and_on_disk() {
+    let cwd = common::tmp_dir("stack_raw_in_ram_identical");
+    let (input, reservation, frames) = gradient_raw_stack(&cwd);
+    let tight = (reservation + frames / 2).to_string();
+    let mut composites = Vec::new();
+    for (name, ceiling) in [("ram", None), ("disk", Some(tight))] {
+        let output = cwd.join(name);
+        std::fs::create_dir(&output).expect("output directory");
+        let mut extra = SMALL_TILES.to_vec();
+        if let Some(ceiling) = &ceiling {
+            extra.extend(["--max-host-memory", ceiling]);
+        }
+        let report = json_of(&run(&cwd, &stack_json_args(&input, &output, &extra)));
+        let want = if ceiling.is_some() {
+            "scratch_file"
+        } else {
+            "memory"
+        };
+        assert_eq!(report["developed_store"], want, "{name}: {report}");
+        let composite = cwd.join(format!("{name}.tif"));
+        let exported = Command::new(env!("CARGO_BIN_EXE_focusforge-cli"))
+            .current_dir(&*cwd)
+            .args([
+                "export",
+                output.join("input.ffp").to_str().expect("UTF-8 project"),
+                "-o",
+                composite.to_str().expect("UTF-8 composite"),
+            ])
+            .output()
+            .expect("run export");
+        assert!(
+            exported.status.success(),
+            "export stderr: {}",
+            String::from_utf8_lossy(&exported.stderr)
+        );
+        composites.push(without_date_time(
+            std::fs::read(composite).expect("exported composite"),
+        ));
+    }
+    assert!(
+        composites[0] == composites[1],
+        "the stores gave different composites"
+    );
+}
+
+#[test]
+fn run_plan_names_raw_input() {
+    let input = common::tmp_dir("stack_raw_run_plan");
+    let cwd = common::tmp_dir("stack_raw_run_plan_cwd");
+    let source = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![512; 64]),
+        false,
+    );
+    for index in 0..2 {
+        std::fs::copy(source.path(), input.join(format!("{index:02}.dng")))
+            .expect("copy RAW frame");
+    }
+    let plan = |extra: &[&str]| -> serde_json::Value {
+        let mut args = vec![
+            "stack".to_string(),
+            input.display().to_string(),
+            "-o".to_string(),
+            cwd.display().to_string(),
+            "--algorithm".to_string(),
+            "laplacian".to_string(),
+            "--no-align".to_string(),
+            "--no-crop".to_string(),
+            "--json".to_string(),
+        ];
+        args.extend(extra.iter().map(ToString::to_string));
+        if cfg!(feature = "gpu") {
+            args.push("--cpu".to_string());
+        }
+        let output = run(&cwd, &args);
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("--json must parse")
+    };
+    let dry = plan(&["--dry-run"]);
+    let ran = plan(&[]);
+    assert_eq!(ran["run_plan"], dry["run_plan"], "{ran}");
+    assert_eq!(ran["run_plan"]["reader"], "raw", "{ran}");
+    assert_eq!(ran["run_plan"]["source_bits_per_sample"], 32, "{ran}");
+    assert_eq!(ran["run_plan"]["frame_count"], 2, "{ran}");
 }

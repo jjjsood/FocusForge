@@ -266,14 +266,36 @@ fn jpeg_cache_stays_within_its_bound() {
             )
             .is_err()
     );
+}
 
-    let required = reservation(&first);
+#[test]
+fn jpeg_cache_refusal_message_is_in_mb_with_tiff_advice() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let first = write(
+        dir.path(),
+        "00.jpg",
+        &encode(37, 23, 3, SamplingFactor::F_1_1, None),
+    );
+    let required = std::fs::metadata(&first).expect("size").len() + 3 * 37 * 23 * 3;
     let small = JpegStack::open_files_with_budget(std::slice::from_ref(&first), required - 1)
         .expect("metadata fits without decode");
     let message = tile_error(&small, 0);
-    assert!(message.contains(&first.display().to_string()), "{message}");
-    assert!(message.contains(&(required - 1).to_string()), "{message}");
-    assert!(message.contains(&required.to_string()), "{message}");
+    assert_refusal_text(&message, &first, required);
+    let tiny = JpegStack::open_files_with_budget(std::slice::from_ref(&first), 1)
+        .expect("metadata fits without decode");
+    let message = tile_error(&tiny, 0);
+    assert_refusal_text(&message, &first, required);
+    assert!(message.contains("allows 0 MB"), "{message}");
+}
+
+fn assert_refusal_text(message: &str, path: &Path, required: u64) {
+    assert!(message.contains(&path.display().to_string()), "{message}");
+    let need = format!("needs {} MB", required.div_ceil(1_000_000));
+    assert!(message.contains(&need), "{message}");
+    assert!(message.contains("memory limit"), "{message}");
+    assert!(message.contains("convert the frames to TIFF"), "{message}");
+    assert!(!message.contains("bytes"), "{message}");
+    assert!(!message.contains(&required.to_string()), "{message}");
 }
 
 fn patch_sof(bytes: &mut [u8], marker: Option<u8>, precision: Option<u8>) {

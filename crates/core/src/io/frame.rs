@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::algorithm::{AlgorithmError, TileReader};
 use crate::params::StackContext;
+use crate::tile::HostBudget;
 
 /// One frame's identity for resume comparison, geometry, and layout facts.
 #[derive(Debug, Clone, PartialEq)]
@@ -72,6 +73,16 @@ pub enum FrameError {
     Jpeg(#[from] crate::io::JpegError),
 }
 
+/// Where [`FrameReader::develop_once`] keeps the developed frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DevelopStore {
+    /// Anonymous memory, nothing written to disk.
+    Memory,
+    /// Files under the scratch root.
+    ScratchFile,
+}
+
 /// An opened set of frames and its tile-shaped pixel source.
 pub trait FrameReader: TileReader + Send + Sync {
     /// How many frames this reader holds.
@@ -94,17 +105,17 @@ pub trait FrameReader: TileReader + Send + Sync {
         None
     }
 
-    /// Develops every frame once into files under `scratch_root`, which later
-    /// reads are served from: up to `workers` at a time, within `budget` bytes
-    /// of decode reservations. Returns how many develop at once, `0` for a
-    /// reader with nothing to develop. `cancelled` is polled before each frame
-    /// ([`AlgorithmError::Cancelled`]); a failed or cancelled pass leaves
-    /// nothing under `scratch_root`. `developed` gains one as each frame
-    /// finishes.
+    /// Develops every frame once into `store`, which later reads are served
+    /// from: up to `workers` at a time, within `budget` bytes of decode
+    /// reservations. [`DevelopStore::ScratchFile`] writes files under
+    /// `scratch_root`, [`DevelopStore::Memory`] nothing there. Returns how many
+    /// develop at once, `0` for nothing to develop. `cancelled` is polled
+    /// before each frame; a failed or cancelled pass keeps no frame and no file.
     fn develop_once(
         &self,
         _scratch_root: &Path,
-        _budget: u64,
+        _store: DevelopStore,
+        _budget: HostBudget,
         _workers: usize,
         _cancelled: &(dyn Fn() -> bool + Sync),
         _developed: &AtomicUsize,
@@ -112,10 +123,24 @@ pub trait FrameReader: TileReader + Send + Sync {
         Ok(0)
     }
 
-    /// Bytes [`FrameReader::develop_once`] writes under its `scratch_root`;
-    /// `0` for a reader that develops nothing.
+    /// Bytes the developed frames occupy, in either store; `0` for a reader
+    /// that develops nothing.
     fn develop_scratch_bytes(&self) -> Result<u64, AlgorithmError> {
         Ok(0)
+    }
+
+    /// Where [`FrameReader::develop_once`] should keep the frames: memory
+    /// when every frame plus the larger of the pass's decode reservations
+    /// (`workers` at a time) and `tile_share` bytes of tile scheduling fits
+    /// `budget`, else scratch files. `None` for a reader with nothing to
+    /// develop.
+    fn develop_store(
+        &self,
+        _budget: HostBudget,
+        _workers: usize,
+        _tile_share: u64,
+    ) -> Result<Option<DevelopStore>, AlgorithmError> {
+        Ok(None)
     }
 
     /// Facts used to resolve stack-dependent parameters.

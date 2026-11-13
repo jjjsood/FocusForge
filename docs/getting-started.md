@@ -4,9 +4,34 @@ FocusForge comes as one package per operating system. Each package holds the
 desktop application, which this manual describes, and the `focusforge-cli`
 command-line program, which does the same work from a terminal.
 
-FocusForge is always available from source. Release packages are optional:
-use one only when the release you want actually provides it for your system,
-otherwise follow [Build from source](#build-from-source) below.
+Release packages exist for the systems listed under
+[What to download](#what-to-download). For any other system, or to build
+FocusForge yourself, see
+[`CONTRIBUTING.md`](https://github.com/jjjsood/FocusForge/blob/main/CONTRIBUTING.md)
+in the repository.
+
+## What your computer needs
+
+- **Free RAM.** What counts is the memory that is free when you fuse, not the
+  memory installed. Plan on about 4 GB free for a stack of TIFF files, 5 GB
+  for JPEG, 8 GB for camera RAW from a 24 to 26 megapixel camera and 15 GB
+  for camera RAW from a 45 to 61 megapixel one. The number of frames hardly
+  matters.
+- **Graphics card.** Optional. FocusForge uses one when it finds one and gives
+  the same result without, only more slowly (see
+  [Machines without a GPU](#machines-without-a-gpu)).
+- **Disk space.** Room for your project files and exported images. A camera
+  RAW stack that does not fit in memory also uses temporary files, 160 to
+  370 MB per frame. FocusForge checks the free space before a run and tells
+  you if it is too little ([Not enough free
+  space](troubleshooting.md#not-enough-free-space)).
+- **Files.** FocusForge opens TIFF, JPEG and camera RAW frames and never
+  changes them. It writes project files (`.ffp`), the images you export
+  (TIFF, PNG, JPEG, and DNG for a RAW project) and, in its own folders, its
+  settings, logs and temporary files (see
+  [Storage](guide/settings-window.md#storage)). The full list of readable
+  files is in [Which files can FocusForge
+  read?](troubleshooting.md#which-files-can-focusforge-read).
 
 ## What to download
 
@@ -21,9 +46,8 @@ for the release number, for example `0.1.0`.
 | Mac with Apple silicon (M1 and later) | `FocusForge-<version>-aarch64.dmg` | A disk image holding `FocusForge.app` |
 | Windows, 64-bit | `FocusForge-<version>-x86_64.msi` | An installer |
 
-> **Note:** A release lists only the files it was built with. If the file for
-> your system is missing, build from source instead; nothing in this manual
-> depends on how you installed.
+> **Note:** A release lists only the files it was built with. Nothing in this
+> manual depends on how you installed.
 
 ## Linux
 
@@ -98,6 +122,8 @@ path.
 `focusforge-gui` tries GPU-backed graphics adapters first and falls back to a
 software adapter (for example in a virtual machine or a Remote Desktop
 session), logging a warning that names it. It runs there at software speed.
+`focusforge-cli stack` and the stacking in the window never compute on a software
+adapter: fusion and alignment run on the CPU, and the log names the adapter.
 When no adapter works at all it exits with an error; on Windows, started from
 the Start menu, it shows that error in a message box.
 
@@ -109,19 +135,6 @@ the terminal that started the program, including when its output is
 redirected. PowerShell does not wait for a windowed program, so there pipe
 the output instead: `focusforge-gui --help | Out-File help.txt`, or
 `focusforge-gui --no-such-flag 2>&1 | Out-String` to get `$LASTEXITCODE`.
-
-## Build from source
-
-Building from source works on every system FocusForge supports and is the way
-to go when no package fits. It needs the Rust toolchain; the exact steps,
-including the one system library Linux needs, are in the repository's
-[build instructions](https://github.com/jjjsood/FocusForge#build). The build
-produces `target/release/focusforge-gui` (the window) and
-`target/release/focusforge-cli`. Start the window with:
-
-```bash
-target/release/focusforge-gui
-```
 
 ## First launch
 

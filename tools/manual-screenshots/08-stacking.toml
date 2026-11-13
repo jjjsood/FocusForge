@@ -132,7 +132,8 @@ steps = [
   ["wait-text", "DEFAULT", "120"],
   ["click-id", "FFToolbar::fuse-button"],
   ["wait-id", "FFToolbar::pause-button", "120"],
-  ["pause", "2000"],
+  ["wait-text", " of 8", "60"],
+  ["pause", "500"],
 ]
 out   = "assets/manual/stacking/stacking-locked-during-run.png"
 

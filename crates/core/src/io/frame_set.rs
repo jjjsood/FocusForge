@@ -9,7 +9,8 @@ use super::{
 use crate::tile::HostBudget;
 
 /// The reader selected for a frame set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReaderKind {
     /// Direct memory-mapped reads from uncompressed strips.
     Mmap,
@@ -62,6 +63,20 @@ fn format_name(path: &Path) -> &'static str {
     }
 }
 
+/// The bit depth of the samples a `kind` reader's source holds: the first
+/// TIFF channel's depth for the TIFF readers, 8 for JPEG, and 32 for RAW
+/// (developed to `f32`). Reads only `first_frame`'s header.
+pub fn source_bits_per_sample(kind: ReaderKind, first_frame: &Path) -> Result<u16, TiffError> {
+    match kind {
+        ReaderKind::Mmap | ReaderKind::Decoded => {
+            let header = TiffHeader::open(first_frame)?;
+            Ok(header.bits_per_sample.first().copied().unwrap_or(16))
+        }
+        ReaderKind::Jpeg => Ok(8),
+        ReaderKind::Raw => Ok(32),
+    }
+}
+
 /// Open `paths` with the reader their headers permit.
 pub fn open_frame_set(paths: &[PathBuf], budget: HostBudget) -> Result<FrameSet, FrameError> {
     let Some(first_path) = paths.first() else {
@@ -83,22 +98,20 @@ pub fn open_frame_set(paths: &[PathBuf], budget: HostBudget) -> Result<FrameSet,
         }
     }
     if first_format == "RAW" {
-        let shares = budget.partition_for_decoded_cache();
+        let (reader, scheduler_budget) = RawStack::open_files_for_budget(paths, budget)?;
         return Ok(FrameSet {
-            reader: Box::new(RawStack::open_files_with_budget(
-                paths,
-                shares.cache.bytes(),
-            )?),
+            reader: Box::new(reader),
             kind: ReaderKind::Raw,
-            scheduler_budget: shares.scheduler,
+            scheduler_budget,
         });
     }
     if first_format == "JPEG" {
         let shares = budget.partition_for_decoded_cache();
         return Ok(FrameSet {
-            reader: Box::new(JpegStack::open_files_with_budget(
+            reader: Box::new(JpegStack::open_files_bounded(
                 paths,
                 shares.cache.bytes(),
+                shares.cache_bound(),
             )?),
             kind: ReaderKind::Jpeg,
             scheduler_budget: shares.scheduler,
@@ -120,7 +133,11 @@ pub fn open_frame_set(paths: &[PathBuf], budget: HostBudget) -> Result<FrameSet,
         ReaderKind::Decoded => {
             let shares = budget.partition_for_decoded_cache();
             Ok(FrameSet {
-                reader: Box::new(DecodedTiffStack::open_files(paths, shares.cache.bytes())?),
+                reader: Box::new(DecodedTiffStack::open_files_bounded(
+                    paths,
+                    shares.cache.bytes(),
+                    shares.cache_bound(),
+                )?),
                 kind,
                 scheduler_budget: shares.scheduler,
             })

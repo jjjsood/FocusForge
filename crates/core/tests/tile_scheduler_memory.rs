@@ -28,6 +28,13 @@ use std::time::Duration;
 use focusforge_core::algorithm::{AlgorithmError, TileReader};
 use focusforge_core::fuse::FusionConsumer;
 use focusforge_core::host::HostFacts;
+use focusforge_core::tile::{HOST_BUDGET_SHARE_PERCENT, HOST_FIXED_BYTES};
+
+/// The usable available memory at which a host-derived budget is exactly
+/// `budget` bytes.
+fn available_for(budget: u64) -> u64 {
+    HOST_FIXED_BYTES + (budget * 100).div_ceil(HOST_BUDGET_SHARE_PERCENT)
+}
 use focusforge_core::io::TiffStack;
 use focusforge_core::params::{self, ParamValues, StackContext};
 use focusforge_core::registry;
@@ -344,11 +351,17 @@ fn pool_decouples_from_the_in_flight_limit_at_scale() {
     }
 
     let frame_count = 600usize;
-    // usable_available = 300_000 B; budget = 40% = 120_000 B. One 128x128 RGB
+    // The host budget is 120_000 B. One 128x128 RGB
     // tile is 114_688 B whatever the frame count, so the budget covers it
     // once and `in_flight_limit()` is 1, while `pool_threads()` stays
     // decoupled from it.
-    let facts = HostFacts::new(600_000, 300_000, None, None, available_parallelism);
+    let facts = HostFacts::new(
+        2 * available_for(120_000),
+        available_for(120_000),
+        None,
+        None,
+        available_parallelism,
+    );
     let scratch_base =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tile_scheduler_memory_decouple");
     let mut options = TileSchedulerOptions::with_host_facts(scratch_base, &facts);
@@ -404,8 +417,8 @@ fn a_tile_larger_than_the_frame_is_accounted_at_the_frame_extent() {
 #[test]
 fn too_small_host_budget_is_refused_by_name() {
     let _guard = serial();
-    // usable_available = 100 B; budget = 40% = 40 B, far under one tile.
-    let facts = HostFacts::new(1_000, 100, None, None, 4);
+    // The host budget is 40 B, far under one tile.
+    let facts = HostFacts::new(2 * available_for(40), available_for(40), None, None, 4);
     let scratch_base =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tile_scheduler_memory_too_small");
     let mut options = TileSchedulerOptions::with_host_facts(scratch_base, &facts);
@@ -470,9 +483,15 @@ impl TileReader for ScratchReader {
 #[test]
 fn host_refusal_counts_reader_scratch() {
     let _guard = serial();
-    // usable_available = 2_000_000 B; budget = 40% = 800_000 B, above the
-    // 114_688 B of tile and below the 1_114_688 B with scratch.
-    let facts = HostFacts::new(4_000_000, 2_000_000, None, None, 4);
+    // The host budget is 800_000 B, above the 114_688 B of tile and below
+    // the 1_114_688 B with scratch.
+    let facts = HostFacts::new(
+        2 * available_for(800_000),
+        available_for(800_000),
+        None,
+        None,
+        4,
+    );
     let scratch_base =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("tile_scheduler_memory_scratch_refusal");
     let mut options = TileSchedulerOptions::with_host_facts(scratch_base, &facts);
@@ -494,6 +513,81 @@ fn host_refusal_counts_reader_scratch() {
         Ok(_) => panic!("scratch must count towards the host refusal"),
         Err(other) => panic!("expected HostMemoryTooSmall, got {other:?}"),
     }
+}
+
+/// A zero-filling reader whose every frame keeps a fixed number of file-cache
+/// bytes hot per read.
+struct PageCacheReader(u64);
+
+impl TileReader for PageCacheReader {
+    fn read_tile_into(
+        &self,
+        _frame: usize,
+        _rect: Rect,
+        out: &mut [u16],
+    ) -> Result<(), AlgorithmError> {
+        out.fill(0);
+        Ok(())
+    }
+
+    fn read_page_cache_bytes(&self, _width: u32, _height: u32) -> u64 {
+        self.0
+    }
+}
+
+/// A reader's page-cache working set times the frame count sets the band
+/// width from the cgroup limit and leaves the in-flight limit at the
+/// zero-working-set value.
+#[test]
+fn page_cache_working_set_sets_band_columns() {
+    use focusforge_core::host::FixedFacts;
+    use focusforge_core::tile::{HostSources, MonotonicClock};
+
+    let _guard = serial();
+    // 12 MB above the fixed part; a tile is 128 x 128 x 7 B = 114_688 B.
+    let facts = HostFacts::new(
+        64_000_000_000,
+        50_000_000_000,
+        Some(HOST_FIXED_BYTES + 12_000_000),
+        Some(0),
+        16,
+    );
+    let scheduler_for = |reader: &dyn TileReader, frame_count: usize, name: &str| {
+        let scratch_base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+        let mut options = TileSchedulerOptions::explicit_budget(scratch_base, u64::MAX);
+        options.host = HostSources {
+            probe: std::sync::Arc::new(FixedFacts(facts)),
+            clock: std::sync::Arc::new(MonotonicClock::new()),
+        };
+        options.tile_size = 128;
+        options.levels = 0;
+        let stack_ctx = StackContext::new(frame_count, 512, 512, 3);
+        let scheduler =
+            TileScheduler::new(reader, stack_ctx, 3, &options).expect("scheduler must build");
+        (scheduler.in_flight_limit(), scheduler.band_columns())
+    };
+    let (none_limit, none_bands) =
+        scheduler_for(&ZeroReader, 8, "tile_scheduler_memory_bands_none");
+    assert_eq!(none_bands, None, "no working set, no bands");
+    // 12e6 less `limit` tiles of 114_688 B, over 1e6 x frames:
+    // 2 frames, (12e6 - limit x 114_688) / 2e6 = 5 for a limit of 6 or more;
+    // 8 frames, (12e6 - limit x 114_688) / 8e6 = 1.
+    let (limit, bands) = scheduler_for(
+        &PageCacheReader(1_000_000),
+        2,
+        "tile_scheduler_memory_bands_2",
+    );
+    assert_eq!(limit, none_limit, "the working set leaves the limit");
+    let expected = (12_000_000 - limit as u64 * 114_688) / 2_000_000;
+    assert_eq!(bands, Some(expected as usize));
+    let (limit, bands) = scheduler_for(
+        &PageCacheReader(1_000_000),
+        8,
+        "tile_scheduler_memory_bands_8",
+    );
+    assert_eq!(limit, none_limit);
+    let expected = ((12_000_000 - limit as u64 * 114_688) / 8_000_000).max(1);
+    assert_eq!(bands, Some(expected as usize));
 }
 
 /// A scaling warp reads a wider footprint than the tile it delivers, so the
@@ -755,7 +849,8 @@ fn f32_tile_budget_counts_four_byte_samples() {
     assert_eq!(f32_bytes - u16_bytes, side * side * spp * 2);
 
     let stack_ctx = StackContext::new(8, 128, 128, 3);
-    let build = |reader: &dyn TileReader, usable: u64, name: &str| {
+    let build = |reader: &dyn TileReader, budget: u64, name: &str| {
+        let usable = available_for(budget);
         let facts = HostFacts::new(usable * 4, usable, None, None, 4);
         let scratch_base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
         let mut options = TileSchedulerOptions::with_host_facts(scratch_base, &facts);
@@ -763,8 +858,7 @@ fn f32_tile_budget_counts_four_byte_samples() {
         options.levels = 0;
         TileScheduler::new(reader, stack_ctx, 3, &options).map(|s| s.bytes_per_tile())
     };
-    // The host budget is 40% of the usable bytes.
-    let exact = f32_bytes * 5 / 2;
+    let exact = f32_bytes;
     assert_eq!(
         build(&ZeroReaderF32, exact, "f32_budget_exact").unwrap(),
         f32_bytes
@@ -773,7 +867,7 @@ fn f32_tile_budget_counts_four_byte_samples() {
         build(&ZeroReader, exact, "f32_budget_u16").unwrap(),
         u16_bytes
     );
-    match build(&ZeroReaderF32, exact - 2, "f32_budget_short") {
+    match build(&ZeroReaderF32, exact - 1, "f32_budget_short") {
         Err(TileError::HostMemoryTooSmall {
             budget_bytes,
             bytes_per_tile,

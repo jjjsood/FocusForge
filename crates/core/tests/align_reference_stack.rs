@@ -23,7 +23,6 @@ use focusforge_core::align::{
 use focusforge_core::io::{TiffStack, frame_paths};
 use focusforge_core::params::StackContext;
 use focusforge_core::registry;
-use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 
 /// Serializes this file's ignored tests so only one reads the 16 GB stack at a
 /// time: run in parallel they would compete for the same disk and for the
@@ -278,7 +277,7 @@ fn the_reference_stack_seeds_on_coarse_levels() {
         AlignPyramid::stream(
             (width, height, spp),
             5,
-            DEFAULT_TILE_SIZE / 2,
+            AlignPyramid::BAND_ROWS,
             |rect, out| ctx.read_tile_into(frame, rect, out),
         )
         .unwrap_or_else(|_| panic!("streaming frame {frame}"))

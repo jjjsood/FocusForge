@@ -30,7 +30,7 @@
 **From shoot to sharp image**
 - Drop in a focus bracket straight from the camera, camera RAW, TIFF or JPEG, and get one image sharp from front to back
 - Shot several subjects in one session? FocusForge sorts the card into separate stacks for you; check the split before it runs
-- Long brackets of high-resolution frames run on an ordinary computer, however much memory the stack would need
+- Long brackets of high-resolution frames run on an ordinary computer: the whole stack never has to fit in memory, only one frame's working memory does (see [What your computer needs](#what-your-computer-needs))
 - Shot handheld, or your lens breathes while focusing? Frames are lined up first and the edges trimmed to what every shot covers
 - Flickering light or exposure drift between shots is evened out
 - Three methods to choose from: Details as the all-rounder, Soft transitions for gentler blends between frames, Focus map for the most coherent source map to pick from
@@ -47,6 +47,7 @@
 **Working through a whole session**
 - Use the desktop app, or script the same steps from the command line
 - Pause, cancel and pick up long runs later without starting over
+- See how long a run will take before it starts: `focusforge-cli stack --dry-run` prints a predicted duration
 - Save your favourite settings as presets; re-run only the one stack you want to tweak
 - A summary after each batch shows which stacks worked, so nothing goes missing quietly
 - Problems and notices collect in one place, and reach you as a system notification while you're in another app
@@ -65,12 +66,18 @@ Linux: install the matching `.deb` or run its AppImage from [Releases](https://g
 macOS: open the matching `.dmg` from [Releases](https://github.com/jjjsood/FocusForge/releases) and drag it to Applications, or build from source.
 Windows: run the matching `.msi` from [Releases](https://github.com/jjjsood/FocusForge/releases), or build from source; no Visual C++ redistributable is needed. See [getting started](docs/getting-started.md) for paths.
 
+## What your computer needs
+
+What a run needs depends on the kind and size of the frames, not on how many there are, and it is the **free** RAM that counts: about 4 GB for TIFF, 5 GB for JPEG, 8 to 15 GB for camera RAW. A graphics card is optional and the result is the same without one.
+
+The [installation chapter](docs/getting-started.md#what-your-computer-needs) lists what else a computer needs.
+
 ## Quick start
 
 ### Build
 
 Rust, toolchain pinned to `1.95.0` (`rust-toolchain.toml`, picked up
-automatically by `rustup`). `crates/gui` links Slint with
+automatically by `rustup`). `crates/ui` and `crates/gui` link Slint with
 `renderer-femtovg-wgpu`, which has a hard dependency on fontconfig; on
 Debian/Ubuntu-family hosts install the dev package before building:
 
@@ -91,15 +98,9 @@ CPU and `--cpu` does not exist as a flag.
 
 ```bash
 target/release/focusforge-cli info path/to/frames/
-target/release/focusforge-cli info path/to/project.ffp
 ```
 
-For a project file, prints stored project facts after structural and head
-Z-Map validation without reading source frames. For a directory, prints one
-block per frame. TIFF entries show size, depth, byte order, compression and
-strip layout; RAW entries show decoder metadata without developing pixels. The
-report ends with a frame count, total size and a uniform-layout verdict. Add
-`--json` for the same report as machine-readable JSON.
+Prints one block per frame and a summary with the frame count and whether all frames share one layout. `info` also reads a `.ffp` project; add `--json` for machine-readable output.
 
 ### Stack a folder
 
@@ -144,12 +145,11 @@ demand.
 
 ## Documentation
 
-The user manual is an mdBook whose source is in [`docs/`](docs/README.md). It
-covers focus stacking and shooting practice, [getting started](docs/getting-started.md),
-the window, stacking, alignment, retouching, checkpoints, export and
-settings, troubleshooting and a glossary. The appendix is the reference for
-every `focusforge-cli` subcommand, the project format and the TIFF layouts it
-reads and writes.
+[Read the manual online](https://jjjsood.github.io/FocusForge/); its mdBook source
+is in [`docs/`](docs/README.md). It covers focus stacking and shooting practice,
+[getting started](docs/getting-started.md), the window, stacking, alignment,
+retouching, checkpoints, export and settings, troubleshooting and a glossary.
+The appendix has the reference for every `focusforge-cli` subcommand.
 
 ## Contributing
 

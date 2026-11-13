@@ -8,9 +8,9 @@
 //! operation actually returns — either a wrapped [`Refusal`] or one of the
 //! structural failures (bad magic, truncated IFD, a value past EOF, …).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::tile::{Rect, SampleFormat};
+use crate::tile::{MemoryBound, Rect, SampleFormat};
 
 /// Why a file that parsed fine does not qualify for the fast (mmap, no
 /// decode) path. The file is not necessarily broken — it is simply outside
@@ -87,11 +87,15 @@ pub enum TiffError {
     },
 
     /// The decoded-segment cache cannot retain even one segment.
-    #[error("{}: decoded cache bound {bound} bytes is below required segment size {required} bytes", path.display())]
+    #[error("{}", cache_refusal_message(path, *bound, *required, *bounded_by, false))]
     DecodedCacheTooSmall {
         path: PathBuf,
+        /// Cache capacity the file got.
         bound: u64,
+        /// Largest decoded segment.
         required: u64,
+        /// What limited `bound`.
+        bounded_by: MemoryBound,
     },
 
     /// The requested frame does not exist in this opened set.
@@ -214,4 +218,162 @@ pub enum TiffError {
         expected: String,
         found: String,
     },
+}
+
+const BYTES_PER_MB: u64 = 1_000_000;
+
+/// The user-facing sentence for a reader that cannot hold one frame's working
+/// memory: sizes in decimal MB, plainly a free-RAM problem when the bound
+/// derives from free RAM, a memory-limit problem when it derives from a fixed
+/// limit. `bound` is what the file got, `required` what it needs;
+/// `bounded_by` says how `bound` came about, and `suggest_tiff` adds the
+/// advice to convert the frames to TIFF.
+pub(crate) fn cache_refusal_message(
+    path: &Path,
+    bound: u64,
+    required: u64,
+    bounded_by: MemoryBound,
+    suggest_tiff: bool,
+) -> String {
+    let need = required.div_ceil(BYTES_PER_MB);
+    let tiff = if suggest_tiff {
+        ", or convert the frames to TIFF"
+    } else {
+        ""
+    };
+    let path = path.display();
+    match bounded_by {
+        MemoryBound::FreeRam {
+            share_percent,
+            fixed_bytes,
+            divisor,
+        } => {
+            let to_free_ram = |bytes: u64| {
+                bytes
+                    .saturating_mul(100 * divisor)
+                    .div_ceil(share_percent.max(1))
+            };
+            // No bound at all means the host is under the fixed part, whose
+            // free RAM is unknown here, so the total is named instead.
+            let ask = if bound == 0 {
+                let total = fixed_bytes
+                    .saturating_add(to_free_ram(required))
+                    .div_ceil(BYTES_PER_MB);
+                format!("{total} MB of free RAM in all")
+            } else {
+                let more = to_free_ram(required.saturating_sub(bound)).div_ceil(BYTES_PER_MB);
+                format!("{more} MB more free RAM")
+            };
+            format!(
+                "{path}: not enough free RAM to read this file. It needs {need} MB of working \
+                 memory, which takes about {ask}. Close other programs{tiff}."
+            )
+        }
+        MemoryBound::Limit { divisor } => {
+            let allowed = bound / BYTES_PER_MB;
+            let raise = required.saturating_mul(divisor).div_ceil(BYTES_PER_MB);
+            format!(
+                "{path}: needs {need} MB of working memory, but the memory limit allows \
+                 {allowed} MB for it. Raise the memory limit to at least {raise} MB or close other programs{tiff}."
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BOUND: u64 = 756_635_648;
+    const REQUIRED: u64 = 952_360_960;
+
+    fn render(bound: u64, required: u64, by: MemoryBound, tiff: bool) -> String {
+        cache_refusal_message(Path::new("a/frame.ARW"), bound, required, by, tiff)
+    }
+
+    fn free_ram(divisor: u64) -> MemoryBound {
+        MemoryBound::FreeRam {
+            share_percent: 40,
+            fixed_bytes: 1_000_000_000,
+            divisor,
+        }
+    }
+
+    #[test]
+    fn free_ram_refusal_pins_the_reported_numbers_at_both_shares() {
+        let quarter = render(BOUND, REQUIRED, free_ram(4), true);
+        assert_eq!(
+            quarter,
+            "a/frame.ARW: not enough free RAM to read this file. It needs 953 MB of working \
+             memory, which takes about 1958 MB more free RAM. Close other programs, or convert \
+             the frames to TIFF."
+        );
+        let whole = render(BOUND, REQUIRED, free_ram(1), true);
+        assert!(whole.contains("about 490 MB more free RAM"), "{whole}");
+        assert!(whole.contains("needs 953 MB"), "{whole}");
+    }
+
+    #[test]
+    fn a_host_under_the_fixed_part_is_told_the_free_ram_needed_in_all() {
+        let quarter = render(0, REQUIRED, free_ram(4), true);
+        assert_eq!(
+            quarter,
+            "a/frame.ARW: not enough free RAM to read this file. It needs 953 MB of working \
+             memory, which takes about 10524 MB of free RAM in all. Close other programs, or \
+             convert the frames to TIFF."
+        );
+        let whole = render(0, REQUIRED, free_ram(1), false);
+        assert!(
+            whole.contains("about 3381 MB of free RAM in all"),
+            "{whole}"
+        );
+    }
+
+    #[test]
+    fn one_byte_gap_rounds_up_and_a_zero_bound_reads_zero_mb() {
+        let one = render(REQUIRED - 1, REQUIRED, free_ram(1), false);
+        assert!(one.contains("about 1 MB more free RAM"), "{one}");
+        assert!(!one.contains("TIFF"), "{one}");
+        let none = render(0, 3_000_000, MemoryBound::Limit { divisor: 4 }, false);
+        assert!(none.contains("allows 0 MB"), "{none}");
+    }
+
+    #[test]
+    fn limit_refusal_raises_to_need_times_divisor() {
+        let whole = render(
+            25_000_000,
+            30_000_000,
+            MemoryBound::Limit { divisor: 1 },
+            true,
+        );
+        assert_eq!(
+            whole,
+            "a/frame.ARW: needs 30 MB of working memory, but the memory limit allows 25 MB for \
+             it. Raise the memory limit to at least 30 MB or close other programs, or convert \
+             the frames to TIFF."
+        );
+        let quarter = render(
+            25_000_000,
+            30_000_000,
+            MemoryBound::Limit { divisor: 4 },
+            false,
+        );
+        assert!(
+            quarter.contains("at least 120 MB or close other programs."),
+            "{quarter}"
+        );
+        assert!(!quarter.contains("free RAM"), "{quarter}");
+    }
+
+    #[test]
+    fn refusal_text_never_holds_a_byte_count() {
+        for text in [
+            render(BOUND, REQUIRED, free_ram(4), true),
+            render(BOUND, REQUIRED, MemoryBound::Limit { divisor: 4 }, true),
+        ] {
+            assert!(!text.contains("bytes"), "{text}");
+            assert!(!text.contains(&BOUND.to_string()), "{text}");
+            assert!(!text.contains(&REQUIRED.to_string()), "{text}");
+        }
+    }
 }

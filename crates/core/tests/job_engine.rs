@@ -900,18 +900,22 @@ fn eta_ignores_time_spent_paused() {
     });
     assert_eq!(first_outcome, JobOutcome::Paused);
 
-    let running_at_pause = control.progress().running;
+    let at_pause = control.progress();
+    let running_at_pause = at_pause.running;
+    assert!(at_pause.eta.is_some(), "a unit is done: {at_pause:?}");
+    assert_eq!(at_pause.total_eta, None, "no prediction is seeded");
 
     // Simulate a long real-world pause: nothing below touches `job` or
     // `control` in any way that would grow the running clock.
     std::thread::sleep(Duration::from_millis(50));
 
+    let paused = control.progress();
     assert_eq!(
-        control.progress().running,
-        running_at_pause,
+        paused.running, running_at_pause,
         "running time -- and therefore the ETA it feeds -- must not grow while the job sits \
          paused"
     );
+    assert_eq!(paused.eta, at_pause.eta, "the ETA is frozen while paused");
 
     control.clear();
     let second_outcome = job
@@ -923,6 +927,24 @@ fn eta_ignores_time_spent_paused() {
         control.progress().running >= running_at_pause,
         "running time only grows while a segment actually executes"
     );
+}
+
+#[test]
+fn eta_of_an_unseeded_job_is_the_observed_rate_with_no_total() {
+    let stack = open_stack();
+    let opts = options("eta-unseeded", 1);
+    let scheduler = build_scheduler(&stack, &opts);
+    let mut job = Job::new(&scheduler);
+    let before = job.control().progress();
+    assert_eq!((before.eta, before.total_eta), (None, None));
+
+    let outcome = job
+        .run(&NoopPreprocess, &Noop)
+        .expect("the run must succeed");
+    assert_eq!(outcome, JobOutcome::Completed);
+    let after = job.control().progress();
+    assert_eq!(after.eta, Some(Duration::ZERO));
+    assert_eq!(after.total_eta, None);
 }
 
 #[test]

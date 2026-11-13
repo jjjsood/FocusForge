@@ -2,7 +2,7 @@
 
 The settings window holds the preferences that apply to FocusForge as a
 whole, not to one [stack](../glossary.md#stack): whether to use the graphics card, how much memory
-FocusForge may claim, whether it looks for a newer release, how the **Images** panel looks, where FocusForge keeps
+FocusForge may use, whether it looks for a newer release, how the **Images** panel looks, where FocusForge keeps
 its files, which mouse and key gestures do what, and the [diagnostics bundle](../glossary.md#diagnostics-bundle)
 you attach to a bug report.
 
@@ -23,7 +23,7 @@ Everything you change here is saved at once in the
 3. To close it, click **Close settings** (the × in its top-right corner) or
    press Esc, from any section, also right after typing in one of its fields.
 
-![The main window with mantis-512 open and the settings window in front of it, showing the Performance section; the gear icon is at the bottom-left corner of the main window](../assets/manual/settings-window/settings-window.png)
+![The main window with a project open and the settings window in front of it, showing the Performance section; the gear icon is at the bottom-left corner of the main window](../assets/manual/settings-window/settings-window.png)
 
 *The settings window in front of the main window. The gear that opens it is
 at the bottom-left corner.*
@@ -64,10 +64,10 @@ take.
 | --- | --- | --- | --- |
 | **GPU processing** | on / off | on | Fuses on the graphics card (GPU) when the [fusion method](../glossary.md#fusion-method) supports it. Off fuses on the processor only. |
 | **Backend** | text | empty | What the last fuse actually ran on, and why. |
-| **Host memory** | a number and a unit (MiB or GiB) | the memory FocusForge would claim on its own | The most working memory a fuse may use. |
-| **VRAM** | a number and a unit (MiB or GiB) | "Not probed yet" until a fuse has used the graphics card, then the card's budget | The most graphics-card memory a fuse may use. |
+| **Host memory** | a number and a unit (MiB or GiB) | the amount FocusForge works out for itself | The most of the computer's own memory (RAM) a fuse may use. |
+| **VRAM** | a number and a unit (MiB or GiB) | "Not probed yet" until a fuse has used the graphics card, then the amount FocusForge works out for the card | The most of the graphics card's memory a fuse may use. |
 
-### GPU processing and the Backend line
+### Use the graphics card
 
 **GPU processing** governs fusing only. How the window itself is drawn is
 separate: on a machine without a GPU the window draws on a software adapter
@@ -75,14 +75,15 @@ whatever this switch says (see [Machines without a
 GPU](../getting-started.md#machines-without-a-gpu)).
 
 With **GPU processing** on, FocusForge tries the graphics card for every
-fuse whose fusion method has a GPU version, and falls back to the processor
-when that is not possible. The result is the same either way; the GPU is
-usually faster. Switch it off if a graphics driver misbehaves or the card is
-busy with other work. The switch applies to the next fuse you start, never to
-one already running, and it is remembered after you quit.
+fuse whose fusion method has a GPU version, and uses the processor when that
+is not possible. The result is the same either way; the GPU is usually
+faster. Switch it off if a graphics driver misbehaves or the card is busy
+with other work. The switch applies to the next fuse you start, never to one
+already running, and it is remembered after you quit.
 
 **Backend** stays empty until a fuse has run in this session. Then it says
-what that fuse used, `gpu` or `cpu`, followed by the reason. For example:
+what that fuse used, `gpu` or `cpu` (the processor), followed by the reason.
+For example:
 
 - "cpu — GPU processing is off": you switched GPU processing off.
 - "gpu — …": the fuse ran on the graphics card named there.
@@ -95,35 +96,27 @@ If a fuse finds no usable graphics card at all, the switch keeps its setting
 but cannot be changed for the rest of the session, and the **VRAM** row
 reads "Unavailable".
 
-### Memory caps and budgets
+### Limit the memory a fuse may use
 
-FocusForge works through a stack in pieces, holding only as many in memory
-as its [budget](../glossary.md#budget) allows. On its own it claims 40 % of
-the memory that is free when it starts a run (the **Host memory** budget),
-and on the graphics card a budget it measures the first time a fuse uses the
-card (the **VRAM** budget).
-
-Each **LIMITS** row shows the number that is in effect: your own
-[cap](../glossary.md#cap) when you set one, otherwise the budget FocusForge
-works out for itself. A cap is a ceiling you set on top of that. It is
-useful when you want to keep working in another program, a raw converter or
-an editor, while a large stack fuses, or when the graphics card is shared
-with your display. A cap can only lower a budget, never raise it. A lower cap
-makes FocusForge hold fewer pieces at once, which can make a fuse slower but
-never changes the result.
+FocusForge decides on its own how much memory a fuse may use: from the RAM
+that is free when the run starts, and from the memory of the graphics card.
+Each row under **LIMITS** shows the amount in effect. You can set a lower one,
+for example to keep working in another program while a large stack fuses, or
+when the graphics card is shared with your display. A limit can only lower
+what FocusForge would use, never raise it. A lower limit can make a fuse
+slower but never changes the result.
 
 - **Host memory** applies from the next fuse you start.
 - **VRAM** shows "Not probed yet" until a fuse has used the graphics card, and
-  you can enter a number before that. A changed VRAM cap is saved and takes
-  effect when the next fuse uses the card; once the session's graphics-card
-  budget is known, the line "Caps only lower the probed budgets. Changes apply
-  from the next start." appears under the rows.
+  you can enter a number before that. Once the card's memory is known, a
+  changed **VRAM** limit counts from the next start of FocusForge, and the
+  line "Caps only lower the probed budgets. Changes apply from the next
+  start." appears under the rows.
 
-On the command line, the same two caps are the `--max-host-memory <SIZE>` and
-`--max-vram <SIZE>` options of `stack` and `align`; they lower the budget in
-the same way.
+On the command line, the same two limits are the `--max-host-memory <SIZE>`
+and `--max-vram <SIZE>` options of `stack` and `align`.
 
-### Set a cap
+### Set a limit
 
 Click the number of a row, type a whole number and pick **MiB** or **GiB**
 in the menu beside it.
@@ -131,19 +124,19 @@ in the menu beside it.
 - The number counts when you confirm it: press Return, click out of the
   field, click another section in the list or close the window. A unit you
   pick counts at once, with the number as shown.
-- To remove a cap, empty the number and confirm. The row then shows the
-  budget FocusForge works out for itself again.
+- To remove a limit, empty the number and confirm. The row then shows the
+  amount FocusForge works out for itself again.
 - The number accepts digits only, so a unit cannot be left half-typed.
 
-![The Performance section after 99999 was confirmed in the Host memory row: the row shows the budget again (17 GiB) and a red line under it reads "Max 17.5 GiB possible."](../assets/manual/settings-window/settings-cap-over-maximum.png)
+![The Performance section after 99999 was confirmed in the Host memory row: the row shows FocusForge's own amount again and a red line under it reads "Max <size> possible."](../assets/manual/settings-window/settings-cap-over-maximum.png)
 
-*A number above what the computer can give stores no cap and names the maximum; the figure is that of the computer the picture was taken on.*
+*A number above what the computer can give stores no limit and names the maximum; the figure is that of the computer the picture was taken on.*
 
-A **Host memory** number above what the computer can give stores no cap: the
-row shows the budget again and a red line "Max `<size>` possible." names the
-largest value. The line stays until you confirm the row again, click another
-section or close the window. **VRAM** accepts a number above the graphics
-card's budget the same way once that budget is known.
+A **Host memory** number above what the computer can give stores no limit: the
+row shows FocusForge's own amount again and a red line "Max `<size>` possible."
+names the largest value. The line stays until you confirm the row again, click
+another section or close the window. **VRAM** accepts a number above the
+graphics card's maximum the same way once that is known.
 
 ## Appearance
 
@@ -172,7 +165,7 @@ What each presentation looks like is shown in
 **Sharpness heatmap** (on by default) shows the sharpness inset in the
 Composite pane while a run fuses; see [The window](gui.md). **Reduce motion**
 makes every transition instant: the projects overview, the settings window
-and its sections, dialogs, toasts, the mode switch and the Composite pane's
+and its sections, dialogs, pop-up messages, the mode switch and the Composite pane's
 crossfades.
 
 The choices are saved in the `[appearance]` table of the settings file and
@@ -183,7 +176,7 @@ quit, and the next start uses the one saved before.
 ## Storage
 
 **Storage** shows where FocusForge keeps its files on this computer, and
-lets you empty the [stage cache](../glossary.md#stage-cache).
+lets you free the disk space used by earlier runs.
 
 ![The Storage section: under LOCATIONS the rows Settings file, Logs, Crash reports and Scratch each show a folder path, Crash reports and Scratch followed by "not created yet"; under CACHE the row Stage cache with "Deletes cached fuse stages." and a Clear cache button](../assets/manual/settings-window/settings-storage.png)
 
@@ -196,7 +189,7 @@ in [The settings file](#the-settings-file) and
 | **Settings file** | `settings.toml`, everything the settings window and the main window remember (see [The settings file](#the-settings-file)) |
 | **Logs** | the log of every session (see [The log](diagnostics.md#the-log)) |
 | **Crash reports** | the evidence of earlier crashes (see [Crash reports](diagnostics.md#crash-reports)) |
-| **Scratch** | working files of a fuse, including the stage cache |
+| **Scratch** | temporary files of a fuse, including the results kept for fusing again |
 
 Paths inside your home folder start with `~`. A long path is cut off at the
 end with "…". "· not created yet" after a path means that folder does not
@@ -204,24 +197,24 @@ exist yet; FocusForge creates it the first time it needs it (the crash folder
 only after a crash). "Unavailable" means FocusForge could not work out that
 location on this system.
 
-### Clear the stage cache
+### Free disk space used by earlier runs
 
-When FocusForge fuses, it keeps the results of expensive steps, above all the
-[alignment](../glossary.md#alignment), in a
-[stage cache](../glossary.md#stage-cache) in the scratch folder. Fusing the
-same frames again, for example with another fusion method, can then skip
-those steps. The cache can grow over time; **Clear cache** deletes it to free
-disk space. Nothing else in the scratch folder is touched, and your [projects](../glossary.md#project),
-[checkpoints](../glossary.md#checkpoint) and exported images are not affected. The next fuse of each stack
-simply computes those steps again.
+When FocusForge fuses, it keeps the results of its slowest steps, above all
+the [alignment](../glossary.md#alignment), in the scratch folder. Fusing the
+same frames again, for example with another fusion method, can then skip those
+steps. This stored material is the **Stage cache** row, and it can grow over
+time. **Clear cache** deletes it to free disk space. Nothing else in the
+scratch folder is touched, and your [projects](../glossary.md#project),
+[checkpoints](../glossary.md#checkpoint) and exported images are not affected.
+The next fuse of each stack simply does those steps again.
 
 Click **Clear cache**. The line under the row then reads, for example,
 "Cleared 12 stage entries.", or "Could not clear the cache: …" with the
 reason. While any fuse is running, the button is unavailable and the line
-reads "A run is active.", because the running fuse uses the cache.
+reads "A run is active.", because the running fuse uses the stored results.
 
 The command-line equivalent is `focusforge-cli cache clear`; see
-[The stage cache](../reference/batch-runs.md#the-stage-cache).
+[Batch runs from the command line](../reference/batch-runs.md#the-stage-cache).
 
 ## Input map
 
@@ -275,7 +268,7 @@ folder path and user name, and never any image data) are in
 
 **About** shows which FocusForge you are running and under which terms.
 
-![The About section: under FOCUSFORGE the rows Version 0.1.0 and License GPL-3.0; under UPDATES the switch Check for updates at start, turned on, and the Check now button; under NOTICE the copyright line, the GNU General Public License paragraph, the no-warranty sentence and the row Source with github.com/jjjsood/FocusForge](../assets/manual/settings-window/settings-about.png)
+![The About section: under FOCUSFORGE the rows Version 0.2.1 and License GPL-3.0; under UPDATES the switch Check for updates at start, turned on, and the Check now button; under NOTICE the copyright line, the GNU General Public License paragraph, the no-warranty sentence and the row Source with github.com/jjjsood/FocusForge](../assets/manual/settings-window/settings-about.png)
 
 *About. The version number depends on the build you installed.*
 
@@ -310,7 +303,7 @@ downloads or installs anything: it only reports the newest final release
   (skipped)." A later release is announced again. **Check now** still shows a
   skipped version.
 
-![The About section after Check now found a newer release: the line "FocusForge 0.2.0 is available.", the link Open download page and the button Skip this version under the Check now button](../assets/manual/settings-window/settings-about-newer.png)
+![The About section after Check now found a newer release: the line "FocusForge 0.3.0 is available.", the link Open download page and the button Skip this version under the Check now button](../assets/manual/settings-window/settings-about-newer.png)
 
 *The result of **Check now** for a newer release.*
 
@@ -460,7 +453,7 @@ file is in TOML format, one table per topic:
 | `[updates]` | `check_on_start = true` or `false`, and `skipped_version`, the release version you chose to skip | [Updates](#updates) |
 | `[performance]` | `gpu = true` or `false`, and the optional size strings `max-host-memory` and `max-vram` | [Performance](#performance) |
 
-For example, after switching GPU processing off and typing a host memory cap,
+For example, after switching GPU processing off and typing a host memory limit,
 the file holds:
 
 ```toml
@@ -474,7 +467,7 @@ others, and any comments you wrote in them, exactly as they were. A file that
 is not valid TOML is never overwritten: FocusForge then starts with the
 defaults, cannot save changes until you fix or delete the file, and says why
 in the log. A single wrong entry in `[performance]`, such as an unparsable
-cap, falls back to its default alone, also with a warning in the log.
+limit, falls back to its default alone, also with a warning in the log.
 
 To start from scratch, quit FocusForge and delete `settings.toml`. The next
 start writes a fresh one with the default bindings.

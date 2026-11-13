@@ -6,6 +6,10 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 ## [Unreleased]
 
+### Fixed
+
+- On a machine without a hardware GPU (a virtual machine, a Remote Desktop session), stacking runs on the CPU instead of a slow software graphics adapter.
+
 ## [0.2.0] - 2026-11-09
 
 ### Added

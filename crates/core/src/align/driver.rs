@@ -16,18 +16,22 @@
 //! **Anchor** builds one [`AlignContext`] against the reference, calling `align_frame` for every
 //! other frame across a driver-owned rayon pool sized from [`AlignDriverOptions::budget`],
 //! built and dropped here so it never overlaps the tile scheduler's pool. **Chain** walks outward
-//! both ways, rebuilding an `AlignContext` per hop and composing `T_i = T_hop.compose(&T_previous)`
-//! -- hop **after** prefix, since [`Transform::compose`] applies its right operand first -- serial
-//! by construction, each hop needing the previous hop's result.
+//! both ways, building an `AlignContext` per hop against the hop's raw neighbour and composing
+//! `T_i = T_hop.compose(&T_previous)` -- hop **after** prefix, since [`Transform::compose`] applies
+//! its right operand first. A hop's solve needs only its neighbour's pixels, so the hops are solved
+//! in parallel on the same kind of pool, within the budget-derived worker count, and composed
+//! serially in hop order on the calling thread.
 //!
-//! ## The reference pyramid is cached once per run
+//! ## Prepared state lives for one run
 //!
-//! `align_stack_with` calls [`AlignAlgorithm::prepare_run`] once, before either sub-arm; the result
+//! `align_stack_with` calls [`AlignAlgorithm::prepare_run`] once per run, in either arm; the result
 //! lives in **this function's own stack frame** as an `Arc`, never as state on the `&'static`
 //! algorithm, so overlapping runs hold separate `Arc`s. It reaches every `align_frame` call through
-//! [`AlignContext::prepared`], by `&`, safe under this module's rayon fan-out because every worker
-//! holds the same shared, already-finished, never-mutated reference. Chain mode never calls
-//! `prepare_run`: its reference changes every hop, so nothing stays stable to cache.
+//! [`AlignContext::prepared`], by `&`. In the anchor arm it is the already-finished, never-mutated
+//! reference every worker shares. In the chain arm the reference changes every hop, so what it
+//! holds is a frame store: each frame's pyramid and level-0 window are built once, by the first
+//! hop to need them, shared by the two hops that touch the frame and released after the last of
+//! them finishes.
 //!
 //! # Failure policy
 //!
@@ -45,10 +49,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
-use crate::algorithm::{AlgorithmError, AlignAlgorithm, AlignContext, AlignStatus, TileReader};
+use crate::algorithm::{
+    AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus, TileReader,
+};
 use crate::align::Transform;
 use crate::align::ecc_algorithm::{
-    retained_template_bytes, seed_scratch_bytes, solve_scratch_bytes,
+    level0_cache_bytes, retained_template_bytes, seed_scratch_bytes, solve_scratch_bytes,
 };
 use crate::display::preview::AlignedFrameSink;
 use crate::gpu::{AlignBackend, EccMomentSession, EccSessionRequest};
@@ -147,12 +153,12 @@ pub const DEFAULT_ALIGN_MAX_BYTES_IN_FLIGHT: usize = 2 * (1 << 30);
 /// type it carries a `Default`: an explicit
 /// [`DEFAULT_ALIGN_MAX_BYTES_IN_FLIGHT`] budget and no control hooks.
 pub struct AlignDriverOptions<'a> {
-    /// The host memory this driver may account: the shared reference data
-    /// once, plus [`bytes_per_registration`] per anchor worker. A
-    /// host-derived budget below the shared data plus one registration
-    /// refuses the run ([`AlgorithmError::HostMemoryTooSmall`]); any other
-    /// budget floors to one worker. See `workers_for_budget` (private to this
-    /// module) for the arithmetic.
+    /// The host memory this driver may account: for an anchor run the shared
+    /// reference data once plus [`bytes_per_registration`] per worker, for a
+    /// chain run one frame build plus [`bytes_per_chain_hop`] per worker. A
+    /// host-derived budget below one registration (anchor) or one frame build
+    /// and hop (chain) refuses the run ([`AlgorithmError::HostMemoryTooSmall`]); any other
+    /// budget floors to one worker.
     pub budget: HostBudget,
     /// Bumped once per frame whose registration has completed, reference
     /// frame included, in completion order -- `None` when the caller has
@@ -223,18 +229,22 @@ pub fn bytes_shared_reference(stack: StackContext) -> u64 {
 /// ```text
 /// plane      = width * height * 4                      // f32 luma
 /// coarse     = plane / 3                               // the frame's own levels 1..N
-/// rows       = band_rows + 5                           // input rows of one band, with its halo
-/// stream     = width * rows * (2 * spp + 7)            // u16 band, f32 luma band, reduce passes
+/// rows       = band_rows + 5                           // priced rows of the streamed build (an over-bound)
+/// stream     = width * rows * (2 * spp + 7)            // u16 rows, f32 luma and reduced rows
 /// solve      = solve_scratch_bytes(width, height, spp) // per-solve vectors and windows
 /// seed       = seed_scratch_bytes(width, height, spp)  // detector scale space, frame features
 /// bytes_per_registration = coarse + max(stream, solve, seed)
 /// ```
 ///
-/// `band_rows` is `DEFAULT_TILE_SIZE`, the input band height
-/// `PyramidalEcc::build_pyramid` streams with. The streaming buffers are
-/// dropped before the solve allocates its own, so the two never coexist, and
+/// `band_rows` is `DEFAULT_TILE_SIZE`. The streaming pyramid build holds at
+/// most `2 * AlignPyramid::BAND_ROWS + 5` raw rows (plus the reader's `u16`
+/// widening scratch for an `f32` read), a ring of reduced rows at half width
+/// and one luma row, so the term is an upper bound.
+///
+/// The streaming buffers are dropped before the solve allocates its own, and
 /// the escalation runs after the solve's buffers are gone. At 8192x5464x3 this
-/// is ~114.7 MB (the detector searches level 4, 512x342, for 33.8 MB); at the
+/// is ~232.8 MB (coarse 59.7 MB plus the solve's 173.1 MB; the stream term is
+/// 55.1 MB, the detector searching level 4, 512x342, 33.8 MB); at the
 /// 512x512x3 fixture ~53.4 MB, nearly all of it the detector's scale space on
 /// the whole frame.
 pub fn bytes_per_registration(stack: StackContext, band_rows: u32) -> u64 {
@@ -255,7 +265,28 @@ pub fn bytes_per_registration(stack: StackContext, band_rows: u32) -> u64 {
             ))
 }
 
-/// The pure arithmetic behind the anchor arm's worker count: mirrors
+/// The bytes one chain hop holds live, reader scratch aside: its neighbour
+/// reference ([`bytes_shared_reference`]), its moving registration
+/// ([`bytes_per_registration`]) and the two level-0 windows its two frames'
+/// shared builds hold. A hop's two frame pyramids are already inside the first
+/// two terms.
+pub fn bytes_per_chain_hop(stack: StackContext, band_rows: u32) -> u64 {
+    bytes_shared_reference(stack)
+        + bytes_per_registration(stack, band_rows)
+        + 2 * level0_cache_bytes(stack.width, stack.height)
+}
+
+/// The bytes one chain run holds live once, whatever the worker count: the
+/// reference frame's shared build (coarse pyramid and level-0 window), which
+/// both legs' first hops use while a worker's own two builds are in flight.
+/// Hops finish in any order, so `2K + 1` builds can be held at once for `K`
+/// hops.
+pub fn bytes_per_frame_build(stack: StackContext) -> u64 {
+    let plane = stack.width as u64 * stack.height as u64 * 4;
+    plane / 3 + level0_cache_bytes(stack.width, stack.height)
+}
+
+/// The pure arithmetic behind both arms' worker counts: mirrors
 /// `crate::tile::scheduler::in_flight_for_budget` clamp for clamp -- floored
 /// at 1 (never 0, so a budget smaller than one registration still makes
 /// progress), capped at `available_parallelism` -- plus one clamp the
@@ -286,8 +317,8 @@ fn workers_for_budget(
 }
 
 /// The result of one [`align_stack_with`] run: the [`StackAlignment`] plus how many workers the
-/// anchor arm was allowed and how many it reached; both are `1` for chain mode and for an anchor
-/// run whose budget floors to one worker. Not stored on [`StackAlignment`] itself: a worker count
+/// run was allowed and how many it reached; both are `1` for a run whose budget floors to one
+/// worker. Not stored on [`StackAlignment`] itself: a worker count
 /// is a property of *this run*, not of the alignment, and `StackAlignment` is round-tripped
 /// verbatim by the resume ledger and the stage cache as an exhaustive struct literal -- a cached or
 /// resumed alignment would otherwise carry a previous run's worker count as if it were this run's.
@@ -296,9 +327,11 @@ pub struct AlignRun {
     pub alignment: StackAlignment,
     pub worker_limit: usize,
     pub peak_workers: usize,
-    /// The bytes this run accounted for: the shared reference data plus
-    /// `worker_limit` registrations. An explicit budget below one
-    /// registration still runs one worker, so this can exceed the budget.
+    /// The bytes this run accounted for: for an anchor run the shared reference
+    /// data plus `worker_limit` registrations, for a chain run one frame build
+    /// ([`bytes_per_frame_build`]) plus `worker_limit` hops
+    /// ([`bytes_per_chain_hop`]). An explicit budget below one registration or
+    /// hop still runs one worker, so this can exceed the budget.
     pub accounted_bytes: u64,
     /// Whether the accelerator opened at least one session and the result is
     /// its run's, not a CPU rerun's.
@@ -432,6 +465,26 @@ fn anchored_alignment(
     }
 }
 
+/// Folds one solved chain hop into `frames[i]`: `failure` is applied to the hop alone, which is
+/// then composed onto `prefix` (hop **after** prefix). Reports the preview and the credit. Returns
+/// the composed transform, the next hop's prefix.
+fn finish_chain_hop(
+    frames: &mut [Option<FrameAlignment>],
+    i: usize,
+    outcome: AlignOutcome,
+    prefix: Transform,
+    failure: FailurePolicy,
+    options: &AlignDriverOptions<'_>,
+) -> Transform {
+    let mut alignment = anchored_alignment(i, outcome, failure);
+    alignment.transform = alignment.transform.compose(&prefix);
+    let composed = alignment.transform;
+    frames[i] = Some(alignment);
+    record_preview(options, i, composed);
+    credit_frame_done(options.frames_done.as_deref());
+    composed
+}
+
 /// Runs one chain leg (either every frame above the reference, ascending,
 /// or every frame below it, descending), writing each hop's
 /// [`FrameAlignment`] into `frames[i]`.
@@ -445,6 +498,7 @@ fn run_chain_leg(
     frames: &mut [Option<FrameAlignment>],
     indices: impl Iterator<Item = usize>,
     reference: usize,
+    prepared: Option<&(dyn std::any::Any + Send + Sync)>,
     options: &AlignDriverOptions<'_>,
 ) -> Result<(), AlgorithmError> {
     let mut previous = reference;
@@ -453,30 +507,139 @@ fn run_chain_leg(
         wait_at_boundary(options)?;
         let ctx = AlignContext::new(stack, previous, reader)
             .with_align_backend(options.align_backend)
-            .with_preview(options.preview);
+            .with_preview(options.preview)
+            .with_prepared(prepared);
         let outcome = algorithm.align_frame(&ctx, i, cfg)?;
-        let diverged = matches!(outcome.status, AlignStatus::Diverged(_));
-        let fallback = diverged && failure == FailurePolicy::IdentityFallback;
-        let hop = if fallback {
-            Transform::identity()
-        } else {
-            outcome.transform
-        };
-        let composed = hop.compose(&prefix);
-        frames[i] = Some(FrameAlignment {
-            frame: i,
-            transform: composed,
-            status: outcome.status,
-            iterations: outcome.iterations,
-            residual: outcome.residual,
-            fallback,
-        });
-        record_preview(options, i, composed);
-        credit_frame_done(options.frames_done.as_deref());
-        prefix = composed;
+        prefix = finish_chain_hop(frames, i, outcome, prefix, failure, options);
         previous = i;
     }
     Ok(())
+}
+
+/// The driver-owned alignment pool, built per call so it never overlaps the tile scheduler's.
+fn build_align_pool(workers: usize) -> Result<rayon::ThreadPool, AlgorithmError> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .thread_name(|i| format!("focusforge-align-{i}"))
+        .panic_handler(crate::pool::log_worker_panic)
+        .build()
+        .map_err(|source| AlgorithmError::Failed {
+            algorithm: "align_stack".to_string(),
+            detail: format!("alignment thread pool: {source}"),
+        })
+}
+
+/// Solves every chain hop on a pool of `workers` threads and composes them on the calling thread,
+/// one cursor over the visiting list (upper leg ascending, then lower leg descending): a hop is
+/// folded once it and every hop before it are solved, so previews, progress credits and the first
+/// error arrive in the serial run's order. Returns the peak number of hops in flight.
+#[allow(clippy::too_many_arguments)]
+fn run_chain_pooled(
+    algorithm: &dyn AlignAlgorithm,
+    stack: StackContext,
+    reader: &dyn TileReader,
+    cfg: &ParamValues,
+    failure: FailurePolicy,
+    frames: &mut [Option<FrameAlignment>],
+    reference: usize,
+    workers: usize,
+    prepared: Option<&(dyn std::any::Any + Send + Sync)>,
+    options: &AlignDriverOptions<'_>,
+) -> Result<usize, AlgorithmError> {
+    // (frame, its raw neighbour, whether it opens a leg), in serial visiting order.
+    let visits: Vec<(usize, usize, bool)> = ((reference + 1)..stack.frame_count)
+        .map(|i| (i, i - 1, i == reference + 1))
+        .chain((0..reference).rev().map(|i| (i, i + 1, i + 1 == reference)))
+        .collect();
+    let pool = build_align_pool(workers)?;
+    let live = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+    let parent = tracing::Span::current();
+
+    // One slot per visit; a pause leaves its slots empty for the next round.
+    let mut solved: Vec<Option<Result<AlignOutcome, AlgorithmError>>> =
+        visits.iter().map(|_| None).collect();
+    let mut cursor = 0;
+    let mut prefix = Transform::identity();
+
+    let solve = |position: usize| -> Option<Result<AlignOutcome, AlgorithmError>> {
+        let (i, neighbour, _) = visits[position];
+        let cur = reserve_live(&live, options.control.as_deref());
+        match options.control.as_deref().map(JobControl::state) {
+            Some(ControlState::CancelRequested) => {
+                live.fetch_sub(1, Ordering::SeqCst);
+                Some(Err(AlgorithmError::Cancelled))
+            }
+            Some(ControlState::PauseRequested) if options.on_pause.is_some() => {
+                live.fetch_sub(1, Ordering::SeqCst);
+                None
+            }
+            _ => {
+                let frame_span = tracing::debug_span!(parent: &parent, "frame", index = i);
+                let _frame = frame_span.enter();
+                peak.fetch_max(cur, Ordering::SeqCst);
+                let _solve = measurement_scope("align_solve");
+                let ctx = AlignContext::new(stack, neighbour, reader)
+                    .with_align_backend(options.align_backend)
+                    .with_preview(options.preview)
+                    .with_prepared(prepared);
+                let result = algorithm.align_frame(&ctx, i, cfg);
+                live.fetch_sub(1, Ordering::SeqCst);
+                Some(result)
+            }
+        }
+    };
+
+    let mut pending: Vec<usize> = (0..visits.len()).collect();
+    loop {
+        let (tx, rx) = std::sync::mpsc::channel();
+        pool.in_place_scope_fifo(|scope| {
+            for &position in &pending {
+                let tx = tx.clone();
+                let solve = &solve;
+                scope.spawn_fifo(move |_| {
+                    let _ = tx.send((position, solve(position)));
+                });
+            }
+            drop(tx);
+            // Ends when every task has dropped its sender, a panicking one included.
+            while let Ok((position, outcome)) = rx.recv() {
+                solved[position] = outcome;
+                while let Some(Some(Ok(outcome))) = solved.get(cursor) {
+                    let (i, _, opens_leg) = visits[cursor];
+                    if opens_leg {
+                        prefix = Transform::identity();
+                    }
+                    prefix = finish_chain_hop(frames, i, *outcome, prefix, failure, options);
+                    cursor += 1;
+                }
+            }
+        });
+
+        // A device loss reaches concurrent hops in different shapes; any hop that saw it makes the
+        // whole run rerunnable, whichever failed first.
+        if let Some(lost) = solved
+            .iter()
+            .position(|slot| matches!(slot, Some(Err(AlgorithmError::BackendLost { .. }))))
+            && let Some(Some(Err(err))) = solved.get_mut(lost).map(Option::take)
+        {
+            return Err(err);
+        }
+        // The first slot that is not an `Ok` is where the serial run would stop.
+        match solved.get_mut(cursor).map(Option::take) {
+            Some(Some(Err(err))) => return Err(err),
+            Some(Some(Ok(_))) => unreachable!("every solved hop at the cursor was composed"),
+            Some(None) => {}
+            None => break,
+        }
+        pending = (cursor..visits.len())
+            .filter(|&position| solved[position].is_none())
+            .collect();
+        // Every hop above has returned (the scope only comes back once they all have), so the hold
+        // runs on the calling thread, never a pool worker.
+        wait_at_boundary(options)?;
+    }
+    Ok(peak.load(Ordering::SeqCst))
 }
 
 /// Registers every frame of `stack` against a reference frame, under
@@ -503,9 +666,9 @@ pub fn align_stack(
 
 /// Registers every frame of `stack` against a reference frame, under
 /// `algorithm`, `cfg`'s reference policy and `failure`'s failure policy, with
-/// the anchor arm's worker count bounded by `options`. See the module docs.
+/// the worker count bounded by `options`. See the module docs.
 ///
-/// The anchor arm runs across a driver-owned rayon pool sized from
+/// Both arms run across a driver-owned rayon pool sized from
 /// `options.budget` and [`bytes_per_registration`], built and
 /// dropped inside this call -- it never coexists with the tile scheduler's
 /// own pool, which (on the `stack` path) is not built until after this call
@@ -513,8 +676,9 @@ pub fn align_stack(
 /// rather than building a pool at all, which is also what keeps the
 /// byte-identity tests' reference side alive.
 ///
-/// Chain mode is **serial by construction** -- see the module docs -- and
-/// always reports `worker_limit: 1, peak_workers: 1`.
+/// Chain mode solves its hops in parallel and composes them serially in hop
+/// order, so its output, the first error it reports and the order of its
+/// previews and progress credits do not depend on the worker count.
 ///
 /// When `options.align_backend` loses its device or runs out of memory
 /// mid-run ([`AlgorithmError::BackendLost`]), every result computed so far is
@@ -632,12 +796,15 @@ fn align_stack_once(
     frames[reference] = Some(identity_alignment(reference));
 
     let shared_bytes = bytes_shared_reference(stack);
-    let mut registration_bytes = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
-    let (worker_limit, peak_workers) = match policy {
+    let available_parallelism = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let registrations = stack.frame_count.saturating_sub(1);
+    let budget_bytes = options.budget.bytes();
+    let (worker_limit, peak_workers, accounted_bytes) = match policy {
         ReferencePolicy::Anchor => {
-            let registrations = stack.frame_count.saturating_sub(1);
-            registration_bytes += reader.read_scratch_bytes(stack.width, DEFAULT_TILE_SIZE);
-            let budget_bytes = options.budget.bytes();
+            let registration_bytes = bytes_per_registration(stack, DEFAULT_TILE_SIZE)
+                + reader.read_scratch_bytes(stack.width, DEFAULT_TILE_SIZE);
             if options.budget.refuses_below_one_tile()
                 && budget_bytes < shared_bytes + registration_bytes
             {
@@ -646,9 +813,6 @@ fn align_stack_once(
                     required_bytes: shared_bytes + registration_bytes,
                 });
             }
-            let available_parallelism = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
             let workers = workers_for_budget(
                 shared_bytes,
                 registration_bytes,
@@ -657,11 +821,10 @@ fn align_stack_once(
                 registrations,
             );
 
-            // `prepare_run` is called exactly here, at most once per run,
-            // only in the anchor arm, so both sub-arms below share the
-            // same prepared reference pyramid from this single line. The
-            // `Arc` binding lives in this stack frame and drops when this
-            // function returns.
+            // `prepare_run` is called exactly here for an anchor run, so both
+            // sub-arms below share the same prepared reference pyramid from
+            // this single line. The `Arc` binding lives in this stack frame
+            // and drops when this function returns.
             let ctx = AlignContext::new(stack, reference, reader)
                 .with_align_backend(options.align_backend)
                 .with_preview(options.preview);
@@ -687,17 +850,9 @@ fn align_stack_once(
                     *slot = Some(alignment);
                     credit_frame_done(options.frames_done.as_deref());
                 }
-                (1, 1)
+                (1, 1, shared_bytes + registration_bytes)
             } else {
-                let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(workers)
-                    .thread_name(|i| format!("focusforge-align-{i}"))
-                    .panic_handler(crate::pool::log_worker_panic)
-                    .build()
-                    .map_err(|source| AlgorithmError::Failed {
-                        algorithm: "align_stack".to_string(),
-                        detail: format!("alignment thread pool: {source}"),
-                    })?;
+                let pool = build_align_pool(workers)?;
 
                 let live = AtomicUsize::new(0);
                 let peak = AtomicUsize::new(0);
@@ -791,34 +946,84 @@ fn align_stack_once(
                     wait_at_boundary(options)?;
                 }
 
-                (workers, peak.load(Ordering::SeqCst))
+                (
+                    workers,
+                    peak.load(Ordering::SeqCst),
+                    shared_bytes + workers as u64 * registration_bytes,
+                )
             }
         }
         ReferencePolicy::Chain => {
+            // Each hop builds its own neighbour reference, so one hop is charged the shared data
+            // too, and the frame store holds the reference frame's build on top of the hops'.
+            let hop_bytes = bytes_per_chain_hop(stack, DEFAULT_TILE_SIZE)
+                + reader.read_scratch_bytes(stack.width, DEFAULT_TILE_SIZE);
+            let frame_bytes = bytes_per_frame_build(stack);
+            if options.budget.refuses_below_one_tile() && budget_bytes < frame_bytes + hop_bytes {
+                return Err(AlgorithmError::HostMemoryTooSmall {
+                    budget_bytes,
+                    required_bytes: frame_bytes + hop_bytes,
+                });
+            }
+            let workers = workers_for_budget(
+                frame_bytes,
+                hop_bytes,
+                budget_bytes,
+                available_parallelism,
+                registrations,
+            );
+
+            // The frame store `prepare_run` returns lives in this stack frame and is handed to
+            // every hop; an algorithm that returns `None` has each hop build both its frames.
+            let ctx = AlignContext::new(stack, reference, reader)
+                .with_align_backend(options.align_backend)
+                .with_preview(options.preview);
+            let prepared = {
+                let _prepare = measurement_scope("align_prepare");
+                algorithm.prepare_run(&ctx, cfg)?
+            };
             credit_frame_done(options.frames_done.as_deref());
-            run_chain_leg(
-                algorithm,
-                stack,
-                reader,
-                cfg,
-                failure,
-                &mut frames,
-                (reference + 1)..stack.frame_count,
-                reference,
-                options,
-            )?;
-            run_chain_leg(
-                algorithm,
-                stack,
-                reader,
-                cfg,
-                failure,
-                &mut frames,
-                (0..reference).rev(),
-                reference,
-                options,
-            )?;
-            (1, 1)
+            if workers <= 1 {
+                run_chain_leg(
+                    algorithm,
+                    stack,
+                    reader,
+                    cfg,
+                    failure,
+                    &mut frames,
+                    (reference + 1)..stack.frame_count,
+                    reference,
+                    prepared.as_deref(),
+                    options,
+                )?;
+                run_chain_leg(
+                    algorithm,
+                    stack,
+                    reader,
+                    cfg,
+                    failure,
+                    &mut frames,
+                    (0..reference).rev(),
+                    reference,
+                    prepared.as_deref(),
+                    options,
+                )?;
+                (1, 1, frame_bytes + hop_bytes)
+            } else {
+                let peak = run_chain_pooled(
+                    algorithm,
+                    stack,
+                    reader,
+                    cfg,
+                    failure,
+                    &mut frames,
+                    reference,
+                    workers,
+                    prepared.as_deref(),
+                    options,
+                )?;
+                (workers, peak, frame_bytes + workers as u64 * hop_bytes)
+            }
         }
     };
 
@@ -839,7 +1044,7 @@ fn align_stack_once(
         },
         worker_limit,
         peak_workers,
-        accounted_bytes: shared_bytes + worker_limit as u64 * registration_bytes,
+        accounted_bytes,
         backend_used: false,
         rerun_reason: None,
     })
@@ -1162,7 +1367,7 @@ mod tests {
         let pyramid = crate::align::AlignPyramid::stream(
             (width, height, spp),
             depth,
-            DEFAULT_TILE_SIZE / 2,
+            crate::align::AlignPyramid::BAND_ROWS,
             |rect, out| -> Result<(), ()> {
                 let row = (width * spp) as usize;
                 let start = rect.y as usize * row;
@@ -1178,8 +1383,12 @@ mod tests {
         // 384 x 384 level-0 solve region, the frame window (the whole 512 px
         // frame) and one 260 px patch window at 10 bytes per pixel.
         let solve = 24 * 384 * 384u64 + 512 * 512 * 10 + 260 * 260 * 10;
-        let rows = DEFAULT_TILE_SIZE as u64 + 5;
-        let stream = width as u64 * rows * (2 * spp as u64 + 7);
+        // The streaming build's real peak: the raw rows of its first band, the
+        // reduced-row ring at half width and one luma row.
+        let band = crate::align::AlignPyramid::BAND_ROWS as u64;
+        let stream = width as u64 * (2 * band + 3) * spp as u64 * 2
+            + width.div_ceil(2) as u64 * (2 * band + 5) * 4
+            + width as u64 * 4;
         // The escalation's detector runs on the whole frame: 192 bytes of
         // scale space per pixel, the frame read in and 2000 features.
         let seed = 512 * 512 * (192 + 10) + 2000 * 72;
@@ -1209,40 +1418,69 @@ mod tests {
         StackContext::new(4, 512, 512, 3)
     }
 
+    /// What one chain hop is charged over [`NullReader`]: its neighbour
+    /// reference, its moving registration, its two level-0 windows and the
+    /// reader's scratch.
+    fn chain_hop_bytes(stack: StackContext) -> u64 {
+        bytes_per_chain_hop(stack, DEFAULT_TILE_SIZE)
+            + NullReader.read_scratch_bytes(stack.width, DEFAULT_TILE_SIZE)
+    }
+
+    /// An explicit budget that holds the frame build and exactly `hops` chain hops.
+    fn chain_budget(stack: StackContext, hops: u64) -> usize {
+        (bytes_per_frame_build(stack) + hops * chain_hop_bytes(stack)) as usize
+    }
+
     #[test]
     fn a_host_derived_budget_below_the_minimum_refuses_before_any_registration() {
-        // usable_available = 100 B, so the budget is 40 B.
-        let facts = crate::host::HostFacts::new(1_000, 100, None, None, 4);
-        let counter = Arc::new(AtomicUsize::new(0));
-        let algo = RecordingAlign {
-            counter,
-            seen: Mutex::new(Vec::new()),
-        };
-        let options = AlignDriverOptions {
-            budget: HostBudget::host_derived(&facts),
-            ..Default::default()
-        };
         let stack = anchor_stack();
-        let error = align_stack_with(
-            &algo,
-            stack,
-            &NullReader,
-            &cfg_with("anchor", "middle"),
-            FailurePolicy::Strict,
-            &options,
-        )
-        .expect_err("a budget of 40 B cannot hold the shared term");
-        let required =
+        let anchor_minimum =
             bytes_shared_reference(stack) + bytes_per_registration(stack, DEFAULT_TILE_SIZE);
-        assert!(
-            matches!(
-                error,
-                AlgorithmError::HostMemoryTooSmall { budget_bytes: 40, required_bytes }
-                    if required_bytes == required
+        for (policy, required) in [
+            ("anchor", anchor_minimum),
+            (
+                "chain",
+                bytes_per_frame_build(stack) + chain_hop_bytes(stack),
             ),
-            "{error:?}"
-        );
-        assert!(algo.seen.lock().unwrap().is_empty(), "no registration ran");
+        ] {
+            // 100 B beyond the fixed part, so the budget is 65 B.
+            let facts = crate::host::HostFacts::new(
+                1 << 31,
+                crate::tile::HOST_FIXED_BYTES + 100,
+                None,
+                None,
+                4,
+            );
+            let algo = RecordingAlign {
+                counter: Arc::new(AtomicUsize::new(0)),
+                seen: Mutex::new(Vec::new()),
+            };
+            let options = AlignDriverOptions {
+                budget: HostBudget::host_derived(&facts),
+                ..Default::default()
+            };
+            let error = align_stack_with(
+                &algo,
+                stack,
+                &NullReader,
+                &cfg_with(policy, "middle"),
+                FailurePolicy::Strict,
+                &options,
+            )
+            .expect_err("a budget of 65 B cannot hold one registration");
+            assert!(
+                matches!(
+                    error,
+                    AlgorithmError::HostMemoryTooSmall { budget_bytes: 65, required_bytes }
+                        if required_bytes == required
+                ),
+                "{policy}: {error:?}"
+            );
+            assert!(
+                algo.seen.lock().unwrap().is_empty(),
+                "{policy}: no registration ran"
+            );
+        }
     }
 
     #[test]
@@ -1266,8 +1504,8 @@ mod tests {
 
     #[test]
     fn a_host_derived_budget_above_the_minimum_runs() {
-        // usable_available = 1 GiB, so the budget is about 430 MB.
-        let facts = crate::host::HostFacts::new(1 << 31, 1 << 30, None, None, 4);
+        // usable_available = 2 GiB, so the budget is about 380 MB.
+        let facts = crate::host::HostFacts::new(1 << 32, 1 << 31, None, None, 4);
         let options = AlignDriverOptions {
             budget: HostBudget::host_derived(&facts),
             ..Default::default()
@@ -1290,11 +1528,29 @@ mod tests {
         let stack = StackContext::new(8, 512, 512, 3);
         let shared = bytes_shared_reference(stack);
         let per_registration = bytes_per_registration(stack, DEFAULT_TILE_SIZE);
-        let options = AlignDriverOptions {
-            budget: HostBudget::explicit(shared + 2 * per_registration),
-            ..Default::default()
-        };
-        for (policy, workers_at_most) in [("anchor", 2), ("chain", 1)] {
+        let hop = chain_hop_bytes(stack);
+        // (policy, budget, workers at most, bytes one worker adds, fixed part)
+        let arms = [
+            (
+                "anchor",
+                shared + 2 * per_registration,
+                2,
+                per_registration,
+                shared,
+            ),
+            (
+                "chain",
+                chain_budget(stack, 2) as u64,
+                2,
+                hop,
+                bytes_per_frame_build(stack),
+            ),
+        ];
+        for (policy, budget, workers_at_most, per_worker, fixed) in arms {
+            let options = AlignDriverOptions {
+                budget: HostBudget::explicit(budget),
+                ..Default::default()
+            };
             let run = align_stack_with(
                 &ConstAlign,
                 stack,
@@ -1307,7 +1563,7 @@ mod tests {
             assert!(run.worker_limit <= workers_at_most, "{policy}");
             assert_eq!(
                 run.accounted_bytes,
-                shared + run.worker_limit as u64 * per_registration,
+                fixed + run.worker_limit as u64 * per_worker,
                 "{policy}"
             );
         }
@@ -1412,6 +1668,7 @@ mod tests {
             ("anchor", 1, CANCEL_ON),
             ("anchor", two_workers, CANCEL_ON + 1),
             ("chain", 1, CANCEL_ON),
+            ("chain", chain_budget(stack, 2), CANCEL_ON + 1),
         ];
         for (policy, max_bytes_in_flight, bound) in arms {
             let control = JobControl::new();
@@ -1560,6 +1817,7 @@ mod tests {
             ("anchor", 1usize, PAUSE_ON),
             ("anchor", two_workers, PAUSE_ON + 1),
             ("chain", 1usize, PAUSE_ON),
+            ("chain", chain_budget(stack, 2), PAUSE_ON + 1),
         ];
         for (policy, max_bytes_in_flight, bound) in arms {
             let control = JobControl::new();
@@ -1629,6 +1887,8 @@ mod tests {
             ("anchor", two_workers, 19usize),
             ("chain", 1usize, 5usize),
             ("chain", 1usize, 19usize),
+            ("chain", chain_budget(stack, 2), 5usize),
+            ("chain", chain_budget(stack, 2), 19usize),
         ];
         for (policy, max_bytes_in_flight, pause_on) in arms {
             let baseline_algo = PausingAlign {
@@ -1866,5 +2126,157 @@ mod tests {
             4,
             "the rerun restarts the count"
         );
+    }
+
+    /// Translates each frame by its index after a per-frame delay, so a hop
+    /// composed on the wrong predecessor changes the result and a slow hop
+    /// lets later ones finish first. Fails the frames in `failing` (on a device
+    /// run only when `device_only`) and loses the device on `lost_on`.
+    struct HopStub {
+        delays_ms: HashMap<usize, u64>,
+        failing: Vec<usize>,
+        device_only: bool,
+        lost_on: Option<usize>,
+        in_flight: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    impl HopStub {
+        fn new(delays_ms: &[(usize, u64)], failing: &[usize]) -> Self {
+            HopStub {
+                delays_ms: delays_ms.iter().copied().collect(),
+                failing: failing.to_vec(),
+                device_only: false,
+                lost_on: None,
+                in_flight: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+            }
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(Ordering::SeqCst)
+        }
+    }
+
+    impl AlignAlgorithm for HopStub {
+        fn id(&self) -> &str {
+            "hop-stub"
+        }
+        fn display_name(&self) -> &str {
+            "Hop Stub"
+        }
+        fn params(&self) -> &[ParamDesc] {
+            &[]
+        }
+        fn align_frame(
+            &self,
+            ctx: &AlignContext<'_>,
+            frame: usize,
+            _cfg: &ParamValues,
+        ) -> Result<AlignOutcome, AlgorithmError> {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(
+                self.delays_ms.get(&frame).copied().unwrap_or(0),
+            ));
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            let on_device = ctx.align_backend().is_some();
+            if on_device && self.lost_on == Some(frame) {
+                return Err(AlgorithmError::BackendLost {
+                    detail: "device lost".to_string(),
+                });
+            }
+            if self.failing.contains(&frame) && (on_device || !self.device_only) {
+                return Err(AlgorithmError::Failed {
+                    algorithm: "stub".to_string(),
+                    detail: format!("frame {frame}"),
+                });
+            }
+            Ok(converged(Transform::translation(frame as f64, 0.0)))
+        }
+    }
+
+    #[test]
+    fn parallel_chain_reports_the_serial_first_error() {
+        // Reference 4: the upper leg visits 5..=8, then the lower leg 3..=0.
+        // The failing frames finish in the opposite order to the visit.
+        let stack = StackContext::new(9, 8, 8, 1);
+        let cfg = cfg_with("chain", "middle");
+        for hops in [1, 2, 8] {
+            let stub = HopStub::new(&[(6, 60), (5, 40)], &[6, 7, 1]);
+            let options = AlignDriverOptions {
+                budget: HostBudget::explicit(chain_budget(stack, hops) as u64),
+                ..Default::default()
+            };
+            let error = align_stack_with(
+                &stub,
+                stack,
+                &NullReader,
+                &cfg,
+                FailurePolicy::Strict,
+                &options,
+            )
+            .expect_err("three hops fail");
+            assert!(
+                matches!(&error, AlgorithmError::Failed { detail, .. } if detail == "frame 6"),
+                "{hops} hops in flight: {error:?}"
+            );
+            assert_eq!(stub.peak() > 1, hops > 1, "{hops} hops in flight");
+        }
+
+        let mut stub = HopStub::new(&[(6, 60)], &[6]);
+        stub.device_only = true;
+        stub.lost_on = Some(7);
+        let run = align_stack_with(
+            &stub,
+            stack,
+            &NullReader,
+            &cfg,
+            FailurePolicy::Strict,
+            &AlignDriverOptions {
+                budget: HostBudget::explicit(chain_budget(stack, 4) as u64),
+                align_backend: Some(&DecliningBackend),
+                ..Default::default()
+            },
+        )
+        .expect("a loss on any hop reruns the stage on the CPU");
+        assert!(run.rerun_reason.is_some());
+        assert!(!run.backend_used);
+    }
+
+    #[test]
+    fn parallel_chain_previews_in_hop_order() {
+        let stack = StackContext::new(9, 8, 8, 1);
+        let cfg = cfg_with("chain", "middle");
+        let delays = [(5, 80), (6, 50), (7, 20), (3, 80), (2, 50), (1, 20)];
+        let run = |hops: u64| {
+            let stub = HopStub::new(&delays, &[]);
+            let sink = AlignedFrameSink::new((8, 8));
+            let done = Arc::new(AtomicUsize::new(0));
+            let options = AlignDriverOptions {
+                budget: HostBudget::explicit(chain_budget(stack, hops) as u64),
+                frames_done: Some(Arc::clone(&done)),
+                preview: Some(&sink),
+                ..Default::default()
+            };
+            align_stack_with(
+                &stub,
+                stack,
+                &NullReader,
+                &cfg,
+                FailurePolicy::Strict,
+                &options,
+            )
+            .unwrap();
+            assert_eq!(done.load(Ordering::SeqCst), 9);
+            (sink.completions(), stub.peak())
+        };
+        let (serial, serial_peak) = run(1);
+        let (parallel, parallel_peak) = run(4);
+        assert_eq!(serial_peak, 1);
+        assert!(parallel_peak > 1, "the hops must overlap");
+        let order: Vec<usize> = serial.iter().map(|(frame, _)| *frame).collect();
+        assert_eq!(order, [5, 6, 7, 8, 3, 2, 1, 0]);
+        assert_eq!(parallel, serial);
     }
 }

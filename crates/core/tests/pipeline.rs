@@ -38,7 +38,7 @@ use focusforge_core::pipeline::{
 };
 use focusforge_core::project::{self, Project};
 use focusforge_core::registry;
-use focusforge_core::tile::{Rect, SampleFormat, Tile, TileError};
+use focusforge_core::tile::{Rect, SampleFormat, Tile, TileError, TilePlan};
 use focusforge_core::zmap::ZMapReader;
 use raw_dng::{DngSpec, write_dng};
 
@@ -551,7 +551,10 @@ fn cancel_during_alignment_stops_at_a_frame_boundary() {
     let frame_count = CANCEL_ON + workers + 8;
     let frames = mantis_64_frames(frame_count);
 
-    for (policy, bound) in [("anchor", CANCEL_ON + workers - 1), ("chain", CANCEL_ON)] {
+    for (policy, bound) in [
+        ("anchor", CANCEL_ON + workers - 1),
+        ("chain", CANCEL_ON + workers - 1),
+    ] {
         let control = JobControl::new();
         let algorithm: &'static CancellingAlign = Box::leak(Box::new(CancellingAlign {
             control: Arc::clone(&control),
@@ -724,8 +727,11 @@ fn pause_during_alignment_stops_registering_frames() {
     let frames = mantis_64_frames(frame_count);
 
     // The pausing call itself, plus at most one in-flight registration per
-    // other worker; the chain arm registers on one thread.
-    for (policy, bound) in [("anchor", PAUSE_ON + workers - 1), ("chain", PAUSE_ON)] {
+    // other worker, in either arm.
+    for (policy, bound) in [
+        ("anchor", PAUSE_ON + workers - 1),
+        ("chain", PAUSE_ON + workers - 1),
+    ] {
         let control = JobControl::new();
         let calls = Arc::new(AtomicUsize::new(0));
         let algorithm: &'static PausingAlign = Box::leak(Box::new(PausingAlign {
@@ -780,7 +786,10 @@ fn cancel_during_alignment_stops_at_a_frame_boundary_from_a_held_pause() {
     let frame_count = PAUSE_ON + workers + 8;
     let frames = mantis_64_frames(frame_count);
 
-    for (policy, bound) in [("anchor", PAUSE_ON + workers - 1), ("chain", PAUSE_ON)] {
+    for (policy, bound) in [
+        ("anchor", PAUSE_ON + workers - 1),
+        ("chain", PAUSE_ON + workers - 1),
+    ] {
         let control = JobControl::new();
         let calls = Arc::new(AtomicUsize::new(0));
         let algorithm: &'static PausingAlign = Box::leak(Box::new(PausingAlign {
@@ -1043,8 +1052,8 @@ fn align_progress_carries_an_eta() {
     let ticks = observer.ticks.lock().expect("no panic while logging");
     let align: Vec<_> = ticks.iter().filter(|t| t.0 == JobStage::Align).collect();
     assert!(
-        align.iter().filter(|t| t.1 == 0).all(|t| t.2.is_none()),
-        "no ETA before a frame completes: {align:?}"
+        align.iter().filter(|t| t.1 == 0).all(|t| t.2.is_some()),
+        "before a frame completes the ETA is the scaled align prediction: {align:?}"
     );
     assert!(
         align.iter().any(|t| 0 < t.1 && t.1 < 5 && t.2.is_some()),
@@ -1071,9 +1080,10 @@ fn align_progress_carries_an_eta() {
 fn align_eta_excludes_a_pause() {
     let control = JobControl::new();
     let observer = AlignEtaLog::default();
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
     let request = timed_align_request(
         "align_eta_pause",
-        8,
+        2 + workers + 8,
         &control,
         2,
         Duration::from_millis(20),
@@ -1105,6 +1115,111 @@ fn align_eta_excludes_a_pause() {
             "{eta:?} after the hold vs {eta_at_hold:?} before it"
         );
     }
+}
+
+/// Logs every tick's snapshot, and the snapshot at the moment the seal and
+/// the end of the run are announced.
+struct TotalEtaLog {
+    control: Arc<JobControl>,
+    ticks: Mutex<Vec<JobProgress>>,
+    finalizing: Mutex<Vec<JobProgress>>,
+}
+
+impl StageObserver for TotalEtaLog {
+    fn tick(&self, progress: &JobProgress) {
+        self.ticks
+            .lock()
+            .expect("no panic while logging")
+            .push(*progress);
+    }
+
+    fn stage(&self, stage: RunStage) {
+        if matches!(stage, RunStage::Seal | RunStage::Finished) {
+            self.finalizing
+                .lock()
+                .expect("no panic while logging")
+                .push(self.control.progress());
+        }
+    }
+}
+
+#[test]
+fn total_run_eta() {
+    let control = JobControl::new();
+    control.set_min_running(Duration::from_millis(150));
+    let observer = TotalEtaLog {
+        control: Arc::clone(&control),
+        ticks: Mutex::default(),
+        finalizing: Mutex::default(),
+    };
+    let mut explicit = ParamValues::new();
+    explicit.insert("levels".to_string(), ParamValue::Int(3));
+    let mut request = base_request(
+        "total_run_eta",
+        brightness_stack("total_run_eta", 1, &[1.0, 1.0, 1.0]),
+        explicit,
+    );
+    // The smallest tile size that plans at three levels: a 3 x 3 grid on
+    // the 300 px frame, one interior tile among eight edge tiles.
+    request.tile_size = Some(160);
+    request.poll = Duration::from_millis(1);
+    request.align = Some(dummy_align_request());
+
+    let outcome = focusforge_core::pipeline::run(&request, &observer, Arc::clone(&control), None)
+        .expect("the run must complete");
+    assert!(matches!(outcome, FuseOutcome::Completed(_)));
+
+    let plan = TilePlan::new(EQ_SIZE, EQ_SIZE, 160, 3).expect("the frame plans at tile size 160");
+    let edge_tiles = plan
+        .tiles()
+        .iter()
+        .filter(|tile| {
+            let i = tile.interior();
+            i.x == 0 || i.y == 0 || i.x + i.width == EQ_SIZE || i.y + i.height == EQ_SIZE
+        })
+        .count();
+    assert!(
+        edge_tiles > 0 && edge_tiles < plan.len(),
+        "{edge_tiles} of {} tiles touch an edge",
+        plan.len()
+    );
+
+    let ticks = observer.ticks.lock().expect("no panic while logging");
+    assert!(!ticks.is_empty(), "the slow-run hook must yield fuse ticks");
+    assert_eq!(
+        ticks.last().map(|tick| tick.unit_total),
+        Some(plan.len()),
+        "the run fused the planned grid"
+    );
+    for tick in ticks.iter() {
+        let total = tick.total_eta.expect("a seeded run reports a total");
+        assert!(
+            total >= tick.eta.unwrap_or_default(),
+            "total {total:?} below stage ETA {:?}: {tick:?}",
+            tick.eta
+        );
+    }
+    for pair in ticks.windows(2) {
+        let (before, after) = (pair[0].total_eta, pair[1].total_eta);
+        assert!(
+            after <= before,
+            "the total rose from {before:?} to {after:?}: {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+    let finalizing = observer.finalizing.lock().expect("no panic while logging");
+    assert!(!finalizing.is_empty(), "the seal must be announced");
+    for snapshot in finalizing.iter() {
+        assert_eq!(snapshot.pixels_done, snapshot.pixel_total);
+        assert!(
+            snapshot
+                .total_eta
+                .is_some_and(|total| total > Duration::ZERO),
+            "the total stays positive through finalize: {snapshot:?}"
+        );
+    }
+    assert_eq!(control.progress().total_eta, Some(Duration::ZERO));
 }
 
 /// Logs the Prepare-stage tally of every tick, and the control's tally at
@@ -3634,6 +3749,23 @@ fn raw_frames(dir: &Path, count: usize, width: u32, height: u32) -> Vec<PathBuf>
             path
         })
         .collect()
+}
+
+#[test]
+fn raw_scheduler_full_budget_after_develop() {
+    let frames = raw_frames(&scratch("raw_full_budget_frames"), 2, 64, 64);
+    let reservation = 64 * 64 * 30 + std::fs::metadata(&frames[0]).expect("frame size").len();
+    let cap = 2 * reservation;
+    let mut request = base_request("raw_full_budget", frames, ParamValues::new());
+    request.output = FuseOutput::Hold(scratch("raw_full_budget_hold"));
+    request.max_host_memory = Some(cap);
+    let FuseOutcome::Completed(report) =
+        focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+            .expect("the capped RAW run completes")
+    else {
+        panic!("the run must complete");
+    };
+    assert_eq!(report.max_bytes_in_flight, cap);
 }
 
 #[test]

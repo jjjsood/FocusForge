@@ -3,7 +3,7 @@
 //! The `Settings` dock panel, generated from `ParamDesc` alone. Plain Rust,
 //! no `use slint::` anywhere in this file -- `build_rows` turns a
 //! resolved schema into the flat [`SettingsRow`] list
-//! `ui/shell/dock/settings_panel.slint`'s `for` loop renders, and every
+//! `crates/ui/ui/shell/dock/settings_panel.slint`'s `for` loop renders, and every
 //! `focusforge_core` reference the panel needs lives here, so
 //! `crate::controller` never names that crate directly. [`crate::settings_panel::control_kind`] is
 //! the crate's only `match` on `ParamKind`.
@@ -204,7 +204,7 @@ pub enum HeadingState {
 }
 
 /// One row of the panel's flat list -- the plain twin of
-/// `ui/shell/dock/settings_panel.slint`'s generated `SettingsRow` struct.
+/// `crates/ui/ui/shell/dock/settings_panel.slint`'s generated `SettingsRow` struct.
 /// Every kind uses a different subset of these fields; unused fields carry
 /// their type's default.
 #[derive(Debug, Clone, PartialEq)]
@@ -302,11 +302,11 @@ pub struct PanelModel {
     pub viewport_height: f32,
 }
 
-// -- Geometry, mirroring `ShellGeometry`'s panel metrics (`ui/geometry.slint`)
+// -- Geometry, mirroring `ShellGeometry`'s panel metrics (`crates/ui/ui/geometry.slint`)
 // exactly as `crate::controller::TAB_PITCH` mirrors `ShellGeometry.tab-pitch`.
 // No inter-row gap constant: the gap before the next row's label is part of
 // a row's own height, so `content_height` (a plain sum) is exactly what
-// `ui/shell/dock/settings_panel.slint` lays out -- the same discipline the
+// `crates/ui/ui/shell/dock/settings_panel.slint` lays out -- the same discipline the
 // tab strip's fixed pitch already uses. --
 
 /// `ShellGeometry.param-label-height`: a slider/field/menu row's own label
@@ -347,7 +347,7 @@ pub const SECTION_HEADING_BOTTOM_GAP: f32 = 8.0;
 /// label's width.
 pub const PANEL_CONTENT_WIDTH: f32 = 228.0;
 /// A slider row's readout field, flush right, plus the gap that separates
-/// it from the track (`ui/components/ff_slider.slint`'s `70px`).
+/// it from the track (`crates/ui/ui/components/ff_slider.slint`'s `70px`).
 pub const SLIDER_READOUT_RESERVE: f32 = 70.0;
 /// A slider's own draggable track width: the row's full width minus its
 /// readout field.

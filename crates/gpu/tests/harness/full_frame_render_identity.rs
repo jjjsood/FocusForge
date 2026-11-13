@@ -7,7 +7,7 @@
 //! `.scratch/full-frame-identity/` for comparison with `focusforge-cli export`.
 
 #[path = "../../../core/tests/common/mod.rs"]
-mod core_common;
+pub(crate) mod core_common;
 
 use std::path::{Path, PathBuf};
 

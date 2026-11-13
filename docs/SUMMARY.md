@@ -32,5 +32,3 @@
 
 - [Command-line reference](reference/cli.md)
 - [Batch runs from the command line](reference/batch-runs.md)
-- [Project file format](reference/project-format.md)
-- [TIFF fast path](reference/tiff-fast-path.md)

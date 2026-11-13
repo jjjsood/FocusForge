@@ -16,7 +16,7 @@ use focusforge_core::align::{
     align_stack_with, auto_crop,
 };
 use focusforge_core::gpu::TileBackend;
-use focusforge_core::io::{FrameReader, TiffSpec, TiffWriter, frame_paths, open_frame_set};
+use focusforge_core::io::{FrameReader, TiffSpec, TiffWriter, all_frame_paths, open_frame_set};
 use focusforge_core::params;
 use focusforge_core::registry;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
@@ -88,14 +88,15 @@ pub struct AlignReport {
     /// no `--no-align`. Present so `align --json` and `stack --json` report
     /// their `align` stage the same way.
     pub align_source: String,
-    /// The anchor arm's worker bound and the peak it reached: always `Some`
-    /// here. `Option` so the key has one type in `align --json` and
-    /// `stack --json`.
+    /// The worker bound of the alignment (anchor registrations or chain hops)
+    /// and the peak it reached: always `Some` here. `Option` so the key has
+    /// one type in `align --json` and `stack --json`.
     pub align_workers: Option<usize>,
     pub peak_align_workers: Option<usize>,
-    /// The bytes the alignment accounted for: the shared reference data plus
-    /// one registration per worker. An explicit budget below one
-    /// registration still runs one worker, so this can exceed the budget.
+    /// The bytes the alignment accounted for: for an anchor run the shared
+    /// reference data plus one registration per worker, for a chain run one
+    /// hop per worker. An explicit budget below one registration or hop still
+    /// runs one worker, so this can exceed the budget.
     pub align_accounted_bytes: u64,
     /// `"cpu"`, or the adapter's display when at least one alignment level
     /// ran on it.
@@ -169,7 +170,7 @@ pub fn run(
     // One monotonic timer shares `start` with `wall_seconds` below.
     let mut timer = StageTimer::from_start(start);
     timer.enter(Stage::Setup);
-    let mut renderer = ProgressRenderer::new(ProgressMode::choose(no_progress));
+    let mut renderer = ProgressRenderer::new(ProgressMode::choose(no_progress), false);
     let sink = StatusSink::new(preset_opts.status, dir.display().to_string(), "align");
 
     // One preset file serves both subcommands: `align` reads `align-algo`
@@ -219,7 +220,7 @@ pub fn run(
         }
     }
 
-    let paths = match frame_paths(dir) {
+    let paths = match all_frame_paths(dir) {
         Ok(paths) => paths,
         Err(err) => return sink.fail(err),
     };

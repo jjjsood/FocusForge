@@ -1143,6 +1143,69 @@ fn align_without_adapter_runs_on_cpu() {
     assert_eq!(report["align_backend"], "cpu");
 }
 
+/// A software rasterizer (lavapipe is the only Vulkan driver visible) is
+/// never used for compute: fusion and alignment both run on the CPU and say
+/// which adapter they declined.
+#[test]
+fn software_adapter_stacks_on_the_cpu() {
+    const LAVAPIPE_ICD: &str = "/usr/share/vulkan/icd.d/lvp_icd.json";
+    if !cfg!(target_os = "linux") || !Path::new(LAVAPIPE_ICD).exists() {
+        println!("SKIP: needs the lavapipe Vulkan driver");
+        return;
+    }
+    let cwd = common::tmp_dir("cli_gpu_software_adapter_cwd");
+    let input = large_synthetic_stack("cli_gpu_software_adapter_in");
+    let work = common::tmp_dir("cli_gpu_software_adapter");
+    let out = out_dir(&work, "out");
+    let result = common::run_in(
+        bin()
+            .env("VK_DRIVER_FILES", LAVAPIPE_ICD)
+            .env("WGPU_BACKEND", "vulkan"),
+        &cwd,
+        &[
+            "stack",
+            input.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--algorithm",
+            "laplacian",
+            "--align-algorithm",
+            "pyramidal-ecc",
+            "--align-set",
+            "mode=translation",
+            "--json",
+        ],
+    );
+    assert!(result.success, "stderr: {}", result.stderr);
+    let stderr = result.stderr.to_lowercase();
+    assert_eq!(
+        stderr.matches("only a software adapter (").count(),
+        2,
+        "fusion and alignment each name the software adapter: {}",
+        result.stderr
+    );
+    assert!(stderr.contains("llvmpipe"), "stderr: {}", result.stderr);
+    assert!(
+        stderr.matches("continuing on the cpu path").count() >= 2,
+        "stderr: {}",
+        result.stderr
+    );
+    assert!(
+        !stderr.contains("using the gpu path"),
+        "stderr: {}",
+        result.stderr
+    );
+    assert!(
+        !stderr.contains("alignment offloads"),
+        "stderr: {}",
+        result.stderr
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&result.stdout).expect("--json must parse");
+    assert_eq!(report["backend"], "cpu", "report: {report}");
+    assert_eq!(report["align_backend"], "cpu", "report: {report}");
+}
+
 /// `--max-vram` caps the align backend's device budget, and a capped backend
 /// still serves the level.
 #[test]

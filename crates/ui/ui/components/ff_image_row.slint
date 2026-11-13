@@ -8,6 +8,9 @@ import { FFTooltip } from "ff_tooltip.slint";
 export component FFImageRow inherits Rectangle {
     in property <color> chip;
     in property <string> name;
+    // The whole name when `name` is shortened; empty when `name` is whole.
+    in property <string> full-name;
+    property <string> tooltip-text: root.full-name != "" ? root.full-name : root.name;
     in property <string> time-text;
     in property <string> capture-stamp;
     in property <string> presentation: "list";
@@ -169,7 +172,7 @@ export component FFImageRow inherits Rectangle {
         list-name-slot := Rectangle {
             horizontal-stretch: 1;
             property <bool> show-tooltip: !root.dragging && root.name != ""
-                && list-name.preferred-width > list-name.width;
+                && (root.tooltip-text != root.name || list-name.preferred-width > list-name.width);
             list-name := Text {
                 width: 100%;
                 height: 100%;
@@ -181,7 +184,7 @@ export component FFImageRow inherits Rectangle {
                 overflow: elide;
             }
             if self.show-tooltip: Tooltip {
-                FFTooltip { text: root.name; tooltip-max-width: root.tooltip-max-width; }
+                FFTooltip { text: root.tooltip-text; tooltip-max-width: root.tooltip-max-width; }
             }
         }
         list-timestamp-slot := Rectangle {
@@ -241,7 +244,7 @@ export component FFImageRow inherits Rectangle {
             width: 100%;
             height: ShellGeometry.image-list-name-height;
             property <bool> show-tooltip: !root.dragging && root.name != ""
-                && image-list-name.preferred-width > image-list-name.width;
+                && (root.tooltip-text != root.name || image-list-name.preferred-width > image-list-name.width);
             image-list-name := Text {
                 width: 100%;
                 height: 100%;
@@ -254,7 +257,7 @@ export component FFImageRow inherits Rectangle {
                 overflow: elide;
             }
             if self.show-tooltip: Tooltip {
-                FFTooltip { text: root.name; tooltip-max-width: root.tooltip-max-width; }
+                FFTooltip { text: root.tooltip-text; tooltip-max-width: root.tooltip-max-width; }
             }
         }
         Text {
@@ -345,7 +348,7 @@ export component FFImageRow inherits Rectangle {
             width: large-timestamp-slot.x - self.x - Theme.space-2;
             height: 100%;
             property <bool> show-tooltip: !root.dragging && root.name != ""
-                && large-name.preferred-width > large-name.width;
+                && (root.tooltip-text != root.name || large-name.preferred-width > large-name.width);
             large-name := Text {
                 width: 100%;
                 height: 100%;
@@ -357,7 +360,7 @@ export component FFImageRow inherits Rectangle {
                 overflow: elide;
             }
             if self.show-tooltip: Tooltip {
-                FFTooltip { text: root.name; tooltip-max-width: root.tooltip-max-width; }
+                FFTooltip { text: root.tooltip-text; tooltip-max-width: root.tooltip-max-width; }
             }
         }
     }

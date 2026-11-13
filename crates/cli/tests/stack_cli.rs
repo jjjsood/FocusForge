@@ -600,6 +600,8 @@ fn report_json_has_every_field() {
         "tiles",
         "frame_tiles_read",
         "in_flight_limit",
+        "in_flight_bound",
+        "page_cache_bytes_per_tile",
         "peak_in_flight",
         "max_bytes_in_flight",
         "accounted_bytes_in_flight",
@@ -708,6 +710,54 @@ fn stage_timings_are_reported_for_every_entered_stage() {
         "human report must name each entered stage: {}",
         human.stdout
     );
+}
+
+#[test]
+fn tiff_stack_json_reports_no_page_cache_working_set() {
+    let cwd = tmp_dir("tiff_no_page_cache_working_set");
+    let frames = common::fixtures_dir().join("mantis-64").join("frames");
+    let json = |name: &str, extra: &[&str]| -> serde_json::Value {
+        let output = cwd.join(name);
+        std::fs::create_dir(&output).unwrap();
+        let mut args = vec![
+            "stack",
+            frames.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--algorithm",
+            "dummy-stack",
+            "--json",
+            "--no-align",
+            "--no-crop",
+        ];
+        args.extend(extra);
+        let out = run_cli_in(&cwd, &args);
+        assert!(out.success, "stderr: {}", out.stderr);
+        serde_json::from_str(&out.stdout).expect("--json must parse")
+    };
+
+    let stacked = json("run", &[]);
+    let dry = json("dry", &["--dry-run"]);
+    assert!(stacked["page_cache_bytes_per_tile"].is_null(), "{stacked}");
+    assert!(stacked["band_columns"].is_null(), "{stacked}");
+    assert!(dry["page_cache_bytes_per_tile"].is_null(), "{dry}");
+
+    // One byte under a tile's accounted bytes: the budget cannot hold a tile,
+    // so the limit floors at 1 and the budget is what set it.
+    let limit = stacked["in_flight_limit"].as_u64().expect("limit");
+    let per_tile = stacked["accounted_bytes_in_flight"]
+        .as_u64()
+        .expect("bytes")
+        / limit;
+    let ceiling = (per_tile - 1).to_string();
+    for (what, extra) in [("run", vec![]), ("dry run", vec!["--dry-run"])] {
+        let mut extra = extra;
+        extra.extend(["--max-host-memory", &ceiling]);
+        let report = json(&format!("tight-{}", what.replace(' ', "-")), &extra);
+        assert_eq!(report["in_flight_limit"], 1, "{what}: {report}");
+        assert_eq!(report["in_flight_bound"], "host_budget", "{what}: {report}");
+        assert!(report["page_cache_bytes_per_tile"].is_null(), "{what}");
+    }
 }
 
 #[test]
@@ -1746,5 +1796,441 @@ fn laplacian_constant_stack_round_trips() {
     assert_eq!((w, h, spp), (width, height, 3));
     for (i, &sample) in samples.iter().enumerate() {
         assert_eq!(sample, CONSTANT[i % 3], "sample {i}");
+    }
+}
+
+/// One `stack --json` (or `--dry-run --json`) document over a fixture's
+/// frames, into a fresh working directory so the run is cold.
+fn run_plan_json(label: &str, frames: &Path, extra: &[&str]) -> serde_json::Value {
+    let cwd = tmp_dir(label);
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let mut args = vec![
+        "stack",
+        frames.to_str().unwrap(),
+        "-o",
+        out_dir.to_str().unwrap(),
+        "--algorithm",
+        "dummy-stack",
+        "--json",
+        "--no-align",
+        "--no-crop",
+    ];
+    args.extend(extra);
+    let out = run_cli_in(&cwd, &args);
+    assert!(out.success, "stderr: {}", out.stderr);
+    serde_json::from_str(&out.stdout).expect("valid JSON")
+}
+
+#[test]
+fn stack_json_reports_trace_accounting_when_asked() {
+    let cwd = tmp_dir("trace_accounting_when_asked");
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    // An 8-bit TIFF takes the decoded reader, which counts decoded bytes; the
+    // alignment stage reports the worker peak.
+    let frames = common::fixtures_dir().join("mantis8-64").join("frames");
+    let out = run_cli_in(
+        &cwd,
+        &[
+            "stack",
+            frames.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algorithm",
+            "dummy-stack",
+            "--align-algorithm",
+            "dummy-align",
+            "--no-crop",
+            "--no-cache",
+            "--tile-size",
+            "32",
+            "--json",
+            "--trace-accounting",
+        ],
+    );
+    assert!(out.success, "stderr: {}", out.stderr);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+    let accounting = report["trace_accounting"]
+        .as_object()
+        .unwrap_or_else(|| panic!("trace_accounting must be an object: {report}"));
+    assert_eq!(
+        accounting.len(),
+        42,
+        "every counter plus saturated: {report}"
+    );
+    assert!(accounting.contains_key("saturated"), "{report}");
+    for key in ["decoded_bytes", "peak_workers"] {
+        assert!(
+            accounting[key].as_u64().is_some_and(|n| n > 0),
+            "{key} must be nonzero: {report}"
+        );
+    }
+    let stages = report["stages"].as_object().expect("stages object");
+    let sum: f64 = stages.values().filter_map(serde_json::Value::as_f64).sum();
+    let wall = report["wall_seconds"].as_f64().expect("wall_seconds");
+    assert!(
+        (sum - wall).abs() < 1e-6,
+        "stages must still sum to wall_seconds: {sum} vs {wall}"
+    );
+}
+
+#[test]
+fn stack_json_trace_accounting_is_null_by_default() {
+    let frames = common::fixtures_dir().join("mantis-64").join("frames");
+    let report = run_plan_json("trace_accounting_null", &frames, &[]);
+    assert_eq!(report["trace_accounting"], serde_json::Value::Null);
+    assert_eq!(report["fuse_tiles"], serde_json::Value::Null);
+    let baseline = [
+        "input",
+        "frame_count",
+        "frames",
+        "width",
+        "height",
+        "samples_per_pixel",
+        "working_space",
+        "algorithm",
+        "display_name",
+        "params",
+        "tile_size",
+        "levels",
+        "margin",
+        "tiles",
+        "frame_tiles_read",
+        "in_flight_limit",
+        "in_flight_bound",
+        "band_columns",
+        "page_cache_bytes_per_tile",
+        "peak_in_flight",
+        "max_bytes_in_flight",
+        "developed_store",
+        "accounted_bytes_in_flight",
+        "budget_provenance",
+        "backed_off",
+        "outputs",
+        "wall_seconds",
+        "output_width",
+        "output_height",
+        "crop",
+        "description",
+        "align",
+        "equalization",
+        "backend",
+        "max_device_bytes_in_flight",
+        "device_budget_provenance",
+        "device_peak_in_flight",
+        "gpu_fallback",
+        "align_cached",
+        "stages",
+        "develop_counts",
+        "align_source",
+        "align_workers",
+        "peak_align_workers",
+        "align_accounted_bytes",
+        "align_backend",
+    ];
+    let mut expected: Vec<&str> = baseline
+        .iter()
+        .copied()
+        .chain(["run_plan", "trace_accounting", "fuse_tiles"])
+        .collect();
+    expected.sort_unstable();
+    let mut keys: Vec<&str> = report
+        .as_object()
+        .expect("report object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, expected);
+
+    let cwd = tmp_dir("trace_accounting_needs_json");
+    let out = run_cli_in(
+        &cwd,
+        &["stack", frames.to_str().unwrap(), "--trace-accounting"],
+    );
+    assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
+}
+
+#[test]
+fn run_plan_matches_between_dry_run_and_run() {
+    for (label, fixture, reader, bits) in [
+        ("run_plan_8bit", "mantis8-64", "decoded", 8),
+        ("run_plan_16bit", "mantis-64", "mmap", 16),
+    ] {
+        let frames = common::fixtures_dir().join(fixture).join("frames");
+        let run = run_plan_json(&format!("{label}_run"), &frames, &[]);
+        let dry = run_plan_json(&format!("{label}_dry"), &frames, &["--dry-run"]);
+        assert_eq!(run["run_plan"], dry["run_plan"], "{fixture}");
+        assert_eq!(run["run_plan"]["reader"], reader, "{fixture}");
+        assert_eq!(run["run_plan"]["source_bits_per_sample"], bits, "{fixture}");
+        assert_eq!(run["run_plan"]["frame_count"], 3, "{fixture}");
+        assert_eq!(run["run_plan"]["frame_pixels"], 64 * 64, "{fixture}");
+        assert_eq!(run["run_plan"]["gpu"], false, "{fixture}");
+        assert_eq!(run["run_plan"]["align_gpu"], false, "{fixture}");
+        assert_eq!(run["run_plan"]["algorithm"], "dummy-stack", "{fixture}");
+        let not_computed = dry["not_computed"].as_array().expect("not_computed");
+        assert!(
+            not_computed.iter().any(|v| v == "alignment cache"),
+            "the dry run names the alignment cache: {dry}"
+        );
+    }
+}
+
+/// `run_plan.align_gpu` of one aligned `stack --json` over the 16-bit
+/// fixture, as a dry run or a real run.
+fn align_gpu_of(
+    label: &str,
+    align_algorithm: &str,
+    dry: bool,
+    extra: &[&str],
+) -> serde_json::Value {
+    let frames = common::fixtures_dir().join("mantis-64").join("frames");
+    let cwd = tmp_dir(label);
+    let out_dir = cwd.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let mut args = vec![
+        "stack",
+        frames.to_str().unwrap(),
+        "-o",
+        out_dir.to_str().unwrap(),
+        "--algorithm",
+        "dummy-stack",
+        "--align-algorithm",
+        align_algorithm,
+        "--no-crop",
+        "--json",
+    ];
+    if dry {
+        args.push("--dry-run");
+    }
+    args.extend(extra);
+    let out = run_cli_in(&cwd, &args);
+    assert!(out.success, "stderr: {}", out.stderr);
+    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+    report["run_plan"].clone()
+}
+
+#[test]
+fn run_plan_reports_the_planned_align_backend() {
+    let offered = cfg!(feature = "gpu");
+    let plan = align_gpu_of("align_gpu_ecc", "pyramidal-ecc", true, &[]);
+    assert_eq!(plan["align_gpu"], offered, "pyramidal-ecc: {plan}");
+    if offered {
+        let plan = align_gpu_of("align_gpu_ecc_cpu", "pyramidal-ecc", true, &["--cpu"]);
+        assert_eq!(plan["align_gpu"], false, "--cpu: {plan}");
+    }
+    let plan = align_gpu_of("align_gpu_none", "pyramidal-ecc", true, &["--no-align"]);
+    assert_eq!(plan["align_gpu"], false, "--no-align: {plan}");
+    let dry = align_gpu_of("align_gpu_dummy_dry", "dummy-align", true, &[]);
+    assert_eq!(dry["align_gpu"], false, "an aligner without a GPU path");
+    let run = align_gpu_of("align_gpu_dummy_run", "dummy-align", false, &[]);
+    assert_eq!(run, dry, "the run plans what the dry run planned");
+}
+
+/// One `stack --dry-run` over `fixtures/<fixture>/frames` with a computed
+/// alignment half, in an empty working directory that must stay empty:
+/// the `--json` document and the human summary.
+fn dry_run_prediction(
+    label: &str,
+    fixture: &str,
+    algorithm: &str,
+    extra: &[&str],
+) -> (serde_json::Value, String) {
+    let frames = common::fixtures_dir().join(fixture).join("frames");
+    let cwd = tmp_dir(label);
+    let out_dir = tmp_dir(&format!("{label}_out"));
+    let run = |json: bool| {
+        let mut args = vec![
+            "stack",
+            frames.to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algorithm",
+            algorithm,
+            "--align-algorithm",
+            "dummy-align",
+            "--no-crop",
+            "--dry-run",
+        ];
+        if json {
+            args.push("--json");
+        }
+        args.extend(extra);
+        let out = run_cli_in(&cwd, &common::push_no_gpu(args));
+        assert!(out.success, "stderr: {}", out.stderr);
+        out.stdout
+    };
+    let json = serde_json::from_str(&run(true)).expect("valid JSON");
+    let human = run(false);
+    assert_eq!(
+        std::fs::read_dir(&*cwd).unwrap().count(),
+        0,
+        "a dry run writes nothing"
+    );
+    (json, human)
+}
+
+#[test]
+fn dry_run_reports_prediction() {
+    let (plan, human) = dry_run_prediction("prediction_calibrated", "mantis-64", "laplacian", &[]);
+    let mut keys: Vec<&str> = plan
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    let mut expected = vec![
+        "dry_run",
+        "input",
+        "frame_count",
+        "width",
+        "height",
+        "samples_per_pixel",
+        "algorithm",
+        "display_name",
+        "params",
+        "align",
+        "tile_size",
+        "levels",
+        "margin",
+        "tiles",
+        "in_flight_limit",
+        "in_flight_bound",
+        "page_cache_bytes_per_tile",
+        "max_bytes_in_flight",
+        "developed_store",
+        "run_plan",
+        "backend",
+        "would_write",
+        "not_computed",
+        "prediction",
+    ];
+    expected.sort_unstable();
+    assert_eq!(keys, expected, "the plan keys, `prediction` included");
+
+    let prediction = &plan["prediction"];
+    let mut prediction_keys: Vec<&str> = prediction
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    prediction_keys.sort_unstable();
+    assert_eq!(prediction_keys, ["calibrated", "stages", "total_seconds"]);
+    assert_eq!(prediction["calibrated"], true, "{prediction}");
+    let stages = &prediction["stages"];
+    assert_eq!(stages.as_object().unwrap().len(), 6, "{stages}");
+    for key in ["develop", "warp_write"] {
+        assert!(stages[key].is_null(), "{key} in {stages}");
+    }
+    let mut sum = 0.0;
+    for key in ["setup", "align", "fuse", "finalize"] {
+        sum += stages[key]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{key} in {stages}"));
+    }
+    let total = prediction["total_seconds"].as_f64().unwrap();
+    assert!((total - sum).abs() <= 1e-9 * total, "{total} vs {sum}");
+    let lines: Vec<&str> = human
+        .lines()
+        .filter(|l| l.starts_with("predicted duration:"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{human}");
+    assert!(
+        !lines[0].contains('~') && !lines[0].contains("not calibrated"),
+        "{human}"
+    );
+    let crop = human.find("crop: not computed").expect("crop line");
+    assert!(human.find("predicted duration:").unwrap() < crop, "{human}");
+
+    let (no_align, _) = dry_run_prediction(
+        "prediction_no_align",
+        "mantis-64",
+        "laplacian",
+        &["--no-align"],
+    );
+    let no_align = &no_align["prediction"];
+    assert!(no_align["stages"]["align"].is_null(), "{no_align}");
+    assert!(no_align["total_seconds"].as_f64().unwrap() < total);
+    assert_eq!(no_align["calibrated"], true);
+
+    for (label, fixture, algorithm, reader) in [
+        (
+            "prediction_deflate",
+            "mantis-64-deflate-p2-strip-ii",
+            "laplacian",
+            "decoded",
+        ),
+        ("prediction_decoded", "mantis8-64", "laplacian", "decoded"),
+        ("prediction_depth_map", "mantis-64", "depth-map", "mmap"),
+        (
+            "prediction_weighted_average",
+            "mantis-64",
+            "weighted-average",
+            "mmap",
+        ),
+    ] {
+        let (plan, human) = dry_run_prediction(label, fixture, algorithm, &[]);
+        assert_eq!(plan["run_plan"]["reader"], reader, "{label}");
+        assert_eq!(plan["prediction"]["calibrated"], true, "{label}");
+        assert!(plan["prediction"]["total_seconds"].as_f64().unwrap() > 0.0);
+        let line = human
+            .lines()
+            .find(|l| l.starts_with("predicted duration:"))
+            .unwrap_or_else(|| panic!("{label}: {human}"));
+        assert!(
+            !line.contains('~') && !line.contains("not calibrated"),
+            "{label}: {line}"
+        );
+    }
+
+    let (plan, human) =
+        dry_run_prediction("prediction_dummy_stack", "mantis-64", "dummy-stack", &[]);
+    assert_eq!(plan["prediction"]["calibrated"], false);
+    assert!(plan["prediction"]["total_seconds"].as_f64().unwrap() > 0.0);
+    let line = human
+        .lines()
+        .find(|l| l.starts_with("predicted duration:"))
+        .unwrap_or_else(|| panic!("{human}"));
+    assert!(
+        line.starts_with("predicted duration: ~")
+            && line.ends_with("(not calibrated for this input)"),
+        "{line}"
+    );
+}
+
+#[test]
+fn fuse_tiles_cover_the_plan_when_accounting_is_on() {
+    let frames = common::fixtures_dir().join("mantis-64").join("frames");
+    // 16 px tiles give interior tiles; 48 px tiles leave a ragged edge.
+    for (tile_size, expect_interior) in [("16", true), ("48", false)] {
+        let report = run_plan_json(
+            &format!("fuse_tiles_{tile_size}"),
+            &frames,
+            &["--tile-size", tile_size, "--trace-accounting"],
+        );
+        let tiles = report["tiles"].as_u64().expect("tiles");
+        assert!(tiles > 1, "tile size {tile_size} must plan several tiles");
+        let entries = report["fuse_tiles"]
+            .as_array()
+            .unwrap_or_else(|| panic!("fuse_tiles must be an array: {report}"));
+        assert_eq!(entries.len() as u64, tiles, "tile size {tile_size}");
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(entry["index"], i as u64, "tile size {tile_size}");
+            for key in ["read_pixels", "output_pixels", "duration_ns"] {
+                assert!(entry[key].is_u64(), "{key} in {entry}");
+            }
+            assert!(entry["touches_edge"].is_boolean(), "{entry}");
+        }
+        let output_total: u64 = entries
+            .iter()
+            .map(|e| e["output_pixels"].as_u64().unwrap())
+            .sum();
+        let extent = report["width"].as_u64().unwrap() * report["height"].as_u64().unwrap();
+        assert_eq!(output_total, extent, "tile size {tile_size}");
+        let has_interior = entries.iter().any(|e| e["touches_edge"] == false);
+        assert_eq!(has_interior, expect_interior, "tile size {tile_size}");
     }
 }

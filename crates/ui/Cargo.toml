@@ -1,0 +1,23 @@
+[package]
+name = "focusforge-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+slint = { version = "~1.17", default-features = false, features = [
+    "std", "compat-1-2", "backend-winit", "renderer-femtovg-wgpu", "unstable-wgpu-29",
+    "unstable-winit-030",
+] }
+
+[build-dependencies]
+slint-build = "~1.17"

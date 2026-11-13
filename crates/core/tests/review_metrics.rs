@@ -64,18 +64,18 @@ fn sharpness_ratio_matches_the_golden_composite() {
     );
     // Measured directly against the committed golden file (`golden_pin_matches_byte_for_byte`
     // in `laplacian_fusion.rs` proves it is byte-identical to a fresh unaligned 448/5 run, which
-    // equals the single-tile run): composite 347107.5, sharpest input 285247.1, ratio 1.2169.
+    // equals the single-tile run): composite 352474.7, sharpest input 285247.1, ratio 1.2357.
     assert!(
-        (composite_lapvar - 347_107.5).abs() < 1.0,
-        "composite lapvar must reproduce 347107.5: got {composite_lapvar:.1}"
+        (composite_lapvar - 352_474.7).abs() < 1.0,
+        "composite lapvar must reproduce 352474.7: got {composite_lapvar:.1}"
     );
     assert!(
         (max_input_lapvar - 285_247.1).abs() < 1.0,
         "sharpest input lapvar must reproduce 285247.1: got {max_input_lapvar:.1}"
     );
     assert!(
-        (ratio - 1.2169).abs() < 0.0005,
-        "ratio must reproduce 1.2169: got {ratio:.4}"
+        (ratio - 1.2357).abs() < 0.0005,
+        "ratio must reproduce 1.2357: got {ratio:.4}"
     );
 }
 
@@ -111,8 +111,8 @@ fn zmap_spread_matches_the_golden_zmap() {
         spread.coherence
     );
     assert!(
-        (spread.coherence - 0.6376).abs() < 0.001,
-        "coherence must reproduce 0.6376: got {:.4}",
+        (spread.coherence - 0.5595).abs() < 0.001,
+        "coherence must reproduce 0.5595: got {:.4}",
         spread.coherence
     );
 

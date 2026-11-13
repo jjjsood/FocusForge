@@ -109,6 +109,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('--dry-run', '--dry-run', [CompletionResultType]::ParameterName, 'Resolve everything, print what would happen -- parameters with their provenance, tile geometry, output paths -- and exit 0 without computing or writing anything. Stops *before* alignment, so it reports no crop rect and no output extent')
             [CompletionResult]::new('--cpu', '--cpu', [CompletionResultType]::ParameterName, 'Force the CPU path even when a usable GPU adapter is available. Only in builds with GPU support')
             [CompletionResult]::new('--no-cache', '--no-cache', [CompletionResultType]::ParameterName, 'Skip the stage cache: recompute the alignment even when a valid entry exists, and store no new entry')
+            [CompletionResult]::new('--trace-accounting', '--trace-accounting', [CompletionResultType]::ParameterName, 'Count bytes read and converted, cache hits, worker peaks and each fused tile''s duration during the run, and add them to the --json report as `trace_accounting` and `fuse_tiles`. Off by default; it costs a little time when on')
             [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail (repeatable)')
             [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Log errors only')
             [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Log errors only')

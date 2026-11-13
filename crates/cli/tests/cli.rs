@@ -67,6 +67,17 @@ fn version_flag_prints_package_version() {
         stdout.contains(env!("CARGO_PKG_VERSION")),
         "stdout did not contain package version: {stdout:?}"
     );
+    let profile = if cfg!(debug_assertions) {
+        "(debug)"
+    } else {
+        "(release)"
+    };
+    assert!(
+        stdout.trim_end().ends_with(profile),
+        "stdout did not end with the build profile {profile}: {stdout:?}"
+    );
+    let short = spawn_in(&cwd, &["-V"]);
+    assert_eq!(short.stdout, output.stdout, "-V differs from --version");
 }
 
 #[test]

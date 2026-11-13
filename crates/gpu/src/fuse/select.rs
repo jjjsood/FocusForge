@@ -17,8 +17,8 @@ fn score_params(width: u32, height: u32, spp: u32, radius: u32) -> [u8; 16] {
 }
 
 /// The two-pass windowed sharpness score of one Laplacian level -- the GPU
-/// twin of `score_plane`. Row pass then column pass, the same pinned order
-/// `score_plane` uses.
+/// twin of `score_plane`. Row pass then column pass in `f32`; it agrees with
+/// the fixed-point `score_plane` to a few `f32` ulps.
 #[allow(clippy::too_many_arguments)]
 pub fn score(
     batch: &mut TileBatch,

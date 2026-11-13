@@ -713,6 +713,10 @@ impl TileReader for PixelScratchReader {
     fn read_scratch_bytes(&self, width: u32, height: u32) -> u64 {
         u64::from(width) * u64::from(height)
     }
+
+    fn read_page_cache_bytes(&self, width: u32, height: u32) -> u64 {
+        u64::from(width) * u64::from(height) * 6
+    }
 }
 
 /// The scratch the warp of a centred `rect` allocates, worked out from the
@@ -784,4 +788,54 @@ fn warp_scratch_footprint_is_clamped_to_the_frame() {
         reader.read_scratch_bytes(64, 64),
         frame_pixels * 3 * 2 + frame_pixels * (3 * 2 + 1) + frame_pixels
     );
+}
+
+#[test]
+fn working_set_of_identity_is_the_inner_figure() {
+    let reader = WarpingReader::new(
+        &PixelScratchReader,
+        (512, 512),
+        3,
+        vec![Transform::identity(); 3],
+    );
+    assert_eq!(reader.read_page_cache_bytes(64, 64), 64 * 64 * 6);
+}
+
+#[test]
+fn working_set_of_a_translation_follows_the_wider_footprint() {
+    let t = Transform::translation(5.5, 3.25);
+    let reader = WarpingReader::new(
+        &PixelScratchReader,
+        (512, 512),
+        3,
+        vec![Transform::identity(), t],
+    );
+    let dst = Rect {
+        x: (512 - 64) / 2,
+        y: (512 - 64) / 2,
+        width: 64,
+        height: 64,
+    };
+    let SourceFootprint::Covers { read, .. } = t.source_footprint(dst, (512, 512)).unwrap() else {
+        panic!("the centred rect must land inside the frame");
+    };
+    let working_set = reader.read_page_cache_bytes(64, 64);
+    assert_eq!(
+        working_set,
+        u64::from(read.width) * u64::from(read.height) * 6
+    );
+    assert!(working_set > 64 * 64 * 6);
+}
+
+#[test]
+fn working_set_takes_the_largest_footprint_over_all_frames() {
+    let shift = Transform::translation(5.5, 3.25);
+    let scale = Transform::similarity(1.5, 0.0, 0.0, 0.0);
+    let one = |transforms| {
+        WarpingReader::new(&PixelScratchReader, (512, 512), 3, transforms)
+            .read_page_cache_bytes(64, 64)
+    };
+    let both = one(vec![shift, scale]);
+    assert_eq!(both, one(vec![scale]));
+    assert!(both > one(vec![shift]));
 }

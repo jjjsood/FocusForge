@@ -236,9 +236,11 @@ fn init() -> Result<SharedDevice, GpuError> {
 
     // Documented preference order: discrete before integrated before
     // fallback. `HighPerformance`, not `default()`, states that order
-    // explicitly rather than leaving it to the platform's own default; a
-    // software adapter is never silently selected
-    // (`force_fallback_adapter: false`).
+    // explicitly rather than leaving it to the platform's own default.
+    // `force_fallback_adapter: false` only stops wgpu forcing a software
+    // adapter; one of device type `Cpu` (WARP on Windows) is still returned
+    // when it is the only adapter, and the stack decisions in `harness`
+    // refuse it.
     let adapter = block_on(instance.request_adapter(&RequestAdapterOptions {
         power_preference: PowerPreference::HighPerformance,
         force_fallback_adapter: false,

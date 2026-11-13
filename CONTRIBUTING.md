@@ -26,6 +26,8 @@ crates/diagnostics/ the shared `tracing` subscriber (stderr sink, rotating
                recorder, the native-crash monitor process and the
                diagnostics bundle writer -- linked only by `crates/cli` and
                `crates/gui`, never by `crates/core` or `crates/gpu`
+crates/ui/     focusforge-ui: the `.slint` sources and their generated Rust
+               bindings, compiled once and depending on nothing but `slint`
 crates/gui/    focusforge-gui: a Slint window shell (toolbar, dock, tab
                strip, projects overlay, settings modal), a wgpu-backed
                canvas that renders a composite/Z-Map pair and, in editor
@@ -69,7 +71,8 @@ docs/          the user manual, an mdBook (`book.toml` at the root); its
 - `focusforge-gui`: `slint = "~1.17"` (`default-features = false`, features
   `std`, `compat-1-2`, `backend-winit`, `renderer-femtovg-wgpu`,
   `unstable-wgpu-29` pinned to the same wgpu major `focusforge-gpu`
-  declares, and `unstable-winit-030`), `slint-build` (build dependency),
+  declares, and `unstable-winit-030`; `focusforge-ui` declares the same
+  line plus `slint-build` as its build dependency),
   `i-slint-backend-testing` (dev dependency), `clap`, `rfd` (native
   folder/file picker), `toml`/`toml_edit`/`serde` (`settings.toml`'s
   `[recent]`, `[appearance]`, `[input]` and `[export]` tables), `notify-rust`
@@ -354,7 +357,10 @@ Release builds use line tables to create a same-build native debug archive and
 Breakpad store for both GUI and CLI. Preserve the platform symbol archive and
 its SHA-256 file with each installer; diagnose a retained minidump locally with
 `python3 tools/symbolicate.py MINIDUMP SYMBOL_ARCHIVE`. The command downloads
-only its pinned stackwalker and never contacts a symbol server.
+only its pinned stackwalker and never contacts a symbol server. Pinned-tool
+downloads in `package-symbols.py` and the check and book workflows go through
+`tools/lib/download.py`, which retries transient HTTP and network failures with
+backoff and fails at once on any other error.
 
 The symbol archives (`FocusForge-<version>-x86_64-unknown-linux-gnu-symbols.tar.gz`,
 `FocusForge-<version>-aarch64-apple-darwin-symbols.tar.gz` and

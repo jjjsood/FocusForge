@@ -12,8 +12,11 @@
 //! keep the composed chain transform.
 
 mod common;
+#[path = "../../core/tests/common/raw_dng.rs"]
+mod raw_dng;
 
 use common::{CliOutput, bin, mantis_512_dir, tmp_dir};
+use raw_dng::{DngSpec, write_dng};
 
 const ANCHOR_FALLBACK_FRAMES: [u64; 4] = [0, 1, 6, 7];
 
@@ -363,6 +366,48 @@ fn set_mode_is_recorded_as_an_explicit_param_and_unknown_modes_are_refused() {
     assert!(
         refused.stderr.contains("mode"),
         "the refusal names the parameter: {}",
+        refused.stderr
+    );
+}
+
+/// `align` reads RAW frames through the decoded-frame cache, which holds one
+/// frame's decode reservation: a budget of two reservations aligns, one byte
+/// under one refuses naming the frame.
+#[test]
+fn raw_align_at_capped_budget() {
+    let (width, height) = (128, 128);
+    let samples = (0..width * height)
+        .map(|i| (1_000 + (i % width) * 8 + (i / width) * 5 + ((i / 3) % 7) * 40) as u16)
+        .collect();
+    let mut spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], samples);
+    spec.width = width;
+    spec.height = height;
+    let source = write_dng(&spec, false);
+    let dir = tmp_dir("align_raw_capped_budget");
+    for index in 0..2 {
+        std::fs::copy(source.path(), dir.join(format!("{index:02}.dng"))).unwrap();
+    }
+    let reservation =
+        u64::from(width * height) * 30 + std::fs::metadata(source.path()).unwrap().len();
+    let align_at = |budget: u64| {
+        run_cli(&[
+            "align",
+            dir.to_str().unwrap(),
+            "--json",
+            "--max-host-memory",
+            &budget.to_string(),
+        ])
+    };
+
+    let fits = align_at(2 * reservation);
+    assert!(fits.success, "stderr: {}", fits.stderr);
+
+    let refused = align_at(reservation - 1);
+    assert!(!refused.success, "stdout: {}", refused.stdout);
+    assert!(refused.stderr.contains(".dng"), "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("MB of working memory"),
+        "{}",
         refused.stderr
     );
 }

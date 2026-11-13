@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The GPU twin of the two-pass windowed sharpness score, `score_plane`.
+// The GPU twin of the two-pass windowed sharpness score, `score_plane`, summed
+// in `f32` (`score_plane` sums in fixed point; the two agree to a few ulps).
 // `rows`: `dx` ascending then `c` ascending, `|L|`, one `f32` accumulator,
 // clamp-to-edge on x. `cols`: `dy` ascending over the rows plane,
 // clamp-to-edge on y. `radius` is a host-computed uniform from the `pub`

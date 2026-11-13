@@ -86,6 +86,7 @@ complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand stack" -l 
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand stack" -l dry-run -d 'Resolve everything, print what would happen -- parameters with their provenance, tile geometry, output paths -- and exit 0 without computing or writing anything. Stops *before* alignment, so it reports no crop rect and no output extent'
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand stack" -l cpu -d 'Force the CPU path even when a usable GPU adapter is available. Only in builds with GPU support'
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand stack" -l no-cache -d 'Skip the stage cache: recompute the alignment even when a valid entry exists, and store no new entry'
+complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand stack" -l trace-accounting -d 'Count bytes read and converted, cache hits, worker peaks and each fused tile\'s duration during the run, and add them to the --json report as `trace_accounting` and `fuse_tiles`. Off by default; it costs a little time when on'
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand stack" -s v -d 'Increase log detail (repeatable)'
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand stack" -s q -l quiet -d 'Log errors only'
 complete -c focusforge-cli -n "__fish_focusforge_cli_using_subcommand stack" -s h -l help -d 'Print help'

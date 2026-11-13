@@ -45,10 +45,15 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 #   align_reference_cache: pyramid reads and per-frame outcomes of real aligner runs.
 #   tile_scheduler_memory: peak in-flight tile memory (counting allocator).
 #   checkpoint_render_memory: peak memory of a full-size checkpoint render and encode.
+# Left to the full gate, one reason per test:
+#   align_parallel `output_is_identical_across_worker_counts_and_budgets`: 14 aligner
+#   runs at the shipped defaults over mantis-512 (chain and anchor, four worker
+#   counts and three budgets each), 185 s in a debug build.
 [profile.quick]
 default-filter = '''
 not (
-  binary_id(focusforge-core::align_parallel_memory)
+  (binary_id(focusforge-core::align_parallel) & test(=output_is_identical_across_worker_counts_and_budgets))
+  | binary_id(focusforge-core::align_parallel_memory)
   | binary_id(focusforge-core::align_reference_cache)
   | binary_id(focusforge-core::tile_scheduler_memory)
   | binary_id(focusforge-core::checkpoint_render_memory)

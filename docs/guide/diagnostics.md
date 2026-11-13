@@ -36,7 +36,7 @@ The **Storage** section of the settings window shows the exact folders on
 your computer; see [Storage](settings-window.md#storage).
 
 > **Tip:** When the settings window tells you a problem is "named in the
-> log" (a refused key binding, a [cap](../glossary.md#cap) in the settings file that does not
+> log" (a refused key binding, a memory limit in the settings file that does not
 > parse), search `focusforge.jsonl` for `WARN`. If you start
 > `focusforge-gui` from a terminal, the same warnings also appear there.
 
@@ -50,7 +50,7 @@ so a crash you cannot repeat still comes with context.
 A harder crash, one the program cannot catch (a segmentation fault, an
 abort), is recorded differently. Before doing any work, FocusForge starts a
 small watcher process beside itself. If the main process dies, the watcher
-writes a [minidump](../glossary.md#minidump) (a snapshot of the crashed
+writes a minidump (a snapshot of the crashed
 program's memory) and a small file naming the program, its version, the
 process number and the signal that ended it.
 
@@ -61,7 +61,7 @@ Either way, the evidence stays in the `crashes` folder until you package it.
 The next time you start the window after a crash, FocusForge tells you once,
 as the notification **Previous session stopped**, for example "A previous
 session stopped unexpectedly. One crash report was detected at startup." It
-appears as a toast and stays in the notification center for the session.
+appears as a pop-up message at the top left of the canvas and stays in the notification center for the session.
 How the notification center works, and the notice's two actions, is in
 [Notifications](batch-runs.md#notifications). In short:
 
@@ -69,7 +69,7 @@ How the notification center works, and the notice's two actions, is in
   not come back.
 - **Diagnostics** does the same and opens the settings window on the
   **Diagnostics** section, ready to make a bundle.
-- Reading the notice, letting its toast expire or closing the notification
+- Reading the notice, letting its pop-up message expire or closing the notification
   center does not mark anything: the notice comes back at the next start.
 
 Creating a bundle also marks every crash it packaged as reported. If the

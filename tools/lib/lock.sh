@@ -36,9 +36,12 @@
 # One lock per resource; a command that compiles and executes holds it for both.
 #
 # The build lock is per target directory: checkouts with separate targets
-# build side by side. With flock, a build also takes one of FF_BUILD_SLOTS
-# machine-wide slots (default 1: one build at a time), and only while used RAM (MemTotal minus
-# MemAvailable) is below FF_BUILD_RAM_CAP_GB (default 40, 0 disables). The
+# build side by side. With flock, a build also takes one of the machine-wide
+# build slots (default 1: one build at a time), and only while used RAM (MemTotal minus
+# MemAvailable) is below FF_BUILD_RAM_CAP_GB (default 40, 0 disables). Slot
+# waiters queue in arrival order, except that builds of the priority target
+# go first. `slots=N` and `priority=<target>` in build.conf in the lock
+# directory set both; FF_BUILD_SLOTS and FF_BUILD_PRIORITY override it. The
 # native backend takes the per-target lock only.
 
 # The lock directory has to be the ONE physical location every checkout's
@@ -71,7 +74,6 @@ _lock_dir() {
 }
 
 FF_LOCK_TIMEOUT="${FF_LOCK_TIMEOUT:-1800}"
-FF_BUILD_SLOTS="${FF_BUILD_SLOTS:-1}"
 FF_BUILD_RAM_CAP_GB="${FF_BUILD_RAM_CAP_GB:-40}"
 
 # The target directory below `cargo-target/`, with `/` as `-`; empty without
@@ -94,31 +96,76 @@ _lock_ram_used_gb() {
   awk '/^MemTotal:/ {t = $2} /^MemAvailable:/ {a = $2} END {print int((t - a) / 1048576)}' "$meminfo"
 }
 
-# _lock_take_slot <dir>: flock one free build-slot-N.lock while RAM is below
-# the cap, polling until FF_LOCK_TIMEOUT. Sets _lock_slot_fd.
+# _lock_conf <dir> <key>: last `key=value` of <dir>/build.conf, empty without one.
+_lock_conf() {
+  [ -r "$1/build.conf" ] || return 0
+  sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1/build.conf" | tail -n 1 | tr -d '[:space:]'
+}
+
+# _lock_queue <dir> <priority>: live waiter tickets (<arrival-ns>.<pid>.<target key>)
+# in grant order -- the priority target (key P or P-*) first, then arrival.
+# A ticket whose pid is gone is dropped.
+# ponytail: liveness is `kill -0 pid`; a sourcing shell that survives an
+# interrupted wait keeps its ticket until it exits.
+_lock_queue() {
+  local q="$1/build-queue" prio="$2" t pid key rank
+  for t in "$q"/*; do
+    [ -e "$t" ] || continue
+    t="${t##*/}"
+    pid="${t#*.}"
+    pid="${pid%%.*}"
+    kill -0 "$pid" 2>/dev/null || { rm -f "$q/$t"; continue; }
+    key="${t#*.*.}"
+    rank=1
+    if [ -n "$prio" ] && { [ "$key" = "$prio" ] || [ "${key#"$prio"-}" != "$key" ]; }; then rank=0; fi
+    printf '%s %s\n' "$rank" "$t"
+  done | sort -k1,1n -k2,2n | cut -d' ' -f2
+}
+
+# _lock_take_slot <dir> <target key>: queue for one of the build slots and flock
+# a free build-slot-N.lock once at the head of the queue and RAM is below the
+# cap, polling until FF_LOCK_TIMEOUT. Slot count and priority target come from
+# FF_BUILD_SLOTS / FF_BUILD_PRIORITY, else <dir>/build.conf (`slots=`,
+# `priority=`), re-read every poll. Sets _lock_slot_fd.
 _lock_take_slot() {
-  local dir="$1" limit="${FF_LOCK_TIMEOUT%%.*}" start="$SECONDS" i fd reason said=""
+  local dir="$1" limit="${FF_LOCK_TIMEOUT%%.*}" start="$SECONDS" i fd reason said="" slots prio ticket queue pos
   limit="${limit:-0}"
+  mkdir -p "$dir/build-queue"
+  ticket="$(date +%s%N).${BASHPID:-$$}.$2"
+  : >"$dir/build-queue/$ticket"
   while :; do
-    if [ "$FF_BUILD_RAM_CAP_GB" -gt 0 ] && [ "$(_lock_ram_used_gb)" -ge "$FF_BUILD_RAM_CAP_GB" ]; then
+    slots="${FF_BUILD_SLOTS:-$(_lock_conf "$dir" slots)}"
+    [[ "$slots" =~ ^[1-9][0-9]*$ ]] || slots=1
+    prio="${FF_BUILD_PRIORITY-$(_lock_conf "$dir" priority)}"
+    queue="$(_lock_queue "$dir" "$prio")"
+    if [ "$(head -n 1 <<<"$queue")" != "$ticket" ]; then
+      pos="$(grep -nxF "$ticket" <<<"$queue" | cut -d: -f1)"
+      reason="queue position ${pos:-?}, behind earlier or priority builds"
+    elif [ "$FF_BUILD_RAM_CAP_GB" -gt 0 ] && [ "$(_lock_ram_used_gb)" -ge "$FF_BUILD_RAM_CAP_GB" ]; then
       reason="used RAM at or above ${FF_BUILD_RAM_CAP_GB} GB"
     else
-      for ((i = 1; i <= FF_BUILD_SLOTS; i++)); do
+      for ((i = 1; i <= slots; i++)); do
         exec {fd}>"$dir/build-slot-$i.lock"
         if flock -n "$fd"; then
           _lock_slot_fd="$fd"
+          _lock_slot_owner="$dir/build-slot-$i.owner"
+          printf '%s %s %s\n' "$2" "${BASHPID:-$$}" "$(date +%s)" >"$_lock_slot_owner"
+          rm -f "$dir/build-queue/$ticket"
+          [ -z "$said" ] || echo ">>> got build slot $i after $((SECONDS - start))s -- running now" >&2
           return 0
         fi
         exec {fd}>&-
       done
-      reason="all $FF_BUILD_SLOTS build slots busy"
+      reason="all $slots build slots busy ($(cat "$dir"/build-slot-*.owner 2>/dev/null | cut -d' ' -f1 | paste -sd, -))"
     fi
     if [ $((SECONDS - start)) -ge "$limit" ]; then
+      rm -f "$dir/build-queue/$ticket"
       echo "with_lock: timed out after ${FF_LOCK_TIMEOUT}s waiting for a build slot ($reason)" >&2
       return 4
     fi
-    [ -n "$said" ] || { echo ">>> waiting for a build slot -- $reason" >&2; said=1; }
-    sleep 2
+    # One line per change of reason, so a reader of the log sees where it stands.
+    [ "$said" = "$reason" ] || { echo ">>> waiting for a build slot -- $reason (still waiting, do not restart)" >&2; said="$reason"; }
+    sleep 1
   done
 }
 
@@ -201,37 +248,41 @@ _with_flock() {  # _with_flock <resource> <file> <command...>
       exec {fd}>&-
       return 3
     fi
-    echo ">>> waiting for the $name lock ($f) -- another process holds it" >&2
+    echo ">>> waiting for the $name lock ($f) -- another process holds it (still waiting, do not restart)" >&2
+    local waited="$SECONDS"
     if ! flock -w "$FF_LOCK_TIMEOUT" "$fd"; then
       echo "with_lock: timed out after ${FF_LOCK_TIMEOUT}s waiting for the $name lock ($f)" >&2
       exec {fd}>&-
       return 4
     fi
+    echo ">>> got the $name lock after $((SECONDS - waited))s -- running now" >&2
   fi
   printf '%s\n' "$$" >"$owner"
   # A nested build under a held slot reuses it instead of queueing for another.
-  local slot_fd="" slot_held="${FF_BUILD_SLOT_HELD:-}"
+  local slot_fd="" slot_owner="" slot_held="${FF_BUILD_SLOT_HELD:-}" _lock_slot_owner=""
   if [ "$name" = build ] && [ -z "$slot_held" ]; then
-    if ! _lock_take_slot "$(dirname "$f")"; then
+    if ! _lock_take_slot "$(dirname "$f")" "$(_lock_target_key)"; then
       rm -f "$owner"
       exec {fd}>&-
       return 4
     fi
     slot_fd="$_lock_slot_fd"
+    slot_owner="$_lock_slot_owner"
     slot_held=1
   fi
   held="$(_lock_held_with "$f")"
   FF_LOCK_HELD="$held" FF_BUILD_SLOT_HELD="$slot_held" "$@"
   status=$?
-  rm -f "$owner"
+  rm -f "$owner" ${slot_owner:+"$slot_owner"}
   [ -z "$slot_fd" ] || exec {slot_fd}>&-
   exec {fd}>&-
   return "$status"
 }
 
 # with_lock <build|gpu> [--] <command> [args...]
-# Blocks until the named lock is free (printing one line to stderr if it had
-# to wait, so a long silent hang reads as contention, not a hang), then runs
+# Blocks until the named lock is free (printing to stderr when it starts to
+# wait, when the reason changes and when it gets its turn, so a wait reads as
+# contention, not a hang), then runs
 # the command while holding it. Exit code is the command's own, except 2 on a
 # usage error, 3 refusing a self-deadlock, and 4 on an FF_LOCK_TIMEOUT wait
 # that never got the lock.

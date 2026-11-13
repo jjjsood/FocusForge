@@ -103,7 +103,7 @@ turn it on for a stack whose frames differ in brightness.
 | **Target brightness (stops)** | −0.5 to +0.5, in steps of 0.1 | 0.0 | Moves the shared brightness the frames are brought to. 0.0 keeps the frames' average brightness; each stop doubles (+1) or halves (−1) it, so the range covers half a stop up or down. |
 
 While the gains are measured, the bottom bar reads **Preparing** with the
-number of frames done and an estimated time remaining.
+number of frames done.
 
 Things to know:
 
@@ -181,13 +181,13 @@ values are still there.
 
 ### Details
 
-The default. Details splits every frame into layers from coarse to fine (an
-image [pyramid](../glossary.md#pyramid)), takes the sharpest frame's
-contribution in every layer separately and puts the layers back together.
+The default. Details splits every frame into layers from coarse to fine,
+takes the sharpest frame's contribution in every layer separately and puts the
+layers back together.
 
 | Setting | Range | Default | What it does |
 |---|---|---|---|
-| **Levels** (under **More...**) | 1 to the deepest level the frames support (7 for 512-pixel frames, 4 for 64-pixel frames) | worked out from the image size | How many layers of detail are compared and blended. |
+| **Levels** (under **More...**) | 1 to the deepest level the frames support | worked out from the image size | How many layers of detail are compared and blended. |
 
 The default of **Levels** is not a fixed number: FocusForge works it out from
 the frame size each time (it reads 5 for 512-pixel frames). Leave it there.
@@ -339,7 +339,7 @@ the Settings tab shows that project's settings.
 
 ## While a fuse is running
 
-![The window during a fuse: the toolbar shows Pause and Cancel, the Composite pane shows the card "Preparing frames", the bottom bar reads Aligning with a progress bar and an ETA, and the whole Settings tab in the dock is drawn faded.](../assets/manual/stacking/stacking-locked-during-run.png)
+![The window during a fuse: the toolbar shows Pause and Cancel, the Composite pane shows the card "Preparing frames", the bottom bar reads Aligning, 1 of 8, with a progress bar, and the whole Settings tab in the dock is drawn faded.](../assets/manual/stacking/stacking-locked-during-run.png)
 
 *During a run the Settings tab is faded and locked.*
 
@@ -405,17 +405,15 @@ the window.
 
 ### RAW frames
 
-RAW input uses `rawler`. Put one compatible RAW format in a directory and run
-the same command as for TIFF; `focusforge-cli info` reports camera metadata
-before a stack run. TIFF, JPEG and RAW frames form separate stacks, and a group that
-mixes them is refused before pixels are developed. A file the decoder cannot
-read reports an error; FocusForge has no alternate RAW decoder.
+Put one kind of RAW file in a directory and run the same command as for TIFF;
+`focusforge-cli info` reports camera metadata before a stack run. TIFF, JPEG
+and RAW frames form separate stacks, and a group that mixes them is refused.
+A RAW file FocusForge cannot read is reported by name.
 
-RAW frames are developed to the camera's own linear colour and fused as
-unclipped 32-bit float samples, so highlights above white survive the blend.
-The result is clipped once, to 16 bits, when it is exported. A RAW project
-saved by an earlier version stored a clipped 16-bit result and is refused on
-open; stack its source frames again (see
+RAW frames are developed to the camera's own linear colour and fused without
+clipping, so highlights above white survive the blend. The result is clipped
+once, to 16 bits, when it is exported. A RAW project saved by an earlier
+version is refused on open; stack its source frames again (see
 [A RAW project saved by an earlier version](../troubleshooting.md#a-raw-project-saved-by-an-earlier-version)).
 
 ### Brightness equalization flags
@@ -429,11 +427,9 @@ focusforge-cli stack path/to/frames/ --algorithm laplacian --set equalize-max-ga
 focusforge-cli stack path/to/frames/ --algorithm laplacian --set equalize-target=0.2
 ```
 
-A frame held at the bound makes the run print a notice naming the frame, the
-gain it needed, the smallest bound that would cover it and the mean it
-reached; a black frame keeps gain 1, and a frame whose gain clips samples at
-white and misses the target is reported as well. The gains are recorded in
-the project, so `export` writes the equalized result.
+A frame held at the limit makes the run print a notice naming the frame and
+the gain it needed. The gains are recorded in the project, so `export` writes
+the equalized result.
 
 ### Getting an image back
 
@@ -484,19 +480,15 @@ focusforge-cli export path/to/frames/frames.ffp --zmap zmap.tif
 
 ### Using the GPU
 
-The GPU path for `laplacian` is compiled in by default
-(`cargo build --release`); `weighted-average` and `depth-map` always run on
-the CPU. When the path is compiled in and a usable adapter is present, `stack`
-uses it automatically; `--cpu` forces the CPU path, and
-`cargo build --release --no-default-features` leaves the GPU path out of the
-binary. A missing or unusable adapter falls back to the CPU on its own,
-printing why on stderr, never silently and never as a hard failure. If the
-graphics device is lost partway through a run, the remaining tiles run on the
-host instead; see [Diagnostics and crash reports](diagnostics.md) for where
-that and other GPU errors are logged. Every GPU kernel matches its CPU
-counterpart to within 1 LSB at 16-bit, so the backend changes speed, not the
-result; `--json`'s `backend` field says which one ran. In the window, GPU use
-is set under **GPU processing** in [the settings window](settings-window.md).
+When a usable graphics card is present, `stack` uses it automatically for
+`laplacian`; `weighted-average` and `depth-map` always run on the processor.
+`--cpu` forces the processor. Without a usable card the run continues on the
+processor and prints why on stderr. If the card is lost partway through, the
+rest of the run finishes on the processor; see
+[Diagnostics and crash reports](diagnostics.md) for where that is logged. The
+result is the same either way, and `--json`'s `backend` field says which one
+ran. In the window, the same choice is **GPU processing** in
+[the settings window](settings-window.md#use-the-graphics-card).
 
 ### Reading the result
 
@@ -504,7 +496,7 @@ is set under **GPU processing** in [the settings window](settings-window.md).
 focusforge-cli stack path/to/frames/ --algorithm laplacian --json
 ```
 
-`--json` reports the frames that were read, the resolved algorithm and
-settings (with where each value came from), the tile geometry the run
-planned, and the project path written; see
-[`reference/cli.md`](../reference/cli.md#stack) for the full schema.
+`--json` reports the frames that were read, the algorithm and settings that
+were used and the project path written; see
+[`reference/cli.md`](../reference/cli.md#stack) for the full report.
+`--no-progress` turns off the progress line printed while a run goes.

@@ -36,7 +36,7 @@ for relative in ("tools/check-notice.sh", "tools/lib/notice.py"):
 for relative, content in {
     "Cargo.toml": '[workspace.package]\nlicense = "GPL-3.0-only"\n',
     "Cargo.lock": "locked input\n",
-    "crates/gui/ui/shell/settings_modal/about_tab.slint": 'text: "Copyright © 2026 Johannes Sood";\n',
+    "crates/ui/ui/shell/settings_modal/about_tab.slint": 'text: "Copyright © 2026 Johannes Sood";\n',
     "assets/fonts/README.md": "Inter [v4.1](https://example.invalid)\n",
     "assets/fonts/OFL.txt": "Inter OFL text\n",
     "assets/icons/LICENSE": "Lucide identity\nVersion vendored: 1.46.0\nISC License\nISC legal text\n---\nThe MIT License (MIT)\nFeather legal text\n",

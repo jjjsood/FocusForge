@@ -166,7 +166,7 @@ fn ladder_index(ladder: &[f64], scale: f64) -> usize {
 }
 
 /// The visible source rect (whole pixels) and its projection into pane-local
-/// logical px, for `crate::gpu_canvas`'s re-upload and `ui/shell/canvas.slint`'s
+/// logical px, for `crate::gpu_canvas`'s re-upload and `crates/ui/ui/shell/canvas.slint`'s
 /// `FFPane` placement properties.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PaneDraw {

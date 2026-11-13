@@ -16,23 +16,17 @@ tab as a whole) and what to do when a frame cannot be aligned.
 
 When you click **Fuse stack**, alignment runs after the brightness of the
 frames has been evened out and before they are fused. The bottom bar reads
-**Aligning** with the number of frames done (such as "3 of 8") and an
-estimated time remaining.
+**Aligning** with the number of frames done (such as "3 of 8").
 
 For every frame, FocusForge:
 
 1. **Picks the frame to compare with.** By default every frame is compared
    with its neighbour, step by step, on the way to the middle frame of the
    stack (see [Chain or Anchor](#chain-or-anchor)).
-2. **Finds the movement.** It compares the two frames on a small, coarse
-   version first, then refines the result on ever larger versions up to full
-   size (an image [pyramid](../glossary.md#pyramid)). It looks for a shift,
-   and with the default **Rotation + Scale** mode also a change of size and a
-   small rotation. Where enough matching features can be found, it starts from
-   a quick feature-based estimate; otherwise from no movement at all. Before
-   the final, full-size comparison both frames are smoothed very slightly, so
-   that the different blur of two frames focused at different depths does not
-   pull the result off.
+2. **Finds the movement.** It compares the two frames coarsely first, then
+   improves the result at larger and larger sizes up to full size. It looks
+   for a shift, and with the default **Rotation + Scale** mode also a change
+   of size and a small rotation.
 3. **Checks the answer.** A result that does not hold up across the frame, or
    whose match is too weak to be trusted, is rejected, and the frame counts as
    not aligned (see
@@ -42,10 +36,6 @@ For every frame, FocusForge:
 
 Finally, **[Auto-crop](../glossary.md#auto-crop)** in the **FINISH** section trims the result to the area
 every aligned frame covers.
-
-On a 61-frame macro stack, alignment recovers up to 159 pixels of drift in
-**Translation only** mode, and up to 199 pixels when the frames also breathe
-in scale and rotation.
 
 ## The ALIGN settings
 
@@ -62,9 +52,9 @@ method, so the menu has one entry.
 | **Enabled** | on / off | on | Lines every frame up with the reference frame before fusing. Off fuses the frames exactly as they were read. |
 | **Algorithm** | **Pyramidal ECC** | **Pyramidal ECC** | The alignment method. |
 | **Mode** | **Translation only**, **Rotation + Scale** | **Rotation + Scale** | Which movements are corrected: a shift only, or a shift plus a change of size and a small rotation. |
-| **Max Iterations** | 1 to 1000 | 400 | How many iterations alignment may take at each size of the pyramid. |
-| **Epsilon (px)** | 0.000000001 to 1 | 0.0001 | How small, in pixels, the last iteration's step must be before alignment counts a frame as settled. |
-| **Pyramid Depth** | 0 to 16 | worked out from the frame size | How many smaller versions of the frame are compared before the full-size one. |
+| **Max Iterations** | 1 to 1000 | 400 | The most adjustment steps alignment may take for a frame at each size. |
+| **Epsilon (px)** | 0.000000001 to 1 | 0.0001 | How small, in pixels, an adjustment step must be before alignment counts a frame as settled. |
+| **Pyramid Depth** | 0 to 16 | worked out from the frame size | How many smaller, coarser versions of the frame are compared before the full-size one. |
 | **Reference Policy** | **Anchor**, **Chain** | **Chain** | Whether every frame is compared directly with the reference frame, or step by step through its neighbours. |
 | **Reference Frame** | **First**, **Middle**, **Last** | **Middle** | Which frame the others are lined up with. |
 
@@ -85,13 +75,11 @@ choose an entry.
 - **Chain** (default) compares each frame with its neighbour, step by step
   towards the reference frame. Neighbouring frames look alike, so this holds
   up even when the first and last frames of a long stack look very different
-  (one sharp at the front, the other at the back). Frames are solved one
-  after the other.
+  (one sharp at the front, the other at the back).
 - **Anchor** compares every frame directly with the reference frame, all at
-  the same time. It is much faster on a machine with many processor cores:
-  on a 61-frame stack of 44.8-megapixel frames, about 6 seconds instead of
-  about 40 with **Chain**. Use it for short stacks or stacks whose frames
-  all look similar, when speed matters.
+  the same time. It is faster than **Chain** on a machine with many processor
+  cores. Use it for short stacks or stacks whose frames all look similar,
+  when speed matters.
 
 ## Choose the reference frame
 
@@ -106,28 +94,23 @@ that frame.
   for example when the image size changes a lot across a long focus-ring stack
   and you want the result at the size of the nearest or farthest focus.
 
-## Fine-tuning: Max Iterations, Epsilon and Pyramid Depth
+## Settings you rarely change
 
-These three control how hard alignment works. Their defaults suit everything
-from small frames to very large ones; leave them unless you have a reason.
+**Max Iterations**, **Epsilon (px)** and **Pyramid Depth** control how hard
+alignment works. Their defaults suit everything from small frames to very
+large ones; leave them unless you have a reason.
 
-- **Max Iterations** caps the iterations at each pyramid size. Frames
-  that settle earlier stop early and cost nothing extra; on a 61-frame stack
-  of 44.8-megapixel frames, no size ever needed more than 202 steps. A frame
-  that reaches the cap is not rejected: it keeps the best position found so
-  far.
-- **Epsilon (px)** is the precision at full size: alignment stops refining
-  once a step moves the frame's corners by less than this many pixels. The
-  smaller versions stop at 100 times this value. The default, a ten-thousandth
-  of a pixel, is already far finer than you can see; a larger value makes
-  alignment a little faster and less exact. The slider spans several powers of
-  ten, marked `1e-9` to `1`.
-- **Pyramid Depth** sets how many smaller versions are compared before the
-  full-size frame. Its default is worked out from your frames: the deepest
-  pyramid whose smallest version is still at least 64 pixels on its shorter
-  side. 512-pixel frames get 3; frames shorter than 127 pixels are aligned at
-  full size only (0). A deeper pyramid can catch larger movements but has
-  less detail to work with at its coarsest step.
+- **Max Iterations** is the most adjustment steps a frame gets at each size.
+  Frames that settle earlier stop early. A frame that reaches the limit is not
+  rejected: it keeps the best position found so far.
+- **Epsilon (px)** is the precision at full size, in pixels. The default, a
+  ten-thousandth of a pixel, is already far finer than you can see; a larger
+  value makes alignment a little faster and less exact. The slider spans
+  several powers of ten, marked `1e-9` to `1`.
+- **Pyramid Depth** is how many coarser versions of the frame are compared
+  before the full-size one. The default is worked out from your frames. A
+  deeper setting can catch larger movements but has less detail to work with
+  at its coarsest step.
 
 ## Switch alignment off
 
@@ -152,19 +135,16 @@ Switching alignment off (or off and on again) removes the **ALIGN**
 section's **DEFAULT** badge; **Reset All to Default** brings it back (see
 [Reset All to Default](stacking.md#reset-all-to-default)).
 
-## Alignment is reused
+## Fusing again is quicker
 
 Aligning is often the slowest part of a fuse, so FocusForge keeps each
 alignment it computes. When you fuse the same frames again after changing
-only the [fusion method](../glossary.md#fusion-method) or its settings under **FUSE**, the stored alignment
-is used and the bottom bar briefly reads
-**Aligning** with "from cache" instead of a frame count. The second fuse is
-then much quicker.
-
-The stored alignments are recognised by the content of the frames, so they
-are found again even when the files were moved or renamed; frames you reshoot
-are aligned afresh. **Clear cache** ([Stage cache](../glossary.md#stage-cache)) in the **Storage** section of
-[the settings window](settings-window.md) deletes them.
+only the [fusion method](../glossary.md#fusion-method) or its settings under
+**FUSE**, the bottom bar briefly reads **Aligning** with "from cache" instead
+of a frame count, and the fuse is much quicker. The kept alignment is found
+again even when the files were moved or renamed; frames you reshoot are
+aligned afresh. To delete it and free the disk space, see
+[Free disk space used by earlier runs](settings-window.md#free-disk-space-used-by-earlier-runs).
 
 ## When a frame cannot be aligned
 
@@ -173,8 +153,7 @@ are aligned afresh. **Clear cache** ([Stage cache](../glossary.md#stage-cache)) 
 *Two frames of the sample stack could not be aligned.*
 
 A frame that cannot be aligned does not stop the fuse. FocusForge uses it
-unmoved, exactly where it was in the camera (this is called an identity
-fallback), finishes the run and then asks **Keep this fused result?**, naming
+unmoved, exactly where it was in the camera, finishes the run and then asks **Keep this fused result?**, naming
 the frames it could not align (past five, the rest are counted). The dialog
 needs an answer: **Escape** does not close it.
 
@@ -235,9 +214,9 @@ fusing anything:
 focusforge-cli align path/to/frames/
 ```
 
-Each row reports the frame's recovered translation, scale and rotation, an
-iteration count, and `rho`, the correlation the solver optimized, in
-`[-1, 1]` (not a pixel distance). The last line is the auto-crop rectangle
+Each row reports the frame's recovered translation, scale and rotation, the
+number of steps taken, and `rho`, how well the frame matches the reference, from
+-1 to 1 (not a pixel distance). The last line is the auto-crop rectangle
 `stack` would apply: the largest axis-aligned rectangle every warped frame
 covers.
 
@@ -260,61 +239,32 @@ range, default and description. See
 
 ### Frame status
 
-Each frame's row ends in the status its solve reached:
+Each frame's row ends in a status. `converged`, `hit-cap` and `stalled` mean
+the frame lined up (the last two stopped before settling fully and keep the
+best position found). `diverged(<reason>)` means it did not line up, for
+example `weak-match` (the best match is too weak to trust) or
+`validation-failed` (the movement found does not hold across the frame); the
+other reasons are in [`reference/cli.md`](../reference/cli.md#align).
 
-- `converged`: the step size fell below `epsilon-px`.
-- `hit-cap`: `max-iterations` ran out while the steps were still shrinking.
-- `stalled`: `max-iterations` ran out with the steps flat or oscillating; the
-  best-correlation transform is kept. A middle pyramid level that loses
-  correlation (typical of a defocused frame) also counts as `stalled`: it
-  hands its best fit to the next finer level, which refines it.
-- `diverged(<reason>)`: the frame did not register. `validation-failed`
-  (JSON) is one reason: the fit converged, but the same transform leaves a
-  large residual at most of the usable patches away from the fit region, so
-  it is rejected rather than trusted. `weak-match` is another: the final
-  correlation is below 0.2, so the best match found is a wrong optimum and is
-  rejected. Heavy defocus and long series can also end in
-  `correlation-decreased`. The other reasons are in
-  [`reference/cli.md`](../reference/cli.md#align).
+<a id="registration-failures-use-identity-fallback"></a>
 
-A pyramid level whose status is worse than the others sets the frame's
-status. Only `diverged` is a registration failure: `stalled`, `hit-cap` and
-`converged` frames never fail a strict run. The full-resolution level gets
-four times the sample budget of the coarse levels.
+### A frame that does not line up
 
-The feature-based starting estimate is accepted when its matches agree over
-enough of the frame: spread across at least 6 cells of a 4x4 grid, or, when
-clustered in as few as 2 cells, when at least 75% of the matches support it.
-Otherwise the solve starts from the identity. The finest level of both frames
-is smoothed with three light low-pass passes before the final solve; coarser
-levels are not smoothed, and a solve region within the smoothing reach of the
-frame edge reads the finest level unsmoothed.
+A frame that ends `diverged` is used unmoved and the run continues, with the
+frame marked in the report. Pass `--strict` to make `stack` or `align` exit 1
+and name every failed frame. `--no-align` skips the stage when the frames are
+already lined up. If the aligned frames share no usable overlap, `stack` stops
+with an error that says so; `--no-crop` keeps the full frame instead.
 
-### Registration failures use identity fallback
+### Using the graphics card and earlier results
 
-A frame that ends `diverged` keeps an identity transform and the run
-continues, with the frame marked as a fallback in the report. Pass `--strict`
-to make `stack` or `align` exit 1 and name every failed frame. `--no-align`
-skips the stage when the frames are already registered. If the aligned frames
-share no usable overlap, `stack` stops with an error that says so; `--no-crop`
-keeps the full frame extent instead.
-
-### Reuse and hardware
-
-`stack` stores each computed alignment in the stage cache, keyed on the
-frames, the alignment parameters, the failure policy and the solver revision,
-so a repeated run, or a re-fuse in the window with only fusion settings
-changed, skips the solve. Frames are identified by their content, and an
-alignment cached by an older solver revision is recomputed. `--no-cache`
-forces a recompute; [Batch runs from the command line](../reference/batch-runs.md)
-describes the cache.
-
-Large pyramid levels run on the GPU when a usable adapter is present; the rest
-of the solve is on the CPU. `--cpu` keeps everything on the CPU and
-`--max-vram <SIZE>` lowers the device memory budget. `--max-host-memory
-<SIZE>` lowers the host-memory budget the alignment workers are sized from.
-If the device is lost mid-run, the whole alignment is redone on the CPU, so
-every frame comes from one backend. Both JSON reports name the backend in `align_backend`.
+`stack` keeps each computed alignment, so a repeated run skips it; `--no-cache`
+recomputes it ([Batch runs from the command line](../reference/batch-runs.md)
+describes where it is kept). The graphics card speeds up the largest steps
+when a usable one is present; `--cpu` keeps everything on the processor. The
+result is the same either way, and both JSON reports name the one used in
+`align_backend`. `--max-vram <SIZE>` and `--max-host-memory <SIZE>` lower the
+memory the alignment may use.
 
 ### Checking a result visually
 

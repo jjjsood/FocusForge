@@ -103,7 +103,7 @@ where there is something to do, a button.
 
 | Headline | Second line on the card | What happened | Button |
 |---|---|---|---|
-| Did not stack | FAILED WHILE PREPARING (or the stage it failed in) | The last fuse of this project failed. The card shows the error. | **Run again** |
+| Did not stack | FAILED WHILE ALIGNING (or the stage it failed in) | The last fuse of this project failed. The card shows the error. | **Run again** |
 | Cancelled | STOPPED WHILE FUSING (or the stage you stopped in) | You cancelled the fuse: "You stopped this one. Nothing was written." | **Run again** |
 | Sources missing | NOTHING TO SHOW | The saved project cannot find its frames: "A project remembers its frames by path. 3 of 3 cannot be found in this location." | **Locate frames…** |
 | Not a project | LEFT ALONE | A folder that holds no stack, such as a subfolder with notes in it: "This folder holds something else. Nothing was read and nothing was changed." | none |
@@ -215,7 +215,7 @@ title and a context line: where it came from ("Import", "Save" or "Startup";
 nothing for a fuse), the project, the frame or file it concerns, and the time,
 for example "Import · 00:19".
 
-![The notification center with two rows: a selected "Preparing failed" row for the project open-rejected showing its full error message, and a "Some images were skipped" row from Import.](../assets/manual/notifications/center.png)
+![The notification center with two rows: a selected "Alignment failed" row for the project open-rejected showing its full error message, and a "Some images were skipped" row from Import.](../assets/manual/notifications/center.png)
 
 *The notification center, newest first, with the selected row showing its full message.*
 
@@ -231,21 +231,21 @@ The center and the Projects overview do not show together: opening the
 overview closes the center, and clicking the bell while the overview is open
 closes the overview and opens the center.
 
-### Toasts
+### Pop-up messages
 
 When a new notification arrives while the window is in front and neither the
-center nor the overview is open, it also appears as a toast at the top left of
-the canvas, under the toolbar:
+center nor the overview is open, it also appears as a pop-up message at the top left
+of the canvas, under the toolbar:
 
-- Toasts appear one at a time, oldest first. Each stays 6 seconds, a crash
-  notice 10 seconds. Resting the pointer on a toast keeps it up.
-- Click the toast or its **Open notification** text to open the center with
+- Pop-up messages appear one at a time, oldest first. Each stays 6 seconds, a
+  crash notice 10 seconds. Resting the pointer on one keeps it up.
+- Click the pop-up message or its **Open notification** text to open the center with
   that notification selected.
-- Click the × (**Dismiss notification**) to close only the toast; the
+- Click the × (**Dismiss notification**) to close only the pop-up; the
   notification stays in the center and on the bell's number.
 
-While the center or the overview is open, no toast appears. What arrives
-meanwhile is counted on the bell and is not shown as a toast later.
+While the center or the overview is open, no pop-up message appears. What arrives
+meanwhile is counted on the bell and is not shown as a pop-up later.
 
 ### The update notice
 
@@ -253,22 +253,22 @@ Once per start, in the background, FocusForge asks whether a newer release
 exists (see [Updates](settings-window.md#updates)). A newer one adds a
 notification titled "FocusForge `<version>` is available" with the context
 line "Startup · `<time>`" and the message "FocusForge `<version>` has been
-released. Download page: `<link>`". It also appears as a toast with the link
+released. Download page: `<link>`". It also appears as a pop-up message with the link
 **Open download page**:
 
-![The toast "FocusForge 0.2.0 is available" with an information icon, the link Open download page and a close icon](../assets/manual/notifications/update-notice.png)
+![The pop-up message "FocusForge 0.3.0 is available" with an information icon, the link Open download page and a close icon](../assets/manual/notifications/update-notice.png)
 
-*The update notice as a toast.*
+*The update notice as a pop-up message.*
 
-Click **Open download page** (or the toast) to open the release page in your
-browser; the toast then closes and the notification stays in the center. The
+Click **Open download page** (or the pop-up) to open the release page in your
+browser; the pop-up then closes and the notification stays in the center. The
 notice appears at most once per start and never when the check finds nothing
 newer, fails or is switched off.
 
 ### Banners while the window is in the background
 
 When every FocusForge window is behind other applications, a new notification
-appears once as a banner from your operating system instead of a toast. The
+appears once as a banner from your operating system instead of a pop-up message. The
 banner carries only the title and a short context line; the full message stays
 in the center. Moving between the main window and a detached image window does
 not count as leaving, and no banner is shown while the Projects overview is
@@ -295,7 +295,7 @@ titled "Previous session stopped", with the context line
 | **Acknowledge** | Marks the crash report as dealt with, so the notice does not come back at the next start. The row then reads "Acknowledged" and the button is dimmed. |
 | **Diagnostics** | Acknowledges the report the same way and opens the settings window on its Diagnostics section, where you can package a [bundle](../glossary.md#diagnostics-bundle) to send with a bug report. See [After a crash](diagnostics.md#after-a-crash). |
 
-Reading the notice, letting its toast run out or closing the center does not
+Reading the notice, letting its pop-up run out or closing the center does not
 acknowledge anything: "Reading or closing this notice does not acknowledge the
 report." Until you acknowledge it, the notice returns at every start.
 
@@ -343,7 +343,7 @@ closes at once.
 Otherwise FocusForge asks "Quit without saving?" ("Quitting FocusForge") and
 says how many projects would lose work, for example "2 projects have unsaved
 work. Quitting now loses all of it." A project counts when it holds an unsaved
-checkpoint, brush strokes, a deletion not yet saved, or a fused result still
+checkpoint, brush strokes, an unsaved deletion, or a fused result still
 waiting for your **Keep** or **Discard**.
 
 ![The quit question: "Quit without saving?", "Quitting FocusForge", "2 projects have unsaved work. Quitting now loses all of it." and the buttons Cancel, Save all and quit, and Quit without saving.](../assets/manual/close-and-quit/quit-question.png)

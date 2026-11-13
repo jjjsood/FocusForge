@@ -6,6 +6,8 @@
 //! trait object, and the *policy* -- what "stop" means, who requested it --
 //! lives in `core::job`, which `core::tile` never names.
 
+use super::plan::PlannedTile;
+
 /// How often a waiter re-reads [`TileControl::admission_cap`] while the cap is
 /// the binding term; lifting a cap wakes nobody.
 pub(crate) const ADMISSION_RECHECK: std::time::Duration = std::time::Duration::from_millis(10);
@@ -19,9 +21,8 @@ pub trait TileControl: Send + Sync {
 
     /// Called once per unit that **finished successfully**, from the rayon
     /// worker that ran it, immediately after the same unit is recorded as
-    /// complete. `pixels` is that unit's read-rect area
-    /// (`PlannedTile::read()`'s `width * height`), the quantity
-    /// `crate::job::JobProgress` weights its ETA by.
+    /// complete. `tile` is the unit: its read-rect area and its position in
+    /// the plan are what `crate::job::JobProgress` weights its ETA by.
     ///
     /// The default is a no-op, so [`NoControl`] and every test control stay
     /// one-method implementations. `crate::job::JobControl` overrides it,
@@ -33,8 +34,8 @@ pub trait TileControl: Send + Sync {
     /// non-blocking -- an atomic add, nothing that could re-enter the
     /// scheduler. It is never handed caller code: `core` polls, it never
     /// pushes (`crate::job::JobProgress`' own docs).
-    fn unit_completed(&self, pixels: u64) {
-        let _ = pixels;
+    fn unit_completed(&self, tile: &PlannedTile) {
+        let _ = tile;
     }
 
     /// The most units this run may hold in flight right now, read afresh on

@@ -431,6 +431,17 @@ pub trait TileReader: Send + Sync {
         0
     }
 
+    /// The file-backed bytes one frame's [`Self::read_tile_into`] of a
+    /// `width x height` rect keeps in the page cache: pages of a scratch file
+    /// the reader reads, which [`Self::read_scratch_bytes`] does not count.
+    /// The scheduler sizes its admission bands from it: neighbouring tiles
+    /// share a margin, and the margin is a cache hit only while the pages in
+    /// between still fit in memory. Readers with no file-backed working set
+    /// keep the default.
+    fn read_page_cache_bytes(&self, _width: u32, _height: u32) -> u64 {
+        0
+    }
+
     /// Every `step`-th row and column of `rect`, as [`read_tile_step_into`].
     /// A reader that can drop unsampled columns while it converts overrides
     /// this; the default reads each sampled row whole.
@@ -514,8 +525,8 @@ pub fn read_tile_step_into<R: TileReader + ?Sized>(
 
 /// What an [`AlignAlgorithm::align_frame`] call sees: the facts about the
 /// stack, which frame is the alignment reference, a handle onto real pixels
-/// through a [`TileReader`], and (in the anchor arm only) a driver-prepared
-/// value from [`AlignAlgorithm::prepare_run`].
+/// through a [`TileReader`], and a driver-prepared value from
+/// [`AlignAlgorithm::prepare_run`].
 ///
 /// `Send + Sync` on [`TileReader`] is what keeps `AlignContext<'_>` `Sync`,
 /// which is what lets `align_frame` run across frames under rayon. `Send +
@@ -806,12 +817,12 @@ pub trait AlignAlgorithm: Send + Sync + 'static {
         false
     }
 
-    /// Called **at most once per run**, by the driver, **only in the anchor
-    /// arm**, before any [`align_frame`](Self::align_frame) call of that
-    /// run -- with the same fully resolved `cfg` every `align_frame` call of
-    /// that run will receive. The returned value is opaque to the driver,
-    /// which only owns it and hands it back to every `align_frame` call
-    /// through [`AlignContext::prepared`]; nothing here interprets it.
+    /// Called **at most once per run**, by the driver, in the anchor and the
+    /// chain arm alike, before any [`align_frame`](Self::align_frame) call of
+    /// that run -- with the same fully resolved `cfg` every call will receive.
+    /// The returned value is opaque to the driver, which owns it and hands it
+    /// back to every `align_frame` call through [`AlignContext::prepared`]; in
+    /// a chain run those calls share it concurrently.
     ///
     /// `Ok(None)` is always a correct implementation -- it costs only the
     /// rebuild it declines to avoid -- which is why every implementor except

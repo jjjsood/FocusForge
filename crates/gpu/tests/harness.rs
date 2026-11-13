@@ -15,6 +15,8 @@ mod budget_gpu;
 mod device;
 #[path = "harness/ecc_parity.rs"]
 mod ecc_parity;
+#[path = "harness/ecc_step_series.rs"]
+mod ecc_step_series;
 #[path = "harness/errors.rs"]
 mod errors;
 #[path = "harness/full_frame_render_identity.rs"]

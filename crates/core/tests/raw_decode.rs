@@ -6,14 +6,18 @@ mod raw_dng;
 
 use focusforge_core::algorithm::{AlgorithmError, TileReader};
 use focusforge_core::equalize::{EqualizeSettings, UNIT_GAIN};
+use focusforge_core::host::HostFacts;
 use focusforge_core::io::Rect;
-use focusforge_core::io::{FrameError, FrameReader, RawError, RawStack};
+use focusforge_core::io::{
+    DevelopStore, FrameError, FrameReader, RawError, RawStack, open_frame_set,
+};
 use focusforge_core::job::{JobControl, JobStage};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::pipeline::{
     FreeSpaceProbe, FuseOutcome, FuseOutput, FuseProduct, FuseRequest, PipelineError, RunStage,
     StageObserver, VolumeShortfall, VolumeSpace,
 };
+use focusforge_core::tile::{HOST_FIXED_BYTES, HostBudget, MemoryBound};
 use rawler::decoders::{RawDecodeParams, WellKnownIFD};
 use rawler::rawsource::RawSource;
 use sha2::{Digest, Sha256};
@@ -22,7 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::common::target_tmp;
-use crate::raw_dng::{DngSpec, write_dng};
+use crate::raw_dng::{DngSpec, copy_padded, write_dng};
 
 #[test]
 fn raw_reader_opens_an_empty_path_list_as_a_named_error() {
@@ -626,7 +630,14 @@ fn raw_scratch_error_on_corpus_frames() {
         let developed = RawStack::open_files(std::slice::from_ref(&path)).expect("sample opens");
         let root = target_tmp();
         developed
-            .develop_once(root.path(), u64::MAX, 1, &|| false, &AtomicUsize::new(0))
+            .develop_once(
+                root.path(),
+                DevelopStore::ScratchFile,
+                HostBudget::explicit(u64::MAX),
+                1,
+                &|| false,
+                &AtomicUsize::new(0),
+            )
             .expect("the pass develops the frame");
         let (width, height) = cached.dimensions();
         let rect = Rect {
@@ -643,7 +654,7 @@ fn raw_scratch_error_on_corpus_frames() {
             .expect("cached u16 read");
         developed
             .read_tile_into(0, rect, &mut got16)
-            .expect("mapped u16 read");
+            .expect("scratch u16 read");
         let differing16 = want16.iter().zip(&got16).filter(|(w, g)| w != g).count();
         let worst16 = want16.iter().zip(&got16).map(|(w, g)| w.abs_diff(*g)).max();
         let over = |limit: u16| {
@@ -660,7 +671,7 @@ fn raw_scratch_error_on_corpus_frames() {
             .expect("cached f32 read");
         developed
             .read_tile_f32_into(0, rect, &mut got)
-            .expect("mapped f32 read");
+            .expect("scratch f32 read");
         let differing = want.iter().zip(&got).filter(|(w, g)| w != g).count();
         let worst = want
             .iter()
@@ -687,7 +698,7 @@ fn raw_scratch_error_on_corpus_frames() {
         );
         assert!(
             got.iter().all(|value| value.is_finite()),
-            "{name}: a mapped read is not finite"
+            "{name}: a scratch read is not finite"
         );
     }
 }
@@ -1763,12 +1774,28 @@ impl TileReader for NarrowOnly<'_> {
 /// The pixel `PROBE` of the weighted-average fusion of the two square frames
 /// `reader` serves.
 fn fused_probe_pixel(reader: &dyn TileReader, label: &str) -> Vec<u16> {
+    fused_rect(reader, 2, label, None, PROBE).2
+}
+
+/// The scheduler's initial in-flight limit, its band width and the samples of
+/// `rect` in the weighted-average fusion of the `frame_count` square frames
+/// `reader` serves, with `facts` as the host the scheduler probes when given.
+fn fused_rect(
+    reader: &dyn TileReader,
+    frame_count: usize,
+    label: &str,
+    facts: Option<HostFacts>,
+    rect: Rect,
+) -> (usize, Option<usize>, Vec<u16>) {
     use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
+    use focusforge_core::host::FixedFacts;
     use focusforge_core::io::TiffStack;
     use focusforge_core::params::{self, ParamValues, StackContext};
-    use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
+    use focusforge_core::tile::{
+        HostSources, MonotonicClock, NoopPreprocess, TileScheduler, TileSchedulerOptions,
+    };
 
-    let (width, height, frame_count) = (SIDE, SIDE, 2);
+    let (width, height) = (SIDE, SIDE);
     let context = StackContext::new(frame_count, width, height, 3);
     let algo = focusforge_core::registry::find_stack("weighted-average")
         .expect("weighted-average resolves");
@@ -1782,7 +1809,15 @@ fn fused_probe_pixel(reader: &dyn TileReader, label: &str) -> Vec<u16> {
     let mut options = TileSchedulerOptions::explicit_budget(out_dir.join(label), 1 << 30);
     options.apply_support(algo.tile_support(&values));
     options.tile_size = 80;
+    if let Some(facts) = facts {
+        options.host = HostSources {
+            probe: Arc::new(FixedFacts(facts)),
+            clock: Arc::new(MonotonicClock::new()),
+        };
+    }
     let scheduler = TileScheduler::new(reader, context, 3, &options).expect("scheduler builds");
+    let in_flight_limit = scheduler.in_flight_limit();
+    let band_columns = scheduler.band_columns();
     let consumer = FusionConsumer::create(
         algo,
         values,
@@ -1803,11 +1838,12 @@ fn fused_probe_pixel(reader: &dyn TileReader, label: &str) -> Vec<u16> {
         .expect("fusion runs");
     consumer.finish().expect("fusion finishes");
 
-    TiffStack::open_files(&[composite])
+    let samples = TiffStack::open_files(&[composite])
         .expect("composite reopens")
-        .read_tile(0, PROBE)
+        .read_tile(0, rect)
         .expect("composite read")
-        .samples
+        .samples;
+    (in_flight_limit, band_columns, samples)
 }
 
 /// A frame of 2x2-cell checkerboard texture: cells alternate between `level`
@@ -2042,96 +2078,133 @@ fn assert_scratch_u16_reads(want: &[u16], got: &[u16], what: &str) {
 
 #[test]
 fn raw_develop_pass_reads_match_cached_reads() {
-    const SIDE: (u32, u32) = (40, 30);
-    let files: Vec<_> = (0..3)
-        .map(|i| gradient_dng(SIDE.0, SIDE.1, i * 700))
-        .collect();
-    let paths: Vec<PathBuf> = files.iter().map(|f| PathBuf::from(f.path())).collect();
-    let cached = RawStack::open_files(&paths).expect("DNG stack opens");
-    let developed = RawStack::open_files(&paths).expect("DNG stack opens");
-    let root = target_tmp();
-    developed
-        .develop_once(root.path(), u64::MAX, 2, &|| false, &AtomicUsize::new(0))
-        .expect("the pass develops every frame");
-    assert_eq!(developed.develop_counts(), Some(vec![1; 3]));
-    let rects = [
-        Rect {
-            x: 0,
-            y: 0,
-            width: SIDE.0,
-            height: SIDE.1,
-        },
-        Rect {
-            x: SIDE.0 - 5,
-            y: SIDE.1 - 3,
-            width: 5,
-            height: 3,
-        },
-        Rect {
-            x: SIDE.0 - 1,
-            y: SIDE.1 - 1,
-            width: 1,
-            height: 1,
-        },
-    ];
-    for frame in 0..3 {
-        for rect in rects {
-            let samples = rect.width as usize * rect.height as usize * 3;
-            for gain in [UNIT_GAIN, UNIT_GAIN * 3 / 2, UNIT_GAIN / 3] {
+    for side in [(40u32, 30u32), (150, 70)] {
+        let files: Vec<_> = (0..3)
+            .map(|i| gradient_dng(side.0, side.1, i * 700))
+            .collect();
+        let paths: Vec<PathBuf> = files.iter().map(|f| PathBuf::from(f.path())).collect();
+        let cached = RawStack::open_files(&paths).expect("DNG stack opens");
+        let developed = RawStack::open_files(&paths).expect("DNG stack opens");
+        let root = target_tmp();
+        developed
+            .develop_once(
+                root.path(),
+                DevelopStore::ScratchFile,
+                HostBudget::explicit(u64::MAX),
+                2,
+                &|| false,
+                &AtomicUsize::new(0),
+            )
+            .expect("the pass develops every frame");
+        assert_eq!(developed.develop_counts(), Some(vec![1; 3]));
+        let rects = [
+            Rect {
+                x: 0,
+                y: 0,
+                width: side.0,
+                height: side.1,
+            },
+            Rect {
+                x: side.0 - 5,
+                y: side.1 - 3,
+                width: 5,
+                height: 3,
+            },
+            Rect {
+                x: side.0 - 1,
+                y: side.1 - 1,
+                width: 1,
+                height: 1,
+            },
+        ];
+        // Rects across 64 px block boundaries, on and off the 32 px grid.
+        let straddling = [
+            Rect {
+                x: 60,
+                y: 60,
+                width: 8,
+                height: 8,
+            },
+            Rect {
+                x: 33,
+                y: 1,
+                width: 100,
+                height: 69,
+            },
+            Rect {
+                x: 63,
+                y: 0,
+                width: 2,
+                height: 70,
+            },
+        ];
+        let rects: Vec<Rect> = rects
+            .into_iter()
+            .chain(
+                straddling
+                    .into_iter()
+                    .filter(|r| r.x + r.width <= side.0 && r.y + r.height <= side.1),
+            )
+            .collect();
+        for frame in 0..3 {
+            for &rect in &rects {
+                let samples = rect.width as usize * rect.height as usize * 3;
+                for gain in [UNIT_GAIN, UNIT_GAIN * 3 / 2, UNIT_GAIN / 3] {
+                    let (mut want, mut got) = (vec![0u16; samples], vec![0u16; samples]);
+                    cached
+                        .read_tile_gained_into(frame, rect, gain, &mut want)
+                        .expect("cached read");
+                    developed
+                        .read_tile_gained_into(frame, rect, gain, &mut got)
+                        .expect("mapped read");
+                    assert_scratch_u16_reads(
+                        &want,
+                        &got,
+                        &format!("u16 frame {frame} {rect:?} gain {gain}"),
+                    );
+
+                    let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
+                    cached
+                        .read_tile_gained_f32_into(frame, rect, gain, &mut want)
+                        .expect("cached read");
+                    developed
+                        .read_tile_gained_f32_into(frame, rect, gain, &mut got)
+                        .expect("mapped read");
+                    assert_scratch_f32_reads(
+                        &want,
+                        &got,
+                        &format!("f32 frame {frame} {rect:?} gain {gain}"),
+                    );
+                }
                 let (mut want, mut got) = (vec![0u16; samples], vec![0u16; samples]);
                 cached
-                    .read_tile_gained_into(frame, rect, gain, &mut want)
+                    .read_tile_into(frame, rect, &mut want)
                     .expect("cached read");
                 developed
-                    .read_tile_gained_into(frame, rect, gain, &mut got)
+                    .read_tile_into(frame, rect, &mut got)
                     .expect("mapped read");
-                assert_scratch_u16_reads(
-                    &want,
-                    &got,
-                    &format!("u16 frame {frame} {rect:?} gain {gain}"),
-                );
-
+                assert_scratch_u16_reads(&want, &got, &format!("unit gain frame {frame} {rect:?}"));
                 let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
                 cached
-                    .read_tile_gained_f32_into(frame, rect, gain, &mut want)
+                    .read_tile_f32_into(frame, rect, &mut want)
                     .expect("cached read");
                 developed
-                    .read_tile_gained_f32_into(frame, rect, gain, &mut got)
+                    .read_tile_f32_into(frame, rect, &mut got)
                     .expect("mapped read");
                 assert_scratch_f32_reads(
                     &want,
                     &got,
-                    &format!("f32 frame {frame} {rect:?} gain {gain}"),
+                    &format!("unit gain f32 frame {frame} {rect:?}"),
                 );
             }
-            let (mut want, mut got) = (vec![0u16; samples], vec![0u16; samples]);
-            cached
-                .read_tile_into(frame, rect, &mut want)
-                .expect("cached read");
-            developed
-                .read_tile_into(frame, rect, &mut got)
-                .expect("mapped read");
-            assert_scratch_u16_reads(&want, &got, &format!("unit gain frame {frame} {rect:?}"));
-            let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
-            cached
-                .read_tile_f32_into(frame, rect, &mut want)
-                .expect("cached read");
-            developed
-                .read_tile_f32_into(frame, rect, &mut got)
-                .expect("mapped read");
-            assert_scratch_f32_reads(
-                &want,
-                &got,
-                &format!("unit gain f32 frame {frame} {rect:?}"),
+            assert_eq!(
+                cached.linear_means(frame).expect("cached means"),
+                developed.linear_means(frame).expect("mapped means"),
+                "means of frame {frame}"
             );
         }
-        assert_eq!(
-            cached.linear_means(frame).expect("cached means"),
-            developed.linear_means(frame).expect("mapped means"),
-            "means of frame {frame}"
-        );
+        assert_eq!(developed.develop_counts(), Some(vec![1; 3]));
     }
-    assert_eq!(developed.develop_counts(), Some(vec![1; 3]));
 }
 
 fn scratch_files(root: &Path) -> Vec<PathBuf> {
@@ -2152,22 +2225,32 @@ fn scratch_files(root: &Path) -> Vec<PathBuf> {
 
 #[test]
 fn raw_scratch_file_size_matches_encoding() {
-    let dng = gradient_dng(48, 20, 0);
-    let root = target_tmp();
-    let paths = copies_of(&dng, 8, root.path());
-    let stack = RawStack::open_files(&paths).expect("DNG stack opens");
-    let scratch = root.path().join("scratch");
-    std::fs::create_dir(&scratch).expect("scratch root");
-    stack
-        .develop_once(&scratch, u64::MAX, 2, &|| false, &AtomicUsize::new(0))
-        .expect("the pass develops every frame");
-    let frame_bytes = stack.scratch_frame_bytes().expect("frame bytes fit");
-    assert_eq!(frame_bytes, 48 * 20 * 6);
-    let files = scratch_files(&scratch);
-    assert_eq!(files.len(), 8, "{files:?}");
-    for file in files {
-        let length = std::fs::metadata(&file).expect("scratch file").len();
-        assert_eq!(length, frame_bytes, "{}", file.display());
+    // One block, and ragged on both axes across several blocks.
+    for (width, height) in [(48u32, 20u32), (130, 70)] {
+        let dng = gradient_dng(width, height, 0);
+        let root = target_tmp();
+        let paths = copies_of(&dng, 8, root.path());
+        let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+        let scratch = root.path().join("scratch");
+        std::fs::create_dir(&scratch).expect("scratch root");
+        stack
+            .develop_once(
+                &scratch,
+                DevelopStore::ScratchFile,
+                HostBudget::explicit(u64::MAX),
+                2,
+                &|| false,
+                &AtomicUsize::new(0),
+            )
+            .expect("the pass develops every frame");
+        let frame_bytes = stack.scratch_frame_bytes().expect("frame bytes fit");
+        assert_eq!(frame_bytes, u64::from(width * height * 6));
+        let files = scratch_files(&scratch);
+        assert_eq!(files.len(), 8, "{files:?}");
+        for file in files {
+            let length = std::fs::metadata(&file).expect("scratch file").len();
+            assert_eq!(length, frame_bytes, "{}", file.display());
+        }
     }
 }
 
@@ -2178,7 +2261,14 @@ fn raw_scratch_keeps_values_above_white() {
     let developed = open_pair(&files);
     let root = target_tmp();
     developed
-        .develop_once(root.path(), u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+        .develop_once(
+            root.path(),
+            DevelopStore::ScratchFile,
+            HostBudget::explicit(u64::MAX),
+            2,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
         .expect("the pass develops every frame");
     let rect = Rect {
         x: 0,
@@ -2199,6 +2289,137 @@ fn raw_scratch_keeps_values_above_white() {
 }
 
 #[test]
+fn cache_refusal_message_names_the_file_in_mb_at_both_sites() {
+    let dng = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]),
+        false,
+    );
+    let one = 8 * 8 * 30 + std::fs::metadata(dng.path()).expect("DNG size").len();
+    let path = PathBuf::from(dng.path());
+    let need = format!("needs {} MB", one.div_ceil(1_000_000));
+    let check = |text: String, wanted: &str| {
+        assert!(text.contains(&dng.path().display().to_string()), "{text}");
+        assert!(text.contains(&need), "{text}");
+        assert!(text.contains(wanted), "{text}");
+        assert!(text.contains("convert the frames to TIFF"), "{text}");
+        assert!(!text.contains("bytes"), "{text}");
+        assert!(!text.contains("cache bound"), "{text}");
+        assert!(!text.contains(&one.to_string()), "{text}");
+    };
+
+    let reader = RawStack::open_files_with_budget(std::slice::from_ref(&path), 1)
+        .expect("metadata fits without decode");
+    let error = reader
+        .read_tile_into(
+            0,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            &mut [0; 3],
+        )
+        .expect_err("a one-byte cache refuses");
+    check(error.to_string(), "memory limit allows 0 MB");
+
+    let root = target_tmp();
+    let stack = RawStack::open_files(std::slice::from_ref(&path)).expect("DNG stack opens");
+    let develop = |budget: HostBudget| {
+        stack
+            .develop_once(
+                root.path(),
+                DevelopStore::ScratchFile,
+                budget,
+                1,
+                &|| false,
+                &AtomicUsize::new(0),
+            )
+            .expect_err("a budget below one reservation refuses")
+            .to_string()
+    };
+    check(
+        develop(HostBudget::explicit(one - 1)),
+        "Raise the memory limit to at least",
+    );
+    let facts = HostFacts::new(3000, 1000, None, None, 1);
+    let text = develop(HostBudget::host_derived(&facts));
+    check(text.clone(), "not enough free RAM");
+    assert!(!text.contains("memory limit"), "{text}");
+}
+
+#[test]
+fn capped_budget_opens_at_the_largest_reservation_and_refuses_one_byte_below() {
+    let source = write_dng(
+        &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]),
+        false,
+    );
+    let root = target_tmp();
+    let sets: [Vec<PathBuf>; 2] = [
+        vec![PathBuf::from(source.path())],
+        (0..3)
+            .map(|index| root.path().join(format!("{index:02}.dng")))
+            .collect(),
+    ];
+    copy_padded(source.path(), &sets[1][0], 0);
+    copy_padded(source.path(), &sets[1][1], 4_000);
+    copy_padded(source.path(), &sets[1][2], 0);
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: 8,
+        height: 8,
+    };
+    for paths in &sets {
+        let (largest_path, largest) = paths
+            .iter()
+            .map(|path| (path, std::fs::metadata(path).expect("DNG size").len()))
+            .max_by_key(|(_, len)| *len)
+            .expect("frames");
+        let r = 8 * 8 * 30 + largest;
+        let opened = open_frame_set(paths, HostBudget::explicit(r)).expect("R opens");
+        for frame in 0..paths.len() {
+            opened
+                .reader
+                .read_tile_into(frame, rect, &mut [0; 8 * 8 * 3])
+                .unwrap_or_else(|error| panic!("frame {frame} at R: {error}"));
+        }
+
+        let refused = |budget: HostBudget| match open_frame_set(paths, budget) {
+            Err(FrameError::Raw(error)) => error,
+            Ok(_) => panic!("a budget below R must refuse at open"),
+            Err(error) => panic!("expected a RAW refusal, got {error}"),
+        };
+        let error = refused(HostBudget::explicit(r - 1));
+        let text = error.to_string();
+        let RawError::CacheTooSmall {
+            path,
+            bound,
+            required,
+            bounded_by,
+        } = error
+        else {
+            panic!("expected CacheTooSmall, got {text}");
+        };
+        assert_eq!((bound, required), (r - 1, r), "{text}");
+        assert_eq!(bounded_by, MemoryBound::Limit { divisor: 1 });
+        assert_eq!(&path, largest_path);
+        assert!(text.contains(&path.display().to_string()), "{text}");
+        assert!(
+            text.contains(&format!("needs {} MB", r.div_ceil(1_000_000))),
+            "{text}"
+        );
+        assert!(!text.contains("bytes"), "{text}");
+
+        let facts = HostFacts::new(HOST_FIXED_BYTES + r, HOST_FIXED_BYTES + r, None, None, 1);
+        let host = HostBudget::host_derived(&facts);
+        assert!(host.bytes() < r);
+        let text = refused(host).to_string();
+        assert!(text.contains("not enough free RAM"), "{text}");
+    }
+}
+
+#[test]
 fn raw_develops_overlap() {
     let dng = write_dng(
         &DngSpec::new(12, 64, 4095, [0, 1, 1, 2], vec![64; 64]),
@@ -2211,12 +2432,27 @@ fn raw_develops_overlap() {
     let pass = |budget: u64, workers: usize| {
         let stack = RawStack::open_files(&paths).expect("DNG stack opens");
         developed.store(0, Ordering::SeqCst);
-        let result = stack.develop_once(root.path(), budget, workers, &|| false, &developed);
+        let result = stack.develop_once(
+            root.path(),
+            DevelopStore::ScratchFile,
+            HostBudget::explicit(budget),
+            workers,
+            &|| false,
+            &developed,
+        );
         (stack, result)
     };
 
     let (stack, result) = pass(4 * one, 4);
     assert_eq!(result.expect("four reservations fit"), 4);
+    assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
+    assert_eq!(developed.load(Ordering::SeqCst), 4);
+    let (stack, result) = pass(2 * one, 4);
+    assert_eq!(result.expect("exactly two reservations fit two"), 2);
+    assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
+    assert_eq!(developed.load(Ordering::SeqCst), 4);
+    let (stack, result) = pass(2 * one - 1, 4);
+    assert_eq!(result.expect("one byte under two reservations fits one"), 1);
     assert_eq!(stack.develop_counts(), Some(vec![1; 4]));
     assert_eq!(developed.load(Ordering::SeqCst), 4);
     let (stack, result) = pass(one + one / 2, 4);
@@ -2445,7 +2681,14 @@ fn raw_scratch_unwritable_is_a_named_error() {
     let blocker = tempfile::NamedTempFile::new_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("a regular file at the scratch root");
     let error = stack
-        .develop_once(blocker.path(), u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+        .develop_once(
+            blocker.path(),
+            DevelopStore::ScratchFile,
+            HostBudget::explicit(u64::MAX),
+            2,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
         .expect_err("a scratch root that is a file cannot hold a directory");
     assert!(
         error
@@ -2524,7 +2767,14 @@ fn scratch_space_needed_matches_written_scratch() {
         std::fs::create_dir(&scratch).expect("scratch root");
         let needed = stack.develop_scratch_bytes().expect("the figure fits");
         stack
-            .develop_once(&scratch, u64::MAX, 2, &|| false, &AtomicUsize::new(0))
+            .develop_once(
+                &scratch,
+                DevelopStore::ScratchFile,
+                HostBudget::explicit(u64::MAX),
+                2,
+                &|| false,
+                &AtomicUsize::new(0),
+            )
             .expect("the pass develops every frame");
         let (width, height) = stack.dimensions();
         assert_eq!(
@@ -2547,7 +2797,9 @@ fn raw_run_space_staged_bytes_cover_written_staging() {
     let develop = 4 * 64 * 48 * 6;
     let root = target_tmp();
     let frames = copies_of(&dng, 4, root.path());
-    let needed = single_shortfall(&mut hold_request(frames.clone(), root.path()), 0).needed;
+    let mut capped = hold_request(frames.clone(), root.path());
+    capped.max_host_memory = Some(on_disk_budget(&dng));
+    let needed = single_shortfall(&mut capped, 0).needed;
     let written = held_len(&hold_request(frames, root.path()));
     let staged = needed - develop;
     assert!(
@@ -2565,13 +2817,15 @@ fn raw_run_space_includes_developed_scratch() {
     let staged = held_len(&hold_request(frames.clone(), root.path()));
     let probe_root = target_tmp();
     let probe_frames = copies_of(&dng, 4, probe_root.path());
-    let needed = single_shortfall(&mut hold_request(probe_frames, probe_root.path()), 0).needed;
+    let mut probe = hold_request(probe_frames, probe_root.path());
+    probe.max_host_memory = Some(on_disk_budget(&dng));
+    let needed = single_shortfall(&mut probe, 0).needed;
     // The sealed result adds its temporary compressed planes to the scratch
     // volume and the project itself to the output volume.
     for free in [develop - 1, 0] {
         let root = target_tmp();
         let frames = copies_of(&dng, 4, root.path());
-        let mut request = raw_request(frames, root.path(), None, None);
+        let mut request = raw_request(frames, root.path(), None, Some(on_disk_budget(&dng)));
         let shortfall = single_shortfall(&mut request, free);
         assert_eq!(shortfall.free, free);
         assert!(
@@ -2656,4 +2910,477 @@ fn scratch_space_query_failure_refuses_the_run() {
     assert!(text.contains("volume query refused"), "{text}");
     assert!(text.contains(&root.path().display().to_string()), "{text}");
     assert_scratch_empty(&root.path().join("scratch"));
+}
+
+#[test]
+fn page_cache_working_set_is_the_block_span_before_and_after_develop() {
+    // 130 x 70: three blocks of 64 across, two down, both edges ragged.
+    let dng = gradient_dng(130, 70, 0);
+    let root = target_tmp();
+    let paths = copies_of(&dng, 2, root.path());
+    let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+    // (rect width, rect height, bytes): a rect can touch one block more than
+    // it covers, whatever its origin, and the frame clamps the span.
+    let cases = [
+        (1, 1, 64 * 64 * 6),
+        (1, 65, 64 * 70 * 6),
+        (32, 32, 128 * 70 * 6),
+        (64, 64, 128 * 70 * 6),
+        (130, 70, 130 * 70 * 6),
+        (512, 512, 130 * 70 * 6),
+    ];
+    let check = |stack: &RawStack, when: &str| {
+        for (width, height, bytes) in cases {
+            assert_eq!(
+                stack.read_page_cache_bytes(width, height),
+                bytes,
+                "{width}x{height} {when}"
+            );
+        }
+    };
+    check(&stack, "before develop");
+    let scratch = root.path().join("scratch");
+    std::fs::create_dir(&scratch).expect("scratch root");
+    stack
+        .develop_once(
+            &scratch,
+            DevelopStore::ScratchFile,
+            HostBudget::explicit(u64::MAX),
+            2,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
+        .expect("the pass develops every frame");
+    check(&stack, "after develop");
+}
+
+#[test]
+fn page_cache_bands_output_identical() {
+    let files = [
+        gradient_dng(SIDE, SIDE, 0),
+        gradient_dng(SIDE, SIDE, 700),
+        gradient_dng(SIDE, SIDE, 1500),
+    ];
+    let stack = open_pair(&files);
+    let root = target_tmp();
+    stack
+        .develop_once(
+            root.path(),
+            DevelopStore::ScratchFile,
+            HostBudget::explicit(u64::MAX),
+            2,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
+        .expect("the pass develops every frame");
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: SIDE,
+        height: SIDE,
+    };
+    let host =
+        |cgroup_limit| HostFacts::new(64_000_000_000, 50_000_000_000, cgroup_limit, Some(0), 16);
+    // Fallback facts give no bands: plain plan order.
+    let (plan_limit, plan_bands, in_plan_order) = fused_rect(
+        &stack,
+        3,
+        "bands-plan-order",
+        Some(HostFacts::fallback()),
+        whole,
+    );
+    assert_eq!(plan_bands, None);
+    // A limit above the fixed part by less than one working set gives
+    // one-column bands.
+    let tight = host(Some(HOST_FIXED_BYTES + 1_000));
+    let (banded_limit, banded_bands, in_bands) =
+        fused_rect(&stack, 3, "bands-one-column", Some(tight), whole);
+    assert_eq!(banded_bands, Some(1));
+    assert_eq!(banded_limit, plan_limit, "bands leave the in-flight limit");
+    assert_eq!(in_bands.len(), (SIDE * SIDE * 3) as usize);
+    assert!(
+        in_plan_order
+            .iter()
+            .any(|&sample| sample != in_plan_order[0]),
+        "the composite must carry detail for the comparison to mean anything"
+    );
+    assert!(
+        in_bands == in_plan_order,
+        "the band order changed the composite"
+    );
+}
+
+/// Develops `stack` into `store` under `root` with room for any pass.
+fn develop_into(stack: &RawStack, root: &Path, store: DevelopStore) {
+    stack
+        .develop_once(
+            root,
+            store,
+            HostBudget::explicit(u64::MAX),
+            2,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
+        .expect("the pass develops every frame");
+}
+
+/// Bytes one decode reserves for the stack's frames: raw pixels at 30 bytes
+/// each plus the file.
+fn decode_reservation(stack: &RawStack) -> u64 {
+    let raw = stack.metadata(0).expect("frame 0 has metadata");
+    u64::from(raw.raw_width) * u64::from(raw.raw_height) * 30
+        + stack.frame(0).expect("frame 0").file_size
+}
+
+/// A host memory ceiling that holds one decode of `dng` but not the developed
+/// frames beside it, so a run with it develops to scratch files.
+fn on_disk_budget(dng: &tempfile::NamedTempFile) -> u64 {
+    decode_reservation(&RawStack::open_files(&[PathBuf::from(dng.path())]).expect("DNG opens")) + 1
+}
+
+#[test]
+fn raw_in_ram_reads_match_scratch_reads() {
+    // One ragged block, and ragged on both axes across several blocks.
+    for side in [(40u32, 30u32), (150, 70)] {
+        let files: Vec<_> = (0..3)
+            .map(|i| gradient_dng(side.0, side.1, i * 700))
+            .collect();
+        let paths: Vec<PathBuf> = files.iter().map(|f| PathBuf::from(f.path())).collect();
+        let on_disk = RawStack::open_files(&paths).expect("DNG stack opens");
+        let in_ram = RawStack::open_files(&paths).expect("DNG stack opens");
+        let disk_root = target_tmp();
+        let ram_root = target_tmp();
+        develop_into(&on_disk, disk_root.path(), DevelopStore::ScratchFile);
+        develop_into(&in_ram, ram_root.path(), DevelopStore::Memory);
+        assert_scratch_empty(ram_root.path());
+        assert_eq!(scratch_files(disk_root.path()).len(), 3);
+        assert_eq!(in_ram.develop_counts(), Some(vec![1; 3]));
+
+        let rect = |x, y, width, height| Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let rects: Vec<Rect> = [
+            // The whole frame, the far corner, and a single pixel.
+            rect(0, 0, side.0, side.1),
+            rect(side.0 - 5, side.1 - 3, 5, 3),
+            rect(side.0 - 1, side.1 - 1, 1, 1),
+            // Across block edges, on and off the 32 px grid.
+            rect(60, 60, 8, 8),
+            rect(33, 1, 100, 69),
+            rect(63, 0, 2, 70),
+            rect(64, 64, 6, 6),
+        ]
+        .into_iter()
+        .filter(|r| r.x + r.width <= side.0 && r.y + r.height <= side.1)
+        .collect();
+        for frame in 0..3 {
+            for &rect in &rects {
+                let samples = rect.width as usize * rect.height as usize * 3;
+                for gain in [UNIT_GAIN, UNIT_GAIN * 3 / 2, UNIT_GAIN / 3] {
+                    let (mut want, mut got) = (vec![0u16; samples], vec![0u16; samples]);
+                    on_disk
+                        .read_tile_gained_into(frame, rect, gain, &mut want)
+                        .expect("scratch read");
+                    in_ram
+                        .read_tile_gained_into(frame, rect, gain, &mut got)
+                        .expect("in-memory read");
+                    assert_eq!(want, got, "u16 frame {frame} {rect:?} gain {gain}");
+
+                    let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
+                    on_disk
+                        .read_tile_gained_f32_into(frame, rect, gain, &mut want)
+                        .expect("scratch read");
+                    in_ram
+                        .read_tile_gained_f32_into(frame, rect, gain, &mut got)
+                        .expect("in-memory read");
+                    assert_eq!(want, got, "f32 frame {frame} {rect:?} gain {gain}");
+                }
+                let (mut want, mut got) = (vec![0u16; samples], vec![0u16; samples]);
+                on_disk
+                    .read_tile_into(frame, rect, &mut want)
+                    .expect("scratch read");
+                in_ram
+                    .read_tile_into(frame, rect, &mut got)
+                    .expect("in-memory read");
+                assert_eq!(want, got, "unit gain u16 frame {frame} {rect:?}");
+                let (mut want, mut got) = (vec![0f32; samples], vec![0f32; samples]);
+                on_disk
+                    .read_tile_f32_into(frame, rect, &mut want)
+                    .expect("scratch read");
+                in_ram
+                    .read_tile_f32_into(frame, rect, &mut got)
+                    .expect("in-memory read");
+                assert_eq!(want, got, "unit gain f32 frame {frame} {rect:?}");
+            }
+            assert_eq!(
+                on_disk.linear_means(frame).expect("scratch means"),
+                in_ram.linear_means(frame).expect("in-memory means"),
+                "means of frame {frame}"
+            );
+        }
+        assert_eq!(in_ram.develop_counts(), Some(vec![1; 3]));
+    }
+}
+
+#[test]
+fn raw_store_choice_flips_at_the_in_ram_requirement() {
+    let dng = gradient_dng(130, 70, 0);
+    let root = target_tmp();
+    let paths = copies_of(&dng, 4, root.path());
+    let stack = RawStack::open_files(&paths).expect("DNG stack opens");
+    let frames = stack.develop_scratch_bytes().expect("the figure fits");
+    assert_eq!(frames, 4 * 130 * 70 * 6);
+    let reservation = decode_reservation(&stack);
+    let workers = 2;
+    let choose = |budget: u64, share: u64| {
+        stack
+            .develop_store(HostBudget::explicit(budget), workers, share)
+            .expect("the choice is made")
+    };
+    // The share below the two reservations, at them, and above them.
+    for share in [0, 2 * reservation, 10 * reservation] {
+        let required = frames + (workers as u64 * reservation).max(share);
+        assert_eq!(
+            choose(required - 1, share),
+            Some(DevelopStore::ScratchFile),
+            "share {share}, one byte short"
+        );
+        assert_eq!(
+            choose(required, share),
+            Some(DevelopStore::Memory),
+            "share {share}, exactly enough"
+        );
+    }
+
+    // Room for both decodes but not for the frames: the pass writes the
+    // frames to scratch and keeps nothing in memory.
+    let budget = 2 * reservation;
+    assert_eq!(choose(budget, 0), Some(DevelopStore::ScratchFile));
+    let on_disk = RawStack::open_files(&paths).expect("DNG stack opens");
+    let disk_root = target_tmp();
+    on_disk
+        .develop_once(
+            disk_root.path(),
+            DevelopStore::ScratchFile,
+            HostBudget::explicit(budget),
+            workers,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
+        .expect("the pass develops every frame");
+    let written: u64 = scratch_files(disk_root.path())
+        .iter()
+        .map(|file| std::fs::metadata(file).expect("scratch file").len())
+        .sum();
+    assert_eq!(written, frames);
+    assert!(on_disk.read_page_cache_bytes(64, 64) > 0);
+
+    let in_ram = RawStack::open_files(&paths).expect("DNG stack opens");
+    let ram_root = target_tmp();
+    develop_into(&in_ram, ram_root.path(), DevelopStore::Memory);
+    assert_scratch_empty(ram_root.path());
+    assert_eq!(in_ram.read_page_cache_bytes(64, 64), 0);
+}
+
+#[test]
+fn raw_in_ram_failure_and_cancel_leave_nothing() {
+    let good = gradient_dng(256, 256, 0);
+    let withheld = write_dng(
+        &tinted_spec(vec![64; 256 * 256], 256, 256, [0, 1, 1, 2]),
+        true,
+    );
+    let frames = vec![
+        PathBuf::from(good.path()),
+        PathBuf::from(withheld.path()),
+        PathBuf::from(good.path()),
+    ];
+    let pass = |stack: &RawStack, root: &Path, store, cancel_after: usize| {
+        let polls = AtomicUsize::new(0);
+        stack.develop_once(
+            root,
+            store,
+            HostBudget::explicit(u64::MAX),
+            1,
+            &|| polls.fetch_add(1, Ordering::SeqCst) >= cancel_after,
+            &AtomicUsize::new(0),
+        )
+    };
+
+    // The pass keeps its frames in memory when nothing goes wrong.
+    let control =
+        RawStack::open_files(&[frames[0].clone(), frames[2].clone()]).expect("DNG stack opens");
+    let root = target_tmp();
+    pass(&control, root.path(), DevelopStore::Memory, usize::MAX).expect("the pass completes");
+    assert_eq!(control.read_page_cache_bytes(64, 64), 0);
+
+    // A header-only frame ends the pass with the same error in both stores.
+    let mut errors = Vec::new();
+    for store in [DevelopStore::ScratchFile, DevelopStore::Memory] {
+        let stack = RawStack::open_files(&frames).expect("DNG stack opens");
+        let root = target_tmp();
+        let error = pass(&stack, root.path(), store, usize::MAX)
+            .expect_err("a frame without pixels must end the pass");
+        assert!(
+            error
+                .to_string()
+                .contains(&withheld.path().display().to_string()),
+            "{store:?}: {error}"
+        );
+        assert_scratch_empty(root.path());
+        assert!(stack.read_page_cache_bytes(64, 64) > 0, "{store:?}");
+        errors.push(error.to_string());
+    }
+    assert_eq!(errors[0], errors[1]);
+
+    // A cancel after the second frame starts leaves nothing either, and the
+    // reader can run the pass again.
+    let stack = RawStack::open_files(&[frames[0].clone(), frames[2].clone(), frames[0].clone()])
+        .expect("DNG stack opens");
+    let root = target_tmp();
+    let cancelled = pass(&stack, root.path(), DevelopStore::Memory, 2);
+    assert!(
+        matches!(cancelled, Err(AlgorithmError::Cancelled)),
+        "{cancelled:?}"
+    );
+    assert_scratch_empty(root.path());
+    assert!(stack.read_page_cache_bytes(64, 64) > 0);
+    pass(&stack, root.path(), DevelopStore::Memory, usize::MAX)
+        .expect("a failed pass retained nothing, so the next one runs");
+    assert_eq!(stack.read_page_cache_bytes(64, 64), 0);
+}
+
+#[test]
+fn raw_in_ram_run_needs_no_scratch_space() {
+    let dng = gradient_dng(64, 48, 0);
+    let develop = 4 * 64 * 48 * 6;
+    let capped = Some(on_disk_budget(&dng));
+    let request = |max_host_memory, free: u64| {
+        let root = target_tmp();
+        let frames = copies_of(&dng, 4, root.path());
+        let mut request = raw_request(frames, root.path(), None, max_host_memory);
+        request.free_space = Some(recording_probe(move |_| volume("only", free)).0);
+        (request, root)
+    };
+    let shortfall = |max_host_memory| {
+        let (mut request, _root) = request(max_host_memory, 0);
+        single_shortfall(&mut request, 0).needed
+    };
+    let on_disk = shortfall(capped);
+    let in_ram = shortfall(None);
+    assert_eq!(in_ram + develop, on_disk, "only the frames differ");
+
+    // A volume that covers the rest but not the frames still runs the stack
+    // through memory and refuses the stack that needs the frames on disk.
+    let (held, _root) = request(None, in_ram);
+    let FuseOutcome::Completed(report) = run_raw(&held).expect("the RAW run completes") else {
+        panic!("expected a completed run");
+    };
+    assert_eq!(report.developed_store, Some(DevelopStore::Memory));
+    let (mut refused, _root) = request(capped, in_ram);
+    let shortfall = single_shortfall(&mut refused, in_ram);
+    assert_eq!((shortfall.needed, shortfall.free), (on_disk, in_ram));
+}
+
+/// A one-frame `width` x `height` DNG stack developed into `store`; the root
+/// and the DNG must outlive the reads.
+fn developed_stack(
+    width: u32,
+    height: u32,
+    store: DevelopStore,
+) -> (RawStack, tempfile::TempDir, tempfile::NamedTempFile) {
+    let mut spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], Vec::new());
+    spec.width = width;
+    spec.height = height;
+    spec.samples = vec![512; (width * height) as usize];
+    let dng = write_dng(&spec, false);
+    let stack = RawStack::open_files(&[PathBuf::from(dng.path())]).expect("DNG opens");
+    let root = target_tmp();
+    stack
+        .develop_once(
+            root.path(),
+            store,
+            HostBudget::explicit(u64::MAX),
+            1,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
+        .expect("the pass develops the frame");
+    (stack, root, dng)
+}
+
+/// The scratch file of frame 0 under `root`.
+fn scratch_file(root: &Path) -> PathBuf {
+    std::fs::read_dir(root)
+        .expect("scratch root lists")
+        .map(|entry| entry.expect("scratch entry").path().join("0.f16"))
+        .find(|path| path.is_file())
+        .expect("frame 0 has a scratch file")
+}
+
+#[test]
+fn raw_scratch_short_read_is_a_scratch_error() {
+    use std::io::ErrorKind;
+
+    for (damage, kind) in [
+        ("truncated", ErrorKind::UnexpectedEof),
+        ("emptied", ErrorKind::UnexpectedEof),
+        ("removed", ErrorKind::NotFound),
+    ] {
+        let (stack, root, _dng) = developed_stack(100, 70, DevelopStore::ScratchFile);
+        let path = scratch_file(root.path());
+        let length = std::fs::metadata(&path).expect("scratch metadata").len();
+        match damage {
+            "truncated" | "emptied" => std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("scratch opens for writing")
+                .set_len(if damage == "emptied" { 0 } else { length / 2 })
+                .expect("scratch shrinks"),
+            _ => std::fs::remove_file(&path).expect("scratch is removed"),
+        }
+        let (width, height) = stack.dimensions();
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let count = width as usize * height as usize * 3;
+        let results = [
+            stack.read_tile_into(0, rect, &mut vec![0u16; count]),
+            stack.read_tile_f32_into(0, rect, &mut vec![0f32; count]),
+        ];
+        for result in results {
+            let error = result.expect_err("a damaged scratch file fails the read");
+            let AlgorithmError::Frame(FrameError::Raw(RawError::Scratch { path: got, source })) =
+                &error
+            else {
+                panic!("{damage}: expected RawError::Scratch, got {error:?}");
+            };
+            assert_eq!(got, &path, "{damage}: the error names the scratch file");
+            assert_eq!(source.kind(), kind, "{damage}");
+        }
+    }
+}
+
+#[test]
+fn raw_read_scratch_bytes_counts_the_read_buffer() {
+    // A 64x64 block of 6-byte pixels; a frame smaller than a block clamps it.
+    for (width, height, expected) in [(100, 70, 64 * 64 * 6), (40, 30, 40 * 30 * 6)] {
+        let (stack, _root, _dng) = developed_stack(width, height, DevelopStore::ScratchFile);
+        assert_eq!(
+            stack.read_scratch_bytes(width, height),
+            expected,
+            "{width}x{height} file-backed"
+        );
+        let (stack, _root, _dng) = developed_stack(width, height, DevelopStore::Memory);
+        assert_eq!(
+            stack.read_scratch_bytes(width, height),
+            0,
+            "{width}x{height} in memory"
+        );
+    }
 }

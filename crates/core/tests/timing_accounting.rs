@@ -218,6 +218,10 @@ fn a_matching_prepared_reference_spares_the_registration_its_preparation() {
     let mut cfg = params::resolved_values(&resolved);
     cfg.insert("pyramid-depth".to_string(), ParamValue::Int(1));
     cfg.insert("max-iterations".to_string(), ParamValue::Int(5));
+    cfg.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum("anchor".to_string()),
+    );
 
     let prepare = |cfg: &ParamValues| {
         PyramidalEcc

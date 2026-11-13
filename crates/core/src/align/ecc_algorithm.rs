@@ -60,6 +60,10 @@
 //! [`TimingCounter::Level0WindowMisses`] and is solved again over a window
 //! regrown to cover seed and result (counted again if still capped).
 //!
+//! A chain run reads each frame's level-0 window once, over that limit plus
+//! the smoothing reach, and cuts both hops' windows from it; a window outside
+//! the limit is read fresh.
+//!
 //! # The off-centre check
 //!
 //! After a frame that did not diverge, `PyramidalEcc::validate`
@@ -70,7 +74,7 @@
 //! [`crate::align::DivergenceReason::WeakMatch`] instead, fit kept, without
 //! the patch evaluation.
 
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use crate::algorithm::{AlgorithmError, AlignAlgorithm, AlignContext, AlignOutcome, AlignStatus};
 use crate::align::ecc::{EccTemplate, solve_prepared, solve_prepared_on};
@@ -84,7 +88,7 @@ use crate::align::{
 use crate::fuse::pyramid::{KERNEL, Plane};
 use crate::params::{EnumVariant, ParamDesc, ParamKind, ParamValue, ParamValues, StackContext};
 use crate::registry::AlignRegistration;
-use crate::tile::plan::{DEFAULT_TILE_SIZE, MAX_LEVELS};
+use crate::tile::plan::MAX_LEVELS;
 use crate::tile::{Rect, Sample, SampleFormat};
 use crate::timing::{TimingCounter, measurement_scope, record_level_iterations, record_timing};
 
@@ -444,24 +448,35 @@ pub(crate) fn seed_scratch_bytes(width: u32, height: u32, spp: u32) -> u64 {
     px * DETECTOR_BYTES_PER_PX + read + FEATURE_SET_BYTES
 }
 
+/// Pixels of the largest level-0 window: the solve region grown by
+/// [`LEVEL0_WINDOW_LIMIT_PX`] and the smoothing reach per side, clamped to the
+/// frame.
+fn level0_window_pixels(width: u32, height: u32) -> u64 {
+    let region = PyramidalEcc::solve_region(width, height, 0);
+    let reach = LEVEL0_WINDOW_LIMIT_PX + LEVEL0_SMOOTHING_RADIUS_PX;
+    (region.width + 2 * reach).min(width) as u64 * (region.height + 2 * reach).min(height) as u64
+}
+
+/// Bytes one frame's cached level-0 window holds: the largest window, `f32`
+/// luma.
+pub(crate) fn level0_cache_bytes(width: u32, height: u32) -> u64 {
+    level0_window_pixels(width, height) * 4
+}
+
 /// Bytes one solve allocates besides the templates: three 8-byte-per-pixel
 /// vectors over the level-0 solve region, plus the largest level-0 frame
-/// read (the region grown by [`LEVEL0_WINDOW_LIMIT_PX`] and the smoothing
-/// reach per side, clamped to the frame: the larger of `4 + 2 * spp` bytes per
+/// read (the largest level-0 window: the larger of `4 + 2 * spp` bytes per
 /// pixel for the `f32` luma and the `u16` samples it was read from and 8 for
 /// the luma plus the scratch plane smoothing works in) and the largest
 /// off-centre patch window at `4 + 2 * spp` bytes per pixel.
 pub(crate) fn solve_scratch_bytes(width: u32, height: u32, spp: u32) -> u64 {
     let region = PyramidalEcc::solve_region(width, height, 0);
     let per_px = 4 + 2 * spp as u64;
-    let reach = LEVEL0_WINDOW_LIMIT_PX + LEVEL0_SMOOTHING_RADIUS_PX;
-    let window_w = (region.width + 2 * reach).min(width) as u64;
-    let window_h = (region.height + 2 * reach).min(height) as u64;
     let patch_extent = patch_window_extent(patch_side(width, height));
     let patch_w = patch_extent.min(width) as u64;
     let patch_h = patch_extent.min(height) as u64;
     region.width as u64 * region.height as u64 * 24
-        + window_w * window_h * per_px.max(8)
+        + level0_window_pixels(width, height) * per_px.max(8)
         + patch_w * patch_h * per_px
 }
 
@@ -516,10 +531,10 @@ impl PyramidalEcc {
         }
     }
 
-    /// Streams `frame` in from `ctx` in full-width row bands of
-    /// [`DEFAULT_TILE_SIZE`] input rows and reduces them into an
-    /// [`AlignPyramid`] of levels `1..=depth` -- never a whole-frame RGB or
-    /// luma buffer.
+    /// Streams `frame` in from `ctx` in full-width row bands of at most
+    /// `2 * AlignPyramid::BAND_ROWS + 5` input rows, each row read once, and
+    /// reduces them into an [`AlignPyramid`] of levels `1..=depth` -- never a
+    /// whole-frame RGB or luma buffer.
     fn build_pyramid(
         ctx: &AlignContext<'_>,
         frame: usize,
@@ -528,7 +543,7 @@ impl PyramidalEcc {
         let _scope = measurement_scope("pyramid_prepare");
         let stack = ctx.stack();
         let extent = (stack.width, stack.height, stack.samples_per_pixel);
-        let band_rows = DEFAULT_TILE_SIZE / 2;
+        let band_rows = AlignPyramid::BAND_ROWS;
         let streamed = match ctx.sample_format() {
             SampleFormat::U16 => AlignPyramid::stream(extent, depth, band_rows, |rect, out| {
                 ctx.read_tile_into(frame, rect, out)
@@ -614,11 +629,11 @@ impl PyramidalEcc {
         };
 
         let stack = ctx.stack();
-        // Accept a driver-prepared reference only when it is the right
-        // thing: the right concrete type, prepared for this reference frame
-        // and mode, built at the same `pyramid-depth`, at this stack's own
-        // dimensions. Any miss falls back to a rebuild, so a mismatch costs
-        // speed and never correctness -- see the module docs on
+        // Accept a driver-prepared value only when it is the right thing: the
+        // right concrete type, prepared for this reference frame and mode,
+        // built at the same `pyramid-depth`, at this stack's own dimensions.
+        // Any miss falls back to a rebuild, so a mismatch costs speed and
+        // never correctness -- see the module docs on
         // `AlignContext::prepared`.
         let prepared = ctx
             .prepared()
@@ -629,16 +644,36 @@ impl PyramidalEcc {
                     && p.pyramid.depth() == depth
                     && p.pyramid.dimensions() == (stack.width, stack.height)
             });
+        let frames = ctx
+            .prepared()
+            .and_then(|p| p.downcast_ref::<ChainFrames>())
+            .filter(|f| f.matches(stack, depth));
+        let hop = frames
+            .map(|f| f.acquire_hop(ctx, ctx.reference(), frame))
+            .transpose()?;
         let built;
         let reference: &PreparedReference = match prepared {
             Some(shared) => shared,
             None => {
-                built = PreparedReference::build(ctx, ctx.reference(), mode, depth)?;
+                built = PreparedReference::build(
+                    ctx,
+                    ctx.reference(),
+                    mode,
+                    depth,
+                    hop.as_ref().map(|(reference, _)| &*reference.build),
+                )?;
                 &built
             }
         };
-        let (attempt, escalation) =
-            Self::register(ctx, frame, reference, depth, &params, levels.is_some())?;
+        let (attempt, escalation) = Self::register(
+            ctx,
+            frame,
+            reference,
+            hop.as_ref().map(|(_, moving)| &*moving.build),
+            depth,
+            &params,
+            levels.is_some(),
+        )?;
         if escalation.attempted {
             record_timing(TimingCounter::FeatureSeedAttempts, 1);
         }
@@ -656,26 +691,36 @@ impl PyramidalEcc {
         })
     }
 
-    /// Registers `frame` against the reference from an identity start. A frame
+    /// Registers `frame` against the reference from an identity start, with
+    /// the pyramid and level-0 window of `built` when it holds them. A frame
     /// that diverges gets exactly one more run, from a feature-based seed, and
     /// that run's outcome replaces the first only when it does not diverge.
     fn register(
         ctx: &AlignContext<'_>,
         frame: usize,
         reference: &PreparedReference,
+        built: Option<&FrameBuild>,
         depth: u32,
         params: &EccParams,
         traced: bool,
     ) -> Result<(Attempt, Escalation), AlgorithmError> {
-        let frame_pyramid = Self::build_pyramid(ctx, frame, depth)?;
+        let fresh;
+        let (frame_pyramid, level0) = match built {
+            Some(b) => (&*b.pyramid, Some(&b.level0)),
+            None => {
+                fresh = Self::build_pyramid(ctx, frame, depth)?;
+                (&fresh, None)
+            }
+        };
         if let Some(sink) = ctx.preview() {
-            sink.offer(frame, &frame_pyramid);
+            sink.offer(frame, frame_pyramid);
         }
         let first = Self::solve_from(
             ctx,
             frame,
             reference,
-            &frame_pyramid,
+            frame_pyramid,
+            level0,
             depth,
             params,
             Transform::identity(),
@@ -685,14 +730,8 @@ impl PyramidalEcc {
         if !matches!(first.status, AlignStatus::Diverged(_)) {
             return Ok((first, escalation));
         }
-        let Some(seed) = Self::feature_seed(
-            ctx,
-            frame,
-            reference,
-            &frame_pyramid,
-            depth,
-            &mut escalation,
-        )?
+        let Some(seed) =
+            Self::feature_seed(ctx, frame, reference, frame_pyramid, depth, &mut escalation)?
         else {
             return Ok((first, escalation));
         };
@@ -701,7 +740,8 @@ impl PyramidalEcc {
             ctx,
             frame,
             reference,
-            &frame_pyramid,
+            frame_pyramid,
+            level0,
             depth,
             params,
             seed,
@@ -790,6 +830,7 @@ impl PyramidalEcc {
         frame: usize,
         reference: &PreparedReference,
         frame_pyramid: &AlignPyramid,
+        level0: Option<&Level0Cache>,
         depth: u32,
         params: &EccParams,
         start: Transform,
@@ -825,6 +866,7 @@ impl PyramidalEcc {
                     &seed,
                     params,
                     LEVEL0_WINDOW_MARGIN_PX,
+                    level0,
                     trace.as_mut(),
                 )?;
                 window_misses += solved.misses;
@@ -1082,32 +1124,67 @@ fn smooths_level0(region: Rect, (width, height): (u32, u32)) -> bool {
 /// the edge sample repeated past the border.
 fn smooth_level0(plane: &mut Plane) {
     let (w, h) = (plane.width() as usize, plane.height() as usize);
-    let tap = |i: usize, d: usize, n: usize| {
-        (i + d)
-            .saturating_sub(SMOOTHING_PASS_RADIUS_PX as usize)
-            .min(n - 1)
-    };
+    let radius = SMOOTHING_PASS_RADIUS_PX as usize;
     let cur = plane.data_mut();
     let mut next = vec![0f32; cur.len()];
     for _ in 0..LEVEL0_SMOOTHING_PASSES {
-        for y in 0..h {
-            for x in 0..w {
-                next[y * w + x] = KERNEL
-                    .iter()
-                    .enumerate()
-                    .map(|(d, k)| k * cur[y * w + tap(x, d, w)])
-                    .sum();
-            }
+        for (src, dst) in cur.chunks_exact(w).zip(next.chunks_exact_mut(w)) {
+            smooth_row(src, dst);
         }
-        for y in 0..h {
-            for x in 0..w {
-                cur[y * w + x] = KERNEL
-                    .iter()
-                    .enumerate()
-                    .map(|(d, k)| k * next[tap(y, d, h) * w + x])
-                    .sum();
-            }
+        for (y, out) in cur.chunks_exact_mut(w).enumerate() {
+            let row = |d: usize| {
+                let r = (y + d).saturating_sub(radius).min(h - 1);
+                &next[r * w..][..w]
+            };
+            smooth_column([row(0), row(1), row(2), row(3), row(4)], out);
         }
+    }
+}
+
+/// One output sample: the five taps summed left to right, products unfused.
+#[inline(always)]
+fn binomial_taps([a, b, c, d, e]: [f32; 5]) -> f32 {
+    let [k0, k1, k2, k3, k4] = KERNEL;
+    k0 * a + k1 * b + k2 * c + k3 * d + k4 * e
+}
+
+/// Smooths one row along x. The samples within the kernel radius of either
+/// end read clamped taps; the interior is one loop over five shifted slices.
+fn smooth_row(src: &[f32], dst: &mut [f32]) {
+    let w = src.len();
+    let radius = SMOOTHING_PASS_RADIUS_PX as usize;
+    let (from, to) = if w > 2 * radius {
+        (radius, w - radius)
+    } else {
+        (w, w)
+    };
+    for x in (0..from).chain(to..w) {
+        dst[x] = binomial_taps(std::array::from_fn(|d| {
+            src[(x + d).saturating_sub(radius).min(w - 1)]
+        }));
+    }
+    if from < to {
+        let n = to - from;
+        let (s0, s1, s2, s3, s4) = (
+            &src[..n],
+            &src[1..][..n],
+            &src[2..][..n],
+            &src[3..][..n],
+            &src[4..][..n],
+        );
+        let out = &mut dst[from..to];
+        for i in 0..n {
+            out[i] = binomial_taps([s0[i], s1[i], s2[i], s3[i], s4[i]]);
+        }
+    }
+}
+
+/// Smooths along y: `out[x]` from the five already-clamped source `rows`.
+fn smooth_column(rows: [&[f32]; 5], out: &mut [f32]) {
+    let n = out.len();
+    let [r0, r1, r2, r3, r4] = rows.map(|r| &r[..n]);
+    for x in 0..n {
+        out[x] = binomial_taps([r0[x], r1[x], r2[x], r3[x], r4[x]]);
     }
 }
 
@@ -1132,13 +1209,77 @@ fn read_level0_luma(
     );
     let mut smoothed = read_luma_window(ctx, frame, grown)?;
     smooth_level0(&mut smoothed);
-    let (dx, dy) = ((rect.x - grown.x) as usize, (rect.y - grown.y) as usize);
+    crop_level0(&smoothed, grown, rect)
+}
+
+/// `rect` of the frame, copied out of `source`, a plane holding `source_rect`.
+fn crop_level0(source: &Plane, source_rect: Rect, rect: Rect) -> Result<Plane, AlgorithmError> {
+    let (dx, dy) = (
+        (rect.x - source_rect.x) as usize,
+        (rect.y - source_rect.y) as usize,
+    );
     let mut out = Vec::with_capacity(rect.width as usize * rect.height as usize);
     for row in 0..rect.height as usize {
-        let start = (dy + row) * grown.width as usize + dx;
-        out.extend_from_slice(&smoothed.data()[start..start + rect.width as usize]);
+        let start = (dy + row) * source_rect.width as usize + dx;
+        out.extend_from_slice(&source.data()[start..start + rect.width as usize]);
     }
     Plane::from_f32_vec(out, rect.width, rect.height, 1).map_err(wrap_error)
+}
+
+/// One frame's level-0 luma over the largest window a solve can name (the
+/// solve region grown by [`LEVEL0_WINDOW_LIMIT_PX`] and the smoothing reach),
+/// read and smoothed once. A sample at least [`LEVEL0_SMOOTHING_RADIUS_PX`]
+/// inside every edge of `rect` that is not a frame edge equals the whole-plane
+/// smoothing, so windows inside `interior` are cropped; any other window is
+/// read fresh.
+struct Level0Cache {
+    rect: Rect,
+    interior: Rect,
+    smooth: bool,
+    plane: Plane,
+}
+
+impl Level0Cache {
+    fn read(ctx: &AlignContext<'_>, frame: usize, region: Rect) -> Result<Self, AlgorithmError> {
+        let stack = ctx.stack();
+        let dims = (stack.width, stack.height);
+        let rect = grown_clamped(
+            region,
+            LEVEL0_WINDOW_LIMIT_PX + LEVEL0_SMOOTHING_RADIUS_PX,
+            dims,
+        );
+        let smooth = smooths_level0(region, dims);
+        let mut plane = read_luma_window(ctx, frame, rect)?;
+        if smooth {
+            smooth_level0(&mut plane);
+        }
+        Ok(Level0Cache {
+            rect,
+            interior: grown_clamped(region, LEVEL0_WINDOW_LIMIT_PX, dims),
+            smooth,
+            plane,
+        })
+    }
+
+    /// `rect` cropped from the cache, or `None` when it lies outside `interior`.
+    fn crop(&self, rect: Rect) -> Result<Option<Plane>, AlgorithmError> {
+        contains(self.interior, rect)
+            .then(|| crop_level0(&self.plane, self.rect, rect))
+            .transpose()
+    }
+
+    /// `rect` as [`read_level0_luma`] gives it, from the cache when it holds it.
+    fn window(
+        &self,
+        ctx: &AlignContext<'_>,
+        frame: usize,
+        rect: Rect,
+    ) -> Result<Plane, AlgorithmError> {
+        match self.crop(rect)? {
+            Some(plane) => Ok(plane),
+            None => read_level0_luma(ctx, frame, rect, self.smooth),
+        }
+    }
 }
 
 /// Reads `rect` of `frame` and converts it to a luma plane.
@@ -1232,7 +1373,8 @@ struct Level0Solve {
 
 /// Solves level 0 over the window of `frame` the seed's footprint names (see
 /// the module docs' "Level-0 windows"). `margin` is the window's slack past
-/// the footprint.
+/// the footprint. Windows come from `cached` when it holds them.
+#[allow(clippy::too_many_arguments)]
 fn solve_level0(
     ctx: &AlignContext<'_>,
     frame: usize,
@@ -1240,6 +1382,7 @@ fn solve_level0(
     seed: &Transform,
     params: &EccParams,
     margin: u32,
+    cached: Option<&Level0Cache>,
     trace: Option<&mut Vec<EccIteration>>,
 ) -> Result<Level0Solve, AlgorithmError> {
     let stack = ctx.stack();
@@ -1250,9 +1393,13 @@ fn solve_level0(
     };
 
     let smooth = smooths_level0(region, dims);
+    let read = |rect: Rect| match cached {
+        Some(cache) => cache.window(ctx, frame, rect),
+        None => read_level0_luma(ctx, frame, rect, smooth),
+    };
     let seed_fp = footprint(seed, region, dims);
     let window = level0_window(seed_fp, region, margin, dims);
-    let plane = read_level0_luma(ctx, frame, window, smooth)?;
+    let plane = read(window)?;
     let mut first_trace = trace.is_some().then(Vec::new);
     let result = solve_routed(
         ctx,
@@ -1272,7 +1419,7 @@ fn solve_level0(
         let covered = seed_fp.map_or(fp, |s| bounding_union(s, fp));
         let regrown = level0_window(Some(covered), region, margin, dims);
         if regrown != window {
-            let plane = read_level0_luma(ctx, frame, regrown, smooth)?;
+            let plane = read(regrown)?;
             let mut second_trace = trace.is_some().then(Vec::new);
             let result = solve_routed(
                 ctx,
@@ -1319,14 +1466,15 @@ struct PatchTemplate {
     template: EccTemplate,
 }
 
-/// What [`AlignAlgorithm::prepare_run`] shares across a run's registrations:
-/// the reference frame's coarse pyramid, the solver template per level (level
-/// 0's from a window around its solve region) and the off-centre patch
-/// templates.
+/// What [`AlignAlgorithm::prepare_run`] shares across an anchor run's
+/// registrations: the reference frame's coarse pyramid, the solver template
+/// per level (level 0's from a window around its solve region) and the
+/// off-centre patch templates. A chain run builds one per hop from the frame
+/// store instead.
 struct PreparedReference {
     reference: usize,
     mode: EccMode,
-    pyramid: AlignPyramid,
+    pyramid: Arc<AlignPyramid>,
     /// Indexed by level; a level whose region is invalid keeps its error, so
     /// `run` reports it per frame.
     templates: Vec<Result<EccTemplate, AlignError>>,
@@ -1338,20 +1486,29 @@ struct PreparedReference {
 }
 
 impl PreparedReference {
+    /// Builds the reference's templates. The pyramid and level-0 window come
+    /// from `built` when it holds the reference frame's, else are read.
     fn build(
         ctx: &AlignContext<'_>,
         reference: usize,
         mode: EccMode,
         depth: u32,
+        built: Option<&FrameBuild>,
     ) -> Result<Self, AlgorithmError> {
         let stack = ctx.stack();
         let dims = (stack.width, stack.height);
-        let pyramid = PyramidalEcc::build_pyramid(ctx, reference, depth)?;
+        let pyramid = match built {
+            Some(b) => Arc::clone(&b.pyramid),
+            None => Arc::new(PyramidalEcc::build_pyramid(ctx, reference, depth)?),
+        };
 
         let mut templates = Vec::with_capacity(depth as usize + 1);
         let region = PyramidalEcc::solve_region(dims.0, dims.1, 0);
         let window = grown_clamped(region, 1, dims);
-        let plane = read_level0_luma(ctx, reference, window, smooths_level0(region, dims))?;
+        let plane = match built {
+            Some(b) => b.level0.window(ctx, reference, window)?,
+            None => read_level0_luma(ctx, reference, window, smooths_level0(region, dims))?,
+        };
         templates.push(EccTemplate::prepare(
             &plane,
             (window.x, window.y),
@@ -1450,6 +1607,164 @@ impl PreparedReference {
     }
 }
 
+/// What a frame contributes to every hop that touches it: its coarse pyramid
+/// and its level-0 window.
+struct FrameBuild {
+    pyramid: Arc<AlignPyramid>,
+    level0: Level0Cache,
+}
+
+struct Slot {
+    build: Option<Arc<FrameBuild>>,
+    /// Hops that have yet to finish with this frame; the build is dropped at 0.
+    uses_left: u32,
+}
+
+/// The frame store of one chain run: each frame's [`FrameBuild`], built by the
+/// first hop to need it and dropped when the last hop touching the frame has
+/// finished, so a frame that is one hop's moving frame and the next one's
+/// reference is read and pyramided once. A failed build is not stored: each
+/// hop that needs the frame retries it. A slot is locked only while a build
+/// runs, which never spawns rayon work.
+struct ChainFrames {
+    depth: u32,
+    dims: (u32, u32),
+    slots: Vec<Mutex<Slot>>,
+    #[cfg(test)]
+    live: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+/// A hop's claim on one frame's build; releases it on drop.
+struct FrameUse<'a> {
+    frames: &'a ChainFrames,
+    frame: usize,
+    build: Arc<FrameBuild>,
+}
+
+impl Drop for FrameUse<'_> {
+    fn drop(&mut self) {
+        self.frames.release(self.frame);
+    }
+}
+
+impl ChainFrames {
+    /// A store for the hops of a chain run around `reference`: every frame
+    /// above it hops from its lower neighbour, every frame below it from its
+    /// upper one.
+    fn new(stack: &StackContext, reference: usize, depth: u32) -> Self {
+        let mut uses = vec![0u32; stack.frame_count];
+        let hops = ((reference + 1)..stack.frame_count)
+            .map(|i| (i, i - 1))
+            .chain((0..reference).map(|i| (i, i + 1)));
+        for (frame, neighbour) in hops {
+            uses[frame] += 1;
+            uses[neighbour] += 1;
+        }
+        ChainFrames {
+            depth,
+            dims: (stack.width, stack.height),
+            slots: uses
+                .into_iter()
+                .map(|uses_left| {
+                    Mutex::new(Slot {
+                        build: None,
+                        uses_left,
+                    })
+                })
+                .collect(),
+            #[cfg(test)]
+            live: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            peak: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn matches(&self, stack: &StackContext, depth: u32) -> bool {
+        self.depth == depth
+            && self.dims == (stack.width, stack.height)
+            && self.slots.len() == stack.frame_count
+    }
+
+    fn lock(&self, frame: usize) -> MutexGuard<'_, Slot> {
+        // A slot only ever holds a finished build, so a poisoned lock is safe to reuse.
+        self.slots[frame]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The builds of one hop, `reference` first. On an error the hop's claims
+    /// on both frames are released.
+    fn acquire_hop(
+        &self,
+        ctx: &AlignContext<'_>,
+        reference: usize,
+        frame: usize,
+    ) -> Result<(FrameUse<'_>, FrameUse<'_>), AlgorithmError> {
+        let reference_use = match self.acquire(ctx, reference) {
+            Ok(claim) => claim,
+            Err(e) => {
+                self.release(frame);
+                return Err(e);
+            }
+        };
+        Ok((reference_use, self.acquire(ctx, frame)?))
+    }
+
+    fn acquire(
+        &self,
+        ctx: &AlignContext<'_>,
+        frame: usize,
+    ) -> Result<FrameUse<'_>, AlgorithmError> {
+        let mut slot = self.lock(frame);
+        let build = match &slot.build {
+            Some(build) => Arc::clone(build),
+            None => match self.build(ctx, frame) {
+                Ok(build) => {
+                    let build = Arc::new(build);
+                    slot.build = Some(Arc::clone(&build));
+                    #[cfg(test)]
+                    {
+                        use std::sync::atomic::Ordering::SeqCst;
+                        let live = self.live.fetch_add(1, SeqCst) + 1;
+                        self.peak.fetch_max(live, SeqCst);
+                    }
+                    build
+                }
+                Err(e) => {
+                    drop(slot);
+                    self.release(frame);
+                    return Err(e);
+                }
+            },
+        };
+        Ok(FrameUse {
+            frames: self,
+            frame,
+            build,
+        })
+    }
+
+    fn build(&self, ctx: &AlignContext<'_>, frame: usize) -> Result<FrameBuild, AlgorithmError> {
+        let (width, height) = self.dims;
+        Ok(FrameBuild {
+            pyramid: Arc::new(PyramidalEcc::build_pyramid(ctx, frame, self.depth)?),
+            level0: Level0Cache::read(ctx, frame, PyramidalEcc::solve_region(width, height, 0))?,
+        })
+    }
+
+    /// One hop is done with `frame`; the last one drops its build.
+    fn release(&self, frame: usize) {
+        let mut slot = self.lock(frame);
+        slot.uses_left = slot.uses_left.saturating_sub(1);
+        if slot.uses_left == 0 && slot.build.take().is_some() {
+            #[cfg(test)]
+            self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 /// One pyramid level of one [`PyramidalEcc::align_frame_traced`] call.
 #[derive(Debug, Clone)]
 pub struct EccLevelRecord {
@@ -1484,12 +1799,12 @@ impl AlignAlgorithm for PyramidalEcc {
         self.run(ctx, frame, cfg, None)
     }
 
-    /// Builds the reference frame's coarse pyramid and, per level, its solver
-    /// template, plus the off-centre patch templates, once, for the driver to
-    /// hand back to every [`AlignAlgorithm::align_frame`] call of this run
-    /// through [`AlignContext::prepared`]. A level whose solve region is
-    /// invalid keeps its error, so `run` reports it per frame, exactly as it
-    /// does without a prepared value.
+    /// Anchor run: builds the reference frame's coarse pyramid and solver
+    /// templates once for every [`AlignAlgorithm::align_frame`] call; a level
+    /// whose solve region is invalid keeps its error, so `run` reports it per
+    /// frame. Chain run: reads nothing and returns the frame store, which
+    /// builds each frame's pyramid and level-0 window on first use and drops
+    /// them after the frame's last hop.
     fn prepare_run(
         &self,
         ctx: &AlignContext<'_>,
@@ -1501,7 +1816,11 @@ impl AlignAlgorithm for PyramidalEcc {
             .get("pyramid-depth")
             .and_then(ParamValue::as_i64)
             .ok_or_else(|| missing_key("pyramid-depth"))? as u32;
-        let prepared = PreparedReference::build(ctx, ctx.reference(), mode, depth)?;
+        if cfg.get("reference-policy").and_then(ParamValue::as_enum) == Some("chain") {
+            let frames = ChainFrames::new(ctx.stack(), ctx.reference(), depth);
+            return Ok(Some(Arc::new(frames)));
+        }
+        let prepared = PreparedReference::build(ctx, ctx.reference(), mode, depth, None)?;
         Ok(Some(Arc::new(prepared)))
     }
 }
@@ -1517,6 +1836,7 @@ mod tests {
     use crate::align::pyramid::max_levels;
     use crate::align::{AlignDriverOptions, FailurePolicy, align_stack_with};
     use crate::gpu::{AlignBackend, ECC_MOMENTS, EccMomentSession, EccSessionRequest};
+    use crate::tile::plan::DEFAULT_TILE_SIZE;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -1861,6 +2181,130 @@ mod tests {
         copy
     }
 
+    /// The per-sample clamped-tap smoothing every sample of
+    /// [`smooth_level0`] must equal bit for bit.
+    fn smooth_level0_reference(plane: &mut Plane) {
+        let (w, h) = (plane.width() as usize, plane.height() as usize);
+        let tap = |i: usize, d: usize, n: usize| {
+            (i + d)
+                .saturating_sub(SMOOTHING_PASS_RADIUS_PX as usize)
+                .min(n - 1)
+        };
+        let cur = plane.data_mut();
+        let mut next = vec![0f32; cur.len()];
+        for _ in 0..LEVEL0_SMOOTHING_PASSES {
+            for y in 0..h {
+                for x in 0..w {
+                    next[y * w + x] = KERNEL
+                        .iter()
+                        .enumerate()
+                        .map(|(d, k)| k * cur[y * w + tap(x, d, w)])
+                        .sum();
+                }
+            }
+            for y in 0..h {
+                for x in 0..w {
+                    cur[y * w + x] = KERNEL
+                        .iter()
+                        .enumerate()
+                        .map(|(d, k)| k * next[tap(y, d, h) * w + x])
+                        .sum();
+                }
+            }
+        }
+    }
+
+    /// Value classes the smoothing is compared over, each a sample generator.
+    const SMOOTHING_VALUE_CLASSES: [&str; 8] = [
+        "positive zero",
+        "negative zero",
+        "signed subnormals",
+        "16-bit integers",
+        "unit interval",
+        "signed above one",
+        "all negative zero",
+        "mixed zero signs",
+    ];
+
+    fn smoothing_plane(w: usize, h: usize, class: usize, seed: &mut u64) -> Plane {
+        let mut next = || {
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (*seed >> 33) as u32
+        };
+        let data: Vec<f32> = (0..w * h)
+            .map(|_| {
+                let r = next();
+                let unit = r as f32 / (1u32 << 31) as f32;
+                match class {
+                    0 => 0.0,
+                    1 if r & 1 == 0 => -0.0,
+                    1 => 0.0,
+                    2 => f32::from_bits((r & 0x3f) | ((r >> 8 & 1) << 31)),
+                    3 => (r & 0xffff) as f32,
+                    4 => unit,
+                    5 => (unit - 0.5) * 40.0,
+                    6 => -0.0,
+                    _ if r & 3 == 0 => -0.0,
+                    _ if r & 3 == 1 => 0.0,
+                    _ => unit - 0.5,
+                }
+            })
+            .collect();
+        Plane::from_f32_vec(data, w as u32, h as u32, 1).unwrap()
+    }
+
+    fn assert_smoothing_matches_the_reference(w: usize, h: usize) {
+        let mut seed = 0x9e37_79b9_7f4a_7c15 ^ (w * 1009 + h) as u64;
+        for (class, name) in SMOOTHING_VALUE_CLASSES.iter().enumerate() {
+            let mut plane = smoothing_plane(w, h, class, &mut seed);
+            let mut expected =
+                Plane::from_f32_vec(plane.data().to_vec(), w as u32, h as u32, 1).unwrap();
+            smooth_level0(&mut plane);
+            smooth_level0_reference(&mut expected);
+            for (i, (got, want)) in plane.data().iter().zip(expected.data()).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "{w}x{h} {name}, sample {i}: {got:e} vs {want:e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn smooth_level0_matches_the_scalar_reference() {
+        for (w, h) in [
+            (5, 5),
+            (6, 7),
+            (7, 5),
+            (8, 9),
+            (16, 17),
+            (31, 33),
+            (64, 3),
+            (3, 64),
+            (65, 65),
+            (257, 31),
+            (700, 4),
+            (4, 700),
+            (333, 200),
+            (1, 300),
+            (300, 1),
+        ] {
+            assert_smoothing_matches_the_reference(w, h);
+        }
+    }
+
+    #[test]
+    fn smooth_level0_clamps_both_edges_of_a_narrow_plane() {
+        for w in 1..=6 {
+            for h in 1..=6 {
+                assert_smoothing_matches_the_reference(w, h);
+            }
+        }
+    }
+
     #[test]
     fn a_smoothed_level0_read_equals_the_whole_plane_smoothing() {
         let mem = reader(W, H, &[(0.0, 0.0), (3.0, 2.0)], false);
@@ -1946,6 +2390,7 @@ mod tests {
                     &params,
                     LEVEL0_WINDOW_MARGIN_PX,
                     None,
+                    None,
                 )
                 .unwrap();
                 assert_eq!(solved.result, whole, "{mode:?} frame {frame}");
@@ -1973,7 +2418,7 @@ mod tests {
             &params,
             None,
         );
-        let solved = solve_level0(&ctx, 1, &template, &seed, &params, 64, None).unwrap();
+        let solved = solve_level0(&ctx, 1, &template, &seed, &params, 64, None, None).unwrap();
         assert_eq!(
             whole.status,
             EccStatus::Diverged(DivergenceReason::TooFewValidSamples)
@@ -2002,8 +2447,17 @@ mod tests {
 
         // A one-pixel margin cannot hold a 3 px drift: counted once, then
         // the regrown window reproduces the whole-plane result.
-        let solved =
-            solve_level0(&ctx, 1, &template, &Transform::identity(), &params, 1, None).unwrap();
+        let solved = solve_level0(
+            &ctx,
+            1,
+            &template,
+            &Transform::identity(),
+            &params,
+            1,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(solved.misses, 1);
         assert_eq!(solved.result, whole);
     }
@@ -2011,7 +2465,7 @@ mod tests {
     /// The off-centre check at `fit`, against frame 1 of `mem`.
     fn check(mem: &MemReader, fit: &Transform) -> Validation {
         let ctx = AlignContext::new(StackContext::new(mem.frames.len(), W, H, 1), 0, mem);
-        let reference = PreparedReference::build(&ctx, 0, EccMode::Translation, 0).unwrap();
+        let reference = PreparedReference::build(&ctx, 0, EccMode::Translation, 0, None).unwrap();
         assert_eq!(reference.patches.len(), 8);
         reference.validate(&ctx, 1, fit, &test_params(400)).unwrap()
     }
@@ -2121,6 +2575,10 @@ mod tests {
         );
         assert!(max_levels(W, H) >= 1);
 
+        cfg.insert(
+            "reference-policy".to_string(),
+            ParamValue::Enum("anchor".to_string()),
+        );
         let prepared = PyramidalEcc.prepare_run(&ctx, &cfg).unwrap().unwrap();
         let with = PyramidalEcc
             .align_frame(&ctx_prepared_later.with_prepared(Some(&*prepared)), 1, &cfg)
@@ -2182,10 +2640,17 @@ mod tests {
         frame: usize,
     ) -> (PreparedReference, Attempt, Escalation) {
         let ctx = AlignContext::new(StackContext::new(mem.frames.len(), W, H, 1), 0, mem);
-        let reference = PreparedReference::build(&ctx, 0, mode, depth).unwrap();
-        let (attempt, escalation) =
-            PyramidalEcc::register(&ctx, frame, &reference, depth, &test_params(400), false)
-                .unwrap();
+        let reference = PreparedReference::build(&ctx, 0, mode, depth, None).unwrap();
+        let (attempt, escalation) = PyramidalEcc::register(
+            &ctx,
+            frame,
+            &reference,
+            None,
+            depth,
+            &test_params(400),
+            false,
+        )
+        .unwrap();
         (reference, attempt, escalation)
     }
 
@@ -2199,13 +2664,14 @@ mod tests {
         start: Transform,
     ) -> Attempt {
         let ctx = AlignContext::new(StackContext::new(mem.frames.len(), W, H, 1), 0, mem);
-        let reference = PreparedReference::build(&ctx, 0, mode, depth).unwrap();
+        let reference = PreparedReference::build(&ctx, 0, mode, depth, None).unwrap();
         let pyramid = PyramidalEcc::build_pyramid(&ctx, frame, depth).unwrap();
         PyramidalEcc::solve_from(
             &ctx,
             frame,
             &reference,
             &pyramid,
+            None,
             depth,
             &test_params(400),
             start,
@@ -2439,7 +2905,7 @@ mod tests {
     fn coarse_levels_stop_at_a_hundred_times_epsilon_and_level_zero_at_epsilon() {
         let mem = reader(W, H, &[(0.0, 0.0), (3.0, -2.0)], false);
         let ctx = AlignContext::new(StackContext::new(2, W, H, 1), 0, &mem);
-        let reference = PreparedReference::build(&ctx, 0, EccMode::Translation, 2).unwrap();
+        let reference = PreparedReference::build(&ctx, 0, EccMode::Translation, 2, None).unwrap();
         let pyramid = PyramidalEcc::build_pyramid(&ctx, 1, 2).unwrap();
         let params = EccParams {
             epsilon_px: 1e-3,
@@ -2450,6 +2916,7 @@ mod tests {
             1,
             &reference,
             &pyramid,
+            None,
             2,
             &params,
             Transform::identity(),
@@ -2529,6 +2996,10 @@ mod tests {
             ParamValue::Enum("translation".to_string()),
         );
 
+        cfg.insert(
+            "reference-policy".to_string(),
+            ParamValue::Enum("anchor".to_string()),
+        );
         let prepared = PyramidalEcc.prepare_run(&ctx, &cfg).unwrap().unwrap();
         let shared = prepared.downcast_ref::<PreparedReference>().unwrap();
         assert!(shared.features.get().is_none(), "preparing detects nothing");
@@ -2569,7 +3040,8 @@ mod tests {
         let depth = 3;
 
         let ctx = AlignContext::new(StackContext::new(2, W, H, 1), 0, &mem);
-        let reference = PreparedReference::build(&ctx, 0, EccMode::Similarity, depth).unwrap();
+        let reference =
+            PreparedReference::build(&ctx, 0, EccMode::Similarity, depth, None).unwrap();
         let frame_pyramid = PyramidalEcc::build_pyramid(&ctx, 1, depth).unwrap();
         let level = seed_level(W, H, depth).expect("a seed level");
         let frame_features = detect_level(&ctx, 1, &frame_pyramid, level)
@@ -2714,7 +3186,7 @@ mod tests {
             epsilon_px: cfg.get("epsilon-px").and_then(ParamValue::as_f64).unwrap(),
             min_valid_fraction: MIN_VALID_FRACTION,
         };
-        let reference = PreparedReference::build(&ctx, reference_frame, mode, depth).unwrap();
+        let reference = PreparedReference::build(&ctx, reference_frame, mode, depth, None).unwrap();
         let level = seed_level(width, height, depth).expect("a seed level");
         let dims = (width.div_ceil(1 << level), height.div_ceil(1 << level));
         let (w, h) = (f64::from(width), f64::from(height));
@@ -2758,7 +3230,7 @@ mod tests {
             };
             let started = std::time::Instant::now();
             let attempt = PyramidalEcc::solve_from(
-                &ctx, frame, &reference, &pyramid, depth, &params, seed, false,
+                &ctx, frame, &reference, &pyramid, None, depth, &params, seed, false,
             )
             .unwrap();
             let off = moved(&attempt.transform, &shipped.transform);
@@ -3005,5 +3477,343 @@ mod tests {
         let accepted = run(Some(&accepting), &Arc::new(AtomicUsize::new(0)));
         assert!(accepted.backend_used);
         assert_eq!(accepted.rerun_reason, None);
+    }
+
+    /// Interleaved frames of the scene, one shifted copy per channel, served as
+    /// `u16` or, when `wide`, as `f32`.
+    struct InterleavedReader {
+        width: u32,
+        spp: usize,
+        wide: bool,
+        frames: Vec<Vec<u16>>,
+    }
+
+    impl InterleavedReader {
+        fn new(width: u32, height: u32, spp: usize, wide: bool, frames: usize) -> Self {
+            let frames = (0..frames)
+                .map(|f| {
+                    let channels: Vec<Vec<u16>> = (0..spp)
+                        .map(|c| render(width, height, ((f * 3 + c) as f64, c as f64), false))
+                        .collect();
+                    (0..width as usize * height as usize)
+                        .flat_map(|i| channels.iter().map(move |ch| ch[i]))
+                        .collect()
+                })
+                .collect();
+            InterleavedReader {
+                width,
+                spp,
+                wide,
+                frames,
+            }
+        }
+    }
+
+    impl TileReader for InterleavedReader {
+        fn sample_format(&self) -> SampleFormat {
+            if self.wide {
+                SampleFormat::F32
+            } else {
+                SampleFormat::U16
+            }
+        }
+
+        fn read_tile_into(
+            &self,
+            frame: usize,
+            rect: Rect,
+            out: &mut [u16],
+        ) -> Result<(), AlgorithmError> {
+            let row_len = rect.width as usize * self.spp;
+            for row in 0..rect.height as usize {
+                let src =
+                    ((rect.y as usize + row) * self.width as usize + rect.x as usize) * self.spp;
+                out[row * row_len..][..row_len]
+                    .copy_from_slice(&self.frames[frame][src..src + row_len]);
+            }
+            Ok(())
+        }
+
+        fn read_tile_f32_into(
+            &self,
+            frame: usize,
+            rect: Rect,
+            out: &mut [f32],
+        ) -> Result<(), AlgorithmError> {
+            let mut narrow = vec![0u16; out.len()];
+            self.read_tile_into(frame, rect, &mut narrow)?;
+            for (wide, narrow) in out.iter_mut().zip(narrow) {
+                *wide = f32::from(narrow);
+            }
+            Ok(())
+        }
+    }
+
+    /// The windows a solve can name at the edges of `interior`: each side's
+    /// strip and each corner.
+    fn edge_windows(interior: Rect) -> Vec<Rect> {
+        let (w, h) = (interior.width.min(40), interior.height.min(40));
+        let (right, bottom) = (
+            interior.x + interior.width - w,
+            interior.y + interior.height - h,
+        );
+        let at = |x, y, width, height| Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        vec![
+            at(interior.x, interior.y, w, interior.height),
+            at(right, interior.y, w, interior.height),
+            at(interior.x, interior.y, interior.width, h),
+            at(interior.x, bottom, interior.width, h),
+            at(interior.x, interior.y, w, h),
+            at(right, bottom, w, h),
+        ]
+    }
+
+    #[test]
+    fn cached_level0_window_crops_equal_fresh_reads() {
+        // 400,300 leaves the cached rect's edges away from the frame's; 20,20
+        // puts the frame's edges inside the cached rect; 3,3 reads unsmoothed.
+        let regions = [
+            Rect {
+                x: 400,
+                y: 300,
+                width: 100,
+                height: 80,
+            },
+            Rect {
+                x: 20,
+                y: 20,
+                width: 100,
+                height: 80,
+            },
+            Rect {
+                x: 3,
+                y: 3,
+                width: 100,
+                height: 80,
+            },
+        ];
+        for (spp, wide) in [(1, false), (1, true), (3, false), (3, true)] {
+            let mem = InterleavedReader::new(W, H, spp, wide, 1);
+            let ctx = AlignContext::new(StackContext::new(1, W, H, spp as u32), 0, &mem);
+            for region in regions {
+                let cache = Level0Cache::read(&ctx, 0, region).unwrap();
+                assert_eq!(cache.smooth, smooths_level0(region, (W, H)));
+                assert_eq!(cache.interior, grown_clamped(region, 256, (W, H)));
+                for window in edge_windows(cache.interior) {
+                    let cropped = cache
+                        .crop(window)
+                        .unwrap()
+                        .unwrap_or_else(|| panic!("{window:?} lies inside the interior"));
+                    let fresh = read_level0_luma(&ctx, 0, window, cache.smooth).unwrap();
+                    assert_eq!(
+                        cropped, fresh,
+                        "spp {spp} wide {wide} region {region:?} window {window:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_level0_window_falls_back_to_a_fresh_read() {
+        let mem = InterleavedReader::new(W, H, 1, false, 1);
+        let ctx = AlignContext::new(StackContext::new(1, W, H, 1), 0, &mem);
+        let region = Rect {
+            x: 400,
+            y: 300,
+            width: 100,
+            height: 80,
+        };
+        let cache = Level0Cache::read(&ctx, 0, region).unwrap();
+
+        let no_footprint = level0_window(None, region, LEVEL0_WINDOW_MARGIN_PX, (W, H));
+        assert_eq!((no_footprint.x, no_footprint.y), (0, 0));
+        // Three pixels past the interior's left edge: inside the cached rect,
+        // but within the smoothing reach of its edge.
+        let crossing = Rect {
+            x: cache.interior.x - 3,
+            y: cache.interior.y + 10,
+            width: 50,
+            height: 50,
+        };
+        assert!(contains(cache.rect, crossing));
+        for window in [no_footprint, crossing] {
+            assert!(cache.crop(window).unwrap().is_none(), "{window:?}");
+            let fresh = read_level0_luma(&ctx, 0, window, cache.smooth).unwrap();
+            assert_eq!(cache.window(&ctx, 0, window).unwrap(), fresh, "{window:?}");
+        }
+        let fresh = read_level0_luma(&ctx, 0, crossing, cache.smooth).unwrap();
+        assert_ne!(
+            crop_level0(&cache.plane, cache.rect, crossing).unwrap(),
+            fresh,
+            "the interior bound is what keeps the crop exact"
+        );
+    }
+
+    /// `mem`'s frames, with every read of frame `failing` refused.
+    struct FailingReader {
+        inner: MemReader,
+        failing: usize,
+        attempts: AtomicUsize,
+    }
+
+    impl TileReader for FailingReader {
+        fn read_tile_into(
+            &self,
+            frame: usize,
+            rect: Rect,
+            out: &mut [u16],
+        ) -> Result<(), AlgorithmError> {
+            if frame == self.failing {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                return Err(AlgorithmError::Failed {
+                    algorithm: "failing".to_string(),
+                    detail: "frame refused".to_string(),
+                });
+            }
+            self.inner.read_tile_into(frame, rect, out)
+        }
+    }
+
+    /// A chain-policy configuration at depth 1 around `reference`.
+    fn chain_config(stack: &StackContext, reference: &str) -> ParamValues {
+        let mut cfg = crate::params::resolved_values(
+            &crate::params::resolve(PyramidalEcc.params(), &ParamValues::new(), stack).unwrap(),
+        );
+        cfg.insert("pyramid-depth".to_string(), ParamValue::Int(1));
+        cfg.insert("max-iterations".to_string(), ParamValue::Int(4));
+        cfg.insert(
+            "mode".to_string(),
+            ParamValue::Enum("translation".to_string()),
+        );
+        cfg.insert(
+            "reference-policy".to_string(),
+            ParamValue::Enum("chain".to_string()),
+        );
+        cfg.insert(
+            "reference-frame".to_string(),
+            ParamValue::Enum(reference.to_string()),
+        );
+        cfg
+    }
+
+    #[test]
+    fn a_failed_shared_frame_build_fails_every_hop_that_needs_it() {
+        let shifts = [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0)];
+        let mem = FailingReader {
+            inner: reader(160, 120, &shifts, false),
+            failing: 2,
+            attempts: AtomicUsize::new(0),
+        };
+        let stack = StackContext::new(4, 160, 120, 1);
+        let cfg = chain_config(&stack, "first");
+        let prepared = PyramidalEcc
+            .prepare_run(&AlignContext::new(stack, 0, &mem), &cfg)
+            .unwrap()
+            .unwrap();
+        let hop = |frame: usize| {
+            let ctx = AlignContext::new(stack, frame - 1, &mem).with_prepared(Some(&*prepared));
+            PyramidalEcc.align_frame(&ctx, frame, &cfg)
+        };
+
+        hop(1).unwrap();
+        // Frame 2 is hop 2's moving frame and hop 3's reference.
+        for frame in [2, 3] {
+            let error = hop(frame).unwrap_err();
+            assert!(
+                matches!(error, AlgorithmError::Failed { ref algorithm, .. } if algorithm == "failing"),
+                "hop {frame}: {error:?}"
+            );
+        }
+        assert_eq!(mem.attempts.load(Ordering::SeqCst), 2, "each hop retries");
+        let frames = prepared.downcast_ref::<ChainFrames>().unwrap();
+        for (frame, slot) in frames.slots.iter().enumerate() {
+            let slot = slot.lock().unwrap();
+            assert!(slot.build.is_none(), "frame {frame} holds a build");
+            assert_eq!(slot.uses_left, 0, "frame {frame}");
+        }
+    }
+
+    /// [`PyramidalEcc`] that keeps the value its `prepare_run` returned.
+    struct StoreProbe {
+        prepared: Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
+    }
+
+    impl AlignAlgorithm for StoreProbe {
+        fn id(&self) -> &str {
+            "store-probe"
+        }
+
+        fn display_name(&self) -> &str {
+            "Store probe"
+        }
+
+        fn params(&self) -> &[ParamDesc] {
+            PyramidalEcc.params()
+        }
+
+        fn align_frame(
+            &self,
+            ctx: &AlignContext<'_>,
+            frame: usize,
+            cfg: &ParamValues,
+        ) -> Result<AlignOutcome, AlgorithmError> {
+            PyramidalEcc.align_frame(ctx, frame, cfg)
+        }
+
+        fn prepare_run(
+            &self,
+            ctx: &AlignContext<'_>,
+            cfg: &ParamValues,
+        ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, AlgorithmError> {
+            let prepared = PyramidalEcc.prepare_run(ctx, cfg)?;
+            self.prepared.lock().unwrap().clone_from(&prepared);
+            Ok(prepared)
+        }
+    }
+
+    #[test]
+    fn chain_store_releases_every_frame_and_bounds_live_entries() {
+        use crate::align::{bytes_per_chain_hop, bytes_per_frame_build};
+        let shifts: Vec<(f64, f64)> = (0..9).map(|i| (f64::from(i) * 0.5, 0.0)).collect();
+        let mem = reader(160, 120, &shifts, false);
+        let stack = StackContext::new(9, 160, 120, 1);
+        for reference in ["first", "middle", "last"] {
+            for workers in [1u64, 2, 4] {
+                let probe = StoreProbe {
+                    prepared: Mutex::new(None),
+                };
+                let budget = bytes_per_frame_build(stack)
+                    + workers * bytes_per_chain_hop(stack, DEFAULT_TILE_SIZE);
+                let run = align_stack_with(
+                    &probe,
+                    stack,
+                    &mem,
+                    &chain_config(&stack, reference),
+                    FailurePolicy::Strict,
+                    &AlignDriverOptions {
+                        budget: crate::tile::HostBudget::explicit(budget),
+                        ..AlignDriverOptions::default()
+                    },
+                )
+                .unwrap();
+                let prepared = probe.prepared.lock().unwrap().take().unwrap();
+                let frames = prepared.downcast_ref::<ChainFrames>().unwrap();
+                let peak = frames.peak.load(Ordering::SeqCst);
+                let label = format!("{reference} x{workers}: limit {}", run.worker_limit);
+                assert!(peak >= 2, "{label}: peak {peak}");
+                assert!(peak <= 2 * run.worker_limit + 1, "{label}: peak {peak}");
+                assert_eq!(frames.live.load(Ordering::SeqCst), 0, "{label}");
+                for slot in &frames.slots {
+                    let slot = slot.lock().unwrap();
+                    assert!(slot.build.is_none() && slot.uses_left == 0, "{label}");
+                }
+            }
+        }
     }
 }

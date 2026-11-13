@@ -15,7 +15,7 @@ use focusforge_core::io::TiffHeader;
 use focusforge_gui::AppWindow;
 use focusforge_gui::canvas::{
     CanvasFeed, DISPLAY_FORMAT, FrameSource, RepaintGate, TextureSpec, draw_rect_fits,
-    needs_realloc, truncate_pane_label, validate_display_format,
+    needs_realloc, truncate_pane_label, truncate_tail, validate_display_format,
 };
 use focusforge_gui::job;
 use focusforge_gui::viewport::PaneRect;
@@ -1592,6 +1592,44 @@ fn pane_label_too_long_keeps_its_tail() {
         truncated.starts_with('\u{2026}'),
         "{truncated:?} must lead with the ellipsis, since the head is what was dropped"
     );
+}
+
+#[test]
+fn truncate_tail_keeps_names_within_the_budget() {
+    for budget in [1, 5, 16] {
+        for len in [budget - 1, budget] {
+            let name = "x".repeat(len);
+            assert_eq!(
+                truncate_tail(&name, budget),
+                name,
+                "{len} chars, budget {budget}"
+            );
+        }
+    }
+}
+
+#[test]
+fn truncate_tail_keeps_the_last_chars_of_a_longer_name() {
+    let name = "0123456789abcdefghijklmnopqrstuvwxyz";
+    for budget in [1, 5, 16] {
+        let cut = truncate_tail(name, budget);
+        assert_eq!(cut.chars().count(), budget, "budget {budget}: {cut:?}");
+        let kept = cut
+            .strip_prefix('\u{2026}')
+            .expect("leads with the ellipsis");
+        assert!(name.ends_with(kept), "budget {budget}: {cut:?} vs {name:?}");
+    }
+    assert_eq!(truncate_tail(name, 1), "\u{2026}");
+    assert_eq!(truncate_tail(name, 5), "\u{2026}wxyz");
+}
+
+#[test]
+fn truncate_tail_cuts_multi_byte_names_on_char_boundaries() {
+    // 2-, 3- and 4-byte chars: a byte-slicing cut panics or miscounts.
+    let name = "\u{c4}\u{2026}\u{1f4f7}".repeat(3);
+    assert_eq!(truncate_tail(&name, 4), "\u{2026}\u{c4}\u{2026}\u{1f4f7}");
+    assert_eq!(truncate_tail(&name, 2), "\u{2026}\u{1f4f7}");
+    assert_eq!(truncate_tail(&name, 9), name);
 }
 
 // ---------------------------------------------------------------------

@@ -18,6 +18,7 @@ import { FFPanePlaceholder } from "../../components/ff_pane_placeholder.slint";
 export struct ImageRowView {
     chip: color,
     name: string,
+    full-name: string,
     time-text: string,
     capture-stamp: string,
     excluded: bool,
@@ -142,6 +143,7 @@ export component FFImagesPanel inherits Rectangle {
             for row[i] in root.rows: FFImageRow {
                 chip: row.chip;
                 name: row.name;
+                full-name: row.full-name;
                 time-text: row.time-text;
                 capture-stamp: row.capture-stamp;
                 presentation: root.presentation;

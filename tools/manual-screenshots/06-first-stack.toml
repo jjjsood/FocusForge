@@ -92,8 +92,8 @@ name  = "first-stack-fuse-running"
 args  = ["--open", "fixtures/mantis-512", "--fuse-tabs", "0", "--slow-run", "1"]
 steps = [
   ["wait-id", "FFToolbar::pause-button", "300"],
-  ["wait-id", "FFBottomBar::eta-text", "60"],
-  ["pause", "2000"],
+  ["wait-text", " of 8", "60"],
+  ["pause", "500"],
 ]
 out   = "assets/manual/first-stack/fuse-running.png"
 

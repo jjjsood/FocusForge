@@ -1410,7 +1410,7 @@ struct ShellState {
     /// the empty state shown. Always `None` while `projects` is empty.
     active: Option<usize>,
     /// Both panes' current geometry, pushed by `set_pane_geometry`
-    /// (`ui/shell/canvas.slint`'s five `out` properties, read once by
+    /// (`crates/ui/ui/shell/canvas.slint`'s five `out` properties, read once by
     /// `src/main.rs` at startup and again on every `canvas-resized`).
     panes: Option<(PaneRect, PaneRect)>,
     /// Last valid rect for each side, including a side whose window is
@@ -1921,6 +1921,8 @@ pub struct AppController {
     /// A literal toolbar/bottom-bar view that [`AppController::job_view`]
     /// returns in place of the active run's, until the next run starts.
     toolbar_preview: Option<JobView>,
+    /// Whether the bottom bar shows the remaining-time estimate.
+    eta_display: bool,
     /// How long every folder or project load waits before it reads anything.
     open_hold: Duration,
     /// How long every Analytics count waits before it reads anything.
@@ -3865,7 +3867,7 @@ impl AppController {
         })
     }
 
-    /// Installs both panes' current geometry, pushed by `ui/shell/canvas.slint`'s
+    /// Installs both panes' current geometry, pushed by `crates/ui/ui/shell/canvas.slint`'s
     /// five `out` properties (`src/bridge.rs`'s `canvas-resized` handler and
     /// `src/main.rs`'s startup push). Fits the viewport on the first call
     /// after a project opens (`open_project` cannot, having no pane rect of
@@ -4738,7 +4740,7 @@ impl AppController {
     // -- Tabs as controller state. --
 
     /// Every open tab, in order -- the plain twin of
-    /// `ui/shell/tab_strip.slint`'s `ProjectTabView`.
+    /// `crates/ui/ui/shell/tab_strip.slint`'s `ProjectTabView`.
     pub fn project_tabs(&self) -> Vec<ProjectTabRow> {
         self.state
             .projects
@@ -6268,11 +6270,10 @@ impl AppController {
             .map(|pixels| pixels.rgba.len() as u64 * 2)
             .sum();
         let host_budget = job::host_budget().capped_to(self.performance.max_host_memory_bytes());
-        let remaining = host_budget
-            .bytes()
-            .saturating_sub(self.preview_cache_bytes)
-            .saturating_sub(self.published_preview_bytes.load(Ordering::Acquire));
-        let budget = job::HostBudget::explicit(remaining);
+        let budget = host_budget
+            .reduced_by(self.preview_cache_bytes)
+            .reduced_by(self.published_preview_bytes.load(Ordering::Acquire));
+        let remaining = budget.bytes();
         let pending: Vec<_> = if remaining == 0 {
             Vec::new()
         } else {
@@ -8824,7 +8825,7 @@ impl AppController {
             toolbar_run_state: job::toolbar_run_state(&run).to_string(),
             stage_word: job::stage_word(&run, progress.as_ref()),
             step_text: job::progress_text(&run, progress.as_ref()),
-            eta_text: job::eta_text(&run, progress.as_ref()),
+            eta_text: job::eta_text(&run, progress.as_ref(), self.eta_display),
             bar_tone: job::bar_tone(&run).to_string(),
             fraction: job::bar_fraction(progress.as_ref()),
             fuse_enabled: self.fuse_enabled(),
@@ -8920,6 +8921,12 @@ impl AppController {
         Some(view)
     }
 
+    /// Shows or hides the remaining-time estimate in [`Self::job_view`] and
+    /// in any toolbar preview set afterwards. Hidden by default.
+    pub fn set_eta_display(&mut self, shown: bool) {
+        self.eta_display = shown;
+    }
+
     /// Holds a literal transport view -- `state` is one of `idle`, `running`,
     /// `paused`, `cancelling` or `failed` -- that [`Self::job_view`] returns
     /// until the next run starts; `fuse_enabled` still follows the active
@@ -8959,7 +8966,11 @@ impl AppController {
             toolbar_run_state: state.to_string(),
             stage_word: stage_word.to_string(),
             step_text: step_text.to_string(),
-            eta_text: eta.to_string(),
+            eta_text: if self.eta_display {
+                eta.to_string()
+            } else {
+                String::new()
+            },
             bar_tone: tone.to_string(),
             fraction,
             fuse_enabled: self.fuse_enabled(),
@@ -10688,14 +10699,14 @@ impl AppController {
     }
 }
 
-/// `ShellGeometry.tab-pitch` (`ui/geometry.slint`): one tab plus its gap.
+/// `ShellGeometry.tab-pitch` (`crates/ui/ui/geometry.slint`): one tab plus its gap.
 pub const TAB_PITCH: f32 = 228.0;
-/// `ShellGeometry.tab-width` (`ui/geometry.slint`).
+/// `ShellGeometry.tab-width` (`crates/ui/ui/geometry.slint`).
 pub const TAB_WIDTH: f32 = 224.0;
-/// `ShellGeometry.strip-box-width` (`ui/geometry.slint`): each scroll arrow
+/// `ShellGeometry.strip-box-width` (`crates/ui/ui/geometry.slint`): each scroll arrow
 /// and "+".
 pub const STRIP_BOX_WIDTH: f32 = 30.0;
-/// `ShellGeometry.strip-box-gap` (`ui/geometry.slint`, `Theme.space-1`).
+/// `ShellGeometry.strip-box-gap` (`crates/ui/ui/geometry.slint`, `Theme.space-1`).
 pub const STRIP_BOX_GAP: f32 = 4.0;
 
 /// Whether `tab_count` tabs plus the trailing "+" outrun a tabs-region
@@ -10709,7 +10720,7 @@ pub fn tabs_overflow(tab_count: usize, region_width: f32) -> bool {
 /// The scrolling viewport's width inside a tabs-region `region_width` wide:
 /// the whole region without overflow; on overflow, the region less the left
 /// arrow, the right arrow and the pinned "+", each with its box gap
-/// (`ui/shell/tab_strip.slint`'s `tabs-viewport`).
+/// (`crates/ui/ui/shell/tab_strip.slint`'s `tabs-viewport`).
 pub fn tab_viewport_width(tab_count: usize, region_width: f32) -> f32 {
     if tabs_overflow(tab_count, region_width) {
         (region_width - 3.0 * (STRIP_BOX_WIDTH + STRIP_BOX_GAP)).max(0.0)

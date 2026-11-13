@@ -37,7 +37,7 @@ See: [Branch from an older checkpoint](guide/history.md#branch-from-an-older-che
 
 The **PREPARE** step that gives every frame one brightness factor (a gain),
 so all frames share the same average brightness before they are aligned and
-fused. It is off by default; with it on, **Max brightness gain** (1.25) limits
+fused. It is off by default; with it on, **Max brightness gain** limits
 how far a frame may be changed.
 See: [Brightness equalization](guide/stacking.md#brightness-equalization).
 
@@ -56,14 +56,6 @@ where you brush. Strokes are kept as a list of edits, so you can undo them
 and the fused result itself is never destroyed.
 See: [Paint a stroke](guide/retouch.md#paint-a-stroke).
 
-## Budget
-
-The amount of memory FocusForge allows itself for a fuse: the host
-memory budget (40 % of the memory free when a run starts) and the VRAM budget
-on the graphics card, measured the first time a fuse uses it. FocusForge
-works through a stack in pieces so that it stays within its budget.
-See: [Memory caps and budgets](guide/settings-window.md#memory-caps-and-budgets).
-
 ## Camera RAW
 
 The unprocessed files a camera records (`.cr3`, `.nef`, `.arw`, DNG and
@@ -74,13 +66,6 @@ RAW project's saved composite stay unclipped, so highlights above white
 survive until the result is exported. One stack is always one kind of file.
 See: [Camera RAW, JPEG and compressed TIFF](guide/first-stack.md#camera-raw-jpeg-and-compressed-tiff)
 and [Choose a file format](stacking/shooting-practice.md#choose-a-file-format).
-
-## Cap
-
-A memory ceiling you set yourself on top of a [budget](#budget): the **Host
-memory** and **VRAM** limits. A cap can only lower a budget, never raise
-it; a lower cap can make a fuse slower but never changes the result.
-See: [Memory caps and budgets](guide/settings-window.md#memory-caps-and-budgets).
 
 ## Checkpoint
 
@@ -111,8 +96,8 @@ and [The two panes](guide/gui.md#the-two-panes).
 ## Crash report
 
 The evidence FocusForge writes when it stops unexpectedly: the error, where
-it happened and the most recent log activity, or a [minidump](#minidump)
-after a hard crash. It stays on your computer; the next start tells you about
+it happened and the most recent log activity, or a snapshot of the program's
+memory after a hard crash. It stays on your computer; the next start tells you about
 it with the notice "Previous session stopped".
 See: [Crash reports](guide/diagnostics.md#crash-reports).
 
@@ -136,9 +121,8 @@ See: [Fuse the stack](guide/first-stack.md#fuse-the-stack).
 ## Details
 
 The default [fusion method](#fusion-method) (`laplacian` on the command
-line). It splits every frame into layers from coarse to fine (a
-[pyramid](#pyramid)) and takes the sharpest frame's contribution in each
-layer. It keeps the most fine detail and is the fastest, but can leave a
+line). It splits every frame into layers from coarse to fine and takes the
+sharpest frame's contribution in each layer. It keeps the most fine detail and is the fastest, but can leave a
 [halo](#halo) at strong depth edges.
 See: [Details](guide/stacking.md#details).
 
@@ -198,7 +182,7 @@ The extension of a FocusForge [project](#project) file. One `.ffp` file holds
 the list of source frames and every [checkpoint](#checkpoint); it does not
 contain the frames themselves.
 See: [What you need](guide/first-stack.md#what-you-need) and
-[The project container](reference/project-format.md).
+[Checkpoints and saving](guide/history.md).
 
 ## Focus breathing
 
@@ -254,9 +238,9 @@ See: [Choose a fusion method](guide/stacking.md#choose-a-fusion-method).
 ## GPU processing
 
 Fusing on the graphics card. It is usually faster and gives the same result
-as the processor (within one step of the 16-bit scale). When no usable
-graphics card is found, FocusForge uses the processor instead.
-See: [GPU processing and the Backend line](guide/settings-window.md#gpu-processing-and-the-backend-line).
+as the processor. When no usable graphics card is found, FocusForge uses the
+processor instead.
+See: [Use the graphics card](guide/settings-window.md#use-the-graphics-card).
 
 ## Grouping
 
@@ -274,13 +258,6 @@ the editor.
 See: [Halos at depth edges](stacking/failure-images.md#halos-at-depth-edges)
 and [Example: fix a halo](guide/retouch.md#example-fix-a-halo).
 
-## Identity fallback
-
-What happens to a frame that cannot be aligned: it is used unmoved, exactly
-as it was shot. In the window the fuse then asks **Keep this fused result?**
-and names the frames.
-See: [When a frame cannot be aligned](guide/alignment.md#when-a-frame-cannot-be-aligned).
-
 ## Magnification
 
 The size of the subject's image on the sensor divided by its real size. 1:1
@@ -288,15 +265,6 @@ The size of the subject's image on the sensor divided by its real size. 1:1
 shrinks the [depth of field](#depth-of-field) most.
 See: [What makes it deep or shallow](stacking/depth-of-field.md#what-makes-it-deep-or-shallow)
 and [Know your magnification](stacking/shooting-practice.md#know-your-magnification).
-
-## Minidump
-
-A snapshot of a crashed program's memory, written by FocusForge's watcher
-process after a hard crash. It cannot be cleaned of personal paths, so a
-[diagnostics bundle](#diagnostics-bundle) includes it only when you switch on
-**Include minidumps**.
-See: [Crash reports](guide/diagnostics.md#crash-reports) and
-[Include minidumps](guide/diagnostics.md#include-minidumps).
 
 ## Motion
 
@@ -309,8 +277,8 @@ See: [Motion between frames](stacking/failure-images.md#motion-between-frames).
 
 A message the window keeps for the session in the notification center behind
 the bell: a failed fuse or save, a notice from a run, skipped folders, a
-crash. A new one also shows briefly as a [toast](#toast), or as a desktop
-banner when the window is in the background.
+crash. A new one also shows briefly as a pop-up at the top left of the canvas,
+or as a desktop banner when the window is in the background.
 See: [Notifications](guide/batch-runs.md#notifications).
 
 ## Overlap
@@ -342,14 +310,6 @@ tab strip. It shows every open project, the ones that need attention, and
 the recent ones.
 See: [The Projects overview](guide/batch-runs.md#the-projects-overview).
 
-## Pyramid
-
-A series of ever smaller, coarser copies of an image. The
-[Details](#details) method blends frames layer by layer of such a pyramid,
-and [alignment](#alignment) finds the movement on the small copies first.
-See: [Details](guide/stacking.md#details) and
-[What alignment does](guide/alignment.md#what-alignment-does).
-
 ## Reference frame
 
 The frame the others are aligned to. By default it is the middle frame of
@@ -377,13 +337,6 @@ The series of frames of one subject, each focused a little deeper than the
 last. In FocusForge one stack becomes one [project](#project).
 See: [What you need](guide/first-stack.md#what-you-need) and
 [Shooting a stack](stacking/shooting-practice.md).
-
-## Stage cache
-
-Where FocusForge keeps the results of expensive steps of a fuse, above all
-the alignment, so that fusing the same frames again can skip them. **Clear
-cache** in the settings window empties it; nothing else is affected.
-See: [Clear the stage cache](guide/settings-window.md#clear-the-stage-cache).
 
 ## Step
 
@@ -414,14 +367,7 @@ An image file format FocusForge stacks besides camera RAW and JPEG: 8-bit or
 TIFF, BigTIFF and TIFF compressed with JPEG are not read. Uncompressed 16-bit
 TIFFs open fastest.
 See: [Choose a file format](stacking/shooting-practice.md#choose-a-file-format)
-and [TIFF fast path](reference/tiff-fast-path.md).
-
-## Toast
-
-The short pop-up at the top left of the canvas that shows a new
-[notification](#notification) while the window is in front. It disappears
-after a few seconds; the notification stays in the center.
-See: [Toasts](guide/batch-runs.md#toasts).
+and [Camera RAW, JPEG and compressed TIFF](guide/first-stack.md#camera-raw-jpeg-and-compressed-tiff).
 
 ## Z-Map
 

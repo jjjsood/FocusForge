@@ -14,7 +14,7 @@ use focusforge_core::align::{
 };
 use focusforge_core::gpu::{AlignBackend, ECC_MOMENTS, EccMomentSession, EccSessionRequest};
 use focusforge_core::params::{ParamValue, StackContext, resolve, resolved_values};
-use focusforge_core::tile::Rect;
+use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};
 use focusforge_gpu::device::shared_device_or_skip;
 use focusforge_gpu::harness::{GpuBackend, gpu_backend};
@@ -608,5 +608,88 @@ fn gpu_ecc_solve_meets_cpu_geometry() {
     {
         assert_eq!(g.status, c.status, "frame {}", g.frame);
     }
+    assert!(error <= 0.04, "corner error {error} px exceeds 0.04 px");
+}
+
+/// Chain hops solved concurrently on the device give the same alignment as
+/// one hop at a time, with no CPU rerun, and stay within the CPU chain run's
+/// geometry.
+#[test]
+fn parallel_chain_on_the_device_is_deterministic() {
+    let _serial = exclusive();
+    let Some(_shared) = shared_device_or_skip() else {
+        return;
+    };
+    const W: u32 = 1501;
+    const H: u32 = 1403;
+    let mem = mem_reader(
+        W,
+        H,
+        &[
+            (0.0, 0.0),
+            (2.1, -1.3),
+            (4.0, -2.2),
+            (6.4, -3.1),
+            (8.8, -4.3),
+        ],
+    );
+    let stack = StackContext::new(5, W, H, 1);
+    let mut cfg = resolved_values(
+        &resolve(PyramidalEcc.params(), &Default::default(), &stack).expect("default parameters"),
+    );
+    cfg.insert(
+        "mode".to_string(),
+        ParamValue::Enum("translation".to_string()),
+    );
+    cfg.insert(
+        "reference-policy".to_string(),
+        ParamValue::Enum("chain".to_string()),
+    );
+    let gpu = gpu_backend().expect("gpu backend");
+    let run = |backend: Option<&dyn AlignBackend>, budget: HostBudget| {
+        align_stack_with(
+            &PyramidalEcc,
+            stack,
+            &mem,
+            &cfg,
+            FailurePolicy::Strict,
+            &AlignDriverOptions {
+                budget,
+                align_backend: backend,
+                ..AlignDriverOptions::default()
+            },
+        )
+        .expect("alignment")
+    };
+    let one_worker = run(Some(gpu), HostBudget::explicit(1));
+    let default_budget = run(Some(gpu), AlignDriverOptions::default().budget);
+    let cpu_run = run(None, AlignDriverOptions::default().budget);
+
+    assert_eq!(one_worker.worker_limit, 1);
+    assert!(
+        default_budget.worker_limit > 1,
+        "the default budget must solve the hops concurrently: {}",
+        default_budget.worker_limit
+    );
+    for gpu_run in [&one_worker, &default_budget] {
+        assert!(gpu_run.backend_used, "the hops ran on the device");
+        assert_eq!(gpu_run.rerun_reason, None);
+    }
+    assert_eq!(
+        one_worker.alignment.frames, default_budget.alignment.frames,
+        "concurrent hops on the device must not change the alignment"
+    );
+
+    let error = default_budget
+        .alignment
+        .frames
+        .iter()
+        .zip(&cpu_run.alignment.frames)
+        .map(|(g, c)| {
+            assert_eq!(g.status, c.status, "frame {}", g.frame);
+            corner_error(&g.transform, &c.transform, (W, H))
+        })
+        .fold(0.0, f64::max);
+    println!("gpu chain against cpu chain: worst corner error {error:.5} px");
     assert!(error <= 0.04, "corner error {error} px exceeds 0.04 px");
 }

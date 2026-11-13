@@ -35,7 +35,9 @@ struct Args {
     /// window would. A file manager's "Open with" passes its selection here.
     #[arg(value_name = "PATH")]
     paths: Vec<PathBuf>,
-    /// Exit this many milliseconds after the window is shown.
+    /// Exit this many milliseconds after startup. With `--undock-pane` the
+    /// count starts when the pane is undocked, and loading the project may take
+    /// up to 60 seconds before that.
     #[arg(long)]
     exit_after: Option<u64>,
     /// Write a screenshot of the window to this path, taken when
@@ -45,6 +47,11 @@ struct Args {
     /// Choose the main or detached window for `--screenshot`.
     #[arg(long, value_enum, default_value = "main", requires = "screenshot")]
     screenshot_window: ScreenshotWindow,
+    /// Take the comparison screenshot and exit once the undock sequence has
+    /// finished and the detached window has rendered at its preferred size.
+    /// `--exit-after` then fails the run if that never happens.
+    #[arg(long, requires_all = ["undock_pane", "screenshot", "exit_after"])]
+    screenshot_when_ready: bool,
     /// Undock a pane once the `--open` project loads, for window inspection.
     #[arg(long, value_enum, requires = "open")]
     undock_pane: Option<UndockPane>,
@@ -862,6 +869,43 @@ fn log_native_display<T: ComponentHandle + 'static>(app: &T) {
     });
 }
 
+/// Timing state shared by the undock sequence in `run` and the timers of
+/// `run_window`.
+#[derive(Clone, Default)]
+struct Inspection {
+    /// Fires `--exit-after`; re-armed when the pane is undocked.
+    watchdog: Rc<slint::Timer>,
+    /// Set once the last `--undock-pane`, `--dock-after` and `--reopen-after`
+    /// step has run.
+    settled: Rc<std::cell::Cell<bool>>,
+}
+
+/// Longest `--undock-pane` waits for its project to load before `--exit-after`
+/// ends the run.
+const UNDOCK_STARTUP_LIMIT: Duration = Duration::from_secs(60);
+
+/// Size the detached comparison window asks for, in logical pixels.
+const COMPARISON_PREFERRED: (u32, u32) = (820, 600);
+
+/// The first thing keeping `--screenshot-when-ready` from capturing: the
+/// undock sequence, the detached window, or its size, in that order.
+fn comparison_missing(settled: bool, window: Option<(slint::PhysicalSize, f32)>) -> Option<String> {
+    if !settled {
+        return Some("the undock sequence has not finished".into());
+    }
+    let Some((size, scale)) = window else {
+        return Some("no detached comparison window is open".into());
+    };
+    let (width, height) = COMPARISON_PREFERRED;
+    if size.width as f32 >= width as f32 * scale && size.height as f32 >= height as f32 * scale {
+        return None;
+    }
+    Some(format!(
+        "the detached window is {}x{}, below the preferred {width}x{height} at scale {scale}",
+        size.width, size.height
+    ))
+}
+
 /// Installs the exit-after and resize timers, then runs the event loop.
 /// Returns the process exit code.
 ///
@@ -877,6 +921,7 @@ fn run_window<T: ComponentHandle + 'static>(
     controller: Option<Arc<Mutex<AppController>>>,
     canvas: Option<Rc<RefCell<Canvas>>>,
     app_handle: Option<slint::Weak<AppWindow>>,
+    inspection: &Inspection,
 ) -> i32 {
     let exit_code = std::rc::Rc::new(std::cell::Cell::new(0i32));
     let device: Rc<RefCell<Option<wgpu::Device>>> = Rc::new(RefCell::new(None));
@@ -1009,43 +1054,93 @@ fn run_window<T: ComponentHandle + 'static>(
         let app_weak = app.as_weak();
         let screenshot_path = args.screenshot.clone();
         let screenshot_window = args.screenshot_window;
+        let when_ready = args.screenshot_when_ready;
+        let settled = inspection.settled.clone();
         let exit_code = exit_code.clone();
         let closing = closing.clone();
-        slint::Timer::single_shot(Duration::from_millis(ms), move || {
-            if let Some(app) = app_weak.upgrade()
-                && let Some(path) = &screenshot_path
-            {
-                if focusforge_gpu::errors::device_lost() {
-                    tracing::error!("--screenshot skipped: the graphics device is already lost");
-                } else {
-                    let snapshot = match screenshot_window {
-                        ScreenshotWindow::Main => app.window().take_snapshot().map(Some),
-                        ScreenshotWindow::Comparison => bridge::comparison_snapshot(),
-                    };
-                    match snapshot {
-                        Ok(None) => {
-                            tracing::error!(
-                                "--screenshot-window comparison requires a detached pane"
-                            );
-                            exit_code.set(1);
-                        }
-                        Ok(Some(buffer)) => {
-                            if let Err(e) = screenshot::write_png(&buffer, path) {
-                                tracing::error!("--screenshot failed: {e}");
+        let startup_limit = if args.undock_pane.is_some() {
+            Duration::from_millis(ms).max(UNDOCK_STARTUP_LIMIT)
+        } else {
+            Duration::from_millis(ms)
+        };
+        inspection
+            .watchdog
+            .start(slint::TimerMode::SingleShot, startup_limit, move || {
+                if when_ready {
+                    let missing =
+                        comparison_missing(settled.get(), bridge::comparison_window_size())
+                            .unwrap_or_else(|| "the detached window is not rendering".into());
+                    tracing::error!("--screenshot-when-ready never became ready: {missing}");
+                    exit_code.set(1);
+                } else if let Some(app) = app_weak.upgrade()
+                    && let Some(path) = &screenshot_path
+                {
+                    if focusforge_gpu::errors::device_lost() {
+                        tracing::error!(
+                            "--screenshot skipped: the graphics device is already lost"
+                        );
+                    } else {
+                        let snapshot = match screenshot_window {
+                            ScreenshotWindow::Main => app.window().take_snapshot().map(Some),
+                            ScreenshotWindow::Comparison => bridge::comparison_snapshot(),
+                        };
+                        match snapshot {
+                            Ok(None) => {
+                                tracing::error!(
+                                    "--screenshot-window comparison requires a detached pane"
+                                );
+                                exit_code.set(1);
+                            }
+                            Ok(Some(buffer)) => {
+                                if let Err(e) = screenshot::write_png(&buffer, path) {
+                                    tracing::error!("--screenshot failed: {e}");
+                                    exit_code.set(1);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("take_snapshot failed: {e}");
                                 exit_code.set(1);
                             }
                         }
-                        Err(e) => {
-                            tracing::error!("take_snapshot failed: {e}");
-                            exit_code.set(1);
-                        }
                     }
                 }
-            }
 
-            closing.set(true);
-            let _ = slint::quit_event_loop();
-        });
+                closing.set(true);
+                let _ = slint::quit_event_loop();
+            });
+    }
+
+    // Captures the detached window once the undock sequence has finished and
+    // the window can be rendered at its preferred size.
+    let ready_timer = slint::Timer::default();
+    if args.screenshot_when_ready
+        && let Some(path) = args.screenshot.clone()
+    {
+        let settled = inspection.settled.clone();
+        let exit_code = exit_code.clone();
+        let closing = closing.clone();
+        ready_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(50),
+            move || {
+                if closing.get()
+                    || comparison_missing(settled.get(), bridge::comparison_window_size()).is_some()
+                {
+                    return;
+                }
+                // A window that has not drawn its first frame refuses the
+                // snapshot; the next tick asks again.
+                let Ok(Some(buffer)) = bridge::comparison_snapshot() else {
+                    return;
+                };
+                if let Err(e) = screenshot::write_png(&buffer, &path) {
+                    tracing::error!("--screenshot failed: {e}");
+                    exit_code.set(1);
+                }
+                closing.set(true);
+                let _ = slint::quit_event_loop();
+            },
+        );
     }
 
     // Polls for a lost device every 250 ms, off the render path entirely --
@@ -1200,6 +1295,7 @@ fn preview_row(chip: [u8; 3], name: &str, time: &str) -> focusforge_gui::ImageRo
         name: name.into(),
         time_text: time.into(),
         capture_stamp: "".into(),
+        full_name: "".into(),
         excluded: false,
         unresolved: false,
         selected: false,
@@ -2068,6 +2164,9 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
     // needs the same renderer cell every other open path feeds.
     let mut controller_state = AppController::new();
     controller_state.set_analytics_background(true);
+    controller_state.set_eta_display(job::eta_display_enabled(
+        std::env::var_os("FOCUSFORGE_SHOW_ETA").as_deref(),
+    ));
     let controller = Arc::new(Mutex::new(controller_state));
     let canvas: Rc<RefCell<Canvas>> = Rc::new(RefCell::new(Canvas::default()));
     let app_handle: Rc<RefCell<Option<slint::Weak<AppWindow>>>> = Rc::new(RefCell::new(None));
@@ -2085,10 +2184,11 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
         Err(code) => return code,
     };
 
+    let inspection = Inspection::default();
     let code = if args.theme_sheet {
         let sheet = ThemeSheet::new().expect("failed to instantiate ThemeSheet");
         fill_stage_sheet(&sheet);
-        run_window(sheet, args, None, None, None)
+        run_window(sheet, args, None, None, None, &inspection)
     } else {
         let app = AppWindow::new().expect("failed to instantiate AppWindow");
         *app_handle.borrow_mut() = Some(app.as_weak());
@@ -2188,6 +2288,8 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
             let dock_after = args.dock_after;
             let reopen_after = args.reopen_after;
             let close_main_after = args.close_main_after;
+            let exit_after = args.exit_after;
+            let inspection = inspection.clone();
             undock_timer.start(
                 slint::TimerMode::Repeated,
                 Duration::from_millis(50),
@@ -2197,33 +2299,43 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
                     };
                     if app.get_project_loaded() {
                         timer.stop();
+                        if let Some(ms) = exit_after {
+                            inspection.watchdog.set_interval(Duration::from_millis(ms));
+                        }
                         match pane {
                             UndockPane::Frame => app.invoke_frame_undock_requested(),
                             UndockPane::Composite => app.invoke_composite_undock_requested(),
                         }
                         if let Some(ms) = dock_after {
                             let app_weak = app.as_weak();
+                            let settled = inspection.settled.clone();
                             slint::Timer::single_shot(Duration::from_millis(ms), move || {
                                 bridge::dock_comparison_for_inspection();
-                                if let Some(reopen_ms) = reopen_after {
-                                    let app_weak = app_weak.clone();
-                                    slint::Timer::single_shot(
-                                        Duration::from_millis(reopen_ms),
-                                        move || {
-                                            if let Some(app) = app_weak.upgrade() {
-                                                match pane {
-                                                    UndockPane::Frame => {
-                                                        app.invoke_frame_undock_requested()
-                                                    }
-                                                    UndockPane::Composite => {
-                                                        app.invoke_composite_undock_requested()
-                                                    }
+                                let Some(reopen_ms) = reopen_after else {
+                                    settled.set(true);
+                                    return;
+                                };
+                                let app_weak = app_weak.clone();
+                                let settled = settled.clone();
+                                slint::Timer::single_shot(
+                                    Duration::from_millis(reopen_ms),
+                                    move || {
+                                        if let Some(app) = app_weak.upgrade() {
+                                            match pane {
+                                                UndockPane::Frame => {
+                                                    app.invoke_frame_undock_requested()
+                                                }
+                                                UndockPane::Composite => {
+                                                    app.invoke_composite_undock_requested()
                                                 }
                                             }
-                                        },
-                                    );
-                                }
+                                        }
+                                        settled.set(true);
+                                    },
+                                );
                             });
+                        } else {
+                            inspection.settled.set(true);
                         }
                         if let Some(ms) = close_main_after {
                             let app_weak = app.as_weak();
@@ -2319,6 +2431,7 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
             Some(controller),
             Some(canvas),
             app_handle.borrow().clone(),
+            &inspection,
         )
     };
 

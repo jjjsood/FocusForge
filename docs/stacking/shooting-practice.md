@@ -541,8 +541,7 @@ Recommendations:
   correct chromatic aberration with a lens profile before stacking. Apply
   exactly the same settings to every frame (synchronise them in your
   converter), with no per-frame automatic adjustments and no cropping.
-  Export at 16 bits per channel; uncompressed TIFFs open fastest (see the
-  [TIFF fast path](../reference/tiff-fast-path.md)).
+  Export at 16 bits per channel; uncompressed TIFFs open fastest.
 - **Do not mix** RAW and TIFF frames in one stack. FocusForge refuses a stack
   that mixes them.
 - **Keep the frames in focus order by file name.** FocusForge reads a stack in

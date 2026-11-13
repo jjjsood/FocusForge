@@ -18,11 +18,12 @@ use focusforge_core::algorithm::{AlgorithmError, TileCtx, TileReader};
 use focusforge_core::align::{
     FailurePolicy, StackAlignment, Transform, WarpingReader, align_stack, auto_crop,
 };
-use focusforge_core::fuse::{FusionConsumer, FusionGeometry, metrics};
+use focusforge_core::fuse::laplacian::score_plane;
+use focusforge_core::fuse::{FusionConsumer, FusionGeometry, build, metrics};
 use focusforge_core::io::{Rect, TiffStack};
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
 use focusforge_core::registry;
-use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
+use focusforge_core::tile::{NoopPreprocess, Tile, TileScheduler, TileSchedulerOptions};
 use focusforge_core::zmap::NO_SOURCE;
 use focusforge_core::zmap::metrics::all_eight_identical_fraction;
 
@@ -741,7 +742,7 @@ fn assert_zmap_is_spatially_coherent(result: &FusionResult) {
 
 /// The all-8-neighbours-identical fraction is the measure that actually
 /// discriminates a structured Z-Map from noise (`spatial_coherence_fraction`'s
-/// majority vote does not). Asserted `>= 55%` against a measured 63.76%
+/// majority vote does not). Asserted `>= 55%` against a measured 55.95%
 /// under this file's border convention and the 12.5% baseline a random
 /// 8-way map produces.
 fn assert_zmap_neighbourhood_is_uniform_well_above_the_random_baseline(result: &FusionResult) {
@@ -887,4 +888,97 @@ fn aligned_run_is_sharper_and_each_frame_agrees_with_the_anchor() {
 
     assert_aligned_composite_is_sharper_than_the_sharpest_frame(&aligned);
     assert_each_frame_agrees_with_the_anchor(&alignment);
+}
+
+/// Seeded 16-bit texture around `base`: every pixel is `base` plus a hashed
+/// offset of at most `amplitude`.
+fn hashed_texture(x: u32, y: u32, base: u16, amplitude: u16) -> u16 {
+    let hash = (x * 7 + y * 13 + 5).wrapping_mul(2654435761u32);
+    let unit = f64::from(hash >> 16) / 65535.0 - 0.5;
+    (f64::from(base) + 2.0 * unit * f64::from(amplitude)) as u16
+}
+
+/// Two frames over one scene whose left half (x < `split`) carries a faint
+/// texture and whose right half carries a texture three times stronger. Each
+/// frame is in focus on exactly one half and flat on the other, so frame 0 is
+/// the true source on the left and frame 1 on the right.
+fn fine_detail_frames(width: u32, height: u32, split: u32) -> Vec<Tile> {
+    let frame = |sharp_left: bool| {
+        let mut samples = Vec::with_capacity((width * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let amplitude = if x < split { 1000 } else { 3000 };
+                let in_focus = (x < split) == sharp_left;
+                samples.push(if in_focus {
+                    hashed_texture(x, y, 30000, amplitude)
+                } else {
+                    30000
+                });
+            }
+        }
+        Tile {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            samples_per_pixel: 1,
+            samples,
+        }
+    };
+    vec![frame(true), frame(false)]
+}
+
+/// Pixels of the interior rows whose Z-Map entry is not the frame in focus
+/// there.
+fn wrong_source_count(zmap: &[u16], width: u32, height: u32, split: u32) -> usize {
+    (8..height - 8)
+        .flat_map(|y| (0..width).map(move |x| (x, y)))
+        .filter(|&(x, y)| zmap[(y * width + x) as usize] != u16::from(x >= split))
+        .count()
+}
+
+/// The score window must stay narrow enough that a strong neighbour does not
+/// claim the pixels of a faint region next to it: the default window picks
+/// the in-focus frame on more of the faint half's pixels than the wider
+/// radius 8 window does.
+#[test]
+fn narrow_score_window_keeps_faint_detail_next_to_strong_detail() {
+    let (width, height, split, levels) = (128u32, 64u32, 64u32, 3u32);
+    let tiles = fine_detail_frames(width, height, split);
+
+    let algo = registry::find_stack("laplacian").expect("laplacian must be registered");
+    let mut values = ParamValues::new();
+    values.insert("levels".to_string(), ParamValue::Int(i64::from(levels)));
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let out = algo
+        .fuse(&TileCtx::new(rect, &tiles), &values)
+        .expect("fusion of the synthetic stack must succeed");
+    let narrow = wrong_source_count(&out.zmap, width, height, split);
+
+    // Level-0 winner of the same stack under a radius 8 window.
+    let scores: Vec<Vec<f32>> = tiles
+        .iter()
+        .map(|tile| {
+            let pyramid = build(&tile.samples, width, height, 1, levels).expect("pyramid");
+            score_plane(&pyramid.levels()[0], 8)
+        })
+        .collect();
+    let wide_zmap: Vec<u16> = scores[0]
+        .iter()
+        .zip(&scores[1])
+        .map(|(a, b)| u16::from(b > a))
+        .collect();
+    let wide = wrong_source_count(&wide_zmap, width, height, split);
+
+    assert!(
+        narrow < wide,
+        "the default window must misassign fewer pixels than radius 8: {narrow} against {wide}"
+    );
 }

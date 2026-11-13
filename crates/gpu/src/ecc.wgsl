@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // One ECC iteration's sampling and masked reductions; the CPU twin is
-// `focusforge_core::align::CpuMomentSession`. Region pixels map to window
-// coordinates in f32 relative to the window origin; a sample whose 4x4
-// Catmull-Rom taps leave the window is invalid.
+// `focusforge_core::align::CpuMomentSession`. A region pixel (i, j) maps to the
+// window position (i + ox + r_x, j + oy + r_y): the integer offset (ox, oy) is
+// exact, and the residual r = (a*i + b*j + bx, c*i + d*j + by) is formed in f32
+// from the linear part minus the identity, so it stays within a few pixels
+// where the f32 spacing is far below the solver's step tolerance. A sample
+// whose 4x4 Catmull-Rom taps leave the window, tested in integers, is invalid.
 
 // Four dispatches per iteration, each a fixed grid-stride count of 256-wide
 // workgroups: `sample_moments` and `template_moments` write one partial row of
@@ -20,7 +23,7 @@ struct Params {
     c: f32,
     d: f32,
     by: f32,
-    pad0: f32,
+    ox: i32,
     rw: u32,
     n: u32,
     win_w: u32,
@@ -28,7 +31,7 @@ struct Params {
     groups: u32,
     cols: u32,
     full_n: f32,
-    pad1: u32,
+    oy: i32,
 }
 
 const STRIDE: u32 = 18u;
@@ -61,20 +64,22 @@ struct Loc {
 }
 
 fn locate(pix: u32) -> Loc {
-    let i = f32(pix % p.rw);
-    let j = f32(pix / p.rw);
-    let lx = p.a * i + p.b * j + p.bx;
-    let ly = p.c * i + p.d * j + p.by;
-    let fx = floor(lx);
-    let fy = floor(ly);
+    let pi = pix % p.rw;
+    let pj = pix / p.rw;
+    let rx = p.a * f32(pi) + p.b * f32(pj) + p.bx;
+    let ry = p.c * f32(pi) + p.d * f32(pj) + p.by;
+    let frx = floor(rx);
+    let fry = floor(ry);
+    let ix = i32(pi) + p.ox + i32(frx);
+    let iy = i32(pj) + p.oy + i32(fry);
     var loc: Loc;
-    loc.ok = (fx >= 1.0) && (fx + 2.0 <= f32(p.win_w) - 1.0)
-        && (fy >= 1.0) && (fy + 2.0 <= f32(p.win_h) - 1.0);
+    loc.ok = (ix >= 1) && (ix + 2 <= i32(p.win_w) - 1)
+        && (iy >= 1) && (iy + 2 <= i32(p.win_h) - 1);
     if loc.ok {
-        loc.ix = i32(fx);
-        loc.iy = i32(fy);
-        loc.tx = lx - fx;
-        loc.ty = ly - fy;
+        loc.ix = ix;
+        loc.iy = iy;
+        loc.tx = rx - frx;
+        loc.ty = ry - fry;
     }
     return loc;
 }

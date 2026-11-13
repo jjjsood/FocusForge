@@ -241,12 +241,12 @@ impl Geometry {
 
     /// The kernel's parameter block for `warp`.
     fn params(&self, warp: &Transform) -> Result<[u8; PARAMS_BYTES], AlgorithmError> {
-        let Some([a, b, bx, c, d, by]) =
+        let Some(([a, b, bx, c, d, by], ox, oy)) =
             window_map(&warp.m, (self.region.x, self.region.y), self.origin)
         else {
             return Err(AlgorithmError::Failed {
                 algorithm: "gpu".to_string(),
-                detail: "the ECC kernel maps affine transforms only".to_string(),
+                detail: "the ECC kernel maps affine transforms with a finite positive scale and an offset inside the i32 range only".to_string(),
             });
         };
         let words: [u32; PARAMS_BYTES / 4] = [
@@ -257,7 +257,7 @@ impl Geometry {
             c.to_bits(),
             d.to_bits(),
             by.to_bits(),
-            0,
+            ox as u32,
             self.region.width,
             self.pixels,
             self.window.0,
@@ -265,7 +265,7 @@ impl Geometry {
             self.groups,
             self.columns,
             (self.pixels as f32).to_bits(),
-            0,
+            oy as u32,
         ];
         let mut bytes = [0u8; PARAMS_BYTES];
         for (chunk, word) in bytes.chunks_exact_mut(4).zip(words) {
@@ -284,12 +284,16 @@ fn groups_for(pixels: u32, max_per_dimension: u32) -> u32 {
         .clamp(1, MAX_GROUPS.min(max_per_dimension).max(1))
 }
 
-/// `[a, b, bx, c, d, by]` with `x_window = a*i + b*j + bx` and
-/// `y_window = c*i + d*j + by` for region pixel `(i, j)`: the map `m` (its
-/// homogeneous scale divided out, as `Transform::map_point` does) taken to
-/// window coordinates, the offset formed in `f64`. `None` for a projective or
-/// degenerate map.
-fn window_map(m: &[[f64; 3]; 3], region: (u32, u32), origin: (u32, u32)) -> Option<[f32; 6]> {
+/// `([a, b, bx, c, d, by], ox, oy)` with `x_window = i + ox + a*i + b*j + bx`
+/// and `y_window = j + oy + c*i + d*j + by` for region pixel `(i, j)`: `m`
+/// taken to window coordinates, `a` and `d` being the linear part minus 1 and
+/// the `f64` offset split into an integer and a fraction in `[0, 1)`. `None`
+/// for a projective or degenerate map, or an offset outside `i32`.
+fn window_map(
+    m: &[[f64; 3]; 3],
+    region: (u32, u32),
+    origin: (u32, u32),
+) -> Option<([f32; 6], i32, i32)> {
     let w = m[2][2];
     if m[2][0] != 0.0 || m[2][1] != 0.0 || w.is_nan() || w <= 0.0 {
         return None;
@@ -298,14 +302,23 @@ fn window_map(m: &[[f64; 3]; 3], region: (u32, u32), origin: (u32, u32)) -> Opti
     let (ox, oy) = (f64::from(origin.0), f64::from(origin.1));
     let bx = (m[0][0] * rx + m[0][1] * ry + m[0][2]) / w - ox;
     let by = (m[1][0] * rx + m[1][1] * ry + m[1][2]) / w - oy;
-    Some([
-        (m[0][0] / w) as f32,
-        (m[0][1] / w) as f32,
-        bx as f32,
-        (m[1][0] / w) as f32,
-        (m[1][1] / w) as f32,
-        by as f32,
-    ])
+    let (ix, iy) = (bx.floor(), by.floor());
+    let range = f64::from(i32::MIN)..=f64::from(i32::MAX);
+    if !range.contains(&ix) || !range.contains(&iy) {
+        return None;
+    }
+    Some((
+        [
+            (m[0][0] / w - 1.0) as f32,
+            (m[0][1] / w) as f32,
+            (bx - ix) as f32,
+            (m[1][0] / w) as f32,
+            (m[1][1] / w - 1.0) as f32,
+            (by - iy) as f32,
+        ],
+        ix as i32,
+        iy as i32,
+    ))
 }
 
 /// An accelerator failure as the driver sees it: a lost device or an
@@ -651,30 +664,77 @@ mod tests {
     use super::{groups_for, window_map};
     use focusforge_core::align::Transform;
 
+    /// The window position the kernel forms from a split map.
+    fn rebuilt(map: &([f32; 6], i32, i32), i: u32, j: u32) -> (f64, f64) {
+        let ([a, b, bx, c, d, by], ox, oy) = *map;
+        let (i, j) = (f64::from(i), f64::from(j));
+        (
+            i + f64::from(ox) + f64::from(a) * i + f64::from(b) * j + f64::from(bx),
+            j + f64::from(oy) + f64::from(c) * i + f64::from(d) * j + f64::from(by),
+        )
+    }
+
     #[test]
-    fn window_map_matches_map_point_when_the_homogeneous_scale_is_not_one() {
+    fn window_map_matches_map_point_at_level_zero_coordinates() {
         // Solved transforms carry m[2][2] a few ulp off 1.0.
-        let mut t = Transform::similarity(1.04, 0.0006, -90.2, -168.1);
-        t.m[2][2] = 0.9999999999999963;
-        let (region, origin) = ((300u32, 200u32), (250u32, 150u32));
-        let [a, b, bx, c, d, by] = window_map(&t.m, region, origin).expect("affine");
-        for (i, j) in [(0u32, 0u32), (1252, 835), (600, 400)] {
-            let (sx, sy) = t
-                .map_point(f64::from(region.0 + i), f64::from(region.1 + j))
-                .expect("maps");
-            let lx = f64::from(a) * f64::from(i) + f64::from(b) * f64::from(j) + f64::from(bx);
-            let ly = f64::from(c) * f64::from(i) + f64::from(d) * f64::from(j) + f64::from(by);
-            assert!(
-                (lx - (sx - f64::from(origin.0))).abs() < 2e-3,
-                "x at {i},{j}"
-            );
-            assert!(
-                (ly - (sy - f64::from(origin.1))).abs() < 2e-3,
-                "y at {i},{j}"
-            );
+        let mut near_one = Transform::similarity(1.04, 0.0006, -90.2, -168.1);
+        near_one.m[2][2] = 0.9999999999999963;
+        // A translation that puts the window origin ahead of the mapped point.
+        let behind = Transform::similarity(0.98, -0.0004, 30.7, 12.3);
+        for (t, region, origin) in [
+            (near_one, (120u32, 90u32), (0u32, 0u32)),
+            (near_one, (300, 200), (250, 150)),
+            (behind, (100, 80), (300, 200)),
+        ] {
+            let map = window_map(&t.m, region, origin).expect("affine");
+            let ([_, _, bx, _, _, by], ox, oy) = map;
+            assert!((0.0..1.0).contains(&bx) && (0.0..1.0).contains(&by));
+            for (i, j) in [(0u32, 0u32), (1252, 835), (2528, 2465), (2528, 0)] {
+                let (sx, sy) = t
+                    .map_point(f64::from(region.0 + i), f64::from(region.1 + j))
+                    .expect("maps");
+                let (lx, ly) = rebuilt(&map, i, j);
+                assert!(
+                    (lx - (sx - f64::from(origin.0))).abs() < 1e-4,
+                    "x at {i},{j}: offset {ox}"
+                );
+                assert!(
+                    (ly - (sy - f64::from(origin.1))).abs() < 1e-4,
+                    "y at {i},{j}: offset {oy}"
+                );
+            }
         }
-        t.m[2][0] = 1e-6;
-        assert!(window_map(&t.m, region, origin).is_none());
+    }
+
+    #[test]
+    fn window_map_floors_a_negative_offset() {
+        let t = Transform::similarity(1.0, 0.0, -2.25, -0.5);
+        let ([_, _, bx, _, _, by], ox, oy) = window_map(&t.m, (0, 0), (0, 0)).expect("affine");
+        assert_eq!((ox, oy), (-3, -1));
+        assert_eq!((bx, by), (0.75, 0.5));
+    }
+
+    #[test]
+    fn window_map_rejects_what_the_kernel_cannot_map() {
+        let (region, origin) = ((300u32, 200u32), (250u32, 150u32));
+        let base = Transform::similarity(1.04, 0.0006, -90.2, -168.1);
+        assert!(window_map(&base.m, region, origin).is_some());
+        let mut projective = base;
+        projective.m[2][0] = 1e-6;
+        assert!(window_map(&projective.m, region, origin).is_none());
+        for scale in [f64::NAN, 0.0, -1.0] {
+            let mut t = base;
+            t.m[2][2] = scale;
+            assert!(window_map(&t.m, region, origin).is_none(), "scale {scale}");
+        }
+        for offset in [3.0e9, -3.0e9, f64::NAN, f64::INFINITY] {
+            let mut t = base;
+            t.m[0][2] = offset;
+            assert!(window_map(&t.m, region, origin).is_none(), "x {offset}");
+            let mut t = base;
+            t.m[1][2] = offset;
+            assert!(window_map(&t.m, region, origin).is_none(), "y {offset}");
+        }
     }
 
     #[test]

@@ -164,9 +164,9 @@ While the question is up, the rest of the window does not react.
   colour, which FocusForge widens to its 16-bit range.
 - **Compressed TIFF** files (LZW or Deflate, in strips or tiles, either byte
   order) open and fuse like uncompressed ones, and so do 8-bit TIFF files.
-  Uncompressed 16-bit TIFFs are read fastest;
-  [The TIFF fast path](../reference/tiff-fast-path.md) explains why. A TIFF
-  compressed with JPEG (`Compression=7`) is not read.
+  Uncompressed 16-bit TIFFs open fastest. A TIFF compressed with JPEG
+  (`Compression=7`) is not read. See
+  [Choose a file format](../stacking/shooting-practice.md#choose-a-file-format).
 - **One file** opens as a one-frame project named after the file (`00.tif`
   gives a tab named `00`). The frame list reads "1 frame · 0 excluded" and
   **Fuse stack** is greyed out, so you can look at a frame or check how it is
@@ -254,7 +254,9 @@ message says why:
 Click **Close** or press `Escape`. If you still have the frames, open their
 folder and fuse again: that makes a new project. A project written by an
 older FocusForge that lacks records the current version needs is refused
-the same way, and re-fusing its frames makes a current project.
+the same way, and re-fusing its frames makes a current project. A RAW
+project saved by an older FocusForge, which kept a clipped result, shows the
+"damaged" message too; open the RAW frames and fuse again.
 
 ## Damaged or moved projects
 
@@ -334,7 +336,7 @@ With the frames open:
 3. Watch the bottom bar. The window stays fully usable while the stack is
    being fused.
 
-![The window during a fuse: the toolbar shows Pause and Cancel, the tab carries a play mark, the Composite pane shows the card "Preparing frames", and the bottom bar shows the current stage (Aligning), the frames done (1 of 8), a progress bar and the estimated time remaining.](../assets/manual/first-stack/fuse-running.png)
+![The window during a fuse: the toolbar shows Pause and Cancel, the tab carries a play mark, the Frame pane shows 00.tif and the Composite pane shows the card "Preparing frames", and the bottom bar shows the current stage (Aligning), the frames done (1 of 8) and a progress bar.](../assets/manual/first-stack/fuse-running.png)
 
 *A fuse in progress.*
 
@@ -352,19 +354,12 @@ shows what the run is doing:
 | **Writing** | Stores the finished result | — |
 
 For a camera RAW stack the bar reads **Developing** first, with the number of
-frames developed and the same time remaining. Each RAW frame is developed
-once, before the other stages, and they reuse the result.
-
-Next to the progress bar, the time remaining reads "estimating" until
-FocusForge has enough to go on, then "ETA 1:12" (minutes and seconds). Time
-spent paused is left out of the estimate. A stage is skipped when its
-setting is off; [Stacking settings](stacking.md) and
+frames developed; the other stages reuse the developed frames. A stage is
+skipped when its setting is off; [Stacking settings](stacking.md) and
 [Alignment](alignment.md) say which.
 
-> **Tip:** You can pan, zoom and look at frames while a fuse runs. While you
-> do, the fuse holds back to a quarter of your computer's processor threads
-> so the view stays smooth, and goes back to full speed a quarter of a second
-> after you stop.
+> **Tip:** You can pan, zoom and look at frames while a fuse runs. The fuse
+> slows down a little while you do, so the view stays smooth.
 
 ## Keep or discard the result
 
@@ -422,8 +417,7 @@ You can stop a running fuse at any time from the toolbar.
 *A paused fuse: **Resume** takes the place of **Pause**.*
 
 - **Pause** holds the run at the next frame or step it finishes. The button
-  turns into **Resume**, the bottom bar reads "Paused" and the time remaining
-  reads "ETA —". A paused run keeps everything it has done so far.
+  turns into **Resume**, the bottom bar reads "Paused". A paused run keeps everything it has done so far.
 - **Resume** carries on where the run stopped.
 - **Cancel** stops the run, paused or not. A greyed-out **Cancelling…**
   button shows for a moment, then **Fuse stack** comes back. Nothing is
@@ -457,7 +451,7 @@ one lets the next in line start.
 A fuse can fail, for example when a frame's file is damaged. The run then
 stops and says so:
 
-![The window after a failed fuse: the toolbar shows Retry, the bottom bar reads Failed in red with "ETA —", the bell in the left bar shows the number 1, and the frame 02.tif in the Images list reads "Preview unavailable".](../assets/manual/first-stack/fuse-failed.png)
+![The window after a failed fuse: the toolbar shows Retry, the bottom bar reads Failed in red, the bell in the left bar shows the number 1, and the frame 02.tif in the Images list reads "Preview unavailable".](../assets/manual/first-stack/fuse-failed.png)
 
 *A fuse that failed because one frame's file is cut short.*
 
@@ -469,7 +463,7 @@ stops and says so:
   with a sentence naming the unreadable file, for example "02.tif could not
   be read. It may be damaged, or it changed after the folder was opened.",
   followed by the reason on the next line. The project's card reads, for
-  example, "FAILED WHILE PREPARING". The notification
+  example, "FAILED WHILE ALIGNING". The notification
   shows as a short pop-up message while the window is in front, and stays in
   the notification center behind the bell, where its full message names the
   file and the reason.

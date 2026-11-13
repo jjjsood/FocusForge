@@ -16,12 +16,20 @@ use focusforge_core::algorithm::StackAlgorithm;
 use focusforge_core::align::ReferencePolicy;
 use focusforge_core::equalize::{EqualizationReport, EqualizeSettings};
 use focusforge_core::gpu::{AlignBackend, TileBackend};
-use focusforge_core::io::{FrameReader, Group, Proposal, Rect, open_frame_set, propose};
+use focusforge_core::io::{
+    DevelopStore, FrameReader, Group, Proposal, Rect, open_frame_set, propose,
+    source_bits_per_sample,
+};
+use focusforge_core::job::prediction::{RawSource, RunPrediction, predict_run};
 use focusforge_core::job::{JobControl, StageCache};
 use focusforge_core::params::{self, ParamValue, ParamValues, Provenance};
+use focusforge_core::pipeline::{
+    FuseTileTiming, RunPlanFeatures, develop_tile_share, host_workers,
+};
 use focusforge_core::project::{self, PROJECT_EXTENSION};
 use focusforge_core::registry;
-use focusforge_core::tile::{TileScheduler, TileSchedulerOptions};
+use focusforge_core::tile::{InFlightBound, TileScheduler, TileSchedulerOptions};
+use focusforge_core::timing::{TimingSnapshot, timing_snapshot};
 use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
 use serde::Serialize;
 
@@ -56,6 +64,17 @@ pub struct StackReport {
     pub tiles: usize,
     pub frame_tiles_read: usize,
     pub in_flight_limit: usize,
+    /// The term that set `in_flight_limit` before its floor of 1:
+    /// `host_budget` (the memory budget, also when it holds no whole tile or
+    /// ties the thread count) or `thread_cap` (the pool's thread count).
+    pub in_flight_bound: InFlightBound,
+    /// The width, in tile columns, of the vertical bands tiles were admitted
+    /// in; `null` when they were admitted in plan order.
+    pub band_columns: Option<usize>,
+    /// The file-cache bytes one tile's reads kept hot across all frames,
+    /// which sized `band_columns`; `null` when the reader reported none
+    /// (TIFF, JPEG, or RAW frames developed into memory).
+    pub page_cache_bytes_per_tile: Option<u64>,
     /// This group's *configured* host in-flight-tile limit (`in_flight_limit`,
     /// above), not a measured peak: `Job::run` does not expose the
     /// scheduler's per-segment `TileRunReport`. `device_peak_in_flight` is
@@ -63,6 +82,9 @@ pub struct StackReport {
     pub peak_in_flight: usize,
     /// The host in-flight-byte budget actually in force for this run.
     pub max_bytes_in_flight: u64,
+    /// Where the RAW frames were developed to: `memory` or `scratch_file`;
+    /// `null` for input that is not developed.
+    pub developed_store: Option<DevelopStore>,
     /// The bytes the scheduler accounted for at its in-flight limit
     /// (`in_flight_limit` tiles, reader scratch included): the figure
     /// compared with `max_bytes_in_flight`, never with resident memory.
@@ -124,6 +146,21 @@ pub struct StackReport {
     /// Full-frame RAW develops per frame, in frame order, across every stage
     /// of this group; `null` for TIFF and JPEG stacks.
     pub develop_counts: Option<Vec<u64>>,
+    /// The run-plan inputs, known before the first stage: frame count and
+    /// pixels, source bit depth, reader (the input format), planned backend,
+    /// worker count, blend method. `align_cache_hit` and `resumed_units`
+    /// carry what the run resolved, not the cold values a dry run reports.
+    pub run_plan: RunPlanFeatures,
+    /// The bounded trace-accounting counters, `null` unless accounting was on
+    /// (`--trace-accounting`). They are process-wide and cumulative: in a
+    /// multi-group run each group's document holds the totals at the end of
+    /// that group, earlier groups included.
+    pub trace_accounting: Option<TimingSnapshot>,
+    /// Every tile this run fused, by plan index, with its read and output
+    /// pixels, whether it touches the frame edge and its wall duration;
+    /// `null` unless trace accounting was on. A resumed run lists only the
+    /// tiles it fused.
+    pub fuse_tiles: Option<Vec<FuseTileTiming>>,
     /// How this run's `align` stage was satisfied: `"computed"` (a real
     /// `align_stack` solve), `"cached"` (the stage cache),
     /// `"resumed"` (a `--resume` ledger peek), or `"skipped"`
@@ -133,13 +170,13 @@ pub struct StackReport {
     /// -- so this field, not that one, is what a later run compares before
     /// reading a stage number as a real cost.
     pub align_source: String,
-    /// The anchor arm's worker bound and the peak it actually reached --
+    /// The alignment worker bound and the peak it actually reached --
     /// `None` unless the alignment was computed this run.
     pub align_workers: Option<usize>,
     pub peak_align_workers: Option<usize>,
-    /// The bytes the alignment accounted for (shared reference data plus one
-    /// registration per worker) -- `None` unless the alignment was computed
-    /// this run.
+    /// The bytes the alignment accounted for: for an anchor run the shared
+    /// reference data plus one registration per worker, for a chain run one
+    /// hop per worker -- `None` unless the alignment was computed this run.
     pub align_accounted_bytes: Option<u64>,
     /// `"cpu"`, or the adapter's display when at least one alignment level
     /// ran on it -- `null` unless the alignment was computed this run.
@@ -264,8 +301,26 @@ pub struct DryRunPlan {
     pub margin: u32,
     pub tiles: usize,
     pub in_flight_limit: usize,
-    /// Host bytes available to the tile scheduler after input caching.
+    /// The term that set `in_flight_limit`, as in the run report.
+    pub in_flight_bound: InFlightBound,
+    /// The file-cache bytes one tile's reads would keep hot across all
+    /// frames, as in the run report; `null` for input without one and when
+    /// `developed_store` is `memory`. With alignment the run's figure can be
+    /// larger than this unwarped one.
+    pub page_cache_bytes_per_tile: Option<u64>,
+    /// Host bytes available to the tile scheduler after input caching and any
+    /// frames kept in memory.
     pub max_bytes_in_flight: u64,
+    /// Where the RAW frames would be developed to: `memory` or `scratch_file`;
+    /// `null` for input that is not developed.
+    pub developed_store: Option<DevelopStore>,
+    /// The run-plan inputs as a cold run would start: no alignment cache hit,
+    /// nothing resumed.
+    pub run_plan: RunPlanFeatures,
+    /// Seconds on the reference machine for a cold run; a stage the plan does
+    /// not enter is `null`, and `calibrated` says whether the input matches
+    /// a measured class. `null` when the stack has no frames or pixels.
+    pub prediction: Option<RunPrediction>,
     pub backend: String,
     /// The paths this invocation *would* write. None of them exists.
     pub would_write: Vec<String>,
@@ -973,7 +1028,10 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     let _stack = tracing::debug_span!("stack", identity = %identity).entered();
     // Inside the span, so a forced crash carries this run's own context.
     focusforge_diagnostics::force_crash("stack");
-    let renderer = ProgressRenderer::new(ProgressMode::choose(job_opts.no_progress));
+    let renderer = ProgressRenderer::new(
+        ProgressMode::choose(job_opts.no_progress),
+        job_opts.show_eta,
+    );
     let status = StatusSink::new(preset_opts.status, identity, "stack");
     status.set_algorithm(algo.id());
 
@@ -1026,6 +1084,20 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         Ok(resolved) => resolved,
         Err(err) => return failed(&status, start, err),
     };
+    let source_bits = match source_bits_per_sample(opened.kind, &paths[0]) {
+        Ok(bits) => bits,
+        Err(err) => return failed(&status, start, err),
+    };
+    // The CLI sets no worker cap on its jobs.
+    let run_plan = RunPlanFeatures::new(
+        &stack_ctx,
+        opened.kind,
+        source_bits,
+        backend.is_some(),
+        align_choice.backend.is_some(),
+        algo.id(),
+        usize::MAX,
+    );
 
     // Resolving the alignment algorithm and its parameters is pure --
     // registry lookup, `--align-set`/`[align]` validation, `auto`
@@ -1101,13 +1173,40 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     // created anywhere. `TileScheduler::new` is pure: it builds a `TilePlan`
     // and divides the byte budget, touching no file.
     if preset_opts.dry_run {
-        let support = algo.tile_support(&params::resolved_values(&resolved));
+        let values = params::resolved_values(&resolved);
+        let support = algo.tile_support(&values);
         let mut options = TileSchedulerOptions::new(".scratch");
         options.apply_support(support);
+        options.working_bytes_per_pixel =
+            algo.working_bytes_per_pixel(&values, spp, frame_reader.sample_format());
         if let Some(tile_size) = job_opts.tile_size {
             options.tile_size = tile_size;
         }
-        options.budget = opened.scheduler_budget;
+        // A developed stack's scheduler keeps the whole budget less any frames
+        // held in memory, as in the run.
+        let developed_bytes = match frame_reader.develop_scratch_bytes() {
+            Ok(bytes) => bytes,
+            Err(err) => return failed(&status, start, err),
+        };
+        let workers = host_workers(frame_reader.len(), usize::MAX);
+        let share = develop_tile_share(
+            &options,
+            frame_reader,
+            (width, height),
+            spp,
+            align_prepared.is_some(),
+            backend.is_some(),
+        );
+        let developed_store = match frame_reader.develop_store(preflight_budget, workers, share) {
+            Ok(store) => store,
+            Err(err) => return failed(&status, start, err),
+        };
+        let scheduler_budget = match developed_store {
+            Some(DevelopStore::Memory) => preflight_budget.reduced_by(developed_bytes),
+            Some(DevelopStore::ScratchFile) => preflight_budget,
+            None => opened.scheduler_budget,
+        };
+        options.budget = scheduler_budget;
         let scheduler = match TileScheduler::new(frame_reader, stack_ctx, spp, &options) {
             Ok(scheduler) => scheduler,
             Err(err) => return failed(&status, start, err),
@@ -1115,6 +1214,12 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         let geometry = scheduler.plan();
         // One project, and nothing else: a run writes no image at all.
         let would_write = vec![output.display().to_string()];
+        let raw = developed_store.zip(paths[0].extension().and_then(|ext| ext.to_str()));
+        let prediction = predict_run(
+            &run_plan,
+            align_prepared.is_some(),
+            raw.map(|(store, extension)| RawSource { extension, store }),
+        );
         let plan = DryRunPlan {
             dry_run: true,
             input: dir.display().to_string(),
@@ -1144,7 +1249,15 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
             margin: geometry.margin(),
             tiles: geometry.tiles().len(),
             in_flight_limit: scheduler.in_flight_limit(),
-            max_bytes_in_flight: opened.scheduler_budget.bytes(),
+            in_flight_bound: scheduler.in_flight_bound(),
+            page_cache_bytes_per_tile: match developed_store {
+                Some(DevelopStore::Memory) => None,
+                _ => scheduler.page_cache_bytes_per_tile(),
+            },
+            max_bytes_in_flight: scheduler_budget.bytes(),
+            developed_store,
+            run_plan,
+            prediction,
             backend: backend
                 .map(|b| b.info().to_string())
                 .unwrap_or_else(|| "cpu".to_string()),
@@ -1153,6 +1266,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                 "crop".to_string(),
                 "output_width".to_string(),
                 "output_height".to_string(),
+                "alignment cache".to_string(),
             ],
         };
         status.dry_run(&plan.would_write);
@@ -1268,6 +1382,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                 device_peak,
                 align_opts,
                 align_choice,
+                run_plan,
                 *report,
             );
             GroupResult::Completed(Box::new(stack_report))
@@ -1319,10 +1434,9 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
                 frames,
                 source: AlignSource::Computed,
             } => renderer.stage(&format!("align {frames} frames")),
-            // A fuse-stage entry line, unconditional and immediate (`eta
-            // --`, since no unit has finished yet): it gives a script or a
-            // human watching a redirected log a fact the instant the job
-            // starts.
+            // A fuse-stage entry line, unconditional and immediate, carrying
+            // the whole run's remaining time: it gives a script or a human
+            // watching a redirected log a fact the instant the job starts.
             RunStage::Fuse => renderer.start(&self.control.progress()),
             RunStage::Seal => renderer.stage("seal project"),
             // The completion line's exact wording is what `job_cli.rs`
@@ -1406,6 +1520,7 @@ fn build_stack_report(
     device_peak: Option<&'static dyn DevicePeak>,
     align_opts: &AlignOptions<'_>,
     align_choice: &AlignBackendChoice,
+    run_plan: RunPlanFeatures,
     report: focusforge_core::pipeline::FuseReport,
 ) -> StackReport {
     let outputs = vec![sealed_path(&report)];
@@ -1467,6 +1582,9 @@ fn build_stack_report(
         tiles: report.tiles,
         frame_tiles_read: report.frame_tiles_read,
         in_flight_limit: report.in_flight_limit,
+        in_flight_bound: report.in_flight_bound,
+        band_columns: report.band_columns,
+        page_cache_bytes_per_tile: report.page_cache_bytes_per_tile,
         // `Job::run` does not expose the per-segment `TileRunReport`
         // `TileScheduler::run` returns, so the true observed peak
         // concurrency is not available through this engine. The configured
@@ -1475,6 +1593,7 @@ fn build_stack_report(
         // concurrency.
         peak_in_flight: report.in_flight_limit,
         max_bytes_in_flight: report.max_bytes_in_flight,
+        developed_store: report.developed_store,
         accounted_bytes_in_flight: report.accounted_bytes_in_flight,
         budget_provenance: report.budget_provenance,
         backed_off: report.backed_off,
@@ -1494,6 +1613,13 @@ fn build_stack_report(
         align_cached: report.align_cached,
         stages: report.stages,
         develop_counts: report.develop_counts,
+        run_plan: RunPlanFeatures {
+            align_cache_hit: report.align_cached,
+            resumed_units: report.resumed_units,
+            ..run_plan
+        },
+        trace_accounting: timing_snapshot(),
+        fuse_tiles: report.fuse_tiles,
         align_source: report.align_source,
         align_workers: report.align_workers,
         peak_align_workers: report.peak_align_workers,
@@ -1566,10 +1692,14 @@ fn render(report: &StackReport) -> String {
         format!("{} - {}", report.algorithm, report.display_name),
     ];
     lines.extend(report.params.iter().map(param_line));
-    lines.push(format!(
+    let mut tile_line = format!(
         "tile_size={} levels={} margin={} tiles={} in_flight_limit={}",
         report.tile_size, report.levels, report.margin, report.tiles, report.in_flight_limit,
-    ));
+    );
+    if let Some(columns) = report.band_columns {
+        tile_line.push_str(&format!(" band_columns={columns}"));
+    }
+    lines.push(tile_line);
     lines.push(format!(
         "max_bytes_in_flight={} accounted_bytes_in_flight={} budget={:?} backed_off={}",
         report.max_bytes_in_flight,
@@ -1698,6 +1828,17 @@ fn render_plan(plan: &DryRunPlan) -> String {
     for output in &plan.would_write {
         lines.push(format!("would write: {output}"));
     }
+    lines.push(match &plan.prediction {
+        Some(p) if p.calibrated => format!(
+            "predicted duration: {:.1} s (estimate for the reference machine, cold run)",
+            p.total_seconds
+        ),
+        Some(p) => format!(
+            "predicted duration: ~{:.1} s (not calibrated for this input)",
+            p.total_seconds
+        ),
+        None => "predicted duration: unknown".to_string(),
+    });
     lines.push("crop: not computed -- --dry-run stops before alignment".to_string());
     lines.push("output size: not computed -- it follows from the crop".to_string());
     lines.join("\n")
@@ -1731,8 +1872,12 @@ mod tests {
             tiles: 4,
             frame_tiles_read: 32,
             in_flight_limit: 5,
+            in_flight_bound: InFlightBound::ThreadCap,
+            band_columns: Some(3),
+            page_cache_bytes_per_tile: Some(1 << 20),
             peak_in_flight: 4,
             max_bytes_in_flight: 1 << 30,
+            developed_store: None,
             accounted_bytes_in_flight: 1 << 29,
             budget_provenance: Provenance::Host,
             backed_off: false,
@@ -1759,6 +1904,17 @@ mod tests {
                 finalize: Some(0.038),
             },
             develop_counts: None,
+            run_plan: RunPlanFeatures::new(
+                &focusforge_core::params::StackContext::new(8, 512, 512, 3),
+                focusforge_core::io::ReaderKind::Mmap,
+                16,
+                false,
+                false,
+                "example-stack",
+                usize::MAX,
+            ),
+            trace_accounting: None,
+            fuse_tiles: None,
             align_source: "computed".to_string(),
             align_workers: Some(3),
             peak_align_workers: Some(3),
@@ -1783,6 +1939,7 @@ mod tests {
             "margin=96",
             "tiles=4",
             "in_flight_limit=5",
+            "band_columns=3",
             "max_bytes_in_flight=1073741824",
             "accounted_bytes_in_flight=536870912",
             "budget=Host",
