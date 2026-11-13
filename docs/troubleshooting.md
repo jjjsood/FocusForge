@@ -237,8 +237,6 @@ see
    or `--max-host-memory` on the command line.
 3. For camera RAW or JPEG frames, convert them to TIFF, which needs the least.
 
-The [free RAM table](memory-needs.md) lists what each kind of frame needs.
-
 ### "Keep this fused result?"
 
 > 00.tif and 02.tif could not be aligned and were fused as they are.
@@ -721,7 +719,8 @@ and [Using the GPU](guide/stacking.md#using-the-gpu).
 
 There is no practical limit on the number of frames, and more frames take
 longer rather than more memory. What a stack needs depends on the kind of
-frames and their size: see the [free RAM table](memory-needs.md). To keep
+frames and their size, see
+[What your computer needs](getting-started.md#what-your-computer-needs). To keep
 memory free for other programs, set a lower limit under **Host memory** (see
 [Limit the memory a fuse may use](guide/settings-window.md#limit-the-memory-a-fuse-may-use)).
 How many frames a subject needs is worked out in

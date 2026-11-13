@@ -16,8 +16,7 @@ in the repository.
   memory installed. Plan on about 4 GB free for a stack of TIFF files, 5 GB
   for JPEG, 8 GB for camera RAW from a 24 to 26 megapixel camera and 15 GB
   for camera RAW from a 45 to 61 megapixel one. The number of frames hardly
-  matters. A run can start on less; the
-  [free RAM table](memory-needs.md) gives both figures for each kind of frame.
+  matters.
 - **Graphics card.** Optional. FocusForge uses one when it finds one and gives
   the same result without, only more slowly (see
   [Machines without a GPU](#machines-without-a-gpu)).

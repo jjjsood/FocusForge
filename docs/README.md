@@ -37,11 +37,9 @@ projects, and the settings window.
 what each one means and what to do about it, and a
 [glossary](glossary.md) of the terms the manual uses.
 
-**[Appendix](memory-needs.md)** holds the table of free RAM each kind of frame
-needs, then the reference material: every command and option of
-`focusforge-cli` for scripting the same steps from a terminal, batch runs from
-the command line, and the formats of the project file and of the TIFF files
-FocusForge reads and writes.
+**[Appendix](reference/cli.md)** holds the reference material: every command
+and option of `focusforge-cli` for scripting the same steps from a terminal,
+and batch runs from the command line.
 
 ## The quickest way in
 

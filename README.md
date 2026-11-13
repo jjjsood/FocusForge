@@ -70,7 +70,7 @@ Windows: run the matching `.msi` from [Releases](https://github.com/jjjsood/Focu
 
 What a run needs depends on the kind and size of the frames, not on how many there are, and it is the **free** RAM that counts: about 4 GB for TIFF, 5 GB for JPEG, 8 to 15 GB for camera RAW. A graphics card is optional and the result is the same without one.
 
-The [installation chapter](docs/getting-started.md#what-your-computer-needs) lists what else a computer needs, and [Free RAM per kind of frame](docs/memory-needs.md) gives the figures for each kind of frame.
+The [installation chapter](docs/getting-started.md#what-your-computer-needs) lists what else a computer needs.
 
 ## Quick start
 

@@ -30,6 +30,5 @@
 
 # Appendix
 
-- [Free RAM per kind of frame](memory-needs.md)
 - [Command-line reference](reference/cli.md)
 - [Batch runs from the command line](reference/batch-runs.md)
