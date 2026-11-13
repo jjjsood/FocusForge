@@ -1678,8 +1678,8 @@ impl ProjectTab {
 
     /// The checkpoints rendered as brush sources: with a session, the chosen
     /// one and every one a stroke of the session paints from, base ops
-    /// included; with none, every one a stroke the open origin readers decide
-    /// paints from.
+    /// included; with none, every one a stroke of the row's ops paints from,
+    /// once the origin readers are open.
     fn wanted_sources(&self) -> BTreeSet<String> {
         let Some(edit) = &self.edit else {
             if self.origin.is_none() {
