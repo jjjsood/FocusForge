@@ -29,6 +29,9 @@ pub struct JobOptions {
     /// suspects the cache, so leaving a fresh entry behind would be a
     /// surprise.
     pub cache: bool,
+    /// Stage lines end in the remaining-time estimate; read from
+    /// `FOCUSFORGE_SHOW_ETA` once, in `main`.
+    pub show_eta: bool,
 }
 
 /// `<argv> --resume`, verbatim, minus any `--resume` already present --

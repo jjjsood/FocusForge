@@ -25,11 +25,12 @@ use std::process::{Child, Command, Stdio};
 use common::{CliOutput, bin, export_composite, mantis_512_dir, read_pixels, tmp_dir};
 
 fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
-    common::run_in(&mut bin(), dir, args)
+    common::run_in(bin().env("FOCUSFORGE_SHOW_ETA", "1"), dir, args)
 }
 
 fn spawn_piped(dir: &Path, args: &[&str]) -> Child {
     bin()
+        .env("FOCUSFORGE_SHOW_ETA", "1")
         .args(args)
         .current_dir(dir)
         .stdout(Stdio::piped())
@@ -154,6 +155,82 @@ fn interruptible_stack_args<'a>(dir: &'a str, output: &'a str) -> Vec<&'a str> {
         args.push("--cpu");
     }
     args
+}
+
+/// Every stderr line that counts frames or tiles of a stage.
+fn count_lines(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter(|line| {
+            let counts_frames = ["develop ", "prepare ", "align "].iter().any(|stage| {
+                line.starts_with(stage) && line.contains("/") && line.contains(" frames")
+            });
+            counts_frames || (line.starts_with("fuse ") && line.contains(" tiles"))
+        })
+        .collect()
+}
+
+#[test]
+fn stage_lines_carry_no_eta_unless_the_eta_display_is_on() {
+    let dir = tmp_dir("job_cli_eta_display");
+    let frames = common::fixtures_dir().join("mantis-64");
+    let args = common::push_no_gpu(vec![
+        "stack",
+        frames.to_str().unwrap(),
+        "-o",
+        dir.to_str().unwrap(),
+        "--algorithm",
+        "laplacian",
+        "--align-algorithm",
+        "dummy-align",
+        "--set",
+        "equalize=true",
+    ]);
+
+    let off = common::run_in(bin().env_remove("FOCUSFORGE_SHOW_ETA"), &dir, &args);
+    assert!(off.success, "stderr: {}", off.stderr);
+    assert!(!off.stderr.contains(" eta "), "display off: {}", off.stderr);
+    let counts = count_lines(&off.stderr);
+    assert!(
+        counts.iter().any(|line| line.starts_with("prepare 0/")),
+        "no `prepare 0/N frames` line: {}",
+        off.stderr
+    );
+    assert!(
+        counts.iter().any(|line| line.starts_with("fuse ")),
+        "no fuse count line: {}",
+        off.stderr
+    );
+    for line in &counts {
+        let ends_at_count = line.ends_with(" frames") || line.ends_with('%');
+        assert!(ends_at_count, "line does not end at its count: {line:?}");
+    }
+
+    let on = common::run_in(bin().env("FOCUSFORGE_SHOW_ETA", "1"), &dir, &args);
+    assert!(on.success, "stderr: {}", on.stderr);
+    let counts = count_lines(&on.stderr);
+    assert!(!counts.is_empty(), "no count lines: {}", on.stderr);
+    let mut numeric = 0;
+    for line in &counts {
+        let (_, token) = line
+            .rsplit_once(" eta ")
+            .unwrap_or_else(|| panic!("count line without an eta token: {line:?}"));
+        let is_clock = token.split_once(':').is_some_and(|(minutes, seconds)| {
+            !minutes.is_empty()
+                && minutes.bytes().all(|b| b.is_ascii_digit())
+                && seconds.len() == 2
+                && seconds.bytes().all(|b| b.is_ascii_digit())
+        });
+        let is_seconds = token
+            .strip_suffix('s')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        assert!(
+            matches!(token, "--" | "<1s") || is_seconds || is_clock,
+            "unknown eta token in {line:?}"
+        );
+        numeric += usize::from(token != "--");
+    }
+    assert!(numeric > 0, "every token read `--`: {}", on.stderr);
 }
 
 #[test]

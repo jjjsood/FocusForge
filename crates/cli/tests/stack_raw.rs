@@ -37,6 +37,7 @@ fn without_date_time(mut tiff: Vec<u8>) -> Vec<u8> {
 
 fn run(dir: &std::path::Path, args: &[String]) -> std::process::Output {
     common::cli_bin("stack_raw")
+        .env("FOCUSFORGE_SHOW_ETA", "1")
         .current_dir(dir)
         .args(args)
         .output()
