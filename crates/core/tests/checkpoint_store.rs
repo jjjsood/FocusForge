@@ -16,7 +16,8 @@ use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::export::{ExportOptions, MetadataOptions};
 use focusforge_core::project::{
-    self, AppendRequest, BrushMode, Metrics, Op, Point, Project, ProjectError, SealRequest,
+    self, AppendRequest, BrushMode, InMemoryCheckpoint, InMemoryKind, Metrics, Op, ParentRef,
+    Point, Project, ProjectError, SealRequest, StrokeSource,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 
@@ -192,8 +193,12 @@ fn sealed(name: &str, w: u32, h: u32, frames: u32) -> (PathBuf, PathBuf) {
 }
 
 fn stroke(source_id: u16, x: i32, y: i32, radius: f32) -> Op {
+    Op::frame_stroke(source_id, vec![Point { x, y }], radius, 0.0)
+}
+
+fn checkpoint_stroke(source: &str, x: i32, y: i32, radius: f32) -> Op {
     Op::BrushStroke {
-        source_id,
+        source: StrokeSource::Checkpoint(source.to_string()),
         path: vec![Point { x, y }],
         radius,
         softness: 0.0,
@@ -1203,4 +1208,191 @@ fn hidden_checkpoints_survive_a_reopen() {
         e.to_string().contains(&format!("checkpoints/{child}.json")),
         "the refusal must name the checkpoint file: {e}"
     );
+}
+
+/// A checkpoint of frame strokes on `parent`, returning its id.
+fn branch(project_path: &Path, parent: &str, ops: Vec<Op>, created_at: i64) -> String {
+    project::append_ops_onto(project_path, parent, ops, None, created_at)
+        .unwrap()
+        .checkpoint
+}
+
+fn render_bytes(project_path: &Path, id: &str, out: &Path) -> Vec<u8> {
+    let mut project = Project::open(project_path).unwrap();
+    project::render_checkpoint(&mut project, id, out, None).unwrap();
+    std::fs::read(out).unwrap()
+}
+
+fn is_hidden(project_path: &Path, id: &str) -> bool {
+    Project::open(project_path)
+        .unwrap()
+        .history()
+        .get(id)
+        .unwrap()
+        .hidden
+}
+
+/// Root R; P = a frame stroke on R; A = a frame stroke on P; X paints from A
+/// on R. Returns `(dir, project, R, P, A, X)`.
+fn used_source_layout(name: &str) -> (PathBuf, PathBuf, String, String, String, String) {
+    let (dir, path) = sealed(name, 48, 32, 6);
+    let root = root_id_of(&path);
+    let p = branch(&path, &root, vec![stroke(1, 10, 10, 6.0)], 1_700_000_001);
+    let a = branch(&path, &p, vec![stroke(2, 24, 16, 6.0)], 1_700_000_002);
+    let x = branch(
+        &path,
+        &root,
+        vec![checkpoint_stroke(&a, 20, 14, 8.0)],
+        1_700_000_003,
+    );
+    (dir, path, root, p, a, x)
+}
+
+#[test]
+fn used_source_kept_with_ancestors() {
+    let (dir, path, _root, p, a, x) = used_source_layout("checkpoint_store_used_kept");
+    let rendered_before = render_bytes(&path, &x, &dir.join("before.tif"));
+    let names_before = archive_entry_names(&path);
+
+    assert!(
+        project::delete_checkpoint(&path, &p)
+            .unwrap()
+            .removed
+            .is_empty()
+    );
+    let deleted = project::delete_checkpoint(&path, &a).unwrap();
+    assert_eq!(deleted.hidden, a);
+    assert!(deleted.removed.is_empty(), "removed: {:?}", deleted.removed);
+
+    assert!(is_hidden(&path, &a));
+    assert!(is_hidden(&path, &p));
+    let names_after = archive_entry_names(&path);
+    assert!(
+        names_before.is_subset(&names_after),
+        "dropped: {:?}",
+        names_before.difference(&names_after).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        rendered_before,
+        render_bytes(&path, &x, &dir.join("after.tif"))
+    );
+}
+
+#[test]
+fn used_source_survives_compact() {
+    let (dir, path, root, p, a, x) = used_source_layout("checkpoint_store_used_compact");
+    let leaf = branch(&path, &root, vec![stroke(1, 30, 8, 2.0)], 1_700_000_004);
+    project::delete_checkpoint(&path, &p).unwrap();
+    project::delete_checkpoint(&path, &a).unwrap();
+    let deleted = project::delete_checkpoint(&path, &leaf).unwrap();
+    assert_eq!(deleted.removed, vec![leaf.clone()]);
+
+    let rendered_before = render_bytes(&path, &x, &dir.join("before.tif"));
+    let record = |id: &str| read_entry_bytes(&path, &format!("checkpoints/{id}.json"));
+    let (p_bytes, a_bytes) = (record(&p), record(&a));
+
+    assert!(project::container::compact(&path).unwrap() > 0);
+
+    assert_eq!(record(&p), p_bytes);
+    assert_eq!(record(&a), a_bytes);
+    assert!(!archive_entry_names(&path).contains(&format!("checkpoints/{leaf}.json")));
+    assert_eq!(
+        rendered_before,
+        render_bytes(&path, &x, &dir.join("after.tif"))
+    );
+}
+
+#[test]
+fn used_source_released() {
+    let (_dir, path) = sealed("checkpoint_store_used_released", 48, 32, 6);
+    let root = root_id_of(&path);
+    let a = branch(&path, &root, vec![stroke(1, 10, 10, 6.0)], 1_700_000_001);
+    let b = branch(
+        &path,
+        &root,
+        vec![checkpoint_stroke(&a, 20, 14, 6.0)],
+        1_700_000_002,
+    );
+    let c = branch(
+        &path,
+        &root,
+        vec![checkpoint_stroke(&b, 22, 16, 6.0)],
+        1_700_000_003,
+    );
+
+    assert!(
+        project::delete_checkpoint(&path, &a)
+            .unwrap()
+            .removed
+            .is_empty()
+    );
+    assert!(
+        project::delete_checkpoint(&path, &b)
+            .unwrap()
+            .removed
+            .is_empty()
+    );
+    assert!(is_hidden(&path, &a) && is_hidden(&path, &b));
+
+    let deleted = project::delete_checkpoint(&path, &c).unwrap();
+    assert_eq!(deleted.strokes_using, 0);
+    let removed: HashSet<String> = deleted.removed.into_iter().collect();
+    assert_eq!(removed, HashSet::from([a.clone(), b.clone(), c.clone()]));
+    let project = Project::open(&path).unwrap();
+    for id in [&a, &b, &c] {
+        assert!(project.history().get(id).is_err(), "{id} is still listed");
+    }
+}
+
+#[test]
+fn strokes_using_counts_every_stored_stroke_of_the_source() {
+    let (_dir, path) = sealed("checkpoint_store_strokes_using", 48, 32, 6);
+    let root = root_id_of(&path);
+    let a = branch(&path, &root, vec![stroke(1, 10, 10, 6.0)], 1_700_000_001);
+    let b = branch(&path, &root, vec![stroke(2, 30, 8, 3.0)], 1_700_000_002);
+    let c = branch(&path, &root, vec![stroke(1, 5, 5, 2.0)], 1_700_000_003);
+    let x = [
+        checkpoint_stroke(&a, 20, 14, 5.0),
+        checkpoint_stroke(&a, 22, 16, 5.0),
+        checkpoint_stroke(&c, 24, 12, 5.0),
+    ];
+    branch(&path, &root, x.to_vec(), 1_700_000_004);
+    let y = branch(
+        &path,
+        &root,
+        vec![checkpoint_stroke(&a, 18, 10, 5.0)],
+        1_700_000_005,
+    );
+    branch(&path, &y, vec![stroke(1, 2, 2, 1.0)], 1_700_000_006);
+    project::delete_checkpoint(&path, &y).unwrap();
+    assert!(is_hidden(&path, &y), "y stays stored under its child");
+
+    let history_count = |id: &str| Project::open(&path).unwrap().history().strokes_using(id);
+    assert_eq!(history_count(&a), 3);
+    assert_eq!(history_count(&b), 0);
+    assert_eq!(history_count(&"0".repeat(32)), 0);
+
+    let deleted = project::delete_checkpoint(&path, &a).unwrap();
+    assert_eq!(deleted.strokes_using, 3);
+}
+
+#[test]
+fn used_source_save_delete() {
+    let (dir, path) = sealed("checkpoint_store_used_save", 48, 32, 6);
+    let root = root_id_of(&path);
+    let a = branch(&path, &root, vec![stroke(1, 10, 10, 6.0)], 1_700_000_001);
+    let entry = InMemoryCheckpoint {
+        kind: InMemoryKind::Ops {
+            ops: vec![checkpoint_stroke(&a, 20, 14, 8.0)],
+            created_at: 1_700_000_002,
+        },
+        parent: Some(ParentRef::Saved(root)),
+    };
+
+    let ids = project::seal_in_memory(&path, &[entry], &[ParentRef::Saved(a.clone())], None, true)
+        .unwrap();
+
+    assert!(is_hidden(&path, &a));
+    assert!(archive_entry_names(&path).contains(&format!("checkpoints/{a}.json")));
+    render_bytes(&path, &ids[0], &dir.join("saved.tif"));
 }

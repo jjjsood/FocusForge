@@ -44,34 +44,7 @@ pub struct CheckpointEntry {
     pub fresh: Option<u64>,
 }
 
-/// A held row's own key into `ProjectTab::held`, stable until a save.
-pub(crate) fn held_key(index: usize) -> String {
-    format!("held:{index}")
-}
-
-/// [`held_key`]'s index back; `None` for a saved checkpoint's id.
-pub(crate) fn held_index(key: &str) -> Option<usize> {
-    key.strip_prefix("held:")?.parse().ok()
-}
-
-/// The ops of in-memory entry `index` and of the op-bearing entries it
-/// descends from, oldest first, up to the first fused entry or saved
-/// checkpoint. `None` when `index` is not an op-bearing entry.
-pub(crate) fn stroke_chain(held: &[InMemoryCheckpoint], index: usize) -> Option<Vec<Op>> {
-    let mut levels = Vec::new();
-    let mut entry = held.get(index)?;
-    while let InMemoryKind::Ops { ops, .. } = &entry.kind {
-        levels.push(ops);
-        match &entry.parent {
-            Some(ParentRef::Entry(parent)) => entry = held.get(*parent)?,
-            _ => break,
-        }
-    }
-    if levels.is_empty() {
-        return None;
-    }
-    Some(levels.into_iter().rev().flatten().cloned().collect())
-}
+pub(crate) use focusforge_core::project::{held_index, held_key, stroke_chain};
 
 /// Op kinds in the order a summary lists them; the last catches any op kind
 /// the list does not name.
@@ -223,7 +196,11 @@ impl Row<'_> {
 
 /// The algorithm `held[index]` carries once written: a fused entry's own, an
 /// op-bearing one's parent chain's (the checkpoint it is replayed onto). Empty when the chain does not resolve.
-fn held_algorithm(index: usize, held: &[InMemoryCheckpoint], saved: &[&Checkpoint]) -> String {
+pub(crate) fn held_algorithm(
+    index: usize,
+    held: &[InMemoryCheckpoint],
+    saved: &[&Checkpoint],
+) -> String {
     let Some(entry) = held.get(index) else {
         return String::new();
     };
@@ -357,7 +334,6 @@ pub fn build_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use focusforge_core::project::BrushMode;
 
     fn checkpoint(id: &str, created_at: i64) -> Checkpoint {
         Checkpoint {
@@ -372,6 +348,7 @@ mod tests {
             label: None,
             fuse: None,
             hidden: false,
+            colour_index: None,
         }
     }
 
@@ -623,14 +600,12 @@ mod tests {
     }
 
     fn stroke(x: i32) -> Op {
-        Op::BrushStroke {
-            source_id: 0,
-            path: vec![focusforge_core::project::Point { x, y: 0 }],
-            radius: 1.0,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }
+        Op::frame_stroke(
+            0,
+            vec![focusforge_core::project::Point { x, y: 0 }],
+            1.0,
+            0.0,
+        )
     }
 
     #[test]

@@ -3916,3 +3916,202 @@ fn raw_project_display_clips_once() {
         .expect("the renderer's reader reads the float composite");
     assert_eq!(shown, clipped_at(&stored, 1));
 }
+
+/// The `Image` elements below the element `id` of the main window.
+fn images_in(app: &AppWindow, id: &str) -> Vec<(f32, f32)> {
+    ElementQuery::from_root(app)
+        .match_id(format!("FFCanvas::{id}"))
+        .find_first()
+        .unwrap_or_else(|| panic!("no element FFCanvas::{id}"))
+        .query_descendants()
+        .match_type_name("Image")
+        .find_all()
+        .iter()
+        .map(|image| (image.size().width, image.size().height))
+        .collect()
+}
+
+#[test]
+fn checkpoint_source_view_cursor_glyph() {
+    common::init_window_backend();
+    let app = AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    app.set_project_loaded(true);
+    app.set_mode("editor".into());
+    app.set_cursor_visible(true);
+    app.set_cursor_checkpoint_source(true);
+    app.set_cursor_glyph_color(slint::Color::from_rgb_u8(200, 120, 40));
+    let pane = ElementQuery::from_root(&app)
+        .match_id("FFCanvas::pane-left")
+        .find_first()
+        .expect("the left pane");
+    let size = pane.size();
+    app.set_cursor_frame_x(40.0);
+    app.set_cursor_frame_y(size.height / 2.0);
+    app.set_cursor_composite_x(40.0);
+    app.set_cursor_composite_y(size.height / 2.0);
+
+    let glyph = (10.0, 10.0);
+    let pipette = (20.0, 20.0);
+    for extent in [24.0, 104.0] {
+        app.set_cursor_extent(extent);
+        for id in ["brush-cursor-left", "brush-cursor-right"] {
+            app.set_cursor_picking(false);
+            assert_eq!(
+                images_in(&app, id),
+                [glyph],
+                "{id} at {extent}: the glyph only"
+            );
+            app.set_cursor_picking(true);
+            assert_eq!(
+                images_in(&app, id),
+                [pipette],
+                "{id} at {extent}: the pipette only"
+            );
+        }
+    }
+
+    app.set_cursor_picking(false);
+    app.set_cursor_checkpoint_source(false);
+    for id in ["brush-cursor-left", "brush-cursor-right"] {
+        assert!(
+            images_in(&app, id).is_empty(),
+            "{id}: a frame source draws no glyph"
+        );
+    }
+}
+
+/// The left pane's label pill in the main window: its width and the sizes of
+/// the `Image` and square `Rectangle` children it draws ahead of the text.
+struct LabelParts {
+    width: f32,
+    icons: Vec<f32>,
+    squares: Vec<f32>,
+}
+
+fn left_label(app: &AppWindow) -> LabelParts {
+    let pane = ElementQuery::from_root(app)
+        .match_id("FFCanvas::pane-left")
+        .find_first()
+        .expect("the left pane");
+    let label = pane
+        .query_descendants()
+        .match_type_name("FFPaneLabel")
+        .find_first()
+        .expect("the pane label");
+    let sides = |kind: &str| -> Vec<f32> {
+        label
+            .query_descendants()
+            .match_type_name(kind)
+            .find_all()
+            .iter()
+            .map(|child| child.size())
+            .filter(|size| size.width == size.height)
+            .map(|size| size.width)
+            .collect()
+    };
+    LabelParts {
+        width: label.size().width,
+        icons: sides("Image"),
+        squares: sides("Rectangle"),
+    }
+}
+
+fn label_app() -> AppWindow {
+    common::init_window_backend();
+    let app = AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    app.set_project_loaded(true);
+    app.set_mode("editor".into());
+    app
+}
+
+#[test]
+fn checkpoint_source_view_label_stays_within_300px_with_the_icon() {
+    let app = label_app();
+    let colour = slint::Color::from_rgb_u8(200, 120, 40);
+    app.set_frame_label_icon(true);
+    app.set_frame_label_icon_color(colour);
+
+    app.set_frame_label("Checkpoint \u{b7} Focus map 14:51:07".into());
+    let short = left_label(&app);
+    assert_eq!(short.icons, [14.0], "the layers icon is shown");
+    assert!(short.squares.is_empty(), "no colour square beside the icon");
+    assert!(
+        (120.0..300.0).contains(&short.width),
+        "a short label hugs its text: {}",
+        short.width
+    );
+
+    app.set_frame_label(
+        "Checkpoint \u{b7} A very long retouch name \u{b7} Detail 14:32:10 \u{b7} 12 strokes \
+         and then some more text to be sure it overflows"
+            .into(),
+    );
+    let long = left_label(&app);
+    assert_eq!(long.width, 300.0, "a long label stops at 300 px and elides");
+}
+
+#[test]
+fn checkpoint_source_view_label_frame_square_and_width_rule() {
+    let app = label_app();
+    let colour = slint::Color::from_rgb_u8(200, 120, 40);
+
+    // A frame label: the file name cut to 16 characters, a colour square in
+    // the icon's slot, text at +28.
+    let name = truncate_pane_label("20260829-IMG_9800-a-very-long-name.tif");
+    assert_eq!(name.chars().count(), 16);
+    app.set_frame_label(name.into());
+    app.set_frame_label_swatch(true);
+    app.set_frame_label_icon_color(colour);
+    let square = left_label(&app);
+    assert_eq!(square.squares, [10.0], "a 10 px colour square");
+    assert!(square.icons.is_empty(), "no icon for a frame");
+    assert!(
+        square.width >= 120.0 && square.width < 300.0,
+        "{}",
+        square.width
+    );
+
+    // Without a mark the label is today's: 120 px at least, hugging its text.
+    app.set_frame_label_swatch(false);
+    app.set_frame_label("01.tif".into());
+    let plain = left_label(&app);
+    assert!(plain.icons.is_empty() && plain.squares.is_empty());
+    assert_eq!(plain.width, 120.0, "a short name keeps the minimum width");
+
+    // The 300 px cap is the checkpoint label's alone.
+    app.set_frame_label("a".repeat(80).into());
+    assert!(
+        left_label(&app).width > 300.0,
+        "a plain label still hugs its text"
+    );
+}
+
+#[test]
+fn checkpoint_source_view_unreadable_scratch_render_is_refused_as_a_checkpoint() {
+    use focusforge_gui::FramePane;
+
+    let dir = common::tree("csv_unreadable_scratch");
+    let junk = dir.join("0-0.tif");
+    fs::write(&junk, b"not a tiff").unwrap();
+    let mut canvas = focusforge_gui::bridge::Canvas::default();
+    let label = "Checkpoint \u{b7} Focus map 14:51:07";
+    canvas.show_frame_pane(Some(FramePane::Checkpoint(junk.clone())), label);
+    assert_eq!(
+        canvas.frame_refusal(),
+        [
+            "Cannot show this checkpoint:".to_string(),
+            label.to_string()
+        ]
+        .as_slice()
+    );
+    canvas.show_frame_pane(Some(FramePane::Checkpoint(junk)), label);
+    assert_eq!(
+        canvas.frame_refusal().len(),
+        2,
+        "a repaint keeps the refusal"
+    );
+    canvas.show_frame_pane(Some(FramePane::Rendering), label);
+    assert!(canvas.frame_refusal().is_empty(), "rendering shows nothing");
+}

@@ -15,7 +15,7 @@ use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::{
     self, BlobKind, BrushMode, InMemoryCheckpoint, InMemoryKind, Metrics, Op, ParentRef, Point,
-    Project, SealRequest,
+    Project, SealRequest, StrokeSource,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 use proptest::collection::vec;
@@ -177,13 +177,8 @@ fn brush_stroke(g: Geometry) -> BoxedStrategy<Op> {
         0.5f32..6.0,
         0.0f32..=1.0,
     )
-        .prop_map(|(source_id, path, radius, softness)| Op::BrushStroke {
-            source_id,
-            path,
-            radius,
-            softness,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
+        .prop_map(|(source_id, path, radius, softness)| {
+            Op::frame_stroke(source_id, path, radius, softness)
         })
         .boxed()
 }
@@ -196,50 +191,82 @@ fn ops_list(g: Geometry) -> BoxedStrategy<Vec<Op>> {
 /// creation order, so every action is valid by construction.
 #[derive(Debug, Clone)]
 enum Action {
-    /// Seal `ops` under the picked visible node; `None` is the root.
-    Seal { parent: Option<Index>, ops: Vec<Op> },
+    /// Seal `ops` under the picked visible node (`None` is the root), plus one
+    /// stroke painted from each picked visible node in `from`.
+    Seal {
+        parent: Option<Index>,
+        ops: Vec<Op>,
+        from: Vec<Index>,
+    },
     /// Delete the picked visible node; skipped while only one is visible.
     Delete { pick: Index },
 }
 
+/// A seal painted from frames only.
 fn seal_action(g: Geometry) -> BoxedStrategy<Action> {
     (any::<Index>(), ops_list(g))
         .prop_map(|(parent, ops)| Action::Seal {
             parent: Some(parent),
             ops,
+            from: Vec::new(),
         })
         .boxed()
 }
 
-fn seal_or_delete(g: Geometry) -> BoxedStrategy<Action> {
+/// A seal that may also paint from up to two earlier checkpoints.
+fn sourced_seal_action(g: Geometry) -> BoxedStrategy<Action> {
+    (any::<Index>(), ops_list(g), vec(any::<Index>(), 0..=2))
+        .prop_map(|(parent, ops, from)| Action::Seal {
+            parent: Some(parent),
+            ops,
+            from,
+        })
+        .boxed()
+}
+
+fn seal_or_delete(
+    g: Geometry,
+    seal: fn(Geometry) -> BoxedStrategy<Action>,
+) -> BoxedStrategy<Action> {
     prop_oneof![
-        3 => seal_action(g),
+        3 => seal(g),
         1 => any::<Index>().prop_map(|pick| Action::Delete { pick }),
     ]
     .boxed()
 }
 
 fn random_seals(g: Geometry) -> BoxedStrategy<Vec<Action>> {
-    vec(seal_action(g), 0..24).boxed()
+    vec(sourced_seal_action(g), 0..24).boxed()
 }
 
 /// Two seals onto the root, a random tail with deletes, then a final delete.
-fn branched_and_deleted(g: Geometry) -> BoxedStrategy<Vec<Action>> {
+fn branched_and_deleted_with(
+    g: Geometry,
+    seal: fn(Geometry) -> BoxedStrategy<Action>,
+) -> BoxedStrategy<Vec<Action>> {
     (
         vec(ops_list(g), 2),
-        vec(seal_or_delete(g), 0..16),
+        vec(seal_or_delete(g, seal), 0..16),
         any::<Index>(),
     )
         .prop_map(|(forks, tail, pick)| {
             let mut actions: Vec<Action> = forks
                 .into_iter()
-                .map(|ops| Action::Seal { parent: None, ops })
+                .map(|ops| Action::Seal {
+                    parent: None,
+                    ops,
+                    from: Vec::new(),
+                })
                 .collect();
             actions.extend(tail);
             actions.push(Action::Delete { pick });
             actions
         })
         .boxed()
+}
+
+fn branched_and_deleted_from_checkpoints(g: Geometry) -> BoxedStrategy<Vec<Action>> {
+    branched_and_deleted_with(g, sourced_seal_action)
 }
 
 fn long_chain(g: Geometry) -> BoxedStrategy<Vec<Vec<Op>>> {
@@ -258,6 +285,8 @@ fn case<T: std::fmt::Debug + 'static>(
 // ---------------------------------------------------------------------
 
 struct Node {
+    /// The nodes this node's strokes paint from.
+    sources: Vec<usize>,
     /// Filled in once the writer has sealed the node; empty for a node a
     /// writer never wrote.
     id: String,
@@ -274,6 +303,7 @@ enum Step {
         node: usize,
         parent: usize,
         ops: Vec<Op>,
+        sources: Vec<usize>,
         created_at: i64,
     },
     /// `removed` is every node this delete takes out of the file.
@@ -292,6 +322,7 @@ impl Model {
     fn new(root_id: String, root_map: Vec<u16>) -> Self {
         Model {
             nodes: vec![Node {
+                sources: Vec::new(),
                 id: root_id,
                 parent: None,
                 map: root_map,
@@ -309,10 +340,11 @@ impl Model {
     }
 
     /// Seals `ops` under `parent`, returning the new node.
-    fn seal(&mut self, parent: usize, ops: Vec<Op>) -> usize {
+    fn seal(&mut self, parent: usize, ops: Vec<Op>, sources: Vec<usize>) -> usize {
         let map = self.nodes[0].map.clone();
         let node = self.nodes.len();
         self.nodes.push(Node {
+            sources: sources.clone(),
             id: String::new(),
             parent: Some(parent),
             map,
@@ -323,33 +355,28 @@ impl Model {
             node,
             parent,
             ops,
+            sources,
             created_at: BASE_TIME + node as i64,
         });
         node
     }
 
-    fn descends_from(&self, mut node: usize, ancestor: usize) -> bool {
-        while let Some(parent) = self.nodes[node].parent {
-            if parent == ancestor {
-                return true;
-            }
-            node = parent;
-        }
-        false
-    }
-
-    /// Hides `node`, then removes every hidden node whose descendants are all
-    /// hidden.
+    /// Hides `node`, then removes every hidden node outside the closure of the
+    /// visible ones under "parent" and "painted from".
     fn delete(&mut self, node: usize) {
         self.nodes[node].hidden = true;
+        let mut needed: Vec<bool> = self.nodes.iter().map(|n| !n.hidden).collect();
+        let mut pending = self.visible();
+        while let Some(i) = pending.pop() {
+            let n = &self.nodes[i];
+            for link in n.parent.into_iter().chain(n.sources.iter().copied()) {
+                if !std::mem::replace(&mut needed[link], true) {
+                    pending.push(link);
+                }
+            }
+        }
         let removed: Vec<usize> = (0..self.nodes.len())
-            .filter(|&i| {
-                let n = &self.nodes[i];
-                n.hidden
-                    && !n.removed
-                    && (i + 1..self.nodes.len())
-                        .all(|j| !self.descends_from(j, i) || self.nodes[j].hidden)
-            })
+            .filter(|&i| !needed[i] && !self.nodes[i].removed)
             .collect();
         for &i in &removed {
             self.nodes[i].removed = true;
@@ -361,11 +388,10 @@ impl Model {
         for action in actions {
             let visible = self.visible();
             match action {
-                Action::Seal { parent, ops } => {
-                    let parent = parent
-                        .as_ref()
-                        .map_or(0, |pick| visible[pick.index(visible.len())]);
-                    self.seal(parent, ops.clone());
+                Action::Seal { parent, ops, from } => {
+                    let pick = |pick: &Index| visible[pick.index(visible.len())];
+                    let parent = parent.as_ref().map_or(0, pick);
+                    self.seal(parent, ops.clone(), from.iter().map(pick).collect());
                 }
                 Action::Delete { pick } if visible.len() >= 2 => {
                     self.delete(visible[pick.index(visible.len())]);
@@ -405,6 +431,18 @@ fn fail(what: &str, err: impl std::fmt::Display) -> TestCaseError {
     TestCaseError::fail(format!("{what}: {err}"))
 }
 
+/// A stroke painting from checkpoint `source`.
+fn checkpoint_stroke(source: String) -> Op {
+    Op::BrushStroke {
+        source: StrokeSource::Checkpoint(source),
+        path: vec![Point { x: 1, y: 1 }],
+        radius: 2.0,
+        softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
+    }
+}
+
 /// One `append_ops_onto` / `delete_checkpoint` call per step: the core
 /// calls behind the GUI's save and `history delete`.
 fn write_per_checkpoint(path: &Path, model: &mut Model) -> Result<(), TestCaseError> {
@@ -413,9 +451,15 @@ fn write_per_checkpoint(path: &Path, model: &mut Model) -> Result<(), TestCaseEr
             Step::Seal {
                 node,
                 parent,
-                ops,
+                mut ops,
+                sources,
                 created_at,
             } => {
+                ops.extend(
+                    sources
+                        .iter()
+                        .map(|&source| checkpoint_stroke(model.nodes[source].id.clone())),
+                );
                 let sealed =
                     project::append_ops_onto(path, &model.nodes[parent].id, ops, None, created_at)
                         .map_err(|e| fail(&format!("seal node {node} under node {parent}"), e))?;
@@ -445,6 +489,10 @@ fn write_in_memory(path: &Path, model: &mut Model) -> Result<(), TestCaseError> 
         0 => ParentRef::Saved(root.clone()),
         n => ParentRef::Entry(n - 1),
     };
+    let source = |node: usize| match node {
+        0 => root.clone(),
+        n => project::held_key(n - 1),
+    };
     let mut entries = Vec::new();
     let mut deletes = Vec::new();
     for step in &model.steps {
@@ -452,15 +500,20 @@ fn write_in_memory(path: &Path, model: &mut Model) -> Result<(), TestCaseError> 
             Step::Seal {
                 parent,
                 ops,
+                sources,
                 created_at,
                 ..
-            } => entries.push(InMemoryCheckpoint {
-                kind: InMemoryKind::Ops {
-                    ops: ops.clone(),
-                    created_at: *created_at,
-                },
-                parent: Some(reference(*parent)),
-            }),
+            } => {
+                let mut ops = ops.clone();
+                ops.extend(sources.iter().map(|&node| checkpoint_stroke(source(node))));
+                entries.push(InMemoryCheckpoint {
+                    kind: InMemoryKind::Ops {
+                        ops,
+                        created_at: *created_at,
+                    },
+                    parent: Some(reference(*parent)),
+                });
+            }
             Step::Delete { node, .. } => deletes.push(reference(*node)),
         }
     }
@@ -564,7 +617,7 @@ proptest! {
 
     #[test]
     fn branched_and_pruned_histories_round_trip(
-        (g, salt, actions) in case(branched_and_deleted)
+        (g, salt, actions) in case(branched_and_deleted_from_checkpoints)
     ) {
         let (dir, path, mut model) = start("branched", g, salt);
         model.play(&actions);
@@ -575,7 +628,7 @@ proptest! {
     }
 
     #[test]
-    fn in_memory_save_round_trips((g, salt, actions) in case(branched_and_deleted)) {
+    fn in_memory_save_round_trips((g, salt, actions) in case(branched_and_deleted_from_checkpoints)) {
         let (dir, path, mut model) = start("in_memory", g, salt);
         model.play(&actions);
         prop_assert!(model.has_branch(), "the case has no branch");
@@ -593,7 +646,7 @@ proptest! {
         let (dir, path, mut model) = start("long", g, salt);
         for ops in chain {
             let newest = model.nodes.len() - 1;
-            model.seal(newest, ops);
+            model.seal(newest, ops, Vec::new());
         }
         write_per_checkpoint(&path, &mut model)?;
         check_round_trip(&path, &model, &dir)?;

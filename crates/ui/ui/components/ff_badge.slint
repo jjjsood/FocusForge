@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// A small pill naming a checkpoint's role in its row: BASE, FUSION, UNSAVED.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFBadge inherits Rectangle {
+    in property <string> text: "";
+
+    width: label.preferred-width + 2 * Theme.space-2;
+    height: ShellGeometry.badge-height;
+    border-radius: Theme.radius-sm;
+    background: Theme.surface-overlay;
+
+    label := Text {
+        text: root.text;
+        color: Theme.text-secondary;
+        font-size: Theme.text-section.size;
+        font-weight: Theme.text-body.weight;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}

@@ -159,7 +159,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (retouch)
 _arguments "${_arguments_options[@]}" : \
-'--ops=[The op list\: a JSON array of ops in the persisted \`Op\` shape. A brush stroke blends frame \`source_id\` over the image along its path\: fully within \`radius * (1 - softness)\`, fading linearly to nothing at \`radius\`. A stroke may also carry \`mode\` (\`normal\`, \`lighten\`, \`darken\` or \`detail\`; default \`normal\`) and \`opacity\` (0 < x ≤ 1; default 1.0). An opacity too small to register still records a state but changes no sample. \`lighten\` changes a pixel only where the source'\''s sum over all its samples is greater than the image'\''s there, \`darken\` only where it is smaller; either then blends every sample by the same amount. \`detail\` keeps the image'\''s own brightness and takes only the source'\''s fine detail, over a reach about the brush radius. Every op is checked before anything is written; positions in error messages count from 0 in list order]:FILE:_files' \
+'--ops=[The op list\: a JSON array of ops in the persisted \`Op\` shape. The source of a brush stroke is \`"source"\: {"frame"\: n}\`, a source frame, or \`"source"\: {"checkpoint"\: "<id prefix>"}\`, a checkpoint'\''s own render; \`"source_id"\: n\` reads as frame n. A checkpoint is named by any unique prefix of a visible checkpoint'\''s id, is stored as its full id, and must share the edited state'\''s pixel grid and sample type. A brush stroke blends its source over the image along its path\: fully within \`radius * (1 - softness)\`, fading linearly to nothing at \`radius\`. A stroke may also carry \`mode\` (\`normal\`, \`lighten\`, \`darken\` or \`detail\`; default \`normal\`) and \`opacity\` (0 < x ≤ 1; default 1.0). An opacity too small to register still records a state but changes no sample. \`lighten\` changes a pixel only where the source'\''s sum over all its samples is greater than the image'\''s there, \`darken\` only where it is smaller; either then blends every sample by the same amount. \`detail\` keeps the image'\''s own brightness and takes only the source'\''s fine detail, over a reach about the brush radius. Every op is checked before anything is written; positions in error messages count from 0 in list order]:FILE:_files' \
 '--from=[The state to append under -- any unique prefix of its id. Defaults to the project'\''s current head]:FROM:_default' \
 '--name=[Name the last appended state]:NAME:_default' \
 '--json[Emit the JSON report instead of human-readable text]' \
@@ -637,7 +637,7 @@ _focusforge-cli__subcmd__help__subcmd__help_commands() {
 _focusforge-cli__subcmd__help__subcmd__history_commands() {
     local commands; commands=(
 'list:List every visible checkpoint, newest first' \
-'delete:Delete one checkpoint\: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by \`history compact\`. Refuses the last visible checkpoint' \
+'delete:Delete one checkpoint\: it is hidden, and dropped from the project once no visible checkpoint is built on it and no stroke paints from it (a checkpoint a stroke paints from stays stored); its space is reclaimed by \`history compact\`. Refuses the last visible checkpoint' \
 'compact:Rewrite the project to its live checkpoints only and report the bytes reclaimed' \
     )
     _describe -t commands 'focusforge-cli help history commands' commands "$@"
@@ -696,7 +696,7 @@ _focusforge-cli__subcmd__help__subcmd__step-plan_commands() {
 _focusforge-cli__subcmd__history_commands() {
     local commands; commands=(
 'list:List every visible checkpoint, newest first' \
-'delete:Delete one checkpoint\: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by \`history compact\`. Refuses the last visible checkpoint' \
+'delete:Delete one checkpoint\: it is hidden, and dropped from the project once no visible checkpoint is built on it and no stroke paints from it (a checkpoint a stroke paints from stays stored); its space is reclaimed by \`history compact\`. Refuses the last visible checkpoint' \
 'compact:Rewrite the project to its live checkpoints only and report the bytes reclaimed' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -716,7 +716,7 @@ _focusforge-cli__subcmd__history__subcmd__delete_commands() {
 _focusforge-cli__subcmd__history__subcmd__help_commands() {
     local commands; commands=(
 'list:List every visible checkpoint, newest first' \
-'delete:Delete one checkpoint\: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by \`history compact\`. Refuses the last visible checkpoint' \
+'delete:Delete one checkpoint\: it is hidden, and dropped from the project once no visible checkpoint is built on it and no stroke paints from it (a checkpoint a stroke paints from stays stored); its space is reclaimed by \`history compact\`. Refuses the last visible checkpoint' \
 'compact:Rewrite the project to its live checkpoints only and report the bytes reclaimed' \
 'help:Print this message or the help of the given subcommand(s)' \
     )

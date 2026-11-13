@@ -547,7 +547,7 @@ impl Blender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use focusforge_core::project::{BrushMode, Point};
+    use focusforge_core::project::{BrushMode, Point, StrokeSource};
     use focusforge_core::zmap::ZMapInfo;
 
     fn pt(x: i32, y: i32) -> Point {
@@ -556,7 +556,7 @@ mod tests {
 
     fn brush(path: Vec<Point>, radius: f32, softness: f32, mode: BrushMode, opacity: f32) -> Op {
         Op::BrushStroke {
-            source_id: 0,
+            source: StrokeSource::Frame(0),
             path,
             radius,
             softness,
@@ -1213,7 +1213,7 @@ mod tests {
             for opacity in opacities {
                 for softness in softnesses {
                     let op = Op::BrushStroke {
-                        source_id: 0,
+                        source: StrokeSource::Frame(0),
                         path: path.clone(),
                         radius: 7.0,
                         softness,

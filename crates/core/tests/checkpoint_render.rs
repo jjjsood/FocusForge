@@ -11,7 +11,7 @@ use focusforge_core::align::{Registration, Transform, WarpingReader};
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::{
-    self, AlignRecord, BrushMode, CheckpointImage, Metrics, Op, Point, Project, SealRequest,
+    self, AlignRecord, CheckpointImage, Metrics, Op, Point, Project, SealRequest,
 };
 use focusforge_core::retouch::blend;
 use focusforge_core::zmap::{NO_SOURCE, ZMapInfo, ZMapWriter};
@@ -230,14 +230,12 @@ fn unedited_child_renders_the_ancestor_composite() {
     let child = project::append_ops_onto(
         &root.project_path,
         &root.root_id,
-        vec![Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: -40, y: -40 }],
-            radius: 3.0,
-            softness: 0.5,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }],
+        vec![Op::frame_stroke(
+            1,
+            vec![Point { x: -40, y: -40 }],
+            3.0,
+            0.5,
+        )],
         None,
         1,
     )
@@ -259,14 +257,12 @@ fn unedited_child_renders_the_ancestor_composite() {
 fn op_bearing_render_blends_the_stroke_over_the_ancestor_composite() {
     let root = seal_root("checkpoint_render_blend");
     // From the translated frame, so the alignment and the crop origin both matter.
-    let stroke = Op::BrushStroke {
-        source_id: 2,
-        path: vec![Point { x: 2, y: 2 }, Point { x: 4, y: 3 }],
-        radius: 3.0,
-        softness: 0.5,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    };
+    let stroke = Op::frame_stroke(
+        2,
+        vec![Point { x: 2, y: 2 }, Point { x: 4, y: 3 }],
+        3.0,
+        0.5,
+    );
     let child = project::append_ops_onto(
         &root.project_path,
         &root.root_id,

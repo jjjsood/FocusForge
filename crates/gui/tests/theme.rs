@@ -488,6 +488,8 @@ mod sheet {
     fn reduced_motion_body() {
         common::init_window_backend();
         let sheet = ThemeSheet::new().unwrap();
+        // The spinner specimen sits in the Controls tab; a hidden tab draws nothing.
+        sheet.set_tab("Controls".into());
         // The element query skips what the window clips away, and the sheet is
         // a long column.
         sheet

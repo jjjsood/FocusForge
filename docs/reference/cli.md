@@ -271,10 +271,15 @@ Write the result with [`export --checkpoint`](#export).
 | `--name <NAME>` | name the last checkpoint added |
 | `--json` | print the report as JSON |
 
+A stroke takes its pixels from a source frame, `"source": {"frame": 3}`, or from
+a checkpoint's own picture, `"source": {"checkpoint": "5b71"}`: an id or a unique
+start of one, naming a visible checkpoint of the same pixel size and sample type
+as the checkpoint being edited. `"source_id": 3` reads as frame 3.
+
 A stroke may carry two more fields. `mode` is `normal` (the default), `lighten`,
-`darken` or `detail`: `lighten` changes a pixel only where the frame's sum over
+`darken` or `detail`: `lighten` changes a pixel only where the source's sum over
 all samples exceeds the image's there, `darken` only where it is smaller, and
-`detail` keeps the image's brightness and takes only the frame's fine detail.
+`detail` keeps the image's brightness and takes only the source's fine detail.
 `opacity`, `0 < x <= 1` (default `1.0`), scales the stroke's coverage. An
 opacity outside that range refuses the run; one too small to register still
 records a checkpoint but changes no sample. A project that holds a stroke with

@@ -6,7 +6,7 @@
 
 use focusforge_core::algorithm::TileReader;
 use focusforge_core::io::TiffStack;
-use focusforge_core::project::{BrushMode, Op, Point};
+use focusforge_core::project::{BrushMode, Op, Point, StrokeSource};
 use focusforge_core::retouch::blend;
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::ZMapInfo;
@@ -32,14 +32,7 @@ fn pt(x: i32, y: i32) -> Point {
 }
 
 fn stroke(path: Vec<Point>, radius: f32, softness: f32) -> Op {
-    Op::BrushStroke {
-        source_id: SRC_FRAME as u16,
-        path,
-        radius,
-        softness,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }
+    Op::frame_stroke(SRC_FRAME as u16, path, radius, softness)
 }
 
 fn blender(shared: &SharedDevice) -> Blender {
@@ -79,8 +72,37 @@ struct Outcome {
     untouched: usize,
 }
 
-/// Blends `op` over `out_rect`'s samples, on the device and on the CPU, from
-/// the fixture.
+/// `region`'s samples of the source frame, at `spp` samples a pixel.
+fn source_frame(stack: &TiffStack, region: Rect, spp: usize) -> Vec<u16> {
+    let native = stack.header(0).samples_per_pixel as usize;
+    frame_samples(stack, SRC_FRAME, region, spp, native)
+}
+
+/// `region`'s samples of a rendered checkpoint: the output frame with a
+/// stroke from the source frame already blended in, so it equals neither.
+fn checkpoint_samples(stack: &TiffStack, region: Rect, spp: usize) -> Vec<u16> {
+    let native = stack.header(0).samples_per_pixel as usize;
+    let info = ZMapInfo::new(512, 512, 8).unwrap();
+    let mut rendered = frame_samples(stack, OUT_FRAME, region, spp, native);
+    let frame = source_frame(stack, region, spp);
+    let (x, y) = (region.x as i32, region.y as i32);
+    let (w, h) = (region.width as i32, region.height as i32);
+    let earlier = styled(
+        vec![pt(x + w / 4, y + h / 2), pt(x + 3 * w / 4, y + h / 2)],
+        30.0,
+        0.5,
+        BrushMode::Normal,
+        0.7,
+    );
+    blend::apply(&earlier, info, region, &mut rendered, region, &frame, spp)
+        .expect("render the checkpoint");
+    assert_ne!(rendered, frame, "the checkpoint differs from the frame");
+    rendered
+}
+
+/// Blends `op` over `out_rect`'s samples, on the device and on the CPU,
+/// reading `src` over `region`.
+#[allow(clippy::too_many_arguments)]
 fn parity_case(
     stack: &TiffStack,
     blender: &Blender,
@@ -88,18 +110,18 @@ fn parity_case(
     op: &Op,
     out_rect: Rect,
     region: Rect,
+    src: &[u16],
     spp: usize,
 ) -> Outcome {
     let native = stack.header(0).samples_per_pixel as usize;
     let info = ZMapInfo::new(512, 512, 8).unwrap();
     let base = frame_samples(stack, OUT_FRAME, out_rect, spp, native);
-    let src = frame_samples(stack, SRC_FRAME, region, spp, native);
 
     let mut cpu = base.clone();
-    blend::apply(op, info, out_rect, &mut cpu, region, &src, spp).expect("cpu blend");
+    blend::apply(op, info, out_rect, &mut cpu, region, src, spp).expect("cpu blend");
     let mut gpu = base.clone();
     blender
-        .apply(op, info, out_rect, &mut gpu, region, &src, spp)
+        .apply(op, info, out_rect, &mut gpu, region, src, spp)
         .expect("gpu blend");
 
     let (worst, at) = worst_delta(&gpu, &cpu);
@@ -186,8 +208,9 @@ fn blend_parity_matches_cpu() {
                         let op = stroke(path.clone(), radius, softness);
                         let label =
                             format!("{place} spp {spp} soft {softness} radius {radius} {shape}");
+                        let src = source_frame(&stack, region, spp);
                         let case =
-                            parity_case(&stack, &blender, &label, &op, out_rect, region, spp);
+                            parity_case(&stack, &blender, &label, &op, out_rect, region, &src, spp);
                         assert_eq!(case.worst, 0, "{label}: expected bit-exact agreement");
                         touched += 1;
                     }
@@ -351,7 +374,7 @@ fn blend_refuses_oversized_region() {
 
 fn styled(path: Vec<Point>, radius: f32, softness: f32, mode: BrushMode, opacity: f32) -> Op {
     Op::BrushStroke {
-        source_id: SRC_FRAME as u16,
+        source: StrokeSource::Frame(SRC_FRAME as u16),
         path,
         radius,
         softness,
@@ -360,14 +383,14 @@ fn styled(path: Vec<Point>, radius: f32, softness: f32, mode: BrushMode, opacity
     }
 }
 
-#[test]
-fn blend_parity_per_mode_matches_cpu() {
-    let Some(shared) = shared_device_or_skip() else {
-        return;
-    };
-    let blender = blender(shared);
-    let stack = common::open_stack();
-
+/// Every blend mode at the opacity and softness extremes, over every place
+/// and path, with `source` giving the samples read from. Returns the number of
+/// cases, all bit-exact.
+fn per_mode_cases(
+    stack: &TiffStack,
+    blender: &Blender,
+    source: impl Fn(&TiffStack, Rect, usize) -> Vec<u16>,
+) -> usize {
     let modes = [
         BrushMode::Normal,
         BrushMode::Lighten,
@@ -396,8 +419,10 @@ fn blend_parity_per_mode_matches_cpu() {
                             let label = format!(
                                 "{mode:?} opacity {opacity} {place} spp {spp} soft {softness} radius {radius} {shape}"
                             );
-                            let case =
-                                parity_case(&stack, &blender, &label, &op, out_rect, region, spp);
+                            let src = source(stack, region, spp);
+                            let case = parity_case(
+                                stack, blender, &label, &op, out_rect, region, &src, spp,
+                            );
                             assert_eq!(case.worst, 0, "{label}: expected bit-exact agreement");
                             changed[n] += case.changed;
                             untouched += case.untouched;
@@ -421,6 +446,18 @@ fn blend_parity_per_mode_matches_cpu() {
             );
         }
     }
+    cases
+}
+
+#[test]
+fn blend_parity_per_mode_matches_cpu() {
+    let Some(shared) = shared_device_or_skip() else {
+        return;
+    };
+    let blender = blender(shared);
+    let stack = common::open_stack();
+
+    let mut cases = per_mode_cases(&stack, &blender, source_frame);
 
     // The largest f32 below 1.0 is Q16 full: the kernel takes it, as the CPU blend does.
     let region = rect(0, 0, 128, 96);
@@ -431,6 +468,7 @@ fn blend_parity_per_mode_matches_cpu() {
         BrushMode::Normal,
         1.0 - f32::EPSILON / 2.0,
     );
+    let src = source_frame(&stack, region, 3);
     let case = parity_case(
         &stack,
         &blender,
@@ -438,12 +476,26 @@ fn blend_parity_per_mode_matches_cpu() {
         &op,
         region,
         region,
+        &src,
         3,
     );
     assert_eq!(case.worst, 0, "an opacity that rounds to Q16 full is exact");
     cases += 1;
     println!("blend parity per mode: {cases} cases, all exact");
     assert_eq!(cases, 721);
+}
+
+#[test]
+fn blend_parity_from_a_checkpoint_source() {
+    let Some(shared) = shared_device_or_skip() else {
+        return;
+    };
+    let blender = blender(shared);
+    let stack = common::open_stack();
+
+    let cases = per_mode_cases(&stack, &blender, checkpoint_samples);
+    println!("blend parity from a checkpoint source: {cases} cases, all exact");
+    assert_eq!(cases, 720);
 }
 
 #[test]

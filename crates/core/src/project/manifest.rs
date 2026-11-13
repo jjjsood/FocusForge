@@ -15,13 +15,14 @@
 //! `FORMAT_VERSION` (2) is refused before the rest of the manifest is decoded,
 //! so a newer manifest whose other fields changed still gets the version
 //! message. The field is written only as 2, when the history holds a stroke
-//! with a non-default mode or opacity ([`required_format_version`]); a project
-//! without one carries no field, and a stored version is never lowered.
+//! painted from a checkpoint or with a non-default mode or opacity
+//! ([`required_format_version`]); a project without one carries no field, and
+//! a stored version is never lowered.
 
 use serde::{Deserialize, Serialize};
 
 use super::blob::FileStamp;
-use super::checkpoint::{BrushMode, History, Op};
+use super::checkpoint::{BrushMode, History, Op, StrokeSource};
 use crate::align::Registration;
 use crate::params::ParamValues;
 use crate::tile::{Rect, SampleFormat};
@@ -68,18 +69,27 @@ pub struct Manifest {
     /// [`super::checkpoint::Checkpoint::parent`] from there.
     pub checkpoint: String,
     /// The project format this manifest's project needs a reader to know, set
-    /// only when it is above 1; see [`required_format_version`].
+    /// only when it is above 1 (a checkpoint-sourced stroke, a non-default
+    /// stroke mode or opacity); see [`required_format_version`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format_version: Option<u32>,
 }
 
 /// The project format version `history` needs: 2 when any listed checkpoint
-/// holds a stroke with a mode other than normal or an opacity other than
-/// `1.0` (the strokes whose serialized form carries those fields), else 1.
+/// holds a stroke painted from a checkpoint, or with a mode other than normal
+/// or an opacity other than `1.0` (the strokes whose serialized form an older
+/// reader cannot take), else 1.
 pub fn required_format_version(history: &History) -> u32 {
     let needs_two = history.all().into_iter().flat_map(|c| &c.ops).any(|op| {
-        let Op::BrushStroke { mode, opacity, .. } = op;
-        *mode != BrushMode::Normal || *opacity != 1.0
+        let Op::BrushStroke {
+            source,
+            mode,
+            opacity,
+            ..
+        } = op;
+        matches!(source, StrokeSource::Checkpoint(_))
+            || *mode != BrushMode::Normal
+            || *opacity != 1.0
     });
     if needs_two { 2 } else { 1 }
 }

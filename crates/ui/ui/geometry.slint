@@ -26,7 +26,10 @@ export global ShellGeometry {
     out property <length> pane-placeholder-width: 220px;
     out property <length> pane-chrome-inset: 10px;
     out property <length> pane-label-width: 120px;
+    out property <length> pane-label-max-width: 300px;
     out property <length> pane-label-height: 22px;
+    // The colour square leading a frame label.
+    out property <length> pane-label-swatch-side: 10px;
     out property <length> undock-control-width: 26px;
     out property <length> undock-control-height: 22px;
 
@@ -102,6 +105,11 @@ export global ShellGeometry {
     out property <length> image-row-action-gap: 4px;
     out property <length> image-row-action-inset: Theme.space-4;
     out property <length> image-row-action-pad: 0px;
+    out property <length> badge-height: 16px;
+    out property <length> group-heading-height: 26px;
+    out property <length> group-gap: Theme.space-3;
+    out property <length> hidden-line-height: 26px;
+    out property <length> hidden-line-wrapped-height: 44px;
     out property <length> tooltip-width: 248px;
 
     // The settings panel. Mirrored one-for-one as `pub const`s in
@@ -290,4 +298,6 @@ export global ShellGeometry {
     out property <length> overlap-legend-swatch: 8px;
     // The brush cursor's mode chip: a square of this side.
     out property <length> brush-tag-side: 16px;
+    // The layers glyph centred in a checkpoint-source cursor.
+    out property <length> cursor-glyph-side: 10px;
 }

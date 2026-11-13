@@ -26,9 +26,9 @@ use crate::canvas::{
 };
 use crate::comparison::{self, ComparisonWindow};
 use crate::controller::{
-    AppController, ChromeKey, DockTab, GroupingQuestion, GuardSecondary, JobView, LocateTarget,
-    OpenAs, OpenOutcome, RefusalAction, SaveAsk, SettingsSection, ShellEvent, ShellMode,
-    StoragePath, WindowChromeIntent, WindowTarget,
+    AppController, ChromeKey, DockTab, FramePane, GroupingQuestion, GuardSecondary, JobView,
+    LabelMark, LocateTarget, OpenAs, OpenOutcome, RefusalAction, SaveAsk, SettingsSection,
+    ShellEvent, ShellMode, StoragePath, WindowChromeIntent, WindowTarget,
 };
 use crate::diagnostics::{
     DiagnosticsStatus, InputBatch, InputSurface, finish_input_batches, input_trace_incomplete,
@@ -214,6 +214,30 @@ impl Canvas {
                 self.failed_frame = Some(path.to_path_buf());
             }
         }
+    }
+
+    /// Shows what the controller says the left pane holds: a frame or the
+    /// checkpoint's render, the refusal lines of an unrenderable checkpoint,
+    /// or nothing while it renders. A checkpoint render that fails to open is
+    /// refused as the checkpoint `label` names.
+    pub fn show_frame_pane(&mut self, pane: Option<FramePane>, label: &str) {
+        match pane {
+            Some(FramePane::Frame(path, view)) => self.set_frame(Some(&path), view),
+            Some(FramePane::Checkpoint(path)) => {
+                self.set_frame(Some(&path), None);
+                if self.failed_frame.as_deref() == Some(path.as_path()) {
+                    self.frame_refusal = job::checkpoint_refusal_lines(label);
+                }
+            }
+            Some(FramePane::Refused(lines)) => self.refuse_frame(lines),
+            Some(FramePane::Rendering) | None => self.set_frame(None, None),
+        }
+    }
+
+    /// Drops whatever frame was open and shows `lines` in its place.
+    pub fn refuse_frame(&mut self, lines: Vec<String>) {
+        self.set_frame(None, None);
+        self.frame_refusal = lines;
     }
 
     /// Hands the worker one request for every pane whose texture does not
@@ -460,11 +484,13 @@ fn show_comparison_pane(
     plane_draw: Option<PaneDraw>,
 ) {
     let cursor_hovered = cursor_hovered(app);
-    let (detached, frame_label, project_loaded, editor_mode, messages, cursor) = {
+    let (detached, frame_label, label_mark, project_loaded, editor_mode, messages, cursor) = {
         let controller = controller.lock().unwrap();
+        let label_mark = controller.frame_pane_label_mark();
         (
             controller.detached_pane(),
-            truncate_pane_label(&controller.frame_pane_label()),
+            pane_label_text(&controller.frame_pane_label(), label_mark),
+            label_mark,
             controller.active_project().is_some(),
             controller.mode() == ShellMode::Editor,
             controller.composite_message_lines(),
@@ -487,6 +513,8 @@ fn show_comparison_pane(
             window.set_cursor_picking(cursor.picking);
             window.set_cursor_mode_tag(cursor.mode_tag.into());
             window.set_cursor_tag_origin(cursor.tag_origin);
+            window.set_cursor_checkpoint_source(cursor.checkpoint_colour.is_some());
+            window.set_cursor_glyph_color(glyph_color(cursor.checkpoint_colour));
             window.set_cursor_pick_color(slint::Color::from_rgb_u8(
                 cursor.pick_color[0],
                 cursor.pick_color[1],
@@ -522,6 +550,9 @@ fn show_comparison_pane(
         match detached {
             PaneSource::Frame => {
                 window.set_pane_label(frame_label.into());
+                window.set_pane_label_icon(matches!(label_mark, Some(LabelMark::Icon(_))));
+                window.set_pane_label_swatch(matches!(label_mark, Some(LabelMark::Swatch(_))));
+                window.set_pane_label_icon_color(label_mark_color(label_mark));
                 window.set_bar_title("FocusForge — Frame".into());
                 window.set_message_lines(string_model(canvas.frame_refusal()));
                 match frame_draw
@@ -549,6 +580,8 @@ fn show_comparison_pane(
                 }
             }
             PaneSource::Composite => {
+                window.set_pane_label_icon(false);
+                window.set_pane_label_swatch(false);
                 window.set_bar_title("FocusForge — Composite".into());
                 window.set_message_lines(string_model(&messages));
                 match plane_draw
@@ -578,6 +611,30 @@ fn show_comparison_pane(
         }
         window.window().request_redraw();
     });
+}
+
+/// The left pane label as the window shows it: a frame's file name is cut to
+/// the pill, a checkpoint label (with its icon) is left whole for the pill to
+/// elide.
+fn pane_label_text(label: &str, mark: Option<LabelMark>) -> String {
+    if matches!(mark, Some(LabelMark::Icon(_))) {
+        label.to_string()
+    } else {
+        truncate_pane_label(label)
+    }
+}
+
+fn label_mark_color(mark: Option<LabelMark>) -> slint::Color {
+    let Some(LabelMark::Icon([r, g, b]) | LabelMark::Swatch([r, g, b])) = mark else {
+        return slint::Color::default();
+    };
+    slint::Color::from_rgb_u8(r, g, b)
+}
+
+fn set_frame_label_mark(app: &AppWindow, mark: Option<LabelMark>) {
+    app.set_frame_label_icon(matches!(mark, Some(LabelMark::Icon(_))));
+    app.set_frame_label_swatch(matches!(mark, Some(LabelMark::Swatch(_))));
+    app.set_frame_label_icon_color(label_mark_color(mark));
 }
 
 /// A fresh model for `lines`, or `None` when `current` already holds them:
@@ -662,9 +719,9 @@ pub fn repaint(
     }
 
     let (
-        frame_path,
-        frame_view,
+        frame_pane,
         frame_label,
+        frame_label_mark,
         frame_draw,
         plane_draw,
         readout,
@@ -674,9 +731,9 @@ pub fn repaint(
     ) = {
         let controller = controller.lock().unwrap();
         (
-            controller.selected_frame_path(),
-            controller.selected_frame_view(),
+            controller.frame_pane(),
             controller.frame_pane_label(),
+            controller.frame_pane_label_mark(),
             controller.frame_draw(),
             controller.plane_draw(),
             controller.zoom_readout(),
@@ -687,11 +744,12 @@ pub fn repaint(
     };
     canvas
         .borrow_mut()
-        .set_frame(frame_path.as_deref(), frame_view);
+        .show_frame_pane(frame_pane, &frame_label);
 
     app.set_zoom_readout(readout.into());
     app.set_project_loaded(project_loaded);
-    app.set_frame_label(truncate_pane_label(&frame_label).into());
+    app.set_frame_label(pane_label_text(&frame_label, frame_label_mark).into());
+    set_frame_label_mark(app, frame_label_mark);
     if let Some(lines) = changed_lines(
         app.get_frame_message_lines(),
         canvas.borrow().frame_refusal(),
@@ -2259,7 +2317,13 @@ fn sync_image_rows(
             model.push(row);
             updates += 1;
         } else if let Some(previous) = model.row_data(index)
-            && (previous.chip != row.chip
+            && (previous.kind != row.kind
+                || previous.method != row.method
+                || previous.strokes != row.strokes
+                || previous.badges.iter().ne(row.badges.iter())
+                || previous.collapsed != row.collapsed
+                || previous.height != row.height
+                || previous.chip != row.chip
                 || previous.name != row.name
                 || previous.time_text != row.time_text
                 || previous.capture_stamp != row.capture_stamp
@@ -2390,12 +2454,15 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
     let rows: Vec<GeneratedImageRow> = panel
         .rows
         .iter()
-        .enumerate()
-        .map(|(index, row)| {
-            let visible = controller.source_preview_row_visible(index);
-            let preview = visible
-                .then(|| controller.source_preview(&row.path))
+        .map(|row| {
+            let frame = row.kind == crate::images::RowKind::Frame;
+            let visible = controller.source_preview_row_visible(row);
+            let source = visible
+                .then(|| controller.row_preview_source(row))
                 .flatten();
+            let preview = source
+                .as_ref()
+                .and_then(|source| controller.source_preview(source));
             if let Some(pixels) = preview
                 && native_previews.insert(Arc::as_ptr(pixels))
             {
@@ -2403,9 +2470,37 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
                     native_preview_bytes.saturating_add(pixels.rgba.len() as u64);
             }
             GeneratedImageRow {
+                kind: match row.kind {
+                    crate::images::RowKind::Frame => "frame",
+                    crate::images::RowKind::Checkpoint => "checkpoint",
+                    crate::images::RowKind::Hidden => "hidden",
+                    crate::images::RowKind::ResultsHeading
+                    | crate::images::RowKind::FramesHeading => "heading",
+                }
+                .into(),
+                method: row.method.clone().into(),
+                strokes: row.strokes.clone().into(),
+                badges: slint::ModelRc::new(slint::VecModel::from(
+                    row.badges
+                        .iter()
+                        .map(|badge| badge.as_str().into())
+                        .collect::<Vec<slint::SharedString>>(),
+                )),
+                collapsed: row.collapsed,
+                height: row.height,
                 chip: slint::Color::from_rgb_u8(row.chip[0], row.chip[1], row.chip[2]),
-                name: truncate_tail(&row.name, name_max).into(),
-                full_name: row.name.clone().into(),
+                name: if frame {
+                    truncate_tail(&row.name, name_max)
+                } else {
+                    row.name.clone()
+                }
+                .into(),
+                full_name: if frame {
+                    row.name.clone()
+                } else {
+                    String::new()
+                }
+                .into(),
                 time_text: row.trailing_text.clone().into(),
                 capture_stamp: row.capture_stamp.clone().into(),
                 excluded: row.excluded,
@@ -2415,8 +2510,8 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
                 focused: false,
                 job_disabled: false,
                 preview: source_preview_image(preview),
-                preview_state: if visible {
-                    controller.source_preview_state(&row.path, row.unresolved)
+                preview_state: if let Some(source) = &source {
+                    controller.source_preview_state(source, row.unresolved)
                 } else if row.unresolved {
                     "missing"
                 } else {
@@ -2431,8 +2526,8 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
     });
     controller.set_published_preview_bytes(native_preview_bytes);
     record_timing(TimingCounter::RowUpdates, updates as u64);
+    app.set_images_list_viewport_y(-controller.images_scroll_y_in(panel.content_height()));
     app.set_images_header_text(panel.header_text.into());
-    app.set_images_list_viewport_y(-controller.images_scroll_y());
     let sort = match controller.frame_sort() {
         Some(crate::images::FrameSort::Name) => "name",
         Some(crate::images::FrameSort::CaptureTime) => "capture-time",
@@ -2616,6 +2711,13 @@ fn push_overlay_controls(app: &AppWindow, controller: &AppController) {
     app.set_overlay_text(format!("{:.0}%", overlay.opacity * 100.0).into());
 }
 
+/// The cursor glyph's colour: the checkpoint's, transparent without one.
+fn glyph_color(colour: Option<[u8; 3]>) -> slint::Color {
+    colour.map_or(slint::Color::from_argb_u8(0, 0, 0, 0), |[r, g, b]| {
+        slint::Color::from_rgb_u8(r, g, b)
+    })
+}
+
 /// Pushes the brush cursor overlay's own view -- every repaint, since its
 /// extent also depends on the active tab's current zoom, which
 /// [`push_editor_toolbar`]'s own `EditorChanged` trigger does not cover.
@@ -2631,6 +2733,8 @@ fn push_brush_cursor(app: &AppWindow, controller: &AppController) {
     app.set_cursor_picking(view.picking);
     app.set_cursor_mode_tag(view.mode_tag.into());
     app.set_cursor_tag_origin(view.tag_origin);
+    app.set_cursor_checkpoint_source(view.checkpoint_colour.is_some());
+    app.set_cursor_glyph_color(glyph_color(view.checkpoint_colour));
     app.set_cursor_pick_color(slint::Color::from_rgb_u8(
         view.pick_color[0],
         view.pick_color[1],
@@ -4761,17 +4865,21 @@ pub fn install(
             }
         }
     });
-    // A plain wheel over the `Images` list steps the selected/brush-source
-    // frame -- the same effect `Ctrl + Wheel` over the canvas has, so this
-    // also needs a repaint.
+    // A plain wheel over an `Images` row steps the source row, which also
+    // needs a repaint; a refused wheel is the list's own scroll and gets none.
     app.on_images_frame_wheel({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
-        move |delta| {
-            dispatch(&controller, &canvas, &app_weak, |controller| {
-                controller.images_list_wheel(delta);
-            });
+        move |row, delta| {
+            let used = controller
+                .lock()
+                .unwrap()
+                .images_list_wheel(row as usize, delta);
+            if used {
+                dispatch(&controller, &canvas, &app_weak, |_| {});
+            }
+            used
         }
     });
     app.on_images_scrollbar_pointer({
@@ -4948,7 +5056,7 @@ pub fn install(
         let app_weak = app.as_weak();
         move |i| {
             dispatch(&controller, &canvas, &app_weak, |controller| {
-                controller.select_frame(i as usize);
+                controller.select_image_row(i as usize);
             });
         }
     });
@@ -4959,7 +5067,7 @@ pub fn install(
         move |delta| {
             record_images_input();
             dispatch(&controller, &canvas, &app_weak, |controller| {
-                controller.select_adjacent_resolved_frame(delta);
+                controller.select_adjacent_image_row(delta);
             });
         }
     });
@@ -5594,6 +5702,7 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             let mut controller = controller.lock().unwrap();
             push_checkpoint_panel(app, &mut controller);
             app.set_projects_save_enabled(controller.save_enabled());
+            push_images_panel(app, &controller);
         }
         ShellEvent::EditorChanged => {
             let controller = controller.lock().unwrap();

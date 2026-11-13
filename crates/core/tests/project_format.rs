@@ -18,7 +18,7 @@ use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
 use focusforge_core::project::{
     self, BlobKind, BrushMode, Checkpoint, HASH_ALGORITHM, Metrics, Op, Plane, Point, Project,
-    SealRequest, SourceResolution, blob,
+    SealRequest, SourceResolution, StrokeSource, blob,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapReader, ZMapWriter};
 
@@ -243,14 +243,7 @@ fn manifest_carries_no_format_version() {
 
     project::append_ops(
         &project_path,
-        vec![Op::BrushStroke {
-            source_id: 0,
-            path: vec![Point { x: 1, y: 1 }],
-            radius: 2.0,
-            softness: 0.5,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }],
+        vec![Op::frame_stroke(0, vec![Point { x: 1, y: 1 }], 2.0, 0.5)],
         None,
     )
     .unwrap();
@@ -343,14 +336,12 @@ fn checkpoint_serializes_every_field_with_no_parent_and_no_ops() {
 
 #[test]
 fn the_brush_stroke_round_trips() {
-    let ops = vec![Op::BrushStroke {
-        source_id: 7,
-        path: vec![Point { x: -3, y: 4 }, Point { x: 10, y: 20 }],
-        radius: 12.5,
-        softness: 0.25,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }];
+    let ops = vec![Op::frame_stroke(
+        7,
+        vec![Point { x: -3, y: 4 }, Point { x: 10, y: 20 }],
+        12.5,
+        0.25,
+    )];
     let text = serde_json::to_string(&ops).unwrap();
     let back: Vec<Op> = serde_json::from_str(&text).unwrap();
     assert_eq!(back, ops);
@@ -369,7 +360,7 @@ fn stroke_list_fixture() -> String {
 
 fn stroke(mode: BrushMode, opacity: f32) -> Op {
     Op::BrushStroke {
-        source_id: 3,
+        source: StrokeSource::Frame(3),
         path: vec![Point { x: -4, y: 9 }, Point { x: 30, y: -2 }],
         radius: 6.5,
         softness: 0.0,
@@ -407,6 +398,49 @@ fn required_format_version_is_two_for_a_listed_non_default_stroke() {
         project::append_ops(&other, vec![stroke(BrushMode::Normal, 1.0)], None).unwrap();
         assert_eq!(required_version(&other), 2, "{op:?} then a default stroke");
     }
+}
+
+/// A default stroke painted from checkpoint `id`.
+fn checkpoint_stroke(id: &str) -> Op {
+    Op::BrushStroke {
+        source: StrokeSource::Checkpoint(id.to_string()),
+        path: vec![Point { x: 2, y: 3 }, Point { x: 9, y: 5 }],
+        radius: 4.0,
+        softness: 0.5,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
+    }
+}
+
+fn head_id(path: &Path) -> String {
+    Project::open(path).unwrap().manifest().checkpoint.clone()
+}
+
+#[test]
+fn required_format_version_is_two_for_a_checkpoint_stroke() {
+    let (_dir, path) = sealed("project_format_required_checkpoint");
+    let root = head_id(&path);
+    project::append_ops(&path, vec![checkpoint_stroke(&root)], None).unwrap();
+    assert_eq!(required_version(&path), 2, "a stroke naming the root");
+
+    let (_dir, later) = sealed("project_format_required_checkpoint_later");
+    project::append_ops(&later, vec![stroke(BrushMode::Normal, 1.0)], None).unwrap();
+    let mid = head_id(&later);
+    assert_eq!(required_version(&later), 1, "a frame stroke");
+    project::append_ops(&later, vec![checkpoint_stroke(&mid)], None).unwrap();
+    assert_eq!(
+        required_version(&later),
+        2,
+        "a stroke naming a later checkpoint"
+    );
+
+    let (_dir, frame) = sealed("project_format_required_checkpoint_frame");
+    project::append_ops(&frame, vec![stroke(BrushMode::Normal, 1.0)], None).unwrap();
+    assert_eq!(
+        required_version(&frame),
+        1,
+        "the same stroke, frame-sourced"
+    );
 }
 
 #[test]
@@ -540,6 +574,148 @@ fn brush_stroke_mode_opacity_default_keeps_its_bytes_and_id() {
         Checkpoint::derive_child_id("parent", "fingerprint", &blake3::hash(ops_json).to_hex(), 7)
     };
     assert_eq!(id(&bytes), id(without_fields.as_bytes()));
+}
+
+fn sourced_stroke(source: StrokeSource, points: usize, mode: BrushMode, opacity: f32) -> Op {
+    Op::BrushStroke {
+        source,
+        path: (0..points as i32)
+            .map(|i| Point { x: i * 3, y: -i })
+            .collect(),
+        radius: 4.0,
+        softness: 0.75,
+        mode,
+        opacity,
+    }
+}
+
+#[test]
+fn stroke_source_round_trips_both_variants() {
+    let sources = [
+        StrokeSource::Frame(0),
+        StrokeSource::Frame(u16::MAX),
+        StrokeSource::Checkpoint("0123456789abcdef0123456789abcdef".into()),
+        StrokeSource::Checkpoint(String::new()),
+    ];
+    for source in sources {
+        for points in [0, 1, 1000] {
+            for (mode, opacity) in [(BrushMode::Normal, 1.0), (BrushMode::Darken, 0.3)] {
+                let op = sourced_stroke(source.clone(), points, mode, opacity);
+                let text = serde_json::to_string(&op).unwrap();
+                assert_eq!(serde_json::from_str::<Op>(&text).unwrap(), op);
+
+                let value = serde_json::to_value(&op).unwrap();
+                let fields = value["brush-stroke"].as_object().unwrap();
+                match &source {
+                    StrokeSource::Frame(n) => {
+                        assert_eq!(fields["source_id"], serde_json::json!(n), "{op:?}");
+                        assert!(!fields.contains_key("source"), "{op:?}");
+                    }
+                    StrokeSource::Checkpoint(id) => {
+                        assert_eq!(
+                            fields["source"],
+                            serde_json::json!({ "checkpoint": id }),
+                            "{op:?}"
+                        );
+                        assert!(!fields.contains_key("source_id"), "{op:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn stroke_source_frame_keeps_its_bytes_and_id() {
+    let literal = r#"[{"brush-stroke":{"source_id":65535,"path":[{"x":-7,"y":0},{"x":0,"y":41},{"x":9,"y":9}],"radius":2.5,"softness":1.0}}]"#;
+    let ops: Vec<Op> = serde_json::from_str(literal).unwrap();
+    let bytes = serde_json::to_vec(&ops).unwrap();
+    assert_eq!(bytes, literal.as_bytes());
+    let id = |ops_json: &[u8]| {
+        Checkpoint::derive_child_id("parent", "fingerprint", &blake3::hash(ops_json).to_hex(), 7)
+    };
+    assert_eq!(id(&bytes), id(literal.as_bytes()));
+    assert_eq!(
+        serde_json::to_string(&Op::frame_stroke(2, vec![Point { x: 0, y: 0 }], 4.5, 0.25)).unwrap(),
+        r#"{"brush-stroke":{"source_id":2,"path":[{"x":0,"y":0}],"radius":4.5,"softness":0.25}}"#
+    );
+    assert_eq!(
+        ops,
+        vec![Op::frame_stroke(
+            u16::MAX,
+            vec![
+                Point { x: -7, y: 0 },
+                Point { x: 0, y: 41 },
+                Point { x: 9, y: 9 }
+            ],
+            2.5,
+            1.0
+        )]
+    );
+
+    let (_dir, path) = sealed("project_format_stroke_source_frame");
+    let frames = vec![
+        Op::frame_stroke(0, vec![Point { x: 1, y: 2 }], 3.0, 0.5),
+        sourced_stroke(StrokeSource::Frame(2), 2, BrushMode::Lighten, 0.5),
+    ];
+    let appended = project::append_ops(&path, frames.clone(), None).unwrap();
+    let entry = format!("checkpoints/{}.json", appended.checkpoint);
+    let raw: serde_json::Value = serde_json::from_slice(
+        &Index::read(&path)
+            .unwrap()
+            .read_entry(&path, &entry)
+            .unwrap(),
+    )
+    .unwrap();
+    for (i, expected) in [0, 2].into_iter().enumerate() {
+        let written = raw["ops"][i]["brush-stroke"].as_object().unwrap();
+        assert_eq!(written["source_id"], serde_json::json!(expected), "{raw}");
+        assert!(!written.contains_key("source"), "{raw}");
+    }
+    assert_eq!(Project::open(&path).unwrap().checkpoint().ops, frames);
+}
+
+fn stroke_with(source_fields: &str) -> String {
+    let comma = if source_fields.is_empty() { "" } else { "," };
+    format!(
+        r#"{{"brush-stroke":{{{source_fields}{comma}"path":[{{"x":2,"y":3}}],"radius":1.5,"softness":0.25}}}}"#
+    )
+}
+
+#[test]
+fn legacy_source_id_reads_as_a_frame() {
+    for n in [0u16, 1, 255, 256, 65535] {
+        for fields in [
+            format!(r#""source_id":{n}"#),
+            format!(r#""source":{{"frame":{n}}}"#),
+        ] {
+            let op: Op = serde_json::from_str(&stroke_with(&fields)).unwrap();
+            let Op::BrushStroke { source, .. } = op else {
+                panic!("not a brush stroke: {op:?}");
+            };
+            assert_eq!(source, StrokeSource::Frame(n), "{fields}");
+        }
+    }
+}
+
+#[test]
+fn legacy_source_id_with_source_is_refused() {
+    let both = stroke_with(r#""source_id":4,"source":{"frame":4}"#);
+    let message = serde_json::from_str::<Op>(&both).unwrap_err().to_string();
+    assert!(
+        message.contains("source_id") && message.contains("source"),
+        "{message}"
+    );
+    assert!(message.contains("both"), "{message}");
+
+    let neither = serde_json::from_str::<Op>(&stroke_with("")).unwrap_err();
+    assert!(
+        neither.to_string().contains("missing field `source_id`"),
+        "{neither}"
+    );
+
+    let unknown = serde_json::from_str::<Op>(&stroke_with(r#""source":{"layer":1}"#)).unwrap_err();
+    assert!(unknown.to_string().contains("unknown variant"), "{unknown}");
 }
 
 #[test]
@@ -945,6 +1121,101 @@ fn open_err(path: &Path) -> project::ProjectError {
     match Project::open(path) {
         Ok(_) => panic!("{} must be refused", path.display()),
         Err(err) => err,
+    }
+}
+
+/// A copy of `src` whose checkpoint `holder` has its first stroke rewritten to
+/// be painted from checkpoint `named`.
+fn with_stroke_source(src: &Path, name: &str, holder: &str, named: &str) -> PathBuf {
+    let dst = src.with_extension(format!("{name}.ffp"));
+    rewrite_entry(src, &dst, &format!("checkpoints/{holder}.json"), |bytes| {
+        let mut record: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        let stroke = record["ops"][0]["brush-stroke"].as_object_mut().unwrap();
+        stroke.remove("source_id");
+        stroke.insert("source".into(), serde_json::json!({ "checkpoint": named }));
+        serde_json::to_vec(&record).unwrap()
+    });
+    dst
+}
+
+#[test]
+fn stamped_project_reopens() {
+    let (_dir, path) = sealed("project_format_stamped_reopens");
+    let root = head_id(&path);
+    let strokes = vec![checkpoint_stroke(&root), stroke(BrushMode::Detail, 0.5)];
+    let ids = project::append_op_chain(&path, None, strokes.clone(), None, 5_000).unwrap();
+    assert_eq!(stored_format_version(&path), Some(serde_json::json!(2)));
+
+    let project = Project::open(&path).unwrap();
+    let read: Vec<Op> = project
+        .history()
+        .op_chain(ids.last().unwrap())
+        .unwrap()
+        .into_iter()
+        .cloned()
+        .collect();
+    assert_eq!(read, strokes);
+}
+
+#[test]
+fn dangling_stroke_source_is_refused() {
+    let (_dir, path) = sealed("project_format_dangling_source");
+    let root = head_id(&path);
+    let ghost = "0123456789abcdef0123456789abcdef";
+
+    // A save naming a missing checkpoint fails and leaves the file as it was.
+    let err = project::append_ops(&path, vec![checkpoint_stroke(ghost)], None).unwrap_err();
+    assert!(
+        matches!(&err, project::ProjectError::CheckpointSourceRefused { index: 0, checkpoint, reason, .. }
+            if checkpoint == ghost && reason == "is not in this project"),
+        "{err:?}"
+    );
+    assert_eq!(head_id(&path), root);
+    assert_eq!(stored_format_version(&path), None);
+
+    // An opened file whose record was rewritten to name one is refused.
+    let tail = project::append_ops(&path, vec![checkpoint_stroke(&root)], None)
+        .unwrap()
+        .checkpoint;
+    let bad = with_stroke_source(&path, "dangling", &tail, ghost);
+    let err = open_err(&bad);
+    assert!(
+        matches!(&err, project::ProjectError::DanglingStrokeSource { checkpoint, referenced, .. }
+            if *checkpoint == tail && referenced == ghost),
+        "{err:?}"
+    );
+    let text = err.to_string();
+    for part in [bad.to_string_lossy().as_ref(), tail.as_str(), ghost] {
+        assert!(text.contains(part), "`{part}` missing from: {text}");
+    }
+}
+
+#[test]
+fn stroke_source_cycle_is_refused() {
+    let (_dir, path) = sealed("project_format_source_cycle");
+    let first = project::append_ops(&path, vec![stroke(BrushMode::Normal, 1.0)], None)
+        .unwrap()
+        .checkpoint;
+    let second = project::append_ops(&path, vec![stroke(BrushMode::Normal, 1.0)], None)
+        .unwrap()
+        .checkpoint;
+
+    for (name, holder, named) in [("self", &second, &second), ("descendant", &first, &second)] {
+        let bad = with_stroke_source(&path, name, holder, named);
+        let err = open_err(&bad);
+        assert!(
+            matches!(&err, project::ProjectError::StrokeSourceCycle { checkpoint, referenced, .. }
+                if checkpoint == holder && referenced == named),
+            "{name}: {err:?}"
+        );
+        let text = err.to_string();
+        for part in [
+            bad.to_string_lossy().as_ref(),
+            holder.as_str(),
+            named.as_str(),
+        ] {
+            assert!(text.contains(part), "{name}: `{part}` missing from: {text}");
+        }
     }
 }
 

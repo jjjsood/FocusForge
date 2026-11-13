@@ -157,7 +157,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             break
         }
         'focusforge-cli;retouch' {
-            [CompletionResult]::new('--ops', '--ops', [CompletionResultType]::ParameterName, 'The op list: a JSON array of ops in the persisted `Op` shape. A brush stroke blends frame `source_id` over the image along its path: fully within `radius * (1 - softness)`, fading linearly to nothing at `radius`. A stroke may also carry `mode` (`normal`, `lighten`, `darken` or `detail`; default `normal`) and `opacity` (0 < x ≤ 1; default 1.0). An opacity too small to register still records a state but changes no sample. `lighten` changes a pixel only where the source''s sum over all its samples is greater than the image''s there, `darken` only where it is smaller; either then blends every sample by the same amount. `detail` keeps the image''s own brightness and takes only the source''s fine detail, over a reach about the brush radius. Every op is checked before anything is written; positions in error messages count from 0 in list order')
+            [CompletionResult]::new('--ops', '--ops', [CompletionResultType]::ParameterName, 'The op list: a JSON array of ops in the persisted `Op` shape. The source of a brush stroke is `"source": {"frame": n}`, a source frame, or `"source": {"checkpoint": "<id prefix>"}`, a checkpoint''s own render; `"source_id": n` reads as frame n. A checkpoint is named by any unique prefix of a visible checkpoint''s id, is stored as its full id, and must share the edited state''s pixel grid and sample type. A brush stroke blends its source over the image along its path: fully within `radius * (1 - softness)`, fading linearly to nothing at `radius`. A stroke may also carry `mode` (`normal`, `lighten`, `darken` or `detail`; default `normal`) and `opacity` (0 < x ≤ 1; default 1.0). An opacity too small to register still records a state but changes no sample. `lighten` changes a pixel only where the source''s sum over all its samples is greater than the image''s there, `darken` only where it is smaller; either then blends every sample by the same amount. `detail` keeps the image''s own brightness and takes only the source''s fine detail, over a reach about the brush radius. Every op is checked before anything is written; positions in error messages count from 0 in list order')
             [CompletionResult]::new('--from', '--from', [CompletionResultType]::ParameterName, 'The state to append under -- any unique prefix of its id. Defaults to the project''s current head')
             [CompletionResult]::new('--name', '--name', [CompletionResultType]::ParameterName, 'Name the last appended state')
             [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Emit the JSON report instead of human-readable text')
@@ -175,7 +175,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
             [CompletionResult]::new('list', 'list', [CompletionResultType]::ParameterValue, 'List every visible checkpoint, newest first')
-            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete one checkpoint: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by `history compact`. Refuses the last visible checkpoint')
+            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete one checkpoint: it is hidden, and dropped from the project once no visible checkpoint is built on it and no stroke paints from it (a checkpoint a stroke paints from stays stored); its space is reclaimed by `history compact`. Refuses the last visible checkpoint')
             [CompletionResult]::new('compact', 'compact', [CompletionResultType]::ParameterValue, 'Rewrite the project to its live checkpoints only and report the bytes reclaimed')
             [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
             break
@@ -212,7 +212,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
         }
         'focusforge-cli;history;help' {
             [CompletionResult]::new('list', 'list', [CompletionResultType]::ParameterValue, 'List every visible checkpoint, newest first')
-            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete one checkpoint: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by `history compact`. Refuses the last visible checkpoint')
+            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete one checkpoint: it is hidden, and dropped from the project once no visible checkpoint is built on it and no stroke paints from it (a checkpoint a stroke paints from stays stored); its space is reclaimed by `history compact`. Refuses the last visible checkpoint')
             [CompletionResult]::new('compact', 'compact', [CompletionResultType]::ParameterValue, 'Rewrite the project to its live checkpoints only and report the bytes reclaimed')
             [CompletionResult]::new('help', 'help', [CompletionResultType]::ParameterValue, 'Print this message or the help of the given subcommand(s)')
             break
@@ -354,7 +354,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
         }
         'focusforge-cli;help;history' {
             [CompletionResult]::new('list', 'list', [CompletionResultType]::ParameterValue, 'List every visible checkpoint, newest first')
-            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete one checkpoint: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by `history compact`. Refuses the last visible checkpoint')
+            [CompletionResult]::new('delete', 'delete', [CompletionResultType]::ParameterValue, 'Delete one checkpoint: it is hidden, and dropped from the project once no visible checkpoint is built on it and no stroke paints from it (a checkpoint a stroke paints from stays stored); its space is reclaimed by `history compact`. Refuses the last visible checkpoint')
             [CompletionResult]::new('compact', 'compact', [CompletionResultType]::ParameterValue, 'Rewrite the project to its live checkpoints only and report the bytes reclaimed')
             break
         }

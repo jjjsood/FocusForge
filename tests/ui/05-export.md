@@ -14,7 +14,7 @@ Start: --open fixtures/mantis-64/frames
 ## Read the dialog
 6. Click **Export image** (`FFCheckpointPanel::checkpoint-export`).
    Expect: a dialog titled "Export image" opens with the line "Exporting the unsaved fuse result held in this tab.", a "Format" row with the segments TIFF, PNG, JPEG and DNG with TIFF highlighted, the heading "TIFF SETTINGS" over "Bit depth" reading "16-bit" and "Compression" reading "None", no "Quality" row, and a "METADATA" heading; an icon button **Close dialog** sits at the panel's top-right corner (`buttons AppWindow::export-dialog` lists it).
-7. Click the "Bit depth" field showing "16-bit" (`FFMenu::root`, match 0; match 1 is "Compression").
+7. Click the "Bit depth" field showing "16-bit" (`FFMenu::root`, match 1; match 0 is the editor toolbar's mode menu showing "Normal", behind the dialog; match 2 is "Compression").
    Expect: a list with the options 16-bit and 8-bit opens under the field, with a check mark beside 16-bit.
 8. Click the option 8-bit (`FFMenuList::option-area`, match 1).
    Expect: the list is closed and the "Bit depth" field reads "8-bit".
@@ -22,7 +22,7 @@ Start: --open fixtures/mantis-64/frames
    Expect: the switch's knob is at its left end (it was at its right end before the click).
 10. Click the switch beside "Metadata" (`FFToggle::area`, match 1).
    Expect: the switch's knob is at its right end again.
-11. Click the "Compression" field showing "None" (`FFMenu::root`, match 1; match 0 is "Bit depth").
+11. Click the "Compression" field showing "None" (`FFMenu::root`, match 2; match 1 is "Bit depth" and match 0 is the editor toolbar's mode menu).
    Expect: a list with the options None, LZW and Deflate opens under the field, with a check mark beside None.
 12. Click the option Deflate (`FFMenuList::option-area`, match 2).
    Expect: the list is closed and the "Compression" field reads "Deflate".
@@ -45,7 +45,7 @@ Start: --open fixtures/mantis-64/frames
 ## Close, Escape and Cancel write nothing
 20. Click **Export image** (`FFCheckpointPanel::checkpoint-export`).
    Expect: the dialog "Export image" opens with the heading "TIFF SETTINGS", the "Compression" field reading "None" and the "Metadata" switch's knob at its right end; "JPEG SETTINGS" and "Deflate" are not shown.
-21. Click the "Compression" field showing "None" (`FFMenu::root`, match 1).
+21. Click the "Compression" field showing "None" (`FFMenu::root`, match 2).
    Expect: a list with the options None, LZW and Deflate opens under the field, with a check mark beside None.
 22. Press Escape while the list is open.
    Expect: Must not: the dialog closes; the list is closed, the "Export image" dialog is still shown with the heading "TIFF SETTINGS" and the "Compression" field reading "None".

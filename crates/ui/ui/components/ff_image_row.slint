@@ -4,10 +4,68 @@ import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
 import { FFIconButton } from "ff_icon_button.slint";
 import { FFTooltip } from "ff_tooltip.slint";
+import { FFBadge } from "ff_badge.slint";
+
+// A checkpoint's one-line identity: layers icon, text elided at the end and
+// the role pills at the trailing edge.
+component CheckpointLine inherits HorizontalLayout {
+    in property <color> chip;
+    in property <string> text;
+    in property <string> hint;
+    in property <color> text-color;
+    in property <[string]> badges;
+    in property <length> tooltip-max-width;
+
+    spacing: Theme.space-2;
+
+    VerticalLayout {
+        alignment: center;
+        Image {
+            width: Theme.icon-sm;
+            height: Theme.icon-sm;
+            source: @image-url("../../../../assets/icons/layers.svg");
+            colorize: root.chip;
+        }
+    }
+    Rectangle {
+        horizontal-stretch: 1;
+        line-text := Text {
+            width: 100%;
+            height: 100%;
+            text: root.text;
+            color: root.text-color;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        Tooltip {
+            FFTooltip {
+                text: root.hint;
+                detail: line-text.preferred-width > line-text.width ? root.text : "";
+                tooltip-max-width: root.tooltip-max-width;
+            }
+        }
+    }
+    VerticalLayout {
+        alignment: center;
+        HorizontalLayout {
+            spacing: Theme.space-1;
+            for badge in root.badges: FFBadge { text: badge; }
+        }
+    }
+}
 
 export component FFImageRow inherits Rectangle {
     in property <color> chip;
     in property <string> name;
+    // "frame", "checkpoint" or "hidden" (a muted line of text in `name`). A
+    // checkpoint reads `name` as its own label, with `method`, `strokes`,
+    // `time-text` and `badges`.
+    in property <string> kind: "frame";
+    in property <string> method;
+    in property <string> strokes;
+    in property <[string]> badges;
     // The whole name when `name` is shortened; empty when `name` is whole.
     in property <string> full-name;
     property <string> tooltip-text: root.full-name != "" ? root.full-name : root.name;
@@ -34,12 +92,23 @@ export component FFImageRow inherits Rectangle {
     // The compact filename surface forwards a drag stream; ordinary clicks
     // continue selecting the row through `clicked`.
     callback drag-pointer(int, length);
-    callback wheel(length);
+    // A plain wheel over the row; `true` when it was used, `false` leaves the
+    // wheel to the list's own scrolling.
+    callback wheel(length) -> bool;
 
+    property <bool> is-checkpoint: root.kind == "checkpoint";
+    property <bool> is-hidden: root.kind == "hidden";
+    property <bool> is-frame: root.kind == "frame";
+    property <string> hint: "Use as brush source";
+    property <string> line-text: (root.name != "" ? root.name + " · " : "") + root.method + " " + root.time-text
+        + (root.strokes != "" ? " " + root.strokes : "");
+    property <color> checkpoint-color: root.unresolved || root.job-disabled ? Theme.text-disabled
+        : root.selected ? Theme.text-primary : Theme.text-secondary;
     property <bool> is-list: root.presentation == "list";
     property <bool> is-image-list: root.presentation == "image-list";
     property <bool> is-large: root.presentation == "large";
-    property <bool> interactive: !root.unresolved && (root.mutable || root.legend);
+    property <bool> interactive: !root.unresolved && !root.is-hidden
+        && (root.mutable || root.legend || root.is-checkpoint);
     property <bool> drag-pressed: false;
     timestamp-measure := Text {
         visible: false;
@@ -56,22 +125,23 @@ export component FFImageRow inherits Rectangle {
     property <length> row-height: root.is-image-list ? ShellGeometry.image-list-row-height
         : root.is-large ? ShellGeometry.large-preview-row-height : ShellGeometry.image-row-height;
 
-    height: root.row-height;
+    height: root.is-hidden ? ShellGeometry.hidden-line-height : root.row-height;
 
     Rectangle {
         opacity: root.floating ? 0.75 : 1.0;
         drop-shadow-color: root.floating ? Theme.surface-canvas.with-alpha(0.5) : transparent;
         drop-shadow-offset-y: Theme.space-1;
         drop-shadow-blur: Theme.space-2;
-        background: root.dragging || (root.interactive && area.has-hover) ? Theme.surface-hover
+        background: root.dragging ? Theme.surface-hover
+            : root.is-checkpoint && root.selected ? Theme.text-primary.with-alpha(0.12)
+            : root.interactive && (area.has-hover || root.hovered) ? Theme.surface-hover
             : root.selected ? root.chip.with-alpha(0.3) : transparent;
 
         if root.unresolved: TouchArea {
             width: 100%;
             height: 100%;
             scroll-event(event) => {
-                root.wheel(event.delta-y);
-                accept
+                if root.wheel(event.delta-y) { accept } else { reject }
             }
         }
 
@@ -130,8 +200,7 @@ export component FFImageRow inherits Rectangle {
                 }
             }
             scroll-event(event) => {
-                root.wheel(event.delta-y);
-                accept
+                if root.wheel(event.delta-y) { accept } else { reject }
             }
 
         if root.dragging: Rectangle {
@@ -146,7 +215,7 @@ export component FFImageRow inherits Rectangle {
             y: 0px;
             width: ShellGeometry.image-row-marker-width;
             height: 100%;
-            background: root.chip;
+            background: root.is-checkpoint ? Theme.text-primary : root.chip;
         }
         if root.focused: Rectangle {
             width: 100%;
@@ -155,7 +224,7 @@ export component FFImageRow inherits Rectangle {
             border-color: Theme.accent-default;
         }
 
-        if root.is-list: list-content := HorizontalLayout {
+        if root.is-list && root.is-frame: list-content := HorizontalLayout {
             x: ShellGeometry.image-row-content-inset;
             width: parent.width - ShellGeometry.image-row-content-inset - ShellGeometry.image-row-action-inset;
             height: 100%;
@@ -207,7 +276,7 @@ export component FFImageRow inherits Rectangle {
             }
         }
 
-        if root.is-image-list: image-list-details := Rectangle {
+        if root.is-image-list && !root.is-hidden: image-list-details := Rectangle {
             x: ShellGeometry.image-preview-inset;
             y: (parent.height - ShellGeometry.image-list-preview-height) / 2;
             width: ShellGeometry.image-list-preview-width;
@@ -237,7 +306,7 @@ export component FFImageRow inherits Rectangle {
                 background: Theme.surface-canvas.with-alpha(0.45);
             }
         }
-        if root.is-image-list: Rectangle {
+        if root.is-image-list && root.is-frame: Rectangle {
             x: ShellGeometry.image-list-details-x;
             width: ShellGeometry.image-list-details-width;
             height: 100%;
@@ -286,7 +355,7 @@ export component FFImageRow inherits Rectangle {
             }
         }
 
-        if root.is-large: large-identity := Rectangle {
+        if root.is-large && !root.is-hidden: large-identity := Rectangle {
             x: (parent.width - ShellGeometry.large-preview-width) / 2;
             y: ShellGeometry.large-preview-y;
             width: ShellGeometry.large-preview-width;
@@ -316,7 +385,7 @@ export component FFImageRow inherits Rectangle {
                 background: Theme.surface-canvas.with-alpha(0.45);
             }
         }
-        if root.is-large: Rectangle {
+        if root.is-large && root.is-frame: Rectangle {
             x: ShellGeometry.image-preview-inset;
             y: ShellGeometry.large-preview-y + ShellGeometry.large-preview-height;
             width: parent.width - 2 * ShellGeometry.image-preview-inset;
@@ -364,6 +433,128 @@ export component FFImageRow inherits Rectangle {
                 if self.show-tooltip: Tooltip {
                     FFTooltip { text: root.tooltip-text; tooltip-max-width: root.tooltip-max-width; }
                 }
+            }
+        }
+
+        if root.is-hidden: Text {
+            x: root.is-list ? ShellGeometry.image-row-content-inset + ShellGeometry.image-chip-size + Theme.space-2
+                : ShellGeometry.image-preview-inset;
+            width: parent.width - self.x - ShellGeometry.image-row-content-inset;
+            height: 100%;
+            text: root.name;
+            color: Theme.text-muted;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            vertical-alignment: center;
+            wrap: word-wrap;
+        }
+
+        if root.is-checkpoint && root.is-list: CheckpointLine {
+            x: ShellGeometry.image-row-content-inset;
+            width: parent.width - 2 * ShellGeometry.image-row-content-inset;
+            height: 100%;
+            chip: root.chip;
+            text: root.line-text;
+            hint: root.hint;
+            text-color: root.checkpoint-color;
+            badges: root.badges;
+            tooltip-max-width: root.tooltip-max-width;
+        }
+
+        if root.is-checkpoint && root.is-large: CheckpointLine {
+            x: (parent.width - ShellGeometry.large-preview-width) / 2;
+            y: ShellGeometry.large-preview-y + ShellGeometry.large-preview-height + Theme.space-1;
+            width: ShellGeometry.large-preview-width;
+            height: ShellGeometry.image-row-height;
+            chip: root.chip;
+            text: root.line-text;
+            hint: root.hint;
+            text-color: root.checkpoint-color;
+            badges: root.badges;
+            tooltip-max-width: root.tooltip-max-width;
+        }
+
+        if root.is-checkpoint && root.is-image-list: Rectangle {
+            x: ShellGeometry.image-list-details-x;
+            width: ShellGeometry.image-list-details-width;
+            height: 100%;
+
+            Image {
+                x: 0px;
+                y: ShellGeometry.image-preview-inset + (ShellGeometry.badge-height - Theme.icon-sm) / 2;
+                width: Theme.icon-sm;
+                height: Theme.icon-sm;
+                source: @image-url("../../../../assets/icons/layers.svg");
+                colorize: root.chip;
+            }
+            VerticalLayout {
+                y: ShellGeometry.image-preview-inset;
+                width: 100%;
+                height: parent.height - self.y;
+                alignment: start;
+                spacing: Theme.space-1;
+                for badge in root.badges: HorizontalLayout {
+                    alignment: end;
+                    FFBadge { text: badge; }
+                }
+            }
+            Rectangle {
+                y: max(ShellGeometry.image-list-name-y,
+                    ShellGeometry.image-preview-inset + root.badges.length * ShellGeometry.badge-height
+                        + max(root.badges.length - 1, 0) * Theme.space-1);
+                width: 100%;
+                height: 3 * ShellGeometry.image-list-name-height;
+                VerticalLayout {
+                    alignment: start;
+                    checkpoint-first-line := Text {
+                        height: ShellGeometry.image-list-name-height;
+                        text: root.name != "" ? root.name : root.method;
+                        color: root.checkpoint-color;
+                        font-size: Theme.text-body.size;
+                        font-weight: Theme.text-body.weight;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    if root.name != "": Text {
+                        height: ShellGeometry.image-list-name-height;
+                        text: root.method;
+                        color: root.checkpoint-color;
+                        font-size: Theme.text-body.size;
+                        font-weight: Theme.text-body.weight;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    if root.strokes != "": Text {
+                        height: ShellGeometry.image-list-name-height;
+                        text: root.strokes;
+                        color: Theme.text-muted;
+                        font-size: Theme.text-body.size;
+                        font-weight: Theme.text-body.weight;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+                Tooltip {
+                    FFTooltip {
+                        text: root.hint;
+                        detail: checkpoint-first-line.preferred-width > checkpoint-first-line.width ? root.line-text : "";
+                        tooltip-max-width: root.tooltip-max-width;
+                    }
+                }
+            }
+            Text {
+                y: parent.height - ShellGeometry.image-preview-inset - ShellGeometry.image-list-name-height;
+                width: 100%;
+                height: ShellGeometry.image-list-name-height;
+                text: root.time-text;
+                color: Theme.text-muted;
+                font-size: Theme.text-body.size;
+                font-weight: Theme.text-body.weight;
+                horizontal-alignment: right;
+                vertical-alignment: center;
             }
         }
 

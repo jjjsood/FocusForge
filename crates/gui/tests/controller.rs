@@ -12,15 +12,18 @@ use std::sync::{Arc, Mutex};
 
 use focusforge_core::align::Registration;
 use focusforge_core::io::Rect;
-use focusforge_core::project::{self, BrushMode, Op, Point, Project};
+use focusforge_core::project::{self, BrushMode, Op, Point, Project, StrokeSource};
 use focusforge_core::zmap::ZMapReader;
 use focusforge_gpu::blend::Blender;
 use focusforge_gpu::device::SharedDevice;
 #[cfg(feature = "gpu-tests")]
 use focusforge_gpu::device::shared_device_or_skip;
 use focusforge_gui::appearance_settings::{AppearanceSettings, SourcePresentation};
-use focusforge_gui::canvas::PaneSource;
-use focusforge_gui::{AppController, DockTab, ShellEvent, ShellMode, performance_settings};
+use focusforge_gui::canvas::{FrameSource, PaneSource};
+use focusforge_gui::source_previews::PreviewSource;
+use focusforge_gui::{
+    AppController, DockTab, FramePane, LabelMark, ShellEvent, ShellMode, performance_settings,
+};
 
 use common::{open_mantis64_tab, record_events, save_to_proposed, scratch_controller, settle_all};
 
@@ -333,7 +336,9 @@ fn is_local_event_seam(path: &std::path::Path, handler: &str) -> bool {
             | (Some("ff_slider.slint"), "focus-changed-event(reason)")
             | (Some("ff_image_row.slint"), "pointer-event(event)")
             | (Some("ff_image_row.slint"), "moved")
+            | (Some("ff_image_row.slint"), "scroll-event(event)")
             | (Some("images_panel.slint"), "clicked")
+            | (Some("images_panel.slint"), "toggled")
             | (Some("images_panel.slint"), "key-pressed(event)")
             | (Some("appearance_tab.slint"), "changed menu-open")
             | (Some("appearance_tab.slint"), "previous-requested")
@@ -579,14 +584,7 @@ fn read_whole_zmap(path: &Path) -> Vec<u16> {
 }
 
 fn one_dab(source_id: u16) -> Op {
-    Op::BrushStroke {
-        source_id,
-        path: vec![Point { x: 20, y: 20 }],
-        radius: 4.0,
-        softness: 0.0,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }
+    Op::frame_stroke(source_id, vec![Point { x: 20, y: 20 }], 4.0, 0.0)
 }
 
 /// `set_mode(Editor)` refused: `false`, nothing emitted, still stacking.
@@ -1736,14 +1734,7 @@ fn pressing_the_checkpoints_scrollbar_thumb_grabs_it_without_jumping() {
     )
     .unwrap();
     for i in 1..10i64 {
-        let op = Op::BrushStroke {
-            source_id: 0,
-            path: vec![Point { x: 1, y: 1 }],
-            radius: 0.5,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        };
+        let op = Op::frame_stroke(0, vec![Point { x: 1, y: 1 }], 0.5, 0.0);
         append_ops_at(&project_path, vec![op], None, noon + i * 60)
             .unwrap_or_else(|err| panic!("checkpoint {i} must append: {err}"));
     }
@@ -4085,10 +4076,8 @@ impl Sealed {
 
     /// `op` blended over `out`, a whole-map composite, from its frame.
     fn blend_over(&self, out: &mut [u16], op: &Op, info: ZMapInfo) {
-        let Op::BrushStroke { source_id, .. } = op else {
-            panic!("only brush strokes are blended");
-        };
-        let src = self.frame_view(usize::from(*source_id));
+        let frame = blend::source_frame(op).expect("only frame strokes are blended");
+        let src = self.frame_view(usize::from(frame));
         blend::apply(op, info, self.map, out, self.map, &src, 3).unwrap();
     }
 
@@ -4216,28 +4205,24 @@ fn drag_produces_one_brush_stroke() {
     drag(&mut c, &line);
     assert_eq!(
         ops(&c),
-        vec![Op::BrushStroke {
-            source_id: 2,
-            path: vec![Point { x: 10, y: 10 }, Point { x: 40, y: 30 }],
+        vec![Op::frame_stroke(
+            2,
+            vec![Point { x: 10, y: 10 }, Point { x: 40, y: 30 }],
             radius,
-            softness: 0.25,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }],
+            0.25
+        )],
         "one op, its straight path resampled down to its two ends"
     );
 
     drag(&mut c, &[(20.0, 21.0)]);
     assert_eq!(
         ops(&c).last(),
-        Some(&Op::BrushStroke {
-            source_id: 2,
-            path: vec![Point { x: 20, y: 21 }],
+        Some(&Op::frame_stroke(
+            2,
+            vec![Point { x: 20, y: 21 }],
             radius,
-            softness: 0.25,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }),
+            0.25
+        )),
         "a press-release with no motion is a one-point op"
     );
     assert_eq!(ops(&c).len(), 2);
@@ -4249,7 +4234,13 @@ fn drag_produces_one_brush_stroke() {
     common::settle_region_renders(&mut c);
     assert_eq!(ops(&c).len(), 3, "a drag starting on the left pane");
     assert!(
-        matches!(ops(&c).last(), Some(Op::BrushStroke { source_id: 2, .. })),
+        matches!(
+            ops(&c).last(),
+            Some(Op::BrushStroke {
+                source: StrokeSource::Frame(2),
+                ..
+            })
+        ),
         "it paints the selected source"
     );
     common::settle_region_renders(&mut c);
@@ -4413,14 +4404,12 @@ fn brush_controls_convert_to_storage_units() {
         drag(&mut c, &[press_at]);
         assert_eq!(
             ops(&c).last(),
-            Some(&Op::BrushStroke {
-                source_id: c.brush_source().unwrap(),
-                path: vec![Point { x: 17, y: 42 }],
-                radius: view.size / 2.0,
-                softness: view.soft / 100.0,
-                mode: BrushMode::Normal,
-                opacity: 1.0,
-            }),
+            Some(&Op::frame_stroke(
+                c.brush_source().unwrap(),
+                vec![Point { x: 17, y: 42 }],
+                view.size / 2.0,
+                view.soft / 100.0
+            )),
             "pressed at {press_at:?}"
         );
     }
@@ -4429,7 +4418,12 @@ fn brush_controls_convert_to_storage_units() {
     c.wheel(0.0, 60.0, 0.0, 0.0, CTRL);
     assert_eq!(c.brush_source(), Some(1), "Ctrl + Wheel steps the source");
     c.wheel(0.0, 120.0, 0.0, 0.0, CTRL);
-    assert_eq!(c.brush_source(), Some(0), "clamped to the frame list");
+    assert_eq!(
+        c.source_checkpoint().as_deref(),
+        Some("held:0"),
+        "two rows up from frame 1 passes frame 0 and lands on the Results row"
+    );
+    assert_eq!(c.brush_source(), Some(1), "the frame selection is kept");
 
     let mut narrow = scratch_controller("brush_units_narrow");
     open_cropped_tab(&mut narrow, "brush_units_narrow", 40, 24);
@@ -4457,14 +4451,14 @@ fn plain_wheel_over_the_images_list_steps_the_source_frame_in_both_modes() {
     let mut stacking = scratch_controller("images_wheel_stacking");
     open_mantis64_tab(&mut stacking, "images_wheel_stacking", 3);
     stacking.select_frame(2);
-    stacking.images_list_wheel(60.0);
+    assert!(stacking.images_list_wheel(2, 60.0));
     assert_eq!(
         stacking.frame_pane_label(),
         "01.tif",
         "plain wheel over the list steps the source in stacking mode, matching \
          Ctrl + Wheel's own direction"
     );
-    stacking.images_list_wheel(120.0);
+    assert!(stacking.images_list_wheel(1, 120.0));
     assert_eq!(
         stacking.frame_pane_label(),
         "00.tif",
@@ -4473,11 +4467,236 @@ fn plain_wheel_over_the_images_list_steps_the_source_frame_in_both_modes() {
 
     let (mut editor, _) = open_editor("images_wheel_editor");
     editor.select_frame(2);
-    editor.images_list_wheel(60.0);
+    let row = frame_row(&editor, 2);
+    assert!(editor.images_list_wheel(row, 60.0));
     assert_eq!(
         editor.frame_pane_label(),
         "01.tif",
         "the same wheel steps the source in editor mode too, with no Ctrl needed"
+    );
+}
+
+#[test]
+fn list_stepping_crosses_between_frames_and_the_results_group() {
+    let (mut c, _) = open_editor("list_step_cross");
+    let edited = common::panel_selected(&c);
+    let events = record_events(&mut c);
+    let ckpt = [(RowKind::Checkpoint, Some("held:0".to_string()), None)];
+
+    c.select_frame(0);
+    c.select_adjacent_image_row(-1);
+    assert_eq!(c.source_checkpoint().as_deref(), Some("held:0"));
+    assert_eq!(
+        selected_rows(&c),
+        ckpt,
+        "up from frame 0 lands on the Results row"
+    );
+    assert!(
+        ops(&c).is_empty(),
+        "choosing the source records no frame stroke"
+    );
+    assert_eq!(common::panel_selected(&c), edited, "no restore");
+    assert!(!checkpoints_changed(&events));
+
+    c.select_adjacent_image_row(-1);
+    assert_eq!(selected_rows(&c), ckpt, "the first row up is a no-op");
+
+    c.select_adjacent_image_row(1);
+    assert_eq!(c.source_checkpoint(), None);
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(0))]);
+
+    c.select_frame(2);
+    c.select_adjacent_image_row(1);
+    assert_eq!(
+        selected_rows(&c),
+        [(RowKind::Frame, None, Some(2))],
+        "last row down"
+    );
+
+    // A checkpoint source steps from its own row, not from the selected frame.
+    c.select_image_row(checkpoint_row(&c, "held:0"));
+    c.select_adjacent_image_row(1);
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(0))]);
+}
+
+#[test]
+fn list_stepping_reaches_every_held_row_and_skips_headings() {
+    let mut c = common::controller_with_frames("list_step_held", 3);
+    common::fuse(&mut c);
+    common::open_session(&mut c);
+    common::retouch(&mut c, &[20]);
+    let keys: Vec<String> = c
+        .images_panel()
+        .rows
+        .iter()
+        .filter(|row| row.kind == RowKind::Checkpoint)
+        .map(|row| row.key.clone().unwrap())
+        .collect();
+    assert!(keys.contains(&"held:0".to_string()) && keys.contains(&"held:1".to_string()));
+
+    c.select_frame(0);
+    for key in keys.iter().rev() {
+        c.select_adjacent_image_row(-1);
+        assert_eq!(c.source_checkpoint().as_ref(), Some(key));
+    }
+    c.select_adjacent_image_row(-1);
+    assert_eq!(
+        c.source_checkpoint().as_ref(),
+        keys.first(),
+        "Results heading is no stop"
+    );
+    for key in keys.iter().skip(1) {
+        c.select_adjacent_image_row(1);
+        assert_eq!(c.source_checkpoint().as_ref(), Some(key));
+    }
+    c.select_adjacent_image_row(1);
+    assert_eq!(
+        selected_rows(&c),
+        [(RowKind::Frame, None, Some(0))],
+        "Frames heading is no stop"
+    );
+}
+
+#[test]
+fn collapsed_results_gives_no_checkpoint_stop() {
+    let (mut c, _) = open_editor("list_step_collapsed");
+    c.select_frame(0);
+    c.select_image_row(0);
+    assert!(c.images_panel().rows[0].collapsed);
+    c.select_adjacent_image_row(-1);
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(0))]);
+    assert_eq!(c.source_checkpoint(), None);
+    let first = frame_row(&c, 0);
+    assert!(
+        !c.images_list_wheel(first, 60.0),
+        "no row above: the list scrolls"
+    );
+
+    // A checkpoint source hidden by the fold steps from the selected frame.
+    c.select_image_row(0);
+    c.select_frame(1);
+    c.select_image_row(checkpoint_row(&c, "held:0"));
+    c.select_image_row(0);
+    assert!(c.images_panel().rows[0].collapsed);
+    c.select_adjacent_image_row(1);
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(2))]);
+    assert_eq!(c.source_checkpoint(), None);
+}
+
+#[test]
+fn plain_wheel_steps_the_one_list_and_defers_to_scrolling_at_its_ends() {
+    let (mut c, _) = open_editor("list_wheel_groups");
+    let events = record_events(&mut c);
+    let ckpt = [(RowKind::Checkpoint, Some("held:0".to_string()), None)];
+    c.select_frame(0);
+    let first_frame = frame_row(&c, 0);
+    assert!(c.images_list_wheel(first_frame, 60.0));
+    assert_eq!(selected_rows(&c), ckpt, "wheel up from frame 0");
+    assert!(ops(&c).is_empty());
+    assert!(!checkpoints_changed(&events));
+
+    let at = checkpoint_row(&c, "held:0");
+    assert!(
+        !c.images_list_wheel(at, 60.0),
+        "first row up scrolls the list"
+    );
+    assert_eq!(selected_rows(&c), ckpt);
+    assert!(
+        c.images_list_wheel(at, -30.0),
+        "a sub-detent tick is consumed"
+    );
+    assert_eq!(selected_rows(&c), ckpt, "without stepping");
+    assert!(c.images_list_wheel(at, -30.0));
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(0))]);
+
+    let rows = c.images_panel().rows;
+    let frames_heading = rows
+        .iter()
+        .position(|row| row.kind == RowKind::FramesHeading)
+        .unwrap();
+    for over in [0, frames_heading, rows.len()] {
+        assert!(
+            !c.images_list_wheel(over, 60.0),
+            "row {over} scrolls natively"
+        );
+        assert!(
+            !c.images_list_wheel(over, -60.0),
+            "row {over} scrolls natively"
+        );
+    }
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(0))]);
+
+    c.select_frame(2);
+    let last = frame_row(&c, 2);
+    assert!(
+        !c.images_list_wheel(last, -60.0),
+        "last row down scrolls the list"
+    );
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(2))]);
+
+    // A checkpoint source steps from its own row.
+    c.select_image_row(at);
+    assert!(c.images_list_wheel(at, -60.0));
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(0))]);
+    assert_eq!(c.source_checkpoint(), None);
+}
+
+#[test]
+fn plain_wheel_skips_unresolved_frames_in_stacking() {
+    let mut c = scratch_controller("list_wheel_unresolved");
+    let root = open_mantis64_tab(&mut c, "list_wheel_unresolved", 3);
+    fs::remove_file(root.join("01.tif")).unwrap();
+    assert!(!c.start_fuse(), "the missing source is refused");
+    assert!(c.images_panel().rows[1].unresolved);
+    assert!(
+        c.images_panel()
+            .rows
+            .iter()
+            .all(|row| row.kind == RowKind::Frame)
+    );
+
+    c.select_frame(2);
+    assert!(c.images_list_wheel(2, 60.0));
+    assert_eq!(
+        c.frame_pane_label(),
+        "00.tif",
+        "the unresolved frame is no stop"
+    );
+    assert!(!c.images_list_wheel(0, 60.0), "first row up");
+    c.select_frame(2);
+    assert!(!c.images_list_wheel(2, -60.0), "last row down");
+}
+
+#[test]
+fn ctrl_wheel_over_the_canvas_steps_the_one_list() {
+    let (mut c, _) = open_editor("ctrl_wheel_list");
+    let events = record_events(&mut c);
+    let ckpt = [(RowKind::Checkpoint, Some("held:0".to_string()), None)];
+
+    c.select_frame(0);
+    c.wheel(0.0, 60.0, 0.0, 0.0, CTRL);
+    assert_eq!(
+        selected_rows(&c),
+        ckpt,
+        "up from frame 0 lands on the Results row"
+    );
+    assert!(ops(&c).is_empty());
+    assert!(!checkpoints_changed(&events));
+    c.wheel(0.0, 60.0, 0.0, 0.0, CTRL);
+    assert_eq!(selected_rows(&c), ckpt, "first row: no-op");
+
+    c.wheel(0.0, -30.0, 0.0, 0.0, CTRL);
+    assert_eq!(selected_rows(&c), ckpt, "a sub-detent tick does not step");
+    c.wheel(0.0, -30.0, 0.0, 0.0, CTRL);
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(0))]);
+    assert_eq!(c.source_checkpoint(), None);
+
+    c.select_frame(2);
+    c.wheel(0.0, -60.0, 0.0, 0.0, CTRL);
+    assert_eq!(
+        selected_rows(&c),
+        [(RowKind::Frame, None, Some(2))],
+        "last row: no-op"
     );
 }
 
@@ -4552,7 +4771,18 @@ fn tab_switches_and_active_closes_reanchor_image_preview_windows() {
 // ---------------------------------------------------------------------
 
 use focusforge_gui::canvas::OverlayDraw;
-use focusforge_gui::images::FrameSort;
+use focusforge_gui::images::{FrameSort, ImageRow, RowKind};
+
+/// The frame rows of the editor list, in frame order: the Results and Frames
+/// headings and the checkpoint rows between them are left out.
+fn frame_rows(controller: &AppController) -> Vec<ImageRow> {
+    controller
+        .images_panel()
+        .rows
+        .into_iter()
+        .filter(|row| row.kind == RowKind::Frame)
+        .collect()
+}
 
 #[test]
 fn legend_rows_carry_the_z_map_palette() {
@@ -4563,9 +4793,10 @@ fn legend_rows_carry_the_z_map_palette() {
     c.toggle_frame_excluded(1);
     assert!(c.set_mode(ShellMode::Editor));
 
-    let panel = c.images_panel();
+    let rows = frame_rows(&c);
+    assert_eq!(rows.len(), 3);
     let table = focusforge_core::zmap::overlay_table(3, None);
-    for (i, row) in panel.rows.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate() {
         assert_eq!(
             row.chip, table[i],
             "row {i}'s colour must come from the Z-Map palette"
@@ -4578,7 +4809,7 @@ fn legend_rows_carry_the_z_map_palette() {
         assert_eq!(row.trailing_text, (i + 1).to_string());
     }
     assert!(
-        !panel.rows[1].excluded,
+        !rows[1].excluded,
         "an exclusion made after the fuse changes no Z-Map source"
     );
 }
@@ -4612,6 +4843,8 @@ fn legend_header_states() {
         None,
         true,
         &std::collections::HashMap::new(),
+        focusforge_gui::images::ROW_HEIGHT,
+        None,
     );
     assert_eq!(one.header_text, "1 frame");
 }
@@ -4622,8 +4855,11 @@ fn legend_lists_only_frames_and_rejects_a_position_past_them() {
     open_fused_tab(&mut c, "legend_no_source", 3);
     c.set_mode(ShellMode::Stacking);
     assert!(c.set_mode(ShellMode::Editor));
-    let panel = c.images_panel();
-    assert_eq!(panel.rows.len(), 3, "the legend holds one row per frame");
+    assert_eq!(
+        frame_rows(&c).len(),
+        3,
+        "the legend holds one row per frame"
+    );
 
     let before = c.brush_source();
     c.select_frame(3);
@@ -4641,20 +4877,16 @@ fn legend_current_source_row_follows_all_inputs() {
     let (mut c, _) = open_editor("legend_wash");
     let selected_row = |c: &AppController| {
         let panel = c.images_panel();
-        let selected: Vec<usize> = panel
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| row.selected)
-            .map(|(i, _)| i)
-            .collect();
+        let selected: Vec<_> = panel.rows.iter().filter(|row| row.selected).collect();
         assert_eq!(selected.len(), 1, "exactly one row carries the wash");
+        assert_eq!(selected[0].kind, RowKind::Frame);
+        let frame = selected[0].frame.expect("a frame row names its frame");
         assert_eq!(
-            Some(selected[0] as u16),
+            Some(frame as u16),
             c.brush_source(),
             "the washed row is always the brush source"
         );
-        selected[0]
+        frame
     };
 
     c.select_frame(2);
@@ -4738,8 +4970,10 @@ fn overlay_for(sources: u32, opacity: f32) -> OverlayDraw {
     OverlayDraw {
         table: focusforge_core::zmap::overlay_table(sources, None),
         ops: Arc::from([]),
+        checkpoint_colors: Arc::default(),
         alpha: focusforge_core::display::alpha_from_opacity(opacity),
         origin: None,
+        checkpoint_sources: Default::default(),
     }
 }
 
@@ -4858,8 +5092,10 @@ fn overlay_controls_match_the_render_parameters() {
         Some(OverlayDraw {
             table: focusforge_core::zmap::overlay_table(3, None),
             ops: Arc::from([]),
+            checkpoint_colors: Arc::default(),
             alpha: focusforge_core::display::alpha_from_opacity(0.3),
             origin: None,
+            checkpoint_sources: Default::default(),
         }),
         "matches display::overlay_cpu's own blend, with no solo source"
     );
@@ -5182,7 +5418,10 @@ fn pipette_reads_and_appends_nothing() {
     assert!(
         matches!(
             ops(&c)[..],
-            [Op::BrushStroke { source_id, .. }] if source_id == picked
+            [Op::BrushStroke {
+                source: StrokeSource::Frame(source_id),
+                ..
+            }] if source_id == picked
         ),
         "the next drag paints with the picked source: {:?}",
         ops(&c)
@@ -5225,14 +5464,7 @@ fn zmap_unreadable_leaves_the_image_working() {
     c.select_frame(1);
     common::paint(
         &mut c,
-        Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 20, y: 20 }],
-            radius: 4.0,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        },
+        Op::frame_stroke(1, vec![Point { x: 20, y: 20 }], 4.0, 0.0),
     );
     assert_eq!(ops(&c).len(), 1, "a stroke appends");
     let (sx, sy) = at(50.0, 50.0);
@@ -5268,7 +5500,10 @@ fn pipette_reads_the_overlay() {
     assert!(
         matches!(
             ops(&c)[..],
-            [Op::BrushStroke { source_id, .. }] if source_id == painter
+            [Op::BrushStroke {
+                source: StrokeSource::Frame(source_id),
+                ..
+            }] if source_id == painter
         ),
         "a stroke from another frame covers the pixel"
     );
@@ -5326,6 +5561,50 @@ fn pipette_reads_the_overlay() {
     assert_eq!(ops(&c).len(), 1, "picking appends nothing");
 }
 
+#[test]
+fn pipette_reads_beneath_a_checkpoint_stroke_without_a_colour() {
+    let (mut c, _) = open_editor("pipette_checkpoint_source");
+    let zmap = c.held_checkpoints().last().unwrap().zmap.clone();
+    let stored = read_whole_zmap(&zmap);
+    let info = ZMapReader::open(&zmap).unwrap().info();
+    let (x, y, under) = (8..info.height() - 8)
+        .flat_map(|y| (8..info.width() - 8).map(move |x| (x, y)))
+        .find_map(|(x, y)| {
+            let source = stored[(y * info.width() + x) as usize];
+            (source != NO_SOURCE).then_some((x, y, source))
+        })
+        .expect("the fused map names a source away from its edge");
+    let held = (under + 1) % 3;
+    let stroke = Op::BrushStroke {
+        source: StrokeSource::Checkpoint("0123456789abcdef0123456789abcdef".to_string()),
+        path: vec![Point {
+            x: x as i32,
+            y: y as i32,
+        }],
+        radius: 8.0,
+        softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
+    };
+    c.edit_session_mut()
+        .unwrap()
+        .append(stroke)
+        .expect("a checkpoint stroke records as geometry");
+
+    let alt_click = |c: &mut AppController| {
+        let (sx, sy) = at(x as f32, y as f32);
+        c.pointer(PointerKind::Down, Button::Left, sx, sy, ALT);
+        c.pointer(PointerKind::Up, Button::Left, sx, sy, ALT);
+    };
+    c.select_frame(usize::from(held));
+    alt_click(&mut c);
+    assert_eq!(
+        c.brush_source(),
+        Some(under),
+        "the pick reads the stored map beneath a checkpoint stroke it has no colour for"
+    );
+}
+
 /// The overlay's colour at every pixel of the map: the active tab's
 /// `overlay_draw()` over the stored indices at `zmap`.
 fn overlay_pixels(c: &AppController, zmap: &Path) -> Vec<[u8; 3]> {
@@ -5374,7 +5653,7 @@ fn frame_other_than(not: &[u16]) -> usize {
 /// A hard-edged single dab.
 fn dab(source_id: u16, centre: (u32, u32), radius: f32, mode: BrushMode, opacity: f32) -> Op {
     Op::BrushStroke {
-        source_id,
+        source: StrokeSource::Frame(source_id),
         path: vec![Point {
             x: centre.0 as i32,
             y: centre.1 as i32,
@@ -6107,7 +6386,9 @@ fn live_overlay_follows_the_drag() {
     assert!(ops(&c).is_empty(), "the stroke is not an op while held");
     let [
         Op::BrushStroke {
-            source_id, path, ..
+            source: StrokeSource::Frame(source_id),
+            path,
+            ..
         },
     ] = &held[..]
     else {
@@ -6863,14 +7144,7 @@ fn live_stroke_previews_each_new_segment() {
     let view = c.brush_toolbar_view();
     let (source, radius, softness) = (1u16, view.size / 2.0, view.soft / 100.0);
     let info = c.edit_session().unwrap().info();
-    let stroke = |path: Vec<Point>| Op::BrushStroke {
-        source_id: source,
-        path,
-        radius,
-        softness,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    };
+    let stroke = |path: Vec<Point>| Op::frame_stroke(source, path, radius, softness);
 
     // A quarter-pixel trace, some steps sub-pixel, wandering across tiles.
     let trace: Vec<(f32, f32)> = (0..45)
@@ -6942,7 +7216,7 @@ fn live_stroke_previews_each_new_segment() {
     release(&mut c, at(trace[44].0, trace[44].1));
     common::settle_region_renders(&mut c);
     let mut live = LiveStroke::new(
-        source,
+        StrokeSource::Frame(source),
         radius,
         softness,
         BrushMode::Normal,
@@ -7597,6 +7871,7 @@ fn background_region_render_matches_the_synchronous_one() {
         16,
         Vec::new(),
         ops(&c),
+        std::collections::HashMap::new(),
     )
     .expect("a second session over the same frames opens");
     assert_eq!(fresh.stack_ops(), ops(&c), "the same op list");
@@ -8055,14 +8330,12 @@ fn modal_opening_mid_stroke_leaves_no_live_drag() {
     release(&mut c, at(50.0, 40.0));
     assert_eq!(
         ops(&c),
-        vec![Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 10, y: 10 }, Point { x: 20, y: 15 }],
-            radius: c.brush_toolbar_view().size / 2.0,
-            softness: c.brush_toolbar_view().soft_fraction,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        }],
+        vec![Op::frame_stroke(
+            1,
+            vec![Point { x: 10, y: 10 }, Point { x: 20, y: 15 }],
+            c.brush_toolbar_view().size / 2.0,
+            c.brush_toolbar_view().soft_fraction
+        )],
         "the stroke ends on the next pointer-up, with nothing added after the modal opened"
     );
 
@@ -8174,14 +8447,12 @@ fn paint(controller: &mut AppController, x: i32) {
         .stored_source(x as u32, 20)
         .expect("the column lies inside the map");
     session
-        .append(Op::BrushStroke {
-            source_id: u16::from(shown == 0),
-            path: vec![Point { x, y: 20 }],
-            radius: 4.0,
-            softness: 0.0,
-            mode: BrushMode::Normal,
-            opacity: 1.0,
-        })
+        .append(Op::frame_stroke(
+            u16::from(shown == 0),
+            vec![Point { x, y: 20 }],
+            4.0,
+            0.0,
+        ))
         .expect("a dab inside the map applies");
 }
 
@@ -9009,14 +9280,7 @@ fn live_soft_edge_is_a_blend_not_a_dither() {
     c.select_frame(1);
     let radius = c.brush_toolbar_view().size / 2.0;
     let softness = c.brush_toolbar_view().soft / 100.0;
-    let stroke = Op::BrushStroke {
-        source_id: 1,
-        path: rounded(&[(20.0, 30.0), (36.0, 30.0)]),
-        radius,
-        softness,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    };
+    let stroke = Op::frame_stroke(1, rounded(&[(20.0, 30.0), (36.0, 30.0)]), radius, softness);
     let source = sealed.frame_view(1);
 
     let check = |c: &AppController, case: &str| {
@@ -9088,14 +9352,7 @@ fn live_tick_reblends_only_its_footprint(name: &str, device: Option<&SharedDevic
     c.select_frame(2);
     let radius = c.brush_toolbar_view().size / 2.0;
     let softness = c.brush_toolbar_view().soft / 100.0;
-    let stroke = |path: Vec<Point>| Op::BrushStroke {
-        source_id: 2,
-        path,
-        radius,
-        softness,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    };
+    let stroke = |path: Vec<Point>| Op::frame_stroke(2, path, radius, softness);
 
     // Segments that double back over each other, so alpha would compound
     // were each segment blended on its own.
@@ -9263,22 +9520,18 @@ fn brush_stroke_appends_soft_op() {
     assert_eq!(
         ops(&c),
         vec![
-            Op::BrushStroke {
-                source_id: 2,
-                path: vec![Point { x: 12, y: 20 }, Point { x: 18, y: 30 }],
+            Op::frame_stroke(
+                2,
+                vec![Point { x: 12, y: 20 }, Point { x: 18, y: 30 }],
                 radius,
-                softness: 0.0,
-                mode: BrushMode::Normal,
-                opacity: 1.0,
-            },
-            Op::BrushStroke {
-                source_id: 2,
-                path: vec![Point { x: 36, y: 20 }, Point { x: 42, y: 30 }],
+                0.0
+            ),
+            Op::frame_stroke(
+                2,
+                vec![Point { x: 36, y: 20 }, Point { x: 42, y: 30 }],
                 radius,
-                softness: 1.0,
-                mode: BrushMode::Normal,
-                opacity: 1.0,
-            },
+                1.0
+            ),
         ]
     );
 }
@@ -9448,6 +9701,7 @@ fn mode_list_closes_on_choice_field_escape_and_canvas_press() {
 /// same function an export of unsaved strokes goes through.
 fn pending_render(composite: &Path, root: &Path, sealed: &Sealed, ops: Vec<Op>) -> Vec<u16> {
     let state = project::PendingState {
+        held: Vec::new(),
         composite: composite.to_path_buf(),
         ops,
         sources: (0..3).map(|i| root.join(format!("{i:02}.tif"))).collect(),
@@ -9455,7 +9709,8 @@ fn pending_render(composite: &Path, root: &Path, sealed: &Sealed, ops: Vec<Op>) 
         reference: 0,
         description: String::new(),
     };
-    let image = project::CheckpointImage::prepare_pending(&state).expect("the state prepares");
+    let image =
+        project::CheckpointImage::prepare_pending(&state, None).expect("the state prepares");
     let full = image.full();
     let mut out = vec![0u16; (full.width * full.height * 3) as usize];
     image
@@ -9649,6 +9904,7 @@ fn a_session_renders_after_its_composite_file_is_removed() {
         16,
         Vec::new(),
         Vec::new(),
+        std::collections::HashMap::new(),
     )
     .expect("a session over the copies opens");
     fs::remove_file(&composite_copy).unwrap();
@@ -10825,7 +11081,12 @@ fn exercise_open_folder(controller: &mut AppController) -> (Vec<&'static str>, V
         controller.poll_source_previews();
         let states: Vec<_> = rows
             .iter()
-            .map(|row| controller.source_preview_state(&row.path, row.unresolved))
+            .map(|row| {
+                let source = controller
+                    .row_preview_source(row)
+                    .unwrap_or_else(|| PreviewSource::Frame(row.path.clone()));
+                controller.source_preview_state(&source, row.unresolved)
+            })
             .collect();
         if !states.contains(&"loading") {
             break states;
@@ -11033,4 +11294,1311 @@ fn stroke_of_the_journey_shape_lands_quickly() {
     ] {
         assert!(took < BUDGET, "{name} took {took:?}, over {BUDGET:?}");
     }
+}
+
+// ---------------------------------------------------------------------
+// The brush source across the editor list's two groups.
+// ---------------------------------------------------------------------
+
+/// The kind, key and frame of every selected row of the editor list.
+fn selected_rows(controller: &AppController) -> Vec<(RowKind, Option<String>, Option<usize>)> {
+    controller
+        .images_panel()
+        .rows
+        .into_iter()
+        .filter(|row| row.selected)
+        .map(|row| (row.kind, row.key, row.frame))
+        .collect()
+}
+
+fn checkpoint_row(controller: &AppController, key: &str) -> usize {
+    controller
+        .images_panel()
+        .rows
+        .iter()
+        .position(|row| row.kind == RowKind::Checkpoint && row.key.as_deref() == Some(key))
+        .unwrap_or_else(|| panic!("no Results row for {key}"))
+}
+
+fn frame_row(controller: &AppController, frame: usize) -> usize {
+    controller
+        .images_panel()
+        .rows
+        .iter()
+        .position(|row| row.kind == RowKind::Frame && row.frame == Some(frame))
+        .unwrap_or_else(|| panic!("no row for frame {frame}"))
+}
+
+fn checkpoints_changed(events: &Arc<Mutex<Vec<ShellEvent>>>) -> bool {
+    events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| matches!(event, ShellEvent::CheckpointsChanged))
+}
+
+/// Ids of the saved project at `path`, in creation order.
+fn creation_order_ids(path: &Path) -> Vec<String> {
+    Project::open(path)
+        .expect("the saved project opens")
+        .history()
+        .all()
+        .into_iter()
+        .rev()
+        .map(|checkpoint| checkpoint.id.clone())
+        .collect()
+}
+
+#[test]
+fn brush_source_selection() {
+    let mut c = common::controller_with_frames("brush_source_selection", 3);
+    common::fuse(&mut c);
+    common::open_session(&mut c);
+    common::retouch(&mut c, &[20]);
+    let edited = common::panel_selected(&c);
+    assert_eq!(edited.as_deref(), Some("held:1"), "the retouch is edited");
+    let frame = c.brush_source().expect("a frame is the source");
+    let other = (frame as usize + 1) % 3;
+    let events = record_events(&mut c);
+
+    // A checkpoint row is the only selected row; the edited state stays.
+    c.select_image_row(checkpoint_row(&c, "held:0"));
+    assert_eq!(
+        selected_rows(&c),
+        [(RowKind::Checkpoint, Some("held:0".to_string()), None)]
+    );
+    assert_eq!(c.source_checkpoint().as_deref(), Some("held:0"));
+    assert_eq!(common::panel_selected(&c), edited);
+    assert!(c.edit_session().is_some(), "the edit session stays open");
+
+    // A frame row takes the selection back.
+    c.select_image_row(frame_row(&c, other));
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(other))]);
+    assert_eq!(c.source_checkpoint(), None);
+    assert_eq!(c.brush_source(), Some(other as u16));
+    assert_eq!(common::panel_selected(&c), edited);
+    assert!(c.edit_session().is_some());
+
+    // A heading folds its group and selects nothing.
+    c.select_image_row(0);
+    assert!(c.images_panel().rows[0].collapsed, "Results folds");
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(other))]);
+    c.select_image_row(0);
+    assert!(!c.images_panel().rows[0].collapsed);
+    let frames_at = c
+        .images_panel()
+        .rows
+        .iter()
+        .position(|row| row.kind == RowKind::FramesHeading)
+        .unwrap();
+    c.select_image_row(frames_at);
+    assert!(c.images_panel().rows[frames_at].collapsed, "Frames folds");
+    assert!(
+        selected_rows(&c).is_empty(),
+        "no frame row is left to select"
+    );
+    c.select_image_row(frames_at);
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(other))]);
+
+    assert_eq!(common::panel_selected(&c), edited);
+    assert!(
+        !checkpoints_changed(&events),
+        "a click on the list never reaches the checkpoint panel"
+    );
+}
+
+#[test]
+fn checkpoint_source_records_no_frame_stroke() {
+    let (mut c, _) = open_editor("brush_checkpoint_source");
+    set_size(&mut c, 8.0);
+    c.set_brush_softness_fraction(0.25);
+    let radius = c.brush_toolbar_view().size / 2.0;
+
+    c.select_image_row(checkpoint_row(&c, "held:0"));
+    assert_eq!(c.source_checkpoint().as_deref(), Some("held:0"));
+    drag(&mut c, &[(10.0, 10.0), (30.0, 25.0), (12.0, 40.0)]);
+    drag(&mut c, &[(20.0, 21.0)]);
+    assert!(
+        ops(&c).is_empty(),
+        "a checkpoint source records no frame stroke"
+    );
+
+    c.select_image_row(frame_row(&c, 1));
+    drag(&mut c, &[(20.0, 21.0)]);
+    assert_eq!(
+        ops(&c),
+        [Op::frame_stroke(
+            1,
+            vec![Point { x: 20, y: 21 }],
+            radius,
+            0.25
+        )],
+        "a frame source records its stroke"
+    );
+}
+
+#[test]
+fn brush_source_survives_state_changes() {
+    use common::{fuse, open_session, panel_selected, retouch, select_panel_row};
+
+    let mut c = common::controller_with_frames("brush_source_survives", 3);
+    fuse(&mut c);
+    open_session(&mut c);
+    retouch(&mut c, &[20]);
+    select_panel_row(&mut c, "held:0");
+    open_session(&mut c);
+    retouch(&mut c, &[30]);
+    assert_eq!(common::panel_ids(&c), ["held:2", "held:1", "held:0"]);
+    let chosen = |key: &str| vec![(RowKind::Checkpoint, Some(key.to_string()), None)];
+    let on_frame = |c: &AppController| {
+        let frame = c.brush_source().expect("a frame is the source");
+        vec![(RowKind::Frame, None, Some(frame as usize))]
+    };
+
+    // A click in the checkpoint panel moves the edited state, not the source.
+    c.select_image_row(checkpoint_row(&c, "held:0"));
+    select_panel_row(&mut c, "held:1");
+    open_session(&mut c);
+    assert_eq!(panel_selected(&c).as_deref(), Some("held:1"));
+    assert_eq!(selected_rows(&c), chosen("held:0"), "after a panel click");
+
+    // So does a new fuse over the same frames.
+    fuse(&mut c);
+    open_session(&mut c);
+    assert_eq!(common::panel_ids(&c).len(), 4);
+    assert_eq!(selected_rows(&c), chosen("held:0"), "after a fuse");
+
+    // And a save, which turns the held row into a saved one.
+    let path = save_to_proposed(&mut c);
+    let ids = creation_order_ids(&path);
+    assert_eq!(ids.len(), 4);
+    assert_eq!(c.source_checkpoint().as_deref(), Some(ids[0].as_str()));
+    assert_eq!(selected_rows(&c), chosen(&ids[0]), "after a save");
+
+    // A deleted source falls back to the frame.
+    assert!(c.queue_checkpoint_delete(&ids[0]));
+    assert_eq!(c.source_checkpoint(), None);
+    assert_eq!(selected_rows(&c), on_frame(&c), "after a delete");
+
+    // A new base on another alignment drops a source it cannot share a grid
+    // with.
+    c.select_image_row(checkpoint_row(&c, &ids[2]));
+    assert_eq!(selected_rows(&c), chosen(&ids[2]));
+    common::stop_editing(&mut c);
+    c.set_align_algorithm("pyramidal-ecc");
+    assert!(c.start_fuse());
+    settle_all(&mut c);
+    if c.pending_divergence().is_some() {
+        c.keep_fused().expect("the parked result is kept");
+    }
+    open_session(&mut c);
+    assert!(
+        c.images_panel()
+            .rows
+            .iter()
+            .any(|row| row.kind == RowKind::Hidden),
+        "the saved retouch is hidden"
+    );
+    assert_eq!(c.source_checkpoint(), None);
+    assert_eq!(
+        selected_rows(&c),
+        on_frame(&c),
+        "after an incompatible base"
+    );
+}
+
+#[test]
+fn held_source_selection_survives_save() {
+    use common::{fuse, open_session, panel_selected, retouch, select_panel_row};
+
+    let mut c = common::controller_with_frames("held_source_save", 3);
+    fuse(&mut c);
+    open_session(&mut c);
+    retouch(&mut c, &[20]);
+    select_panel_row(&mut c, "held:0");
+    open_session(&mut c);
+    retouch(&mut c, &[30]);
+    // The first retouch is deleted and not written, so the second one's
+    // position among the held rows is not its position among the saved ones.
+    assert!(c.queue_checkpoint_delete("held:1"));
+    select_panel_row(&mut c, "held:0");
+    open_session(&mut c);
+    c.select_image_row(checkpoint_row(&c, "held:2"));
+    assert_eq!(c.source_checkpoint().as_deref(), Some("held:2"));
+
+    let path = save_to_proposed(&mut c);
+    let ids = creation_order_ids(&path);
+    assert_eq!(ids.len(), 2, "the fuse and the kept retouch");
+    assert_eq!(c.source_checkpoint().as_deref(), Some(ids[1].as_str()));
+    assert_eq!(
+        selected_rows(&c),
+        [(RowKind::Checkpoint, Some(ids[1].clone()), None)]
+    );
+    assert_eq!(panel_selected(&c).as_deref(), Some(ids[0].as_str()));
+
+    // A held row the save does not write leaves the frame selected.
+    open_session(&mut c);
+    retouch(&mut c, &[40]);
+    select_panel_row(&mut c, &ids[0]);
+    open_session(&mut c);
+    retouch(&mut c, &[50]);
+    select_panel_row(&mut c, &ids[0]);
+    open_session(&mut c);
+    c.select_image_row(checkpoint_row(&c, "held:1"));
+    assert!(c.queue_checkpoint_delete("held:1"));
+    assert!(c.save_active_project(|_| panic!("a saved tab never asks where")));
+    let kept = creation_order_ids(&path);
+    assert_eq!(kept.len(), 3, "only the first new retouch is written");
+    assert_eq!(c.source_checkpoint(), None);
+    let frame = c.brush_source().expect("a frame is the source") as usize;
+    assert_eq!(selected_rows(&c), [(RowKind::Frame, None, Some(frame))]);
+}
+
+#[test]
+fn checkpoint_source_stroke_records_the_checkpoint() {
+    let (mut c, _) = open_editor("checkpoint_source_stroke");
+    common::settle_session(&mut c);
+    let key = c
+        .images_panel()
+        .rows
+        .iter()
+        .find(|row| row.kind == RowKind::Checkpoint)
+        .and_then(|row| row.key.clone())
+        .expect("the Results group lists the edited checkpoint");
+    set_size(&mut c, 8.0);
+    let (start, end) = (at_pane(RIGHT, 20.0, 20.0), at_pane(RIGHT, 30.0, 26.0));
+
+    c.select_image_row(checkpoint_row(&c, &key));
+    press(&mut c, start);
+    assert!(
+        c.edit_session().unwrap().stroke.is_none(),
+        "a checkpoint still rendering opens no stroke"
+    );
+    release(&mut c, start);
+    common::settle_session(&mut c);
+
+    let source = StrokeSource::Checkpoint(key.clone());
+    assert_eq!(c.stroke_source(), Some(source.clone()));
+    press(&mut c, start);
+    c.select_frame(2);
+    c.pointer_moved(end.0, end.1);
+    release(&mut c, end);
+    common::settle_region_renders(&mut c);
+
+    let drawn = ops(&c);
+    assert_eq!(drawn.len(), 1, "one stroke");
+    let Op::BrushStroke { source: got, .. } = &drawn[0] else {
+        panic!("a brush stroke")
+    };
+    assert_eq!(got, &source, "the source survives the selection change");
+}
+
+/// The edit session's image: its base under the resident tiles.
+fn session_view(c: &AppController) -> Vec<u16> {
+    let session = c.edit_session().expect("an edit session");
+    let (width, height) = session.base.dimensions();
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let mut out = vec![0u16; (width * height * 3) as usize];
+    session.base.read_tile_into(0, whole, &mut out).unwrap();
+    session.tiles.overlay_into(whole, &mut out);
+    out
+}
+
+/// The key of every Results row of the editor list, in list order.
+fn checkpoint_keys(c: &AppController) -> Vec<String> {
+    c.images_panel()
+        .rows
+        .into_iter()
+        .filter(|row| row.kind == RowKind::Checkpoint)
+        .filter_map(|row| row.key)
+        .collect()
+}
+
+/// Selects the Results row `key` and waits until its render is ready to
+/// paint from.
+fn select_checkpoint_source(c: &mut AppController, key: &str) {
+    c.select_image_row(checkpoint_row(c, key));
+    common::settle_session(c);
+    assert_eq!(
+        c.stroke_source(),
+        Some(StrokeSource::Checkpoint(key.to_string())),
+        "{key} is ready as a source"
+    );
+}
+
+/// A fused three-frame editor over several checkpoints: a Laplacian fuse, a
+/// retouch of it, and a weighted-average fuse as the edited head. Its rows are
+/// held, so a save rewrites their names.
+fn editor_over_several_checkpoints(name: &str) -> AppController {
+    let mut c = common::controller_with_frames(name, 3);
+    c.set_resident_tile_size_for_test(16);
+    c.set_pane_geometry(LEFT, RIGHT);
+    c.set_fuse_algorithm("laplacian");
+    common::fuse(&mut c);
+    common::open_session(&mut c);
+    common::retouch(&mut c, &[20]);
+    c.set_fuse_algorithm("weighted-average");
+    common::fuse(&mut c);
+    common::open_session(&mut c);
+    c.set_pane_geometry(LEFT, RIGHT);
+    assert!(c.plane_draw().is_some(), "both panes are installed");
+    assert!(
+        checkpoint_keys(&c).len() >= 3,
+        "a fuse, its retouch and the head are listed: {:?}",
+        checkpoint_keys(&c)
+    );
+    c
+}
+
+/// Strokes from every listed checkpoint in turn, each in its own mode and
+/// opacity, a press-and-release dab then a ticked drag.
+fn paint_from_every_checkpoint(c: &mut AppController) -> usize {
+    set_size(c, 10.0);
+    let keys = checkpoint_keys(c);
+    for (i, key) in keys.iter().enumerate() {
+        select_checkpoint_source(c, key);
+        c.set_brush_softness_fraction([0.0, 0.5, 1.0][i % 3]);
+        let x = 8.0 + 14.0 * (i % 4) as f32;
+        let (mode, percent) = SCRIPTED_LOOKS[(2 * i) % 6];
+        set_look(c, mode, percent);
+        drag(c, &[(x, 10.0)]);
+        let (mode, percent) = SCRIPTED_LOOKS[(2 * i + 1) % 6];
+        set_look(c, mode, percent);
+        drag_ticked(c, &[(x - 4.0, 24.0), (x + 4.0, 32.0), (x - 3.0, 44.0)]);
+    }
+    for op in ops(c) {
+        let Op::BrushStroke { source, .. } = op else {
+            panic!("a brush stroke")
+        };
+        assert!(matches!(source, StrokeSource::Checkpoint(_)));
+    }
+    keys.len()
+}
+
+/// Paints [`paint_from_every_checkpoint`], optionally with the blend device
+/// attached, and compares the released live view with the saved render.
+fn live_checkpoint_view_matches_saved_render(name: &str, device: Option<&SharedDevice>) {
+    let mut c = editor_over_several_checkpoints(name);
+    attach_blend_device(&mut c, device);
+    let strokes = paint_from_every_checkpoint(&mut c);
+    assert_eq!(ops(&c).len(), 2 * strokes);
+    let shown = displayed_whole(&mut c);
+    let path = save_to_proposed(&mut c);
+    common::open_session(&mut c);
+    common::settle_region_renders(&mut c);
+    assert!(
+        shown == saved_render(&path),
+        "the live view differs from the saved render"
+    );
+    assert!(
+        shown == session_view(&c),
+        "a save that renames held sources changes the canvas"
+    );
+}
+
+#[test]
+fn live_checkpoint_stroke_equals_the_saved_render() {
+    live_checkpoint_view_matches_saved_render("live_ckpt_equals_saved", None);
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn live_checkpoint_stroke_on_the_device() {
+    let Some(shared) = shared_device_or_skip() else {
+        return;
+    };
+    live_checkpoint_view_matches_saved_render("live_ckpt_equals_saved_device", Some(shared));
+}
+
+#[test]
+fn live_checkpoint_stroke_equals_the_saved_render_after_undo_and_redo() {
+    let mut c = editor_over_several_checkpoints("live_ckpt_undo_redo");
+    paint_from_every_checkpoint(&mut c);
+    let shown = displayed_whole(&mut c);
+    // The selection moves to a frame; every stroke still renders from its checkpoint.
+    c.select_frame(1);
+    let count = ops(&c).len();
+    for _ in 0..count {
+        c.undo();
+        common::settle_region_renders(&mut c);
+    }
+    assert_eq!(ops(&c).len(), 0, "every stroke is undone");
+    assert!(shown != displayed_whole(&mut c), "undo changes the canvas");
+    for _ in 0..count {
+        c.redo();
+        common::settle_region_renders(&mut c);
+    }
+    assert!(
+        shown == displayed_whole(&mut c),
+        "redo re-renders the strokes from their checkpoints"
+    );
+}
+
+#[test]
+fn live_checkpoint_stroke_equals_the_saved_render_from_the_base() {
+    let (mut c, _) = open_editor("live_ckpt_base");
+    common::settle_session(&mut c);
+    let path = save_to_proposed(&mut c);
+    common::open_session(&mut c);
+    let base_key = checkpoint_keys(&c)[0].clone();
+    let base = saved_render_at(&path, &base_key);
+
+    set_size(&mut c, 10.0);
+    c.set_brush_softness_fraction(0.0);
+    set_look(&mut c, BrushMode::Normal, 100);
+    c.select_frame(2);
+    drag(&mut c, &[(20.0, 24.0), (34.0, 30.0)]);
+    assert!(
+        session_view(&c) != base,
+        "the frame stroke changes the area"
+    );
+    select_checkpoint_source(&mut c, &base_key);
+    drag(&mut c, &[(26.0, 26.0)]);
+    let shown = session_view(&c);
+    let map = map_rect(&c);
+    for y in 23..=29 {
+        for x in 23..=29 {
+            let at = ((y * map.width + x) * 3) as usize;
+            assert_eq!(
+                shown[at..at + 3],
+                base[at..at + 3],
+                "BASE sample at ({x}, {y}) restored bit-identically"
+            );
+        }
+    }
+}
+
+#[test]
+fn live_checkpoint_stroke_equals_the_saved_render_through_a_failed_save() {
+    let mut c = editor_over_several_checkpoints("live_ckpt_failed_save");
+    paint_from_every_checkpoint(&mut c);
+    let shown = displayed_whole(&mut c);
+    let blocked = common::tree("live_ckpt_failed_save_blocked").join("plain");
+    fs::write(&blocked, b"not a directory").unwrap();
+    assert!(!common::save_and_settle(&mut c, |_| Some(
+        blocked.join("saved.ffp")
+    )));
+    assert!(
+        shown == displayed_whole(&mut c),
+        "a failed save leaves the canvas as it was"
+    );
+}
+
+#[test]
+fn checkpoint_source_unreadable_or_rejected() {
+    let mut c = editor_over_several_checkpoints("ckpt_source_unreadable");
+    let held = c.held_checkpoints();
+    let target = held.first().expect("an unsaved fuse is held");
+    let key = "held:0".to_string();
+    assert!(
+        checkpoint_keys(&c).contains(&key),
+        "the first fuse is listed"
+    );
+    select_checkpoint_source(&mut c, "held:1");
+    fs::remove_file(&target.composite).unwrap();
+
+    set_size(&mut c, 8.0);
+    c.select_image_row(checkpoint_row(&c, &key));
+    common::settle_session(&mut c);
+    assert_ne!(
+        c.stroke_source(),
+        Some(StrokeSource::Checkpoint(key.clone())),
+        "a failed render is no source"
+    );
+    let before = ops(&c).len();
+    let start = at_pane(RIGHT, 20.0, 20.0);
+    press(&mut c, start);
+    assert!(
+        c.edit_session().unwrap().stroke.is_none(),
+        "no stroke opens"
+    );
+    release(&mut c, start);
+    common::settle_region_renders(&mut c);
+    assert_eq!(ops(&c).len(), before, "no op was appended");
+}
+
+#[test]
+fn a_deleted_held_row_a_session_stroke_paints_from_is_kept_and_saved() {
+    let mut c = common::controller_with_frames("deleted_held_source", 3);
+    c.set_resident_tile_size_for_test(16);
+    c.set_pane_geometry(LEFT, RIGHT);
+    c.set_fuse_algorithm("laplacian");
+    common::fuse(&mut c);
+    let path = save_to_proposed(&mut c);
+    let root = common::panel_ids(&c)[0].clone();
+    // Held 0 and held 1 both hang from the saved fuse: neither is the other's parent.
+    c.set_fuse_algorithm("weighted-average");
+    common::fuse(&mut c);
+    common::select_panel_row(&mut c, &root);
+    c.set_fuse_algorithm("depth-map");
+    common::fuse(&mut c);
+    common::open_session(&mut c);
+    c.set_pane_geometry(LEFT, RIGHT);
+    assert_eq!(c.held_checkpoints().len(), 2);
+
+    set_size(&mut c, 10.0);
+    select_checkpoint_source(&mut c, "held:0");
+    drag(&mut c, &[(20.0, 20.0), (34.0, 28.0)]);
+    assert_eq!(ops(&c).len(), 1, "one stroke from held:0");
+    let shown = session_view(&c);
+
+    let row = c
+        .checkpoints_panel()
+        .entries
+        .iter()
+        .position(|entry| entry.id.as_deref() == Some("held:0"))
+        .expect("the fuse has a row");
+    c.request_checkpoint_delete(row);
+    c.confirm_checkpoint_delete();
+    assert!(
+        c.save_active_project(|_| panic!("a saved tab never asks where")),
+        "the save succeeds"
+    );
+    common::open_session(&mut c);
+    common::settle_region_renders(&mut c);
+
+    let project = saved(&path);
+    let fuses: Vec<String> = project
+        .history()
+        .all()
+        .iter()
+        .filter(|checkpoint| checkpoint.fuse.is_some())
+        .map(|checkpoint| checkpoint.id.clone())
+        .collect();
+    assert_eq!(fuses.len(), 3, "the deleted fuse is still written");
+    let history = project.history().all();
+    let stroked: Vec<_> = history
+        .iter()
+        .filter(|checkpoint| !checkpoint.ops.is_empty())
+        .collect();
+    assert_eq!(stroked.len(), 1, "the stroke is written");
+    let Op::BrushStroke { source, .. } = &stroked[0].ops[0] else {
+        panic!("a brush stroke")
+    };
+    let StrokeSource::Checkpoint(id) = source else {
+        panic!("a checkpoint source")
+    };
+    assert!(fuses.contains(id), "the source names a written fuse: {id}");
+    assert!(
+        shown == saved_render(&path),
+        "the saved render shows what the session showed"
+    );
+}
+
+/// `rect` of the scratch render the left pane shows for the chosen checkpoint,
+/// read the way the pane reads it.
+fn left_pane_tile(c: &AppController, rect: Rect) -> Vec<u16> {
+    let Some(FramePane::Checkpoint(path)) = c.frame_pane() else {
+        panic!(
+            "the left pane shows a checkpoint render: {:?}",
+            c.frame_pane()
+        );
+    };
+    let mut frame = FrameSource::default();
+    frame
+        .set(&path, None, job::host_budget())
+        .expect("the scratch render opens");
+    let mut out = vec![0u16; (rect.width * rect.height * 3) as usize];
+    frame
+        .read_into(rect, NonZeroU32::MIN, &mut out)
+        .expect("the scratch render reads");
+    out
+}
+
+/// `tile` of the whole-map samples `whole`.
+fn tile_of(whole: &[u16], map: Rect, tile: Rect) -> Vec<u16> {
+    let mut out = Vec::with_capacity((tile.width * tile.height * 3) as usize);
+    for y in tile.y..tile.y + tile.height {
+        let at = ((y * map.width + tile.x) * 3) as usize;
+        out.extend_from_slice(&whole[at..at + (tile.width * 3) as usize]);
+    }
+    out
+}
+
+/// Chooses each listed checkpoint as the source in turn, then checks each one
+/// out and compares the composite pane's `tile` with what the left pane showed
+/// for it. Returns the number compared.
+fn left_pane_matches_every_checkout(c: &mut AppController, tile: Rect) -> usize {
+    let mut shown = Vec::new();
+    for key in checkpoint_keys(c) {
+        c.select_image_row(checkpoint_row(c, &key));
+        assert_eq!(
+            c.frame_pane(),
+            Some(FramePane::Rendering),
+            "{key} is still rendering: the pane shows nothing"
+        );
+        common::settle_session(c);
+        shown.push((key, left_pane_tile(c, tile)));
+    }
+    assert!(
+        shown.iter().any(|(_, samples)| *samples != shown[0].1),
+        "the checkpoints differ over the tile, so the comparison is not vacuous"
+    );
+    for (key, samples) in &shown {
+        common::select_panel_row(c, key);
+        // A saved row's planes render on the first ask.
+        let _ = c.materialize_active_tab_planes();
+        common::settle_render(c);
+        common::settle_session(c);
+        common::settle_region_renders(c);
+        let map = map_rect(c);
+        let checked_out = tile_of(&displayed_whole(c), map, tile);
+        assert!(
+            *samples == checked_out,
+            "the left pane differs from the composite pane with {key} checked out"
+        );
+    }
+    shown.len()
+}
+
+#[test]
+fn checkpoint_source_view_frame_pane_shows_the_checkpoint_render() {
+    let mut c = editor_over_several_checkpoints("csv_frame_pane");
+    let tile = Rect {
+        x: 16,
+        y: 12,
+        width: 32,
+        height: 40,
+    };
+    assert!(
+        left_pane_matches_every_checkout(&mut c, tile) >= 3,
+        "a fuse, its retouch and the head"
+    );
+
+    // Saved: the same rows after a save.
+    let mut c = editor_over_several_checkpoints("csv_frame_pane_saved");
+    save_to_proposed(&mut c);
+    common::open_session(&mut c);
+    common::settle_region_renders(&mut c);
+    assert!(left_pane_matches_every_checkout(&mut c, tile) >= 3);
+
+    // A frame again: the pane shows the frame, not a stale render.
+    c.select_frame(1);
+    assert!(matches!(c.frame_pane(), Some(FramePane::Frame(..))));
+}
+
+/// The Results row of the editor list holding `key`.
+fn results_row(c: &AppController, key: &str) -> focusforge_gui::images::ImageRow {
+    c.images_panel().rows[checkpoint_row(c, key)].clone()
+}
+
+/// `Checkpoint · [<name> · ]<method> <time>[ · N strokes]` from a Results row
+/// as the list draws it.
+fn expected_checkpoint_label(row: &focusforge_gui::images::ImageRow) -> String {
+    let mut label = String::from("Checkpoint \u{b7} ");
+    if !row.name.is_empty() {
+        label.push_str(&format!("{} \u{b7} ", row.name));
+    }
+    label.push_str(&format!("{} {}", row.method, row.trailing_text));
+    if !row.strokes.is_empty() {
+        label.push_str(&format!(" {}", row.strokes));
+    }
+    label
+}
+
+#[test]
+fn checkpoint_source_view_label_names_the_checkpoint() {
+    use focusforge_core::project::append_ops_at;
+
+    let mut c = editor_over_several_checkpoints("csv_label_src");
+    let path = save_to_proposed(&mut c);
+    let stroke = Op::frame_stroke(1, vec![Point { x: 20, y: 20 }], 4.0, 0.0);
+    append_ops_at(
+        &path,
+        vec![stroke],
+        Some("Halo fix".to_string()),
+        1_756_468_800,
+    )
+    .expect("the named retouch is appended");
+    let mut c = reopen(&path, "csv_label");
+    common::enter_editor(&mut c);
+    c.set_pane_geometry(LEFT, RIGHT);
+
+    let keys = checkpoint_keys(&c);
+    assert!(keys.len() >= 4, "two fuses and two retouches: {keys:?}");
+    let (mut named, mut plain_fuse, mut methods) = (None, None, Vec::new());
+    for key in &keys {
+        c.select_image_row(checkpoint_row(&c, key));
+        let row = results_row(&c, key);
+        assert_eq!(
+            c.frame_pane_label(),
+            expected_checkpoint_label(&row),
+            "{key}"
+        );
+        assert_eq!(
+            c.frame_pane_label_mark(),
+            Some(LabelMark::Icon(row.chip)),
+            "{key}: the icon carries the row colour"
+        );
+        methods.push(row.method.clone());
+        if !row.name.is_empty() {
+            named = Some(row.clone());
+        } else if row.strokes.is_empty() {
+            plain_fuse = Some(row.clone());
+        }
+    }
+    let named = named.expect("a named retouch is listed");
+    let label = expected_checkpoint_label(&named);
+    assert!(
+        label.starts_with("Checkpoint \u{b7} Halo fix \u{b7} "),
+        "{label}"
+    );
+    assert!(label.ends_with(" \u{b7} 1 stroke"), "{label}");
+    let fuse = expected_checkpoint_label(&plain_fuse.expect("an unretouched fuse is listed"));
+    assert!(
+        !fuse.contains("stroke") && fuse.matches('\u{b7}').count() == 1,
+        "{fuse}"
+    );
+    methods.sort();
+    methods.dedup();
+    assert!(methods.len() >= 2, "two methods are listed: {methods:?}");
+    assert!(
+        c.frame_pane_label().chars().count() > 16,
+        "not cut to 16 characters"
+    );
+
+    c.select_frame(1);
+    assert_eq!(
+        c.frame_pane_label(),
+        "01.tif",
+        "a frame gives back its file name"
+    );
+    assert_eq!(
+        c.frame_pane_label_mark(),
+        Some(LabelMark::Swatch(job::source_color(1, 3))),
+        "the square carries the frame's source colour"
+    );
+
+    let none = scratch_controller("csv_label_no_tab");
+    assert_eq!(none.frame_pane_label_mark(), None, "no tab, no mark");
+    assert_eq!(none.frame_pane_label(), "");
+}
+
+#[test]
+fn checkpoint_source_view_cursor_marks_a_checkpoint_source() {
+    let mut c = editor_over_several_checkpoints("csv_cursor");
+    let keys = checkpoint_keys(&c);
+    let mut colours = Vec::new();
+    for key in &keys {
+        c.select_image_row(checkpoint_row(&c, key));
+        let view = c.brush_cursor_view().expect("a cursor over the editor");
+        assert_eq!(
+            view.checkpoint_colour,
+            Some(results_row(&c, key).chip),
+            "{key}: the row colour"
+        );
+        assert!(!view.picking);
+        colours.push(view.checkpoint_colour);
+    }
+    colours.sort();
+    colours.dedup();
+    assert!(
+        colours.len() >= 2,
+        "different checkpoints, different colours"
+    );
+
+    c.toggle_pipette();
+    let view = c.brush_cursor_view().unwrap();
+    assert!(view.picking, "the pipette look is still asked for");
+    assert!(view.checkpoint_colour.is_some());
+    c.toggle_pipette();
+
+    c.select_frame(1);
+    let view = c.brush_cursor_view().unwrap();
+    assert_eq!(
+        view.checkpoint_colour, None,
+        "a frame source keeps today's cursor"
+    );
+}
+
+/// Everything the left pane, its label mark and the cursor say, the scratch
+/// path left out (each choice renders its own file).
+fn source_view(c: &AppController) -> (String, String, Option<LabelMark>, Option<[u8; 3]>) {
+    let pane = match c.frame_pane().expect("a pane") {
+        FramePane::Checkpoint(path) => {
+            assert!(path.is_file(), "the scratch render exists");
+            "checkpoint".to_string()
+        }
+        other => format!("{other:?}"),
+    };
+    (
+        pane,
+        c.frame_pane_label(),
+        c.frame_pane_label_mark(),
+        c.brush_cursor_view().unwrap().checkpoint_colour,
+    )
+}
+
+#[test]
+fn checkpoint_source_view_wheel_checkpoint_drives_view_like_a_click() {
+    let mut c = editor_over_several_checkpoints("csv_wheel");
+    let last = checkpoint_keys(&c).pop().expect("a Results row");
+    let first_frame = frame_row(&c, 0);
+
+    c.select_image_row(checkpoint_row(&c, &last));
+    common::settle_session(&mut c);
+    let clicked = source_view(&c);
+    assert_eq!(clicked.0, "checkpoint");
+
+    // Ctrl + Wheel up from the first frame lands on the last Results row.
+    c.select_frame(0);
+    c.wheel(0.0, 60.0, 0.0, 0.0, CTRL);
+    common::settle_session(&mut c);
+    assert_eq!(c.source_checkpoint().as_deref(), Some(last.as_str()));
+    assert_eq!(source_view(&c), clicked, "Ctrl + Wheel equals a click");
+
+    // So does the plain wheel over the list.
+    c.select_frame(0);
+    assert!(c.images_list_wheel(first_frame, 60.0));
+    common::settle_session(&mut c);
+    assert_eq!(source_view(&c), clicked, "the list wheel equals a click");
+
+    // One detent down from the last Results row is the first frame.
+    c.wheel(0.0, -60.0, 0.0, 0.0, CTRL);
+    assert_eq!(c.source_checkpoint(), None);
+    let (pane, label, mark, colour) = source_view(&c);
+    assert!(pane.starts_with("Frame("), "{pane}");
+    assert_eq!(label, "00.tif");
+    assert_eq!(mark, Some(LabelMark::Swatch(job::source_color(0, 3))));
+    assert_eq!(colour, None);
+}
+
+#[test]
+fn checkpoint_source_view_unreadable_checkpoint_is_refused() {
+    let mut c = editor_over_several_checkpoints("csv_refused");
+    let target = c.held_checkpoints().first().expect("a held fuse").clone();
+    let key = "held:0".to_string();
+    select_checkpoint_source(&mut c, "held:1");
+    fs::remove_file(&target.composite).unwrap();
+
+    c.select_image_row(checkpoint_row(&c, &key));
+    common::settle_session(&mut c);
+    let Some(FramePane::Refused(lines)) = c.frame_pane() else {
+        panic!("the pane is refused, got {:?}", c.frame_pane());
+    };
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some("Cannot show this checkpoint:")
+    );
+    assert_eq!(
+        lines.last(),
+        Some(&c.frame_pane_label()),
+        "the lines name it"
+    );
+    assert!(
+        lines.iter().all(|line| !line.contains("frame")),
+        "{lines:?}"
+    );
+
+    c.select_frame(1);
+    assert!(
+        matches!(c.frame_pane(), Some(FramePane::Frame(..))),
+        "a frame choice clears the lines"
+    );
+}
+
+/// One hard, opaque Normal dab of size 8 from the chosen source at image
+/// point `at`, painted through the editor.
+fn dab_from_chosen_source(c: &mut AppController, at: (u32, u32)) {
+    set_size(c, 8.0);
+    c.set_brush_softness_fraction(0.0);
+    set_look(c, BrushMode::Normal, 100);
+    drag(c, &[(at.0 as f32, at.1 as f32)]);
+}
+
+/// The overlay's colour at map pixel `at` of the edited checkpoint.
+fn overlay_at(c: &mut AppController, at: (u32, u32)) -> [u8; 3] {
+    let (_, zmap) = c
+        .materialize_active_tab_planes()
+        .expect("the planes are ready");
+    let width = ZMapReader::open(&zmap).unwrap().info().width();
+    overlay_pixels(c, &zmap)[(at.1 * width + at.0) as usize]
+}
+
+/// The pipette swatch with the pointer over map pixel `at`, armed.
+fn swatch_at(c: &mut AppController, at_pixel: (u32, u32)) -> [u8; 3] {
+    let (x, y) = at(at_pixel.0 as f32, at_pixel.1 as f32);
+    c.toggle_pipette();
+    c.pointer(PointerKind::Move, Button::Left, x, y, NO_MODS);
+    let colour = c.brush_cursor_view().expect("a cursor").pick_color;
+    c.toggle_pipette();
+    colour
+}
+
+#[test]
+fn checkpoint_source_view_eyedropper_follows_the_core_resolution() {
+    let mut c = editor_over_several_checkpoints("csv_eyedropper");
+    let keys = checkpoint_keys(&c);
+    let (a, b) = (keys[keys.len() - 1].clone(), keys[keys.len() - 2].clone());
+    let (patch_a, patch_b, patch_frame) = ((14, 16), (36, 16), (14, 42));
+    select_checkpoint_source(&mut c, &a);
+    dab_from_chosen_source(&mut c, patch_a);
+    select_checkpoint_source(&mut c, &b);
+    dab_from_chosen_source(&mut c, patch_b);
+    c.select_frame(1);
+    dab_from_chosen_source(&mut c, patch_frame);
+    assert_eq!(ops(&c).len(), 3);
+    c.set_overlay_on(true);
+
+    let colour_a = results_row(&c, &a).chip;
+    let colour_b = results_row(&c, &b).chip;
+    assert_ne!(colour_a, colour_b);
+    let frame_colour = job::source_color(1, 3);
+    for (key, patch, colour) in [(&a, patch_a, colour_a), (&b, patch_b, colour_b)] {
+        c.select_frame(0);
+        assert_eq!(overlay_at(&mut c, patch), colour, "{key}: overlay");
+        assert_eq!(swatch_at(&mut c, patch), colour, "{key}: swatch");
+        c.toggle_pipette();
+        drag(&mut c, &[(patch.0 as f32, patch.1 as f32)]);
+        assert_eq!(
+            c.source_checkpoint().as_deref(),
+            Some(key.as_str()),
+            "{key}: armed pick"
+        );
+        c.select_frame(0);
+        alt_click_at(&mut c, patch);
+        assert_eq!(
+            c.source_checkpoint().as_deref(),
+            Some(key.as_str()),
+            "{key}: Alt + click"
+        );
+    }
+
+    // A frame stroke still resolves to its frame.
+    c.select_frame(0);
+    assert_eq!(overlay_at(&mut c, patch_frame), frame_colour);
+    assert_eq!(swatch_at(&mut c, patch_frame), frame_colour);
+    alt_click_at(&mut c, patch_frame);
+    assert_eq!(c.source_checkpoint(), None);
+    assert_eq!(c.brush_source(), Some(1), "the pick selects the frame");
+
+    // A hidden-but-kept checkpoint keeps its overlay colour; the pick and the
+    // swatch treat its pixels as no source.
+    let mut c = common::controller_with_frames("csv_eyedropper_hidden", 3);
+    c.set_resident_tile_size_for_test(16);
+    c.set_pane_geometry(LEFT, RIGHT);
+    c.set_fuse_algorithm("laplacian");
+    common::fuse(&mut c);
+    save_to_proposed(&mut c);
+    let root = common::panel_ids(&c)[0].clone();
+    c.set_fuse_algorithm("weighted-average");
+    common::fuse(&mut c);
+    common::select_panel_row(&mut c, &root);
+    c.set_fuse_algorithm("depth-map");
+    common::fuse(&mut c);
+    common::open_session(&mut c);
+    c.set_pane_geometry(LEFT, RIGHT);
+    select_checkpoint_source(&mut c, "held:0");
+    dab_from_chosen_source(&mut c, patch_a);
+    c.set_overlay_on(true);
+    let kept_colour = results_row(&c, "held:0").chip;
+    assert_eq!(overlay_at(&mut c, patch_a), kept_colour);
+
+    let row = c
+        .checkpoints_panel()
+        .entries
+        .iter()
+        .position(|entry| entry.id.as_deref() == Some("held:0"))
+        .expect("the fuse has a row");
+    c.request_checkpoint_delete(row);
+    c.confirm_checkpoint_delete();
+    assert!(
+        !checkpoint_keys(&c).contains(&"held:0".to_string()),
+        "the deleted fuse is no Results row"
+    );
+    c.select_frame(2);
+    assert_eq!(
+        overlay_at(&mut c, patch_a),
+        kept_colour,
+        "the overlay keeps its colour"
+    );
+    assert_eq!(
+        swatch_at(&mut c, patch_a),
+        job::source_color(2, 3),
+        "the swatch shows the chosen source"
+    );
+    alt_click_at(&mut c, patch_a);
+    assert_eq!(c.source_checkpoint(), None, "the pick leaves the source");
+    assert_eq!(c.brush_source(), Some(2));
+}
+
+/// A hard Lighten dab from checkpoint `key` over the editor's image, with
+/// pixels deep inside it where the checkpoint's render is brighter than the
+/// image (the dab acts) and where it is not, each over a stored source.
+struct CheckpointDab {
+    op: Op,
+    centre: (u32, u32),
+    acts: (u32, u32),
+    idle: (u32, u32),
+}
+
+fn checkpoint_lighten_dab(c: &mut AppController, key: &str, opacity: f32) -> CheckpointDab {
+    const RADIUS: f32 = 10.0;
+    let map = map_rect(c);
+    let image = session_view(c);
+    let render = read_plane(
+        c.edit_session()
+            .unwrap()
+            .checkpoint_source_path(key)
+            .expect("the checkpoint is rendered"),
+        map,
+    );
+    let (_, zmap) = c.materialize_active_tab_planes().unwrap();
+    let stored = read_whole_zmap(&zmap);
+    let sum =
+        |plane: &[u16], p| -> u32 { (0..3).map(|k| u32::from(plane[map_index(p) * 3 + k])).sum() };
+    for centre in [(16, 18), (29, 30), (42, 42), (20, 44), (44, 16)] {
+        let (mut acts, mut idle) = (None, None);
+        for p in map_pixels() {
+            if !deep_inside(centre, RADIUS, 2.0, p) || stored[map_index(p)] == NO_SOURCE {
+                continue;
+            }
+            let slot = if sum(&render, p) > sum(&image, p) {
+                &mut acts
+            } else {
+                &mut idle
+            };
+            slot.get_or_insert(p);
+        }
+        if let Some((acts, idle)) = acts.zip(idle) {
+            let op = Op::BrushStroke {
+                source: StrokeSource::Checkpoint(key.to_string()),
+                path: vec![Point {
+                    x: centre.0 as i32,
+                    y: centre.1 as i32,
+                }],
+                radius: RADIUS,
+                softness: 0.0,
+                mode: BrushMode::Lighten,
+                opacity,
+            };
+            return CheckpointDab {
+                op,
+                centre,
+                acts,
+                idle,
+            };
+        }
+    }
+    panic!("no Lighten dab from {key} acts at some of its pixels and not at others");
+}
+
+#[test]
+fn overlay_and_pipette_apply_lighten_to_a_checkpoint_source() {
+    let mut c = editor_over_several_checkpoints("lighten_from_checkpoint");
+    let key = checkpoint_keys(&c).pop().expect("a listed checkpoint");
+    select_checkpoint_source(&mut c, &key);
+    let case = checkpoint_lighten_dab(&mut c, &key, 1.0);
+    let (_, zmap) = c.materialize_active_tab_planes().unwrap();
+    let stored = read_whole_zmap(&zmap);
+    let frames = c.frame_count().unwrap();
+    common::paint(&mut c, case.op.clone());
+    common::settle_region_renders(&mut c);
+    c.set_overlay_on(true);
+    settle_origin_readers(&mut c);
+
+    let table = focusforge_core::zmap::overlay_table(frames, None);
+    let chip = results_row(&c, &key).chip;
+    let pixels = overlay_pixels(&c, &zmap);
+    let stored_at = |p: (u32, u32)| stored[map_index(p)];
+    assert_eq!(
+        pixels[map_index(case.acts)],
+        chip,
+        "the overlay where it acts"
+    );
+    assert_eq!(
+        pixels[map_index(case.idle)],
+        table[usize::from(stored_at(case.idle))],
+        "the overlay where it does not"
+    );
+
+    c.select_frame(frame_other_than(&[stored_at(case.idle)]));
+    alt_click_at(&mut c, case.acts);
+    assert_eq!(
+        c.source_checkpoint().as_deref(),
+        Some(key.as_str()),
+        "Alt + click where it acts"
+    );
+    c.select_frame(frame_other_than(&[stored_at(case.idle)]));
+    alt_click_at(&mut c, case.idle);
+    assert_eq!(c.source_checkpoint(), None, "Alt + click where it does not");
+    assert_eq!(c.brush_source(), Some(stored_at(case.idle)));
+
+    c.toggle_pipette();
+    for (p, want) in [
+        (case.acts, chip),
+        (case.idle, job::source_color(stored_at(case.idle), frames)),
+    ] {
+        let (sx, sy) = at(p.0 as f32, p.1 as f32);
+        c.pointer(PointerKind::Move, Button::Left, sx, sy, NO_MODS);
+        assert_eq!(
+            c.brush_cursor_view().unwrap().pick_color,
+            want,
+            "the armed cursor at {p:?}"
+        );
+    }
+}
+
+/// Paints a hard Lighten dab from a frame through the editor, at the first of
+/// `centres` and frame where it changes some pixels deep inside it and leaves
+/// others alone; returns one of each and the frame.
+fn frame_lighten_dab(
+    c: &mut AppController,
+    centres: &[(u32, u32)],
+) -> ((u32, u32), (u32, u32), u16) {
+    let (_, zmap) = c.materialize_active_tab_planes().unwrap();
+    let stored = read_whole_zmap(&zmap);
+    set_size(c, 20.0);
+    c.set_brush_softness_fraction(0.0);
+    set_look(c, BrushMode::Lighten, 100);
+    for (centre, source) in centres
+        .iter()
+        .flat_map(|&centre| (0..3u16).map(move |source| (centre, source)))
+    {
+        c.select_frame(usize::from(source));
+        let before = session_view(c);
+        drag(c, &[(centre.0 as f32, centre.1 as f32)]);
+        common::settle_region_renders(c);
+        let after = session_view(c);
+        let radius = match ops(c).last() {
+            Some(Op::BrushStroke { radius, .. }) => *radius,
+            other => panic!("a brush stroke, got {other:?}"),
+        };
+        let (mut acts, mut idle) = (None, None);
+        for p in map_pixels() {
+            let i = map_index(p);
+            if !deep_inside(centre, radius, 2.0, p) || stored[i] == NO_SOURCE {
+                continue;
+            }
+            let slot = if before[i * 3..i * 3 + 3] != after[i * 3..i * 3 + 3] {
+                &mut acts
+            } else {
+                &mut idle
+            };
+            slot.get_or_insert(p);
+        }
+        if let Some((acts, idle)) = acts.zip(idle) {
+            return (acts, idle, source);
+        }
+        c.undo();
+        common::settle_region_renders(c);
+    }
+    panic!("no frame Lighten dab at {centres:?} acts at some of its pixels and not at others");
+}
+
+#[test]
+fn checkpoint_origin_keeps_stored_colour_when_source_read_fails() {
+    let mut c = editor_over_several_checkpoints("lighten_ckpt_read_fails");
+    let key = checkpoint_keys(&c).pop().expect("a listed checkpoint");
+    assert_eq!(key, "held:0", "the oldest fuse");
+    select_checkpoint_source(&mut c, &key);
+    let case = checkpoint_lighten_dab(&mut c, &key, 1.0);
+    common::paint(&mut c, case.op.clone());
+    common::settle_region_renders(&mut c);
+    let far: Vec<(u32, u32)> = [(14u32, 44u32), (44, 14), (46, 46), (12, 12), (30, 50)]
+        .into_iter()
+        .filter(|&(x, y)| x.abs_diff(case.centre.0).max(y.abs_diff(case.centre.1)) > 20)
+        .collect();
+    let (frame_acts, frame_idle, frame) = frame_lighten_dab(&mut c, &far);
+    let (_, zmap) = c.materialize_active_tab_planes().unwrap();
+    let stored = read_whole_zmap(&zmap);
+    let frames = c.frame_count().unwrap();
+    assert!(c.save_checkpoint());
+    let target = c.held_checkpoints().first().expect("a held fuse").clone();
+    fs::remove_file(&target.composite).unwrap();
+
+    // A new session renders the strokes' checkpoints again; the removed
+    // composite makes the stroke's render fail.
+    let ids = common::panel_ids(&c);
+    let (row, other) = (ids[0].clone(), ids[1].clone());
+    common::select_panel_row(&mut c, &other);
+    common::settle_session(&mut c);
+    common::select_panel_row(&mut c, &row);
+    common::settle_session(&mut c);
+    assert!(
+        !c.edit_session().unwrap().has_checkpoint_source(&key),
+        "the render failed"
+    );
+    c.set_overlay_on(true);
+    settle_origin_readers(&mut c);
+
+    let table = focusforge_core::zmap::overlay_table(frames, None);
+    let pixels = overlay_pixels(&c, &zmap);
+    let stored_colour = |p: (u32, u32)| table[usize::from(stored[map_index(p)])];
+    for p in [case.acts, case.idle, frame_idle] {
+        assert_eq!(pixels[map_index(p)], stored_colour(p), "stored at {p:?}");
+    }
+    assert_eq!(
+        pixels[map_index(frame_acts)],
+        table[usize::from(frame)],
+        "the frame stroke keeps its origin"
+    );
+
+    let start = frame_other_than(&[frame, stored[map_index(case.acts)]]);
+    c.select_frame(start);
+    alt_click_at(&mut c, case.acts);
+    assert_eq!(
+        c.brush_source(),
+        Some(start as u16),
+        "the pick leaves the source"
+    );
+    assert_eq!(c.source_checkpoint(), None);
+    alt_click_at(&mut c, frame_acts);
+    assert_eq!(
+        c.brush_source(),
+        Some(frame),
+        "the frame stroke still picks"
+    );
+}
+
+#[test]
+fn checkpoint_origin_covers_a_row_without_a_session() {
+    let mut c = editor_over_several_checkpoints("lighten_ckpt_no_session");
+    let key = checkpoint_keys(&c).pop().expect("a listed checkpoint");
+    select_checkpoint_source(&mut c, &key);
+    let case = checkpoint_lighten_dab(&mut c, &key, 1.0);
+    common::paint(&mut c, case.op.clone());
+    common::settle_region_renders(&mut c);
+    let path = save_to_proposed(&mut c);
+
+    let mut c = reopen(&path, "lighten_ckpt_no_session_reopened");
+    assert!(c.edit_session().is_none(), "no editor session");
+    c.set_overlay_on(true);
+    let _ = c.materialize_active_tab_planes();
+    common::settle_render(&mut c);
+    let (_, zmap) = c.materialize_active_tab_planes().unwrap();
+    let stored = read_whole_zmap(&zmap);
+    let table = focusforge_core::zmap::overlay_table(3, None);
+    settle_origin_readers(&mut c);
+    let stored_colour = |p: (u32, u32)| table[usize::from(stored[map_index(p)])];
+
+    let before = overlay_pixels(&c, &zmap);
+    for p in [case.acts, case.idle] {
+        assert_eq!(
+            before[map_index(p)],
+            stored_colour(p),
+            "before it lands: {p:?}"
+        );
+    }
+    common::settle_session(&mut c);
+    assert!(c.edit_session().is_none(), "still no editor session");
+    let chip = *c
+        .overlay_draw()
+        .expect("the overlay is on")
+        .checkpoint_colors
+        .values()
+        .next()
+        .expect("the stroke's checkpoint has a colour");
+    let after = overlay_pixels(&c, &zmap);
+    assert_eq!(after[map_index(case.acts)], chip, "where it acts");
+    assert_eq!(
+        after[map_index(case.idle)],
+        stored_colour(case.idle),
+        "where it does not"
+    );
 }

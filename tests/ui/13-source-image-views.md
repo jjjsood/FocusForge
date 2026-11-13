@@ -34,11 +34,11 @@ Use a fresh settings directory. Presentation choices belong to the open Appearan
    Expect: eye and delete icons replace the timestamp of that row (`buttons FFDock::images-panel` lists **Exclude** `FFImageRow::large-exclude-button` and **Remove** `FFImageRow::large-remove-button`); the filename beside them reads "00.tif" and the second row still shows "—" as its timestamp.
 14. Click **first visible source filename** (`FFImageRow::large-name-slot`).
    Expect: the first source is selected and eye/delete are visible in its timestamp area.
-15. Click **Exclude**, the eye on the first source (`FFImageRow::large-exclude-button`).
+15. Click **Exclude**, the eye on the first source (`FFImageRow::large-exclude-button`). The buttons exist only while the pointer rests on that row: hover its timestamp area (`FFImageRow::large-timestamp-slot` 0) right before the click, and again if the click finds no element.
    Expect: that source dims without changing the source order or count.
 16. Click **second visible source filename** (`FFImageRow::large-name-slot`) (instance 1).
    Expect: the second source is selected with eye/delete visible; the excluded first source stays dimmed.
-17. Click **Remove**, the single visible delete button on the hovered second source (`FFImageRow::large-remove-button`, instance 0). Only the hovered row mounts its action buttons; do not use source-row instance 1 for this button.
+17. Click **Remove**, the single visible delete button on the hovered second source (`FFImageRow::large-remove-button`, instance 0). Only the hovered row mounts its action buttons: hover its timestamp area (`FFImageRow::large-timestamp-slot` 1) right before the click, and again if the click finds no element; do not use source-row instance 1 for this button.
    Expect: source count decreases by one; no confirmation appears before a first checkpoint.
 
 ## Back to Image list

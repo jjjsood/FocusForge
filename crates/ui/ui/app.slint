@@ -99,6 +99,8 @@ export component AppWindow inherits Window {
     in property <color> cursor-pick-color;
     in property <string> cursor-mode-tag: "";
     in property <length> cursor-tag-origin;
+    in property <bool> cursor-checkpoint-source: false;
+    in property <color> cursor-glyph-color;
     in property <bool> cursor-visible: false;
     in property <length> cursor-frame-x;
     in property <length> cursor-frame-y;
@@ -246,6 +248,9 @@ export component AppWindow inherits Window {
     // composite above.
     in property <image> frame-source;
     in property <string> frame-label: "";
+    in property <bool> frame-label-icon: false;
+    in property <bool> frame-label-swatch: false;
+    in property <color> frame-label-icon-color;
     // Each pane's refusal, one entry per line: the selected frame's on the
     // left, the current checkpoint's on the right.
     in property <[string]> frame-message-lines: [];
@@ -378,6 +383,9 @@ export component AppWindow inherits Window {
             composite-source: root.composite-source;
             frame-source: root.frame-source;
             frame-label: root.frame-label;
+            frame-label-icon: root.frame-label-icon;
+            frame-label-swatch: root.frame-label-swatch;
+            frame-label-icon-color: root.frame-label-icon-color;
             frame-message-lines: root.frame-message-lines;
             composite-message-lines: root.composite-message-lines;
             undock-enabled: root.canvas-undock-enabled;
@@ -437,6 +445,8 @@ export component AppWindow inherits Window {
             cursor-pick-color: root.cursor-pick-color;
             cursor-mode-tag: root.cursor-mode-tag;
             cursor-tag-origin: root.cursor-tag-origin;
+            cursor-checkpoint-source: root.cursor-checkpoint-source;
+            cursor-glyph-color: root.cursor-glyph-color;
         cursor-visible: root.cursor-visible;
         cursor-frame-x: root.cursor-frame-x;
         cursor-frame-y: root.cursor-frame-y;
@@ -512,7 +522,7 @@ export component AppWindow inherits Window {
     callback images-frame-remove-requested(int);
     callback images-frame-drag-pointer(int, int, length);
     callback images-viewport-scrolled(length);
-    callback images-frame-wheel(length);
+    callback images-frame-wheel(int, length) -> bool;
     callback images-scrollbar-pointer(int, length);
     callback images-scrollbar-dragged(length);
     callback images-viewport-height-changed(length);
@@ -580,7 +590,7 @@ export component AppWindow inherits Window {
         images-frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
         images-frame-drag-pointer(i, kind, y) => { root.images-frame-drag-pointer(i, kind, y); }
         images-viewport-scrolled(offset) => { root.images-viewport-scrolled(offset); }
-        images-frame-wheel(delta) => { root.images-frame-wheel(delta); }
+        images-frame-wheel(row, delta) => { return root.images-frame-wheel(row, delta); }
         images-scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }
         images-scrollbar-dragged(y) => { root.images-scrollbar-dragged(y); }
         images-viewport-height-changed(h) => { root.images-viewport-height-changed(h); }

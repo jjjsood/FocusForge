@@ -1291,6 +1291,12 @@ fn apply_appearance_preview(app: &AppWindow, preview: Option<AppearancePreview>)
 
 fn preview_row(chip: [u8; 3], name: &str, time: &str) -> focusforge_gui::ImageRowView {
     focusforge_gui::ImageRowView {
+        kind: "frame".into(),
+        method: "".into(),
+        strokes: "".into(),
+        badges: Default::default(),
+        collapsed: false,
+        height: 0.0,
         chip: slint::Color::from_rgb_u8(chip[0], chip[1], chip[2]),
         name: name.into(),
         time_text: time.into(),
@@ -1387,6 +1393,14 @@ fn fill_stage_sheet(sheet: &ThemeSheet) {
     sheet.set_stage_complete(build(&|_| true, &|_| false, false));
     sheet.set_stage_heat(build(&|t| t < FRONT, &|_| false, true));
     sheet.set_stage_tiles(slint::ModelRc::new(slint::VecModel::from(tiles)));
+    let chip = |c| {
+        let [r, g, b] = job::checkpoint_color(c, 61);
+        slint::Color::from_rgb_u8(r, g, b)
+    };
+    sheet.set_checkpoint_c0(chip(0));
+    sheet.set_checkpoint_c1(chip(1));
+    sheet.set_checkpoint_c2(chip(2));
+    sheet.set_checkpoint_c3(chip(3));
 }
 
 fn preview_image() -> slint::Image {

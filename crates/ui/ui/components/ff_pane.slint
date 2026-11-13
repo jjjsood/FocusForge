@@ -9,6 +9,9 @@ import { FFUndockControl } from "ff_undock_control.slint";
 export component FFPane inherits Rectangle {
     in property <image> source;
     in property <string> label: "";
+    in property <bool> label-icon: false;
+    in property <bool> label-swatch: false;
+    in property <color> label-icon-color;
     in property <[string]> message-lines: [];
     in property <bool> undock-enabled: true;
     in property <bool> dock-back: false;
@@ -86,6 +89,9 @@ export component FFPane inherits Rectangle {
         x: ShellGeometry.pane-chrome-inset;
         y: ShellGeometry.pane-chrome-inset;
         label: root.label;
+        show-icon: root.label-icon;
+        show-swatch: root.label-swatch;
+        icon-color: root.label-icon-color;
         visible: root.project-loaded;
     }
 

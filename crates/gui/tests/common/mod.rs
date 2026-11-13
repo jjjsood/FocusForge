@@ -848,3 +848,99 @@ pub fn element_center(handle: &i_slint_backend_testing::ElementHandle) -> slint:
     let size = handle.size();
     slint::LogicalPosition::new(pos.x + size.width / 2.0, pos.y + size.height / 2.0)
 }
+
+/// Settles every run, fuses once and leaves the tab in whichever mode the
+/// fuse chose.
+#[allow(dead_code)]
+pub fn fuse(controller: &mut AppController) {
+    assert!(controller.start_fuse());
+    settle_all(controller);
+}
+
+/// Enters the editor if needed and waits for the edit session.
+#[allow(dead_code)]
+pub fn open_session(controller: &mut AppController) {
+    if controller.mode() != ShellMode::Editor {
+        assert!(controller.set_mode(ShellMode::Editor));
+    }
+    let start = Instant::now();
+    while controller.edit_session().is_none() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the editor session did not open"
+        );
+        controller.settle_checkpoint_render();
+        controller.settle_edit_session();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Leaves the editor.
+#[allow(dead_code)]
+pub fn stop_editing(controller: &mut AppController) {
+    if controller.mode() != ShellMode::Stacking {
+        assert!(controller.set_mode(ShellMode::Stacking));
+    }
+}
+
+/// A stroke at column `x` that changes the map there.
+#[allow(dead_code)]
+pub fn stroke_at(controller: &mut AppController, x: i32) {
+    let session = controller
+        .edit_session_mut()
+        .expect("the tab has an edit session");
+    let shown = session
+        .stored_source(x as u32, 20)
+        .expect("the column lies inside the map");
+    session
+        .append(Op::frame_stroke(
+            u16::from(shown == 0),
+            vec![focusforge_core::project::Point { x, y: 20 }],
+            4.0,
+            0.0,
+        ))
+        .expect("a dab inside the map applies");
+}
+
+/// One in-memory retouch checkpoint holding a stroke at each of `columns`.
+#[allow(dead_code)]
+pub fn retouch(controller: &mut AppController, columns: &[i32]) {
+    for &x in columns {
+        stroke_at(controller, x);
+    }
+    assert!(controller.save_checkpoint());
+}
+
+/// The ids of the checkpoint panel's rows, in its order.
+#[allow(dead_code)]
+pub fn panel_ids(controller: &AppController) -> Vec<String> {
+    controller
+        .checkpoints_panel()
+        .entries
+        .into_iter()
+        .filter_map(|entry| entry.id)
+        .collect()
+}
+
+/// The id of the checkpoint panel's selected row.
+#[allow(dead_code)]
+pub fn panel_selected(controller: &AppController) -> Option<String> {
+    controller
+        .checkpoints_panel()
+        .entries
+        .iter()
+        .find(|entry| entry.selected)
+        .and_then(|entry| entry.id.clone())
+}
+
+/// Clicks the checkpoint panel's row `id`.
+#[allow(dead_code)]
+pub fn select_panel_row(controller: &mut AppController, id: &str) {
+    let index = controller
+        .checkpoints_panel()
+        .entries
+        .iter()
+        .position(|entry| entry.id.as_deref() == Some(id))
+        .unwrap_or_else(|| panic!("no checkpoint row for {id}"));
+    controller.select_checkpoint_row(index);
+}

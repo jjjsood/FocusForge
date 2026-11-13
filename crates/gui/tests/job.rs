@@ -18,7 +18,7 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{self, FuseOutcome, FuseOutput, FuseRequest, StageObserver};
-use focusforge_core::project::{self, BrushMode, Op, Point, Project};
+use focusforge_core::project::{self, BrushMode, Op, Point, Project, StrokeSource};
 use focusforge_core::registry;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use focusforge_gui::canvas::CanvasFeed;
@@ -4491,14 +4491,7 @@ fn quit_and_close_questions_cannot_overlap() {
 
 /// A one-dab brush stroke of source 1 at `(x, 10)`.
 fn dab(x: i32) -> job::Op {
-    job::Op::BrushStroke {
-        source_id: 1,
-        path: vec![Point { x, y: 10 }],
-        radius: 0.5,
-        softness: 0.0,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }
+    job::Op::frame_stroke(1, vec![Point { x, y: 10 }], 0.5, 0.0)
 }
 
 /// Enters the editor on the active tab and paints `strokes` dabs.
@@ -8304,6 +8297,7 @@ fn open_session_at(
         16,
         Vec::new(),
         Vec::new(),
+        std::collections::HashMap::new(),
     )
 }
 
@@ -8326,14 +8320,12 @@ fn raw_edit_session_below_the_cap_is_refused_naming_the_cap() {
 }
 
 fn raw_stroke() -> Op {
-    Op::BrushStroke {
-        source_id: 1,
-        path: vec![Point { x: 4, y: 11 }, Point { x: 32, y: 11 }],
-        radius: 40.0,
-        softness: 0.5,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }
+    Op::frame_stroke(
+        1,
+        vec![Point { x: 4, y: 11 }, Point { x: 32, y: 11 }],
+        40.0,
+        0.5,
+    )
 }
 
 /// `region` rendered from the base under `ops` into a fresh session's
@@ -8354,6 +8346,7 @@ fn live_region(session: &mut job::EditState, region: Rect, ops: Vec<Op>) -> Vec<
 
 fn raw_pending(files: &RawFiles, ops: Vec<Op>) -> project::PendingState {
     project::PendingState {
+        held: Vec::new(),
         composite: files.composite.clone(),
         ops,
         sources: files.sources.clone(),
@@ -8364,7 +8357,7 @@ fn raw_pending(files: &RawFiles, ops: Vec<Op>) -> project::PendingState {
 }
 
 fn pending_f32(state: &project::PendingState) -> Vec<f32> {
-    let image = project::CheckpointImage::prepare_pending(state).unwrap();
+    let image = project::CheckpointImage::prepare_pending(state, None).unwrap();
     let mut out = vec![0f32; (RAW_W * RAW_H * 3) as usize];
     image
         .render_f32(None, raw_whole(), &mut |band, rect| {
@@ -8441,7 +8434,7 @@ fn raw_project_live_retouch_matches_saved_and_export() {
         xmp: false,
         iptc: false,
     };
-    project::export_pending(&stroked, &out, &ExportOptions::default(), &metadata).unwrap();
+    project::export_pending(&stroked, None, &out, &ExportOptions::default(), &metadata).unwrap();
     let exported = focusforge_core::io::TiffStack::open_files(std::slice::from_ref(&out)).unwrap();
     let mut got = vec![0u16; live.len()];
     exported.read_tile_into(0, whole, &mut got).unwrap();
@@ -8451,7 +8444,7 @@ fn raw_project_live_retouch_matches_saved_and_export() {
 
 fn raw_stroke_in(mode: BrushMode, source_id: u16, (x, y): (i32, i32), radius: f32) -> Op {
     Op::BrushStroke {
-        source_id,
+        source: StrokeSource::Frame(source_id),
         path: vec![Point { x, y }, Point { x: x + 3, y: y + 2 }],
         radius,
         softness: 0.3,
@@ -8620,4 +8613,468 @@ fn raw_session_blends_on_the_cpu() {
         "samples above white survive"
     );
     assert_eq!(bits(&with_device), bits(&plain));
+}
+
+/// A stroke painted from unsaved checkpoint `entry`.
+fn held_dab(entry: usize, x: i32) -> job::Op {
+    job::Op::BrushStroke {
+        source: job::StrokeSource::Checkpoint(format!("held:{entry}")),
+        path: vec![Point { x, y: 10 }],
+        radius: 0.5,
+        softness: 0.0,
+        mode: job::BrushMode::Normal,
+        opacity: 1.0,
+    }
+}
+
+/// The checkpoint every op paints from, `None` for a frame stroke.
+fn painted_from(ops: &[job::Op]) -> Vec<Option<&str>> {
+    ops.iter().map(job::Op::checkpoint_source).collect()
+}
+
+/// The panel index of the row with `id`.
+fn row_of(controller: &AppController, id: &str) -> usize {
+    controller
+        .checkpoints_panel()
+        .entries
+        .iter()
+        .position(|entry| entry.id.as_deref() == Some(id))
+        .unwrap_or_else(|| panic!("no row for {id}"))
+}
+
+#[test]
+fn held_source_files_kept() {
+    for uses_source in [false, true] {
+        let (mut c, path) = two_saved(&format!("held_source_files_{uses_source}"));
+        let root = saved_rows(&path)[0].0.clone();
+        // Held 0 hangs from the head, held 1 from the root: neither is the
+        // other's parent.
+        fuse_and_settle(&mut c);
+        c.select_checkpoint_row(row_of(&c, &root));
+        fuse_and_settle(&mut c);
+        assert_eq!(c.held_checkpoints().len(), 2);
+        common::enter_editor(&mut c);
+        common::paint(
+            &mut c,
+            if uses_source {
+                held_dab(0, 12)
+            } else {
+                dab(12)
+            },
+        );
+        assert!(c.save_checkpoint(), "the stroke becomes an entry");
+
+        let first = c.held_checkpoints()[0].composite.clone();
+        assert!(first.is_file());
+        c.request_checkpoint_delete(row_of(&c, "held:0"));
+        c.confirm_checkpoint_delete();
+        assert_eq!(
+            first.is_file(),
+            uses_source,
+            "a deleted fuse a stroke paints from keeps its files, any other loses them"
+        );
+    }
+}
+
+#[test]
+fn held_source_rewritten_after_save() {
+    let mut c = painted_tab("held_source_rewritten", 2, 0);
+    common::enter_editor(&mut c);
+    common::paint(&mut c, held_dab(0, 12));
+    let sources = |c: &AppController| {
+        painted_from(&c.edit_session().unwrap().stack_ops())
+            .into_iter()
+            .map(|id| id.map(str::to_string))
+            .collect::<Vec<_>>()
+    };
+
+    // A failed save changes no reference.
+    let held_before = held_paths(&c);
+    let blocked = unwritable_target("held_source_rewritten_blocked");
+    assert!(!common::save_and_settle(&mut c, |_| Some(blocked.clone())));
+    assert_eq!(sources(&c), [Some("held:0".to_string())]);
+    assert_eq!(held_paths(&c), held_before);
+
+    // A successful one names the saved id in the chain, in a stroke drawn
+    // while it ran and in one undone meanwhile.
+    let target = common::tree("held_source_rewritten_target").join("saved.ffp");
+    assert!(c.start_save_active_project(|_| Some(target.clone())));
+    common::paint(&mut c, held_dab(0, 20));
+    common::paint(&mut c, held_dab(0, 28));
+    c.edit_session_mut()
+        .unwrap()
+        .undo()
+        .expect("a stroke to undo");
+    c.join_save();
+    assert_eq!(c.settle_save(), Some(true));
+
+    let root = saved_rows(&target)
+        .into_iter()
+        .find(|row| row.3)
+        .expect("the fuse is saved")
+        .0;
+    assert_eq!(sources(&c), vec![Some(root.clone()); 2]);
+    c.edit_session_mut()
+        .unwrap()
+        .redo()
+        .expect("a stroke to redo");
+    assert_eq!(sources(&c), vec![Some(root); 3]);
+}
+
+#[test]
+fn held_source_not_written_cannot_alias_a_new_entry() {
+    let (mut c, path) = two_saved("held_source_gone");
+    let root = saved_rows(&path)[0].0.clone();
+    fuse_and_settle(&mut c);
+    c.select_checkpoint_row(row_of(&c, &root));
+    fuse_and_settle(&mut c);
+    common::enter_editor(&mut c);
+    // An undone stroke is no entry's, so nothing written paints from held 0.
+    common::paint(&mut c, held_dab(0, 12));
+    c.edit_session_mut()
+        .unwrap()
+        .undo()
+        .expect("a stroke to undo");
+    c.request_checkpoint_delete(row_of(&c, "held:0"));
+    c.confirm_checkpoint_delete();
+    assert!(c.save_active_project(|_| panic!("a saved tab never asks where")));
+
+    // Held 0 is a new entry's name from here on; the undone stroke is not its.
+    assert!(c.held_checkpoints().is_empty());
+    c.edit_session_mut()
+        .unwrap()
+        .redo()
+        .expect("a stroke to redo");
+    let ops = c.edit_session().unwrap().stack_ops();
+    assert_eq!(painted_from(&ops), [Some(job::GONE_KEY)]);
+}
+
+/// An editor session over a saved head with 16 px resident tiles, the project's
+/// path, the id of a saved checkpoint that carries strokes (so its pixels
+/// differ from the head's) and a scratch path for its render.
+fn session_with_a_stroked_source(name: &str) -> (AppController, PathBuf, String, PathBuf) {
+    let (mut c, path) = two_saved(name);
+    c.set_resident_tile_size_for_test(16);
+    common::enter_editor(&mut c);
+    for x in [14, 26, 38] {
+        common::paint(
+            &mut c,
+            job::Op::frame_stroke(
+                1,
+                vec![Point { x, y: 20 }, Point { x: x + 6, y: 30 }],
+                7.0,
+                0.2,
+            ),
+        );
+    }
+    assert!(c.save_active_project(|_| panic!("a saved tab never asks where")));
+    let id = saved_rows(&path)
+        .into_iter()
+        .find(|row| row.2 > 0)
+        .expect("a saved checkpoint carries the strokes")
+        .0;
+    common::open_session(&mut c);
+    let scratch = common::tree(&format!("{name}_source")).join("source.tif");
+    (c, path, id, scratch)
+}
+
+fn checkpoint_stroke(id: &str, mode: job::BrushMode) -> job::Op {
+    job::Op::BrushStroke {
+        source: job::StrokeSource::Checkpoint(id.to_string()),
+        path: vec![Point { x: 10, y: 24 }, Point { x: 44, y: 30 }],
+        radius: 11.0,
+        softness: 0.3,
+        mode,
+        opacity: 0.8,
+    }
+}
+
+fn read_u16(stack: &focusforge_core::io::TiffStack, rect: Rect) -> Vec<u16> {
+    let mut out = vec![0u16; (rect.width * rect.height * 3) as usize];
+    stack.read_tile_into(0, rect, &mut out).unwrap();
+    out
+}
+
+fn whole_of(session: &job::EditState) -> Rect {
+    let (width, height) = session.base.dimensions();
+    Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    }
+}
+
+#[test]
+fn checkpoint_source_region_equals_the_blend_over_the_source() {
+    use focusforge_core::retouch::blend;
+
+    let (mut c, project, id, scratch) = session_with_a_stroked_source("checkpoint_source_region");
+    let session = c.edit_session_mut().unwrap();
+    let source =
+        job::render_checkpoint_source(Some(&project), &[], &id, &scratch, None, &session.base)
+            .expect("the saved checkpoint renders");
+    let whole = whole_of(session);
+    let base = read_u16(&session.base, whole);
+    let rendered = focusforge_core::io::TiffStack::open_staged(&scratch).unwrap();
+    let source_samples = read_u16(&rendered, whole);
+    assert_ne!(
+        base, source_samples,
+        "the source differs from the edited image"
+    );
+    session.set_checkpoint_source(id.clone(), source);
+
+    let part = Rect {
+        x: 5,
+        y: 3,
+        width: 40,
+        height: 33,
+    };
+    for (mode, region) in [
+        (job::BrushMode::Normal, whole),
+        (job::BrushMode::Normal, part),
+        (job::BrushMode::Detail, whole),
+    ] {
+        let op = checkpoint_stroke(&id, mode);
+        session
+            .render_region_now(&job::RegionRender {
+                region,
+                pre: job::PreImage::Base,
+                ops: vec![op.clone()],
+                ends_drag: false,
+            })
+            .expect("the region renders");
+        let mut got = vec![0u16; (region.width * region.height * 3) as usize];
+        session.tiles.overlay_into(region, &mut got);
+
+        let mut expected = read_u16(&session.base, region);
+        let src = read_u16(&rendered, region);
+        blend::apply(&op, session.info(), region, &mut expected, region, &src, 3).unwrap();
+        assert_ne!(expected, read_u16(&session.base, region), "{mode:?} paints");
+        assert_eq!(got, expected, "{mode:?} over {region:?}");
+    }
+}
+
+/// A 16-bit three-sample TIFF of `width` x `height` pixels, `sample(i)` the
+/// `i`-th sample.
+#[cfg(feature = "gpu-tests")]
+fn write_u16_image(path: &Path, width: u32, height: u32, sample: impl Fn(usize) -> u16) {
+    let mut writer = TiffWriter::create(
+        path,
+        TiffSpec {
+            width,
+            height,
+            samples_per_pixel: 3,
+            description: None,
+        },
+    )
+    .unwrap();
+    let samples: Vec<u16> = (0..(width * height * 3) as usize).map(sample).collect();
+    writer
+        .write_tile(
+            Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            &samples,
+        )
+        .unwrap();
+    writer.finish().unwrap();
+}
+
+#[cfg(feature = "gpu-tests")]
+#[test]
+fn checkpoint_source_region_the_device_refuses_blends_on_the_cpu() {
+    use focusforge_gpu::blend::{BlendError, Blender};
+
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    const WIDTH: u32 = 16_400;
+    let dir = common::tree("checkpoint_source_past_the_device_range");
+    let (composite, frame, held_composite) = (
+        dir.join("composite.tif"),
+        dir.join("frame.tif"),
+        dir.join("held.tif"),
+    );
+    write_u16_image(&composite, WIDTH, 2, |i| (i * 7 % 40_000) as u16);
+    write_u16_image(&frame, WIDTH, 2, |i| (i * 13 % 60_000 + 500) as u16);
+    write_u16_image(&held_composite, WIDTH, 2, |i| {
+        (i * 29 % 56_000 + 9_000) as u16
+    });
+    let zmap = dir.join("zmap.tif");
+    let info = ZMapInfo::new(WIDTH, 2, 1).unwrap();
+    let mut map = ZMapWriter::create(&zmap, info).unwrap();
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: WIDTH,
+        height: 2,
+    };
+    map.write_tile(whole, &vec![0u16; (WIDTH * 2) as usize])
+        .unwrap();
+    map.finish().unwrap();
+    let held = job::InMemoryCheckpoint {
+        kind: job::InMemoryKind::Fused(job::HeldCheckpoint {
+            composite: held_composite,
+            zmap: zmap.clone(),
+            width: WIDTH,
+            height: 2,
+            sources: vec![frame.clone()],
+            algorithm: "laplacian".to_string(),
+            params: Default::default(),
+            align: None,
+            registration: Registration::default(),
+            composite_description: "held composite".to_string(),
+            metrics: Default::default(),
+            created_at: 900,
+            compressed_composite: None,
+        }),
+        parent: None,
+    };
+    let region = Rect {
+        x: 16_384,
+        y: 0,
+        width: 16,
+        height: 2,
+    };
+    let op = job::Op::BrushStroke {
+        source: job::StrokeSource::Checkpoint("held:0".to_string()),
+        path: vec![Point { x: 16_391, y: 1 }],
+        radius: 6.0,
+        softness: 0.3,
+        mode: job::BrushMode::Normal,
+        opacity: 1.0,
+    };
+
+    let shown = |blender: Option<Blender>, scratch: &str| {
+        let mut session = job::open_edit_session(
+            Some(&zmap),
+            &composite,
+            job::FrameSource::Open {
+                frames: vec![frame.clone()],
+                budget: job::host_budget(),
+            },
+            Registration::default(),
+            16,
+            Vec::new(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let source = job::render_checkpoint_source(
+            None,
+            std::slice::from_ref(&held),
+            "held:0",
+            &dir.join(scratch),
+            None,
+            &session.base,
+        )
+        .expect("the held fuse renders");
+        session.set_checkpoint_source("held:0".to_string(), source);
+        session.set_blender(blender);
+        live_region(&mut session, region, vec![op.clone()])
+    };
+    let plain = shown(None, "source_cpu.tif");
+    let with_device = shown(
+        Some(Blender::new(shared.device(), shared.queue())),
+        "source_device.tif",
+    );
+    let unpainted = {
+        let stack = focusforge_core::io::TiffStack::open_staged(&composite).unwrap();
+        read_u16(&stack, region)
+    };
+    assert!(
+        plain
+            .iter()
+            .zip(&unpainted)
+            .any(|(painted, base)| *painted != f32::from(*base)),
+        "the stroke paints the region"
+    );
+    assert_eq!(bits(&with_device), bits(&plain));
+
+    let mut out = unpainted.clone();
+    let err = Blender::new(shared.device(), shared.queue())
+        .apply(&op, info, region, &mut out, region, &unpainted, 3)
+        .expect_err("a region at 2^14 or more is the device's to refuse");
+    assert!(matches!(err, BlendError::Refused { .. }), "{err}");
+}
+
+#[test]
+fn checkpoint_source_missing_leaves_the_tiles_unchanged() {
+    let (mut c, _, id, _) = session_with_a_stroked_source("checkpoint_source_missing");
+    let session = c.edit_session_mut().unwrap();
+    assert!(!session.has_checkpoint_source(&id));
+    let region = whole_of(session);
+    let error = session
+        .render_region_now(&job::RegionRender {
+            region,
+            pre: job::PreImage::Base,
+            ops: vec![checkpoint_stroke(&id, job::BrushMode::Normal)],
+            ends_drag: false,
+        })
+        .expect_err("a source nobody rendered cannot be read");
+    assert!(
+        error.contains(&id),
+        "the error names the checkpoint: {error}"
+    );
+    let mut after = vec![f32::NAN; (region.width * region.height * 3) as usize];
+    session.tiles.overlay_into(region, &mut after);
+    assert!(after.iter().all(|s| s.is_nan()), "no tile was filled");
+}
+
+#[test]
+fn checkpoint_source_of_another_size_or_format_is_refused() {
+    let (mut c, project, id, scratch) = session_with_a_stroked_source("checkpoint_source_mismatch");
+    let session = c.edit_session_mut().unwrap();
+    let dir = scratch.parent().unwrap();
+    let write = |name: &str, width: u32, float: bool| {
+        let path = dir.join(name);
+        let spec = TiffSpec {
+            width,
+            height: 8,
+            samples_per_pixel: 3,
+            description: None,
+        };
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height: 8,
+        };
+        if float {
+            let mut w = TiffWriter::create_f32(&path, spec).unwrap();
+            w.write_tile_f32(rect, &vec![0f32; (width * 8 * 3) as usize])
+                .unwrap();
+            w.finish().unwrap();
+        } else {
+            let mut w = TiffWriter::create(&path, spec).unwrap();
+            w.write_tile(rect, &vec![0u16; (width * 8 * 3) as usize])
+                .unwrap();
+            w.finish().unwrap();
+        }
+        focusforge_core::io::TiffStack::open_staged(&path).unwrap()
+    };
+    let (width, _) = session.base.dimensions();
+    for (label, other) in [
+        ("size", write("small.tif", 8, false)),
+        ("format", write("float.tif", width, true)),
+    ] {
+        let _ = std::fs::remove_file(&scratch);
+        let Err(error) =
+            job::render_checkpoint_source(Some(&project), &[], &id, &scratch, None, &other)
+        else {
+            panic!("a {label} mismatch is refused");
+        };
+        assert!(
+            matches!(&error, job::CheckpointSourceError::Mismatch { key, .. } if *key == id),
+            "{label}: {error}"
+        );
+        assert!(
+            !scratch.exists(),
+            "{label}: the refused render leaves no file"
+        );
+    }
 }

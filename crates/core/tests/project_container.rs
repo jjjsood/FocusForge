@@ -14,8 +14,8 @@ use focusforge_core::align::Registration;
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, HEADER_LEN, Index, TRAILER_LEN};
 use focusforge_core::project::{
-    self, AppendRequest, BrushMode, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op,
-    ParentRef, Plane, Point, Project, ProjectError, SealRequest,
+    self, AppendRequest, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, ParentRef,
+    Plane, Point, Project, ProjectError, SealRequest,
 };
 
 const T0: i64 = 1_700_000_000;
@@ -34,14 +34,7 @@ fn params() -> ParamValues {
 }
 
 fn stroke(x: i32, y: i32) -> Vec<Op> {
-    vec![Op::BrushStroke {
-        source_id: 1,
-        path: vec![Point { x, y }],
-        radius: 3.0,
-        softness: 0.0,
-        mode: BrushMode::Normal,
-        opacity: 1.0,
-    }]
+    vec![Op::frame_stroke(1, vec![Point { x, y }], 3.0, 0.0)]
 }
 
 /// A project over `fixtures/mantis-512`'s golden planes, in its own directory.

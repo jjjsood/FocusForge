@@ -2,6 +2,8 @@
 //
 // The brush cursor: a dashed ring at the radius around a solid core, or,
 // while picking, the pipette icon beside a swatch of the colour it would pick.
+// A checkpoint source draws the ring in `text-primary` with a layers glyph at
+// the centre.
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
@@ -19,8 +21,13 @@ export component FFBrushCursor inherits Rectangle {
     // axes of the square.
     in property <string> mode-tag: "";
     in property <length> tag-origin;
+    // The brush source is a checkpoint: a `text-primary` ring around the
+    // layers glyph in `glyph-color`. Picking takes precedence.
+    in property <bool> checkpoint-source: false;
+    in property <color> glyph-color;
 
-    property <color> ink: Theme.cursor-ink;
+    property <bool> checkpoint-look: root.checkpoint-source && !root.picking;
+    property <color> ink: root.checkpoint-look ? Theme.text-primary : Theme.cursor-ink;
 
     width: root.extent;
     height: root.extent;
@@ -33,7 +40,7 @@ export component FFBrushCursor inherits Rectangle {
         viewbox-width: root.extent / 1px;
         viewbox-height: root.extent / 1px;
         commands: root.ring-commands;
-        stroke: root.ink.with-alpha(0.7);
+        stroke: root.ink.with-alpha(root.checkpoint-look ? 0.9 : 0.7);
         stroke-width: 1px;
     }
     if !root.picking: Path {
@@ -46,6 +53,15 @@ export component FFBrushCursor inherits Rectangle {
         commands: root.core-commands;
         stroke: root.ink;
         stroke-width: 1px;
+    }
+
+    if root.checkpoint-look: Image {
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        width: ShellGeometry.cursor-glyph-side;
+        height: ShellGeometry.cursor-glyph-side;
+        source: @image-url("../../../../assets/icons/layers.svg");
+        colorize: root.glyph-color;
     }
 
     // The active brush mode's one-letter chip, outside the ring at its

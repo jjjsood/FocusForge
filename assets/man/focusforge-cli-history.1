@@ -23,7 +23,7 @@ focusforge\-cli\-history\-list(1)
 List every visible checkpoint, newest first
 .TP
 focusforge\-cli\-history\-delete(1)
-Delete one checkpoint: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by `history compact`. Refuses the last visible checkpoint
+Delete one checkpoint: it is hidden, and dropped from the project once no visible checkpoint is built on it and no stroke paints from it (a checkpoint a stroke paints from stays stored); its space is reclaimed by `history compact`. Refuses the last visible checkpoint
 .TP
 focusforge\-cli\-history\-compact(1)
 Rewrite the project to its live checkpoints only and report the bytes reclaimed
