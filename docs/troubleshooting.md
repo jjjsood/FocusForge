@@ -210,6 +210,33 @@ With several volumes, one such sentence per volume is joined by "; ".
 (`-o` on the command line), then **Retry** or run the command again.
 See: [When a fuse fails](guide/first-stack.md#when-a-fuse-fails).
 
+### "Not enough free RAM to read this file"
+
+```
+<file>: not enough free RAM to read this file. It needs 953 MB of working memory, which takes about 1958 MB more free RAM. Close other programs, or convert the frames to TIFF.
+```
+
+```
+<file>: needs 1 MB of working memory, but the memory limit allows 0 MB for it. Raise the memory limit to at least 1 MB or close other programs.
+```
+
+**Cause:** FocusForge reads a frame through a working memory that comes out of
+the memory free when the run starts, or out of the memory limit you set, and
+the frame named needs more than that. Camera RAW and JPEG frames, and TIFF
+frames that are compressed, need a whole frame or block decoded at once. The
+first sentence says the free RAM is too low and by how much; the second says
+your memory limit is. When the free memory is too low to start at all, the
+sentence names the free RAM needed in all ("about N MB of free RAM in all").
+On the command line the line follows `error:` and the exit status is 1; in the
+window it is the message of the failed run, see
+["Failed"](#failed-setup-failed-alignment-failed-preparing-failed-or-fusing-failed).
+
+**Fix:** close other programs, raise or remove the memory limit
+(**Host memory** under [Memory caps and budgets](guide/settings-window.md#memory-caps-and-budgets),
+or `--max-host-memory`), or, for camera RAW and JPEG frames, convert the
+frames to TIFF. [Hardware](hardware.md) lists the free RAM each kind of frame
+needs.
+
 ### "Keep this fused result?"
 
 > 00.tif and 02.tif could not be aligned and were fused as they are.
@@ -329,7 +356,8 @@ no GPU-backed adapter works; rendering on the software adapter <name>
 **Cause:** none of the graphics adapters in the computer can draw the
 window, as in a virtual machine or a Remote Desktop session, so
 FocusForge draws it on a software adapter. Panning, zooming and the live
-view are slower there; fusing is not affected.
+view are slower there. Fusing never computes on a software adapter: it runs
+on the processor.
 
 **Fix:** nothing is required. For a faster window, run FocusForge on the
 machine itself, or install a graphics driver. The **GPU processing**
@@ -703,7 +731,8 @@ a fuse starts, after about 1.6 GB set aside for the run itself. More frames take
 for other programs, set a [cap](glossary.md#cap). How many frames a subject
 needs is worked out in [Count the frames](stacking/shooting-practice.md#count-the-frames).
 Plan disk space too: a 16-bit TIFF from a 45-megapixel camera is about
-270 MB.
+270 MB. How much free memory each kind of frame needs is in
+[Hardware](hardware.md).
 
 ### Which files can FocusForge read?
 

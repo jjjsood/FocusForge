@@ -334,7 +334,7 @@ With the frames open:
 3. Watch the bottom bar. The window stays fully usable while the stack is
    being fused.
 
-![The window during a fuse: the toolbar shows Pause and Cancel, the tab carries a play mark, the Composite pane shows the card "Preparing frames", and the bottom bar shows the current stage (Aligning), the frames done (1 of 8), a progress bar and the estimated time remaining.](../assets/manual/first-stack/fuse-running.png)
+![The window during a fuse: the toolbar shows Pause and Cancel, the tab carries a play mark, the Frame pane shows 00.tif and the Composite pane shows the frame just aligned ("Aligned · 04.tif"), and the bottom bar shows the current stage (Aligning), the frames done (2 of 8), a progress bar and the estimated time remaining.](../assets/manual/first-stack/fuse-running.png)
 
 *A fuse in progress.*
 
@@ -352,15 +352,19 @@ shows what the run is doing:
 | **Writing** | Stores the finished result | — |
 
 For a camera RAW stack the bar reads **Developing** first, with the number of
-frames developed. Each RAW frame is developed once, before the other stages,
-and they reuse the result.
+frames developed and the same time remaining. Each RAW frame is developed
+once, before the other stages, and they reuse the result.
 
-The time remaining is hidden by default. When it is switched on (start
-FocusForge with the environment variable `FOCUSFORGE_SHOW_ETA=1`), it appears
-next to the progress bar and reads "estimating" until FocusForge has enough to
-go on, then "ETA 1:12" (minutes and seconds). Time spent paused is left out of
-the estimate. A stage is skipped when its setting is off;
-[Stacking settings](stacking.md) and [Alignment](alignment.md) say which.
+Next to the progress bar, the time remaining is the time left in the whole
+run, not in the current stage. FocusForge predicts every stage from your
+frames and settings before the run starts and corrects the prediction as the
+first stages finish. The figure does not fall back to "estimating" when a
+stage ends and does not rise while a stage runs. It reads "ETA" followed by
+minutes and seconds (hours, minutes and seconds from an hour), or
+"estimating" while there is no estimate yet. Time
+spent paused is left out of the estimate. A stage is skipped when its
+setting is off; [Stacking settings](stacking.md) and
+[Alignment](alignment.md) say which.
 
 > **Tip:** You can pan, zoom and look at frames while a fuse runs. While you
 > do, the fuse holds back to a quarter of your computer's processor threads
@@ -423,8 +427,8 @@ You can stop a running fuse at any time from the toolbar.
 *A paused fuse: **Resume** takes the place of **Pause**.*
 
 - **Pause** holds the run at the next frame or step it finishes. The button
-  turns into **Resume** and the bottom bar reads "Paused". A paused run keeps
-  everything it has done so far.
+  turns into **Resume**, the bottom bar reads "Paused" and the time remaining
+  reads "ETA —". A paused run keeps everything it has done so far.
 - **Resume** carries on where the run stopped.
 - **Cancel** stops the run, paused or not. A greyed-out **Cancelling…**
   button shows for a moment, then **Fuse stack** comes back. Nothing is
