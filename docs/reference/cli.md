@@ -30,12 +30,12 @@ focusforge-cli [OPTIONS] <COMMAND>
 
 `focusforge-cli <command> --help` prints the same options on the terminal.
 
-## Options every command takes
+## Global options
 
-| option | meaning |
+| flag | meaning |
 |---|---|
-| `-v` | more detail on stderr; repeat it for still more |
-| `-q, --quiet` | errors only; wins over `-v` |
+| `-v` | increase log detail; repeat it for more detail |
+| `-q, --quiet` | log errors only |
 | `-h, --help` | print help |
 | `-V, --version` | print the version |
 
@@ -90,7 +90,7 @@ Frames are aligned first and the result is trimmed to the area every frame
 covers. When `<DIR>` holds several stacks, `stack` prints the proposed split
 before it starts.
 
-| option | meaning |
+| flag | meaning |
 |---|---|
 | `-o, --output <DIR>` | folder to collect the projects in; it must exist. Without it each project is written beside its frames |
 | `--algorithm <ALGO>` | stacking method; required unless a preset names one. `focusforge-cli algorithms` lists them |
@@ -184,7 +184,7 @@ Reports, for each frame of `<DIR>`, how far it has to move, scale and turn to
 line up with the reference frame, and the area that would be kept. Nothing is
 fused.
 
-| option | meaning |
+| flag | meaning |
 |---|---|
 | `--algorithm <ALGO>` | alignment method; the only one available is the default |
 | `--set <KEY=VALUE>` | set an [alignment setting](#algorithms); repeatable |
@@ -195,7 +195,9 @@ fused.
 | `--status <PATH>` | append one JSON line for this run to this file |
 | `--json` | print the report as JSON |
 | `--no-progress` | print no progress line |
-| `--cpu`, `--max-host-memory <SIZE>`, `--max-vram <SIZE>` | as for [`stack`](#stack) |
+| `--cpu` | as for [`stack`](#stack) |
+| `--max-host-memory <SIZE>` | as for [`stack`](#stack) |
+| `--max-vram <SIZE>` | as for [`stack`](#stack) |
 
 ```bash
 focusforge-cli align frames/
@@ -217,7 +219,7 @@ Writes an image from a project. It is the only command that writes an image.
 Give at least one of `-o`, `--zmap` and `--frame`. The output must not be the
 project file itself.
 
-| option | meaning |
+| flag | meaning |
 |---|---|
 | `-o, --output <FILE>` | write the image to this file |
 | `--zmap <FILE>` | write the source map (which frame each pixel came from) as a TIFF; retouching is not included |
@@ -262,7 +264,7 @@ checkpoint, each the child of the previous one, under the latest checkpoint or
 under `--from`. See [Retouching](../guide/retouch.md) for the stroke list.
 Write the result with [`export --checkpoint`](#export).
 
-| option | meaning |
+| flag | meaning |
 |---|---|
 | `--ops <FILE>` | the list of strokes, a JSON file; required. Every stroke is checked before anything is written, and an invalid one is named by its position counting from 0 |
 | `--from <ID>` | the checkpoint to add under: an id or a unique start of one; the latest by default |
@@ -286,7 +288,7 @@ focusforge-cli retouch frames.ffp --ops stroke-list.json --name "halo fixed"
 ## `history`
 
 ```
-focusforge-cli history <list|delete|compact> [OPTIONS] <PROJECT>
+focusforge-cli history [OPTIONS] <COMMAND>
 ```
 
 Reads and changes a project's checkpoints without opening the window. A
@@ -295,12 +297,48 @@ refused and names every match.
 
 | subcommand | does |
 |---|---|
-| `list` | prints every visible checkpoint, newest first |
-| `delete --checkpoint <ID>` | hides a checkpoint, and removes it from the file once no visible checkpoint builds on it. The last visible checkpoint cannot be deleted |
-| `compact` | rewrites the project to what is still visible and reports the space freed |
+| `list <PROJECT> [--json] [--accept-changed-sources]` | prints every visible checkpoint, newest first |
+| `delete <PROJECT> --checkpoint <ID> [--json] [--accept-changed-sources]` | hides a checkpoint, and removes it from the file once no visible checkpoint builds on it. The last visible checkpoint cannot be deleted |
+| `compact <PROJECT> [--json]` | rewrites the project to what is still visible and reports the space freed |
 
 `list` and `delete` also take `--accept-changed-sources` (see exit code `9`),
 and all three take `--json`.
+
+| flag | meaning |
+|---|---|
+
+### `history list`
+
+```
+focusforge-cli history list [OPTIONS] <PROJECT>
+```
+
+| flag | meaning |
+|---|---|
+| `--json` | print the list as JSON |
+| `--accept-changed-sources` | accept changed source frames and print their warning instead of refusing |
+
+### `history delete`
+
+```
+focusforge-cli history delete [OPTIONS] --checkpoint <CHECKPOINT> <PROJECT>
+```
+
+| flag | meaning |
+|---|---|
+| `--checkpoint <CHECKPOINT>` | the checkpoint to delete: an id or a unique start of one |
+| `--json` | print the result as JSON |
+| `--accept-changed-sources` | accept changed source frames and print their warning instead of refusing |
+
+### `history compact`
+
+```
+focusforge-cli history compact [OPTIONS] <PROJECT>
+```
+
+| flag | meaning |
+|---|---|
+| `--json` | print the result as JSON |
 
 ```bash
 focusforge-cli history list mantis-64.ffp
@@ -316,8 +354,11 @@ focusforge-cli info [OPTIONS] <PATH>
 
 Prints what is stored in a project file, a TIFF, JPEG or RAW frame, or every
 frame directly inside a folder (or its `frames` subfolder). Only file headers
-are read, so it answers at once even for large stacks. `--json` prints the
-report as JSON.
+are read, so it answers at once even for large stacks.
+
+| flag | meaning |
+|---|---|
+| `--json` | emit the JSON document instead of human-readable text |
 
 For a folder, the report ends with the number of frames, their total size and
 whether all frames share one layout; if not, it names the odd one out. A file
@@ -341,8 +382,11 @@ or a plain folder of `.ffp` projects. Each line has the stack's name, its
 outcome, the sharpness ratio, the number of source frames and a coherence
 value of the source map; `--` stands for a value that is not available, as for
 a failed stack, whose error is printed instead. A failed stack is a visible
-line, not a missing file. Nothing is written and no frame is read. `--json`
-prints the report as JSON.
+line, not a missing file. Nothing is written and no frame is read.
+
+| flag | meaning |
+|---|---|
+| `--json` | print the report as JSON |
 
 ```bash
 focusforge-cli review projects/
@@ -355,9 +399,13 @@ focusforge-cli algorithms [OPTIONS] [ID]
 ```
 
 Without `ID` it lists the methods and the project settings. With an `ID` it
-prints that method's settings with range and default. `--json` prints JSON.
-`--set <KEY=VALUE>` checks a value against the method's range and names every
-value that is out of range.
+prints that method's settings with range and default. `--set` checks a value
+against the method's range and names every value that is out of range.
+
+| flag | meaning |
+|---|---|
+| `--set <KEY=VALUE>` | check a value against the method's range; repeatable, the last value of a key wins |
+| `--json` | print the result as JSON |
 
 The window's names for the methods:
 
@@ -405,7 +453,7 @@ focusforge-cli step-plan [OPTIONS]
 
 Plans a focus bracket from the optics and the depth range you want to cover.
 
-| option | meaning |
+| flag | meaning |
 |---|---|
 | `--set <KEY=VALUE>` | set one of the values below; repeatable, the last value of a key wins |
 | `--json` | print the plan as one JSON object |
@@ -449,7 +497,7 @@ A pair's overlap is twice the counted cells sharp in both frames, divided by
 the sum of the counted cells sharp in each; a frame is sharp in a cell when its
 score there is at least `overlap-threshold` times the cell's best.
 
-| option | meaning |
+| flag | meaning |
 |---|---|
 | `--set <KEY=VALUE>` | set one of the values below; repeatable |
 | `--json` | print the counts and the overlaps as one JSON object; an overlap with no data is `null` |
@@ -483,7 +531,7 @@ of zeros. Each map is an `f32` TIFF of the frames' size,
 `<frame>-sharpness.tif`. The text output is the scale, then one row per frame
 (index, file name, map) and, with `--composite`, a `composite` row.
 
-| option | meaning |
+| flag | meaning |
 |---|---|
 | `--out <OUT>` | the folder the maps are written to; created if missing; required |
 | `--composite <COMPOSITE>` | a composite image of the frames' size, written as `composite-sharpness.tif` on the frames' scale |
@@ -501,12 +549,29 @@ focusforge-cli sharpness-map frames/ --out maps --composite result.tif
 ## `cache`
 
 ```
-focusforge-cli cache clear [--json]
+focusforge-cli cache [OPTIONS] <COMMAND>
 ```
 
+| subcommand | does |
+|---|---|
+| `clear` | removes the saved alignment results |
+
+| flag | meaning |
+|---|---|
+| `--json` | emit the JSON report instead of human-readable text |
+
+### `cache clear`
+
+```
+focusforge-cli cache clear [OPTIONS]
+```
+
+| flag | meaning |
+|---|---|
+| `--json` | emit the JSON report instead of human-readable text |
+
 Removes the saved alignment results under `.scratch/stage-cache/`. It never
-touches a cancelled run that `--resume` can continue, or any project. With
-`--json` it prints `{"removed": <count>}`.
+touches a cancelled run that `--resume` can continue, or any project.
 
 ```
 $ focusforge-cli cache clear
@@ -525,7 +590,7 @@ list is printed before the ZIP is written. The home folder and the user name
 are removed from every text entry, no image data is included and nothing is
 sent anywhere. See [Diagnostics and crash reports](../guide/diagnostics.md).
 
-| option | meaning |
+| flag | meaning |
 |---|---|
 | `-o, --output <FILE>` | where to write the ZIP; without it a dated name in the current folder |
 | `--include-minidumps` | include the crash dump files; they cannot be redacted and are marked in the file list |
@@ -541,11 +606,15 @@ focusforge-cli diagnostics -o report.zip
 ## `check-update`
 
 ```
-focusforge-cli check-update [--json]
+focusforge-cli check-update [OPTIONS]
 ```
 
 Asks the release server once whether a newer final release exists. The request
 carries only the program version; nothing is downloaded or installed.
+
+| flag | meaning |
+|---|---|
+| `--json` | print the report as JSON |
 
 | code | meaning |
 |---|---|
