@@ -10,6 +10,8 @@ use rawler::imgop::matrix::transform_1d;
 use rawler::imgop::xyz::{Illuminant, SRGB_TO_XYZ_D65};
 use rawler::rawimage::RawImage;
 
+use crate::tile::Sample;
+
 type Matrix = [[f64; 3]; 3];
 
 const IDENTITY: Matrix = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
@@ -126,6 +128,65 @@ impl LookTransform {
             camera[1] / self.balance[1],
             camera[2] / self.balance[2],
         ]
+    }
+}
+
+/// The look space on the 16-bit scale a RAW document stores.
+const WHITE: f64 = 65535.0;
+
+/// A sensor channel counts as clipped from this fraction of the saturation
+/// point up: a saturated sample returns from the `f32` store through
+/// [`LookTransform::inverse`] within about 1e-5 relative, and demosaiced
+/// borders sit a little under the saturation point.
+const DETECTION_FRACTION: f64 = 1.0 - 1e-4;
+
+/// Narrows look-space samples of a RAW document to `u16`, clipping pixels
+/// whose sensor saturated in camera space so they come out neutral instead of
+/// tinted by the per-channel clamp.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HighlightClip {
+    look: LookTransform,
+    saturation: f64,
+}
+
+impl HighlightClip {
+    /// A clip for documents in `look` whose sensor saturates at `saturation`
+    /// camera-linear (1.0 unless the frames were scaled by an equalization
+    /// gain).
+    pub fn new(look: LookTransform, saturation: f64) -> Self {
+        Self { look, saturation }
+    }
+
+    /// Narrows one look-space triple on the 16-bit scale. A pixel with a
+    /// sensor channel at the saturation point has its white-balanced channels
+    /// clamped to the least-amplified channel's saturation point, so a fully
+    /// saturated pixel comes out neutral. Every other pixel, and any triple
+    /// with a non-finite value, narrows as `u16::narrow` does.
+    pub fn narrow(&self, rgb: [f32; 3]) -> [u16; 3] {
+        let plain = rgb.map(<u16 as Sample>::narrow);
+        if !rgb.iter().all(|value| value.is_finite()) {
+            return plain;
+        }
+        let camera = self.look.inverse(rgb.map(|value| f64::from(value) / WHITE));
+        let threshold = self.saturation * DETECTION_FRACTION;
+        if camera.iter().all(|channel| *channel < threshold) {
+            return plain;
+        }
+        let balance = self.look.balance;
+        let level = self.saturation * balance.iter().copied().fold(f64::INFINITY, f64::min);
+        let clipped = std::array::from_fn(|c| (camera[c] * balance[c]).min(level) / balance[c]);
+        self.look
+            .forward(clipped)
+            .map(|channel| <u16 as Sample>::narrow((channel * WHITE) as f32))
+    }
+
+    /// [`Self::narrow`] over an interleaved RGB band; `out` has `samples`'
+    /// length.
+    pub fn narrow_band(&self, samples: &[f32], out: &mut [u16]) {
+        assert_eq!(samples.len(), out.len(), "one output sample per input");
+        for (rgb, narrowed) in samples.chunks_exact(3).zip(out.chunks_exact_mut(3)) {
+            narrowed.copy_from_slice(&self.narrow([rgb[0], rgb[1], rgb[2]]));
+        }
     }
 }
 
@@ -349,6 +410,141 @@ mod look_transform {
         let back = look.inverse(look.forward(rgb));
         for channel in 0..3 {
             assert!((back[channel] - rgb[channel]).abs() < 1e-12);
+        }
+    }
+}
+
+#[cfg(test)]
+mod raw_highlight_clip {
+    use super::*;
+
+    const XYZ_TO_CAMERA: [[f32; 3]; 3] = [
+        [0.72, -0.21, -0.08],
+        [-0.31, 1.12, 0.12],
+        [-0.02, 0.19, 0.55],
+    ];
+    /// As-shot multipliers: one with red and blue above green, one with red
+    /// below it.
+    const MULTIPLIERS: [[f32; 3]; 2] = [[2.1, 1.0, 1.6], [0.6, 1.0, 2.4]];
+    const SATURATIONS: [f64; 2] = [1.0, 0.8];
+
+    fn looks() -> Vec<LookTransform> {
+        MULTIPLIERS
+            .iter()
+            .map(|m| LookTransform::new([m[0], m[1], m[2], f32::NAN], XYZ_TO_CAMERA))
+            .collect()
+    }
+
+    fn camera_of(look: &LookTransform, rgb: [f32; 3]) -> [f64; 3] {
+        look.inverse(rgb.map(|v| f64::from(v) / WHITE))
+    }
+
+    /// Look-space triples on the 16-bit scale from below black to well above
+    /// white, plus the non-finite and out-of-range edges.
+    fn triples() -> Vec<[f32; 3]> {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 0.3) as f32 * 65535.0
+        };
+        let mut all: Vec<[f32; 3]> = (0..20_000).map(|_| [next(), next(), next()]).collect();
+        all.extend([
+            [f32::NAN, 40_000.0, 40_000.0],
+            [70_000.0, f32::INFINITY, 100.0],
+            [f32::NEG_INFINITY, 65_535.0, 65_535.0],
+            [-5.0, -70_000.0, 0.4],
+            [90_000.0, 80_000.0, 70_000.0],
+            [0.0; 3],
+            [65_535.0; 3],
+        ]);
+        all
+    }
+
+    #[test]
+    fn a_pixel_below_the_saturation_point_narrows_as_u16_narrow() {
+        let mut compared = 0;
+        let mut clipped = 0;
+        for look in looks() {
+            for saturation in SATURATIONS {
+                let clip = HighlightClip::new(look.clone(), saturation);
+                let threshold = saturation * DETECTION_FRACTION;
+                for rgb in triples() {
+                    let plain = rgb.map(<u16 as Sample>::narrow);
+                    let finite = rgb.iter().all(|v| v.is_finite());
+                    let below = camera_of(&look, rgb).iter().all(|c| *c < threshold);
+                    if !finite || below {
+                        assert_eq!(clip.narrow(rgb), plain, "{rgb:?} at {saturation}");
+                        compared += 1;
+                    } else if clip.narrow(rgb) != plain {
+                        clipped += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            compared > 20_000,
+            "only {compared} triples stayed unclipped"
+        );
+        assert!(clipped > 5_000, "only {clipped} triples were clipped");
+    }
+
+    #[test]
+    fn a_pixel_saturated_in_every_channel_comes_out_neutral() {
+        for look in looks() {
+            let lowest = look.balance.iter().copied().fold(f64::INFINITY, f64::min);
+            for saturation in SATURATIONS {
+                let clip = HighlightClip::new(look.clone(), saturation);
+                let expected =
+                    <u16 as Sample>::narrow((encode(saturation * lowest) * WHITE) as f32);
+                for scale in [1.0, 1.2] {
+                    let triple = look
+                        .forward([saturation * scale; 3])
+                        .map(|v| (v * WHITE) as f32);
+                    let [r, g, b] = clip.narrow(triple);
+                    assert!(r.abs_diff(g) <= 1 && g.abs_diff(b) <= 1, "{r} {g} {b}");
+                    assert!(g.abs_diff(expected) <= 1, "{g} against {expected}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_pixel_saturated_in_one_channel_loses_that_channel_and_raises_none() {
+        for look in looks() {
+            let lowest = look.balance.iter().copied().fold(f64::INFINITY, f64::min);
+            for saturation in SATURATIONS {
+                let clip = HighlightClip::new(look.clone(), saturation);
+                for channel in (0..3).filter(|c| look.balance[*c] > lowest) {
+                    let mut camera: [f64; 3] =
+                        std::array::from_fn(|c| 0.9 * saturation / look.balance[c]);
+                    camera[channel] = saturation;
+                    let triple = look.forward(camera).map(|v| (v * WHITE) as f32);
+                    let narrowed = clip.narrow(triple);
+                    assert_ne!(narrowed, triple.map(<u16 as Sample>::narrow));
+                    // The 16-bit ceiling can only lower the camera values
+                    // read back, never hide a raise from below.
+                    assert!(narrowed.iter().all(|v| *v > 0), "{narrowed:?}");
+                    let after = camera_of(&look, narrowed.map(f32::from));
+                    for c in 0..3 {
+                        assert!(after[c] <= camera[c] + 2e-3, "{after:?} against {camera:?}");
+                    }
+                    assert!(after[channel] < camera[channel] - 1e-3 || narrowed.contains(&65535));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_band_narrows_each_triple_as_narrow_does() {
+        let clip = HighlightClip::new(looks().remove(0), 1.0);
+        let triples = triples();
+        let samples: Vec<f32> = triples.iter().flatten().copied().collect();
+        let mut out = vec![0u16; samples.len()];
+        clip.narrow_band(&samples, &mut out);
+        for (rgb, narrowed) in triples.iter().zip(out.chunks_exact(3)) {
+            assert_eq!(narrowed, clip.narrow(*rgb), "{rgb:?}");
         }
     }
 }
