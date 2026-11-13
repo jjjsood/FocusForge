@@ -216,7 +216,7 @@ focusforge-cli export frames.ffp -o result.dng
 The file holds the fused result in the camera's own colour space, with the
 camera's colour matrices and as-shot white balance, and with the highlights
 above white kept as they are. A raw converter opens it and develops it with
-exposure, white balance and highlight recovery still open. A DNG has no
+exposure, white balance and highlight recovery all adjustable. A DNG has no
 format options. The window's export dialog offers DNG too, in the **Format**
 row.
 

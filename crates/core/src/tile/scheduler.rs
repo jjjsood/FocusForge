@@ -709,9 +709,7 @@ impl<'a> TileScheduler<'a> {
                             // what makes a polled `JobProgress` advance
                             // during the run instead of only when the
                             // segment ends.
-                            let read_rect = planned.read();
-                            control
-                                .unit_completed(read_rect.width as u64 * read_rect.height as u64);
+                            control.unit_completed(planned);
                             tracing::debug!("tile complete");
                             Ok(())
                         }

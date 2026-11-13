@@ -362,6 +362,12 @@ enum Command {
         /// entry exists, and store no new entry.
         #[arg(long = "no-cache", action = clap::ArgAction::SetFalse)]
         cache: bool,
+        /// Count bytes read and converted, cache hits, worker peaks and each
+        /// fused tile's duration during the run, and add them to the --json
+        /// report as `trace_accounting` and `fuse_tiles`. Off by default; it
+        /// costs a little time when on.
+        #[arg(long = "trace-accounting", requires = "json")]
+        trace_accounting: bool,
     },
     /// Turn a project into an image file: the image with `-o`, the
     /// Z-Map with `--zmap`, either or both in one invocation. At least one
@@ -730,7 +736,11 @@ fn main() -> ExitCode {
             #[cfg(feature = "gpu")]
             gpu,
             cache,
+            trace_accounting,
         } => {
+            if trace_accounting {
+                focusforge_core::timing::enable_trace_accounting();
+            }
             #[cfg(feature = "gpu")]
             let no_gpu = !gpu;
             #[cfg(not(feature = "gpu"))]
@@ -756,6 +766,9 @@ fn main() -> ExitCode {
                     no_progress,
                     tile_size,
                     cache,
+                    show_eta: progress::eta_display_enabled(
+                        std::env::var_os("FOCUSFORGE_SHOW_ETA").as_deref(),
+                    ),
                 },
                 &preset::PresetOptions {
                     preset: preset.as_deref(),
