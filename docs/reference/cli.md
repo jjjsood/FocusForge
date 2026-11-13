@@ -194,7 +194,9 @@ fused.
 | `--status <PATH>` | append one JSON line for this run to this file |
 | `--json` | print the report as JSON |
 | `--no-progress` | print no progress line |
-| `--cpu`, `--max-host-memory <SIZE>`, `--max-vram <SIZE>` | as for [`stack`](#stack) |
+| `--cpu` | as for [`stack`](#stack) |
+| `--max-host-memory <SIZE>` | as for [`stack`](#stack) |
+| `--max-vram <SIZE>` | as for [`stack`](#stack) |
 
 ```bash
 focusforge-cli align frames/
@@ -275,21 +277,57 @@ focusforge-cli retouch frames.ffp --ops stroke-list.json --name "halo fixed"
 ## `history`
 
 ```
-focusforge-cli history <list|delete|compact> [OPTIONS] <PROJECT>
+focusforge-cli history [OPTIONS] <COMMAND>
 ```
 
 Reads and changes a project's checkpoints without opening the window. A
 checkpoint is given by its id or a unique start of it; an ambiguous start is
 refused and names every match.
 
+| option | meaning |
+|---|---|
+| `-h, --help` | print help |
+
 | subcommand | does |
 |---|---|
-| `list` | prints every visible checkpoint, newest first |
-| `delete --checkpoint <ID>` | hides a checkpoint, and removes it from the file once no visible checkpoint builds on it. The last visible checkpoint cannot be deleted |
-| `compact` | rewrites the project to what is still visible and reports the space freed |
+| [`list`](#history-list) | prints every visible checkpoint, newest first |
+| [`delete`](#history-delete) | hides a checkpoint, and removes it from the file once no visible checkpoint builds on it. The last visible checkpoint cannot be deleted |
+| [`compact`](#history-compact) | rewrites the project to what is still visible and reports the space freed |
 
-`list` and `delete` also take `--accept-changed-sources` (see exit code `9`),
-and all three take `--json`.
+### `history list`
+
+```
+focusforge-cli history list [OPTIONS] <PROJECT>
+```
+
+| option | meaning |
+|---|---|
+| `--json` | print the result as JSON |
+| `--accept-changed-sources` | go ahead with a warning when a source frame has changed since the project was written (see exit code `9`) |
+
+### `history delete`
+
+```
+focusforge-cli history delete [OPTIONS] --checkpoint <CHECKPOINT> <PROJECT>
+```
+
+| option | meaning |
+|---|---|
+| `--checkpoint <CHECKPOINT>` | the checkpoint to delete: an id or a unique start of one |
+| `--json` | print the result as JSON |
+| `--accept-changed-sources` | go ahead with a warning when a source frame has changed since the project was written (see exit code `9`) |
+
+### `history compact`
+
+```
+focusforge-cli history compact [OPTIONS] <PROJECT>
+```
+
+| option | meaning |
+|---|---|
+| `--json` | print the result as JSON |
+
+### Examples
 
 ```bash
 focusforge-cli history list mantis-64.ffp
@@ -302,6 +340,10 @@ focusforge-cli history compact mantis-64.ffp
 ```
 focusforge-cli info [OPTIONS] <PATH>
 ```
+
+| option | meaning |
+|---|---|
+| `--json` | print the result as JSON |
 
 Prints what is stored in a project file, a TIFF, JPEG or RAW frame, or every
 frame directly inside a folder (or its `frames` subfolder). Only file headers
@@ -325,6 +367,10 @@ focusforge-cli info mantis-64.ffp
 focusforge-cli review [OPTIONS] <DIR>
 ```
 
+| option | meaning |
+|---|---|
+| `--json` | print the result as JSON |
+
 Prints one line per stack found in `<DIR>`: the output folder of a `stack` run
 or a plain folder of `.ffp` projects. Each line has the stack's name, its
 outcome, the sharpness ratio, the number of source frames and a coherence
@@ -342,6 +388,11 @@ focusforge-cli review projects/
 ```
 focusforge-cli algorithms [OPTIONS] [ID]
 ```
+
+| option | meaning |
+|---|---|
+| `--json` | print the result as JSON |
+| `--set <KEY=VALUE>` | check a setting's value against its range; repeatable, the last value of a key wins |
 
 Without `ID` it lists the methods and the project settings. With an `ID` it
 prints that method's settings with range and default. `--json` prints JSON.
@@ -455,8 +506,26 @@ focusforge-cli sharp-areas frames/ --set cell-size=128
 ## `cache`
 
 ```
-focusforge-cli cache clear [--json]
+focusforge-cli cache [OPTIONS] <COMMAND>
 ```
+
+| option | meaning |
+|---|---|
+| `--json` | print the result as JSON |
+
+| subcommand | does |
+|---|---|
+| [`clear`](#cache-clear) | removes the saved alignment results |
+
+### `cache clear`
+
+```
+focusforge-cli cache clear [OPTIONS]
+```
+
+| option | meaning |
+|---|---|
+| `--json` | print the result as JSON |
 
 Removes the saved alignment results under `.scratch/stage-cache/`. It never
 touches a cancelled run that `--resume` can continue, or any project. With
@@ -495,8 +564,12 @@ focusforge-cli diagnostics -o report.zip
 ## `check-update`
 
 ```
-focusforge-cli check-update [--json]
+focusforge-cli check-update [OPTIONS]
 ```
+
+| option | meaning |
+|---|---|
+| `--json` | print the result as JSON |
 
 Asks the release server once whether a newer final release exists. The request
 carries only the program version; nothing is downloaded or installed.
