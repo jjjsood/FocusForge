@@ -27,6 +27,7 @@ write "$TMP/.githooks/pre-commit" '#!/usr/bin/env bash\n# SPDX-License-Identifie
 write "$TMP/Cargo.toml" '[package]\n'
 write "$TMP/fixtures/example.rs" 'not checked\n'
 write "$TMP/target/generated.rs" 'not checked\n'
+write "$TMP/spikes/demo/target/release/build/x/out/generated.rs" 'not checked\n'
 write "$TMP/assets/vendor.rs" 'not checked\n'
 write "$TMP/crates/demo/data/font.icc" 'not checked\n'
 

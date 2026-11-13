@@ -193,6 +193,10 @@ export global ShellGeometry {
     out property <length> progress-step-x: 118px;
     out property <length> progress-bar-x: 202px;
     out property <length> progress-bar-height: 4px;
+    // The loading band's width as a share of the field it crosses, and the
+    // share of the band that fades in at each end.
+    out property <float> sweep-band-share: 0.35;
+    out property <float> sweep-band-edge: 0.3;
     // The ETA's slot, right-bounded by the overlay cluster below; the track
     // ends before it, and a longer readout is elided.
     out property <length> eta-width: 80px;
@@ -271,6 +275,27 @@ export global ShellGeometry {
     out property <length> analytics-mm-width: 100px;
     out property <length> analytics-count-width: 56px;
     out property <length> analytics-bar-height: 10px;
+    // The overlap bar block: its height, the bar's top and thickness inside
+    // it, the gap between segments, the boundary tick, the top of the number
+    // band, the box a number is centred in, the least distance between two
+    // shown numbers, the segment widths from which the percent text and the
+    // no-data dash show, and the legend chip.
+    out property <length> overlap-block-height: 94px;
+    out property <length> overlap-bar-y: 58px;
+    out property <length> overlap-legend-y: 32px;
+    out property <length> overlap-bar-height: 20px;
+    out property <length> overlap-segment-gap: 1px;
+    out property <length> overlap-tick-width: 1px;
+    out property <length> overlap-tick-height: 3px;
+    out property <length> overlap-number-y: 80px;
+    out property <length> overlap-number-width: 24px;
+    out property <length> overlap-number-spacing: 40px;
+    out property <length> overlap-text-from: 40px;
+    out property <length> overlap-dash-from: 24px;
+    out property <length> overlap-legend-chip-height: 18px;
+    out property <length> overlap-legend-chip-inset: 6px;
+    out property <length> overlap-legend-chip-gap: 5px;
+    out property <length> overlap-legend-swatch: 8px;
     // The brush cursor's mode chip: a square of this side.
     out property <length> brush-tag-side: 16px;
     // The layers glyph centred in a checkpoint-source cursor.

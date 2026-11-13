@@ -17,7 +17,7 @@ Each feature file says how a user reaches the feature, which controls matter, an
 | [open-and-refusals](open-and-refusals.md) | 12, 16 | RAW folder, compressed TIFF variants, empty start, not-a-project, mismatch and missing-frames projects, grouping question, skipped subfolder, failed fuse |
 | [notifications](notifications.md) | 15 | bell and unread count, notification center, toasts, crash record |
 | [step-calculator](step-calculator.md) | 21, 23 | calculator button and overlay, Lens and Objective optics, entered boxes, SUMMARY read-out, violation line, one overlay at a time, no project open |
-| [analytics](analytics.md) | 22 | Analytics button and overlay, one row per frame (chip, name, bar, count), waiting caption, recount on tab switch, close and Escape, one overlay at a time, button greyed with no project |
+| [analytics](analytics.md) | 22 | Analytics button and overlay, sharpness overlap bar (segments, numbers, no-data dash, hover tooltip, pending state), one row per frame (chip, name, bar, count), waiting panel with no project, recount on tab switch, close and Escape, one overlay at a time |
 | [retouch-from-checkpoints](retouch-from-checkpoints.md) | 24 | a result chosen as brush source and its left pane label, a stroke painted from it and saved, Alt+click picking that result back, the hidden line refusing a click, the delete question counting the strokes that use a result, hidden and kept after delete, Save project clearing UNSAVED |
 
 Each feature file carries a `Book:` line after `Guides:`: the manual sections (`page.md#anchor` under `docs/`) that show the feature, each holding an image. `tools/check-manual-coverage.py` checks it.

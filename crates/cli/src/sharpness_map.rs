@@ -10,11 +10,12 @@ use std::process::ExitCode;
 use focusforge_core::io::{FrameReader, TiffSpec, TiffWriter, open_frame_set};
 use focusforge_core::job::JobControl;
 use focusforge_core::project::container::PartialFile;
+use focusforge_core::sharp_areas::SharpAreasError;
 use focusforge_core::sharpness_map::{
-    SHARPNESS_PERCENTILE, sharpness_map_tile, sharpness_plan, stack_sharpness_scale,
+    SHARPNESS_PERCENTILE, sharpness_maps, stack_sharpness_scale_with_backend,
 };
-use focusforge_core::tile::HostBudget;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
+use focusforge_core::tile::{HostBudget, TileControl};
 
 use crate::sharp_areas::Priority;
 
@@ -31,36 +32,64 @@ fn file_name(path: &Path) -> String {
     )
 }
 
-/// Writes the map of `frame` of `reader` beside `final_path` as a partial file.
-fn write_map(
+/// A map write that failed, in the message the command prints.
+struct MapFailed(String);
+
+impl From<SharpAreasError> for MapFailed {
+    fn from(err: SharpAreasError) -> Self {
+        Self(err.to_string())
+    }
+}
+
+/// Writes the maps of the first `frames` frames of `reader` beside
+/// `final_paths` as partial files, in one pass over the tiles.
+fn write_maps(
     reader: &dyn FrameReader,
-    frame: usize,
+    frames: usize,
     scale: f32,
-    final_path: &Path,
-) -> Result<PartialFile, String> {
+    final_paths: &[PathBuf],
+    control: &dyn TileControl,
+) -> Result<Vec<PartialFile>, String> {
     let (width, height) = reader.dimensions();
-    let spp = reader.frame(frame).samples_per_pixel;
-    let plan = sharpness_plan((width, height), DEFAULT_TILE_SIZE).map_err(|err| err.to_string())?;
-    let partial = PartialFile::new(final_path);
-    let mut writer = TiffWriter::create_f32(
-        partial.path(),
-        TiffSpec {
-            width,
-            height,
-            samples_per_pixel: 1,
-            description: None,
+    let spp = reader.frame(0).samples_per_pixel;
+    let mut partials = Vec::with_capacity(frames);
+    let mut writers = Vec::with_capacity(frames);
+    for final_path in final_paths {
+        let partial = PartialFile::new(final_path);
+        writers.push(
+            TiffWriter::create_f32(
+                partial.path(),
+                TiffSpec {
+                    width,
+                    height,
+                    samples_per_pixel: 1,
+                    description: None,
+                },
+            )
+            .map_err(|err| err.to_string())?,
+        );
+        partials.push(partial);
+    }
+    sharpness_maps(
+        reader,
+        frames,
+        (width, height),
+        spp,
+        scale,
+        DEFAULT_TILE_SIZE,
+        control,
+        crate::sharpness_backend(),
+        |frame, interior, map: &[f32]| {
+            writers[frame]
+                .write_tile_f32(interior, map)
+                .map_err(|err| MapFailed(err.to_string()))
         },
     )
-    .map_err(|err| err.to_string())?;
-    for tile in plan.tiles() {
-        let map =
-            sharpness_map_tile(reader, frame, tile, spp, scale).map_err(|err| err.to_string())?;
-        writer
-            .write_tile_f32(tile.interior(), &map)
-            .map_err(|err| err.to_string())?;
+    .map_err(|MapFailed(message)| message)?;
+    for writer in writers {
+        writer.finish().map_err(|err| err.to_string())?;
     }
-    writer.finish().map_err(|err| err.to_string())?;
-    Ok(partial)
+    Ok(partials)
 }
 
 /// The scale and the maps of one run; nothing is on disk unless this is `Ok`.
@@ -106,34 +135,43 @@ fn build(
     if priority == Priority::Low {
         control.set_admission_cap(Some(1));
     }
-    let scale = stack_sharpness_scale(
+    let scale = stack_sharpness_scale_with_backend(
         reader,
         reader.len(),
         extent,
         spp,
         DEFAULT_TILE_SIZE,
         &*control,
+        crate::sharpness_backend(),
     )
-    .map_err(|err| err.to_string())?;
+    .map_err(|err| err.to_string())?
+    .value;
 
-    let mut partials = Vec::new();
-    let mut frame_maps = Vec::new();
-    for (index, path) in paths.iter().enumerate() {
-        let stem = path
-            .file_stem()
-            .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
-        let map = out.join(format!("{stem}-sharpness.tif"));
-        partials.push(write_map(reader, index, scale, &map)?);
-        frame_maps.push(Mapped {
-            file: file_name(path),
-            map,
-        });
-    }
+    let frame_maps: Vec<Mapped> = paths
+        .iter()
+        .map(|path| {
+            let stem = path
+                .file_stem()
+                .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+            Mapped {
+                file: file_name(path),
+                map: out.join(format!("{stem}-sharpness.tif")),
+            }
+        })
+        .collect();
+    let map_paths: Vec<PathBuf> = frame_maps.iter().map(|mapped| mapped.map.clone()).collect();
+    let mut partials = write_maps(reader, reader.len(), scale, &map_paths, &*control)?;
     let composite_map = match &composite {
         None => None,
         Some((path, set)) => {
             let map = out.join("composite-sharpness.tif");
-            partials.push(write_map(set.reader.as_ref(), 0, scale, &map)?);
+            partials.extend(write_maps(
+                set.reader.as_ref(),
+                1,
+                scale,
+                std::slice::from_ref(&map),
+                &*control,
+            )?);
             Some(Mapped {
                 file: file_name(path),
                 map,

@@ -15,16 +15,19 @@ use std::time::Duration;
 use focusforge_core::host;
 use focusforge_core::io::open_frame_set;
 use focusforge_core::params::ParamValues;
-use focusforge_core::sharp_areas::{count_sharp_areas, count_sharp_areas_reporting};
+use focusforge_core::sharp_areas::{SharpAreas, count_sharp_areas, count_sharp_areas_reporting};
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 use focusforge_core::tile::{HostBudget, NoControl};
 use focusforge_core::zmap::source_color;
-use focusforge_gui::analytics::{AnalyticsRow, AnalyticsView, CountPriority, RowValue};
+use focusforge_gui::Theme;
+use focusforge_gui::analytics::{
+    AnalyticsRow, AnalyticsView, CountPriority, OverlapSegment, RowValue,
+};
 use focusforge_gui::input_map::Modifiers;
 use focusforge_gui::{AppController, AppWindow, ChromeKey, ShellMode};
-use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementQuery};
+use i_slint_backend_testing::{AccessibleRole, ElementHandle, ElementQuery, mock_elapsed_time};
 use slint::platform::{Key, PointerEventButton, WindowEvent};
-use slint::{ComponentHandle, Model};
+use slint::{ComponentHandle, Global, Model};
 
 type SharedController = Arc<Mutex<AppController>>;
 
@@ -126,7 +129,7 @@ impl Rig {
 }
 
 /// `count_sharp_areas` over `paths` with the command line's defaults.
-fn core_counts(paths: &[PathBuf]) -> Vec<u32> {
+fn core_areas(paths: &[PathBuf]) -> SharpAreas {
     let set = open_frame_set(paths, HostBudget::host_derived(&host::snapshot()))
         .expect("the fixture frames open");
     let reader = set.reader.as_ref();
@@ -140,7 +143,10 @@ fn core_counts(paths: &[PathBuf]) -> Vec<u32> {
         &NoControl,
     )
     .expect("the fixture frames count")
-    .counts
+}
+
+fn core_counts(paths: &[PathBuf]) -> Vec<u32> {
+    core_areas(paths).counts
 }
 
 fn fixture_frames(count: usize) -> Vec<PathBuf> {
@@ -161,7 +167,15 @@ fn count_now(controller: &mut AppController) {
 
 fn rows_of(controller: &AppController) -> Vec<AnalyticsRow> {
     match controller.analytics_view() {
-        AnalyticsView::Rows(rows) => rows.clone(),
+        AnalyticsView::Rows(rows, _) => rows.clone(),
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// The overlap segments of a finished view.
+fn segments_of(controller: &AppController) -> Vec<OverlapSegment> {
+    match controller.analytics_view() {
+        AnalyticsView::Rows(_, segments) => segments.clone(),
         other => panic!("expected rows, got {other:?}"),
     }
 }
@@ -475,7 +489,14 @@ fn unreadable_frame_shows_the_error() {
     assert_eq!(rig.app.get_analytics_state(), "failed");
     assert_eq!(rig.app.get_analytics_error(), message.as_str());
     assert_eq!(rig.app.get_analytics_rows().row_count(), 0);
-    assert_eq!(labelled(&rig, "Counting failed"), 1);
+    assert_eq!(rig.app.get_analytics_segments().row_count(), 0);
+    assert!(overlap_bar(&rig).is_none(), "a failure draws no bar");
+    assert_eq!(labelled(&rig, "Analysis failed"), 1);
+    assert_eq!(
+        labelled(&rig, "SHARP AREAS PER IMAGE"),
+        0,
+        "a failure shows the panel without the list heading"
+    );
     assert_eq!(
         labelled(&rig, &message),
         1,
@@ -635,7 +656,7 @@ fn analytics_opens_without_a_stack() {
     assert_eq!(rig.app.get_analytics_state(), "waiting");
     assert_eq!(rig.app.get_analytics_rows().row_count(), 0);
     assert_eq!(labelled(&rig, "No stack loaded"), 1);
-    assert_eq!(labelled(&rig, "Load a stack to count its sharp areas."), 1);
+    assert_eq!(labelled(&rig, "Load a stack to analyse it."), 1);
     assert_eq!(spinners(&rig), 0, "the waiting panel has no spinner");
     assert!(
         rig.controller
@@ -985,6 +1006,66 @@ fn analytics_overlay(rig: &Rig) -> ElementHandle {
         .expect("the window has the Analytics overlay")
 }
 
+/// The `FFOverlapBar` the overlay draws, if any.
+fn overlap_bar(rig: &Rig) -> Option<ElementHandle> {
+    analytics_overlay(rig)
+        .query_descendants()
+        .match_type_name("FFOverlapBar")
+        .find_all()
+        .into_iter()
+        .next()
+}
+
+/// How many `FFOverlapSegment`s the bar draws.
+fn drawn_segments(rig: &Rig) -> usize {
+    analytics_overlay(rig)
+        .query_descendants()
+        .match_type_name("FFOverlapSegment")
+        .find_all()
+        .len()
+}
+
+/// The segment views the window holds, as the view they came from.
+fn shown_segments(rig: &Rig) -> Vec<OverlapSegment> {
+    rig.app
+        .get_analytics_segments()
+        .iter()
+        .map(|view| OverlapSegment {
+            scale: view.scale,
+            has_data: view.has_data,
+            dimmed: view.dimmed,
+            percent: view.percent.to_string(),
+            tooltip: view.tooltip.to_string(),
+        })
+        .collect()
+}
+
+/// The bar's boundary numbers with the x of each, left to right.
+fn boundary_numbers(rig: &Rig) -> Vec<(u32, f32)> {
+    let bar = overlap_bar(rig).expect("the overlay draws the bar");
+    let mut numbers: Vec<(u32, f32)> = bar
+        .query_descendants()
+        .match_accessible_role(AccessibleRole::Text)
+        .find_all()
+        .into_iter()
+        .filter_map(|text| {
+            let number = text.accessible_label()?.parse().ok()?;
+            Some((number, text.absolute_position().x))
+        })
+        .collect();
+    numbers.sort_by(|a, b| a.1.total_cmp(&b.1));
+    numbers
+}
+
+/// The y of the heading over the per-image list.
+fn list_heading_y(rig: &Rig) -> f32 {
+    ElementHandle::find_by_accessible_label(&rig.app, "SHARP AREAS PER IMAGE")
+        .next()
+        .expect("the overlay has the list heading")
+        .absolute_position()
+        .y
+}
+
 /// The UI driver's hover: a drag with the `Other` button from the centre of
 /// the Analytics overlay onto the centre of dock image row `row`.
 fn hover_dock_row(rig: &Rig, row: usize) {
@@ -1230,6 +1311,8 @@ fn cached_counts_show_at_once() {
     let mut controller = background_controller("analytics_bg_cache", 3, Duration::ZERO);
     finish_count(&mut controller);
     let counted = rows_of(&controller);
+    let counted_segments = segments_of(&controller);
+    assert_eq!(counted_segments.len(), 2);
 
     assert!(controller.toggle_analytics().is_none(), "no new worker");
     assert!(controller.take_analytics_worker().is_none());
@@ -1238,6 +1321,7 @@ fn cached_counts_show_at_once() {
     assert_eq!(rig.app.get_analytics_state(), "rows");
     assert_eq!(row_states(&rig), ["final"; 3]);
     assert_eq!(spinners(&rig), 0);
+    assert_eq!(shown_segments(&rig), counted_segments, "reopened");
 
     // A second stack counts on its own; the first shows its kept rows again.
     {
@@ -1246,6 +1330,7 @@ fn cached_counts_show_at_once() {
         assert_eq!(controller.active_project(), Some(1));
         controller.select_project(0);
         assert_eq!(rows_of(&controller), counted);
+        assert_eq!(segments_of(&controller), counted_segments);
         if let Some(stale) = controller.take_analytics_worker() {
             stale.join().unwrap();
         }
@@ -1255,8 +1340,14 @@ fn cached_counts_show_at_once() {
             counted,
             "the cancelled count lands nowhere"
         );
+        assert_eq!(segments_of(&controller), counted_segments);
     }
     rig.pump();
+    assert_eq!(
+        shown_segments(&rig),
+        counted_segments,
+        "after a tab round trip"
+    );
     assert_eq!(row_states(&rig), ["final"; 3]);
     assert_eq!(spinners(&rig), 0);
 }
@@ -1353,4 +1444,239 @@ fn stacking_holds_the_background_count() {
     controller.settle_analytics();
     let rows = rows_of(&controller);
     assert!(rows.iter().all(|r| r.value == RowValue::Final), "{rows:?}");
+}
+
+/// The share of one pair as the bar words it.
+fn percent_of(share: Option<f64>) -> String {
+    share.map_or_else(String::new, |s| format!("{} %", (s * 100.0).round()))
+}
+
+#[test]
+fn overlap_bar_matches_the_core_overlaps() {
+    let mut controller =
+        common::controller_with_frames_from("mantis-512", "analytics_overlap_core", 8);
+    count_now(&mut controller);
+    let overlaps = core_areas(&fixture_frames(8)).overlaps;
+    let segments = segments_of(&controller);
+
+    assert_eq!(segments.len(), 7, "one segment per neighbour pair");
+    let (mut expected_share, mut expected_scale) = (Vec::new(), Vec::new());
+    for (k, (segment, pair)) in segments.iter().zip(&overlaps).enumerate() {
+        let at = format!("pair {}-{}", k + 1, k + 2);
+        let share = pair.share();
+        assert_eq!(segment.has_data, share.is_some(), "{at}: has data");
+        assert_eq!(segment.dimmed, pair.either < 10, "{at}: dimmed");
+        assert_eq!(segment.percent, percent_of(share), "{at}: percent");
+        assert!(
+            segment.tooltip.starts_with(&format!(
+                "Images {} and {} \u{b7} {k:02}.tif, {:02}.tif\n",
+                k + 1,
+                k + 2,
+                k + 1
+            )),
+            "{at}: {}",
+            segment.tooltip
+        );
+        expected_share.push(share);
+        expected_scale.push(segment.scale);
+    }
+    // The values of the 8 mantis-512 frames: pairs 1-2 to 4-5 and 6-7 share
+    // nothing, 5-6 has no sharp area, 7-8 shares all.
+    assert_eq!(
+        expected_share,
+        [
+            Some(0.0),
+            Some(0.0),
+            Some(0.0),
+            Some(0.0),
+            None,
+            Some(0.0),
+            Some(1.0)
+        ]
+    );
+    assert_eq!(expected_scale, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0]);
+    assert_eq!(
+        segments.iter().map(|s| s.dimmed).collect::<Vec<_>>(),
+        [true, true, false, false, true, true, true],
+        "pairs 1-2, 2-3, 5-6 (no data), 6-7 and 7-8 rest on few sharp areas"
+    );
+}
+
+#[test]
+fn overlap_bar_renders_one_segment_per_pair() {
+    let mut controller =
+        common::controller_with_frames_from("mantis-512", "analytics_overlap_render", 8);
+    count_now(&mut controller);
+    let expected = segments_of(&controller);
+    let rig = rig_with(controller);
+    rig.pump();
+
+    assert_eq!(rig.app.get_analytics_state(), "rows");
+    assert_eq!(drawn_segments(&rig), 7, "one segment per pair");
+    assert_eq!(shown_segments(&rig), expected, "the views, in order");
+    let numbers: Vec<u32> = boundary_numbers(&rig).iter().map(|n| n.0).collect();
+    assert_eq!(numbers, (1..=8).collect::<Vec<_>>());
+}
+
+#[test]
+fn overlap_bar_thins_boundary_numbers() {
+    for frames in [61, 30] {
+        let mut controller =
+            controller_with_identical_frames(&format!("analytics_overlap_thin_{frames}"), frames);
+        count_now(&mut controller);
+        let rig = rig_with(controller);
+        rig.pump();
+
+        let at = format!("{frames} frames");
+        assert_eq!(drawn_segments(&rig), frames - 1, "{at}");
+        let numbers = boundary_numbers(&rig);
+        let shown: Vec<u32> = numbers.iter().map(|n| n.0).collect();
+        assert_eq!(shown[0], 1, "{at}: the first number shows");
+        assert_eq!(
+            *shown.last().unwrap(),
+            frames as u32,
+            "{at}: the last shows"
+        );
+        assert!(shown.len() < frames, "{at}: {shown:?}");
+        let inner = &shown[1..shown.len() - 1];
+        assert!(
+            [1, 2, 5, 10, 20]
+                .iter()
+                .any(|step| inner.iter().all(|k| k % step == 0)),
+            "{at}: one step from 1, 2, 5, 10, 20 in {shown:?}"
+        );
+        for pair in numbers.windows(2) {
+            assert!(
+                pair[1].1 - pair[0].1 >= 40.0,
+                "{at}: {} and {} are {} px apart",
+                pair[0].0,
+                pair[1].0,
+                pair[1].1 - pair[0].1
+            );
+        }
+        if frames == 61 {
+            let expected: Vec<u32> = [1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 61].into();
+            assert_eq!(shown, expected, "{at}");
+        }
+        let ticks = analytics_overlay(&rig)
+            .query_descendants()
+            .match_type_name("Rectangle")
+            .find_all()
+            .into_iter()
+            .filter(|r| r.size() == slint::LogicalSize::new(1.0, 3.0))
+            .count();
+        assert_eq!(ticks, shown.len(), "{at}: a tick under each shown number");
+    }
+}
+
+#[test]
+fn overlap_bar_absent_without_pairs() {
+    // No stack: the waiting panel alone, without a bar.
+    let mut waiting = AppController::new();
+    waiting.toggle_analytics();
+    let rig = rig_with(waiting);
+    rig.pump();
+    assert_eq!(rig.app.get_analytics_state(), "waiting");
+    assert!(overlap_bar(&rig).is_none());
+    assert_eq!(rig.app.get_analytics_segments().row_count(), 0);
+    assert_eq!(
+        labelled(&rig, "SHARP AREAS PER IMAGE"),
+        0,
+        "the waiting panel stands alone, without the list heading"
+    );
+
+    // One frame: no pair, so an info panel stands in for the headings and
+    // the list.
+    let mut controller = controller_with_identical_frames("analytics_overlap_one", 1);
+    count_now(&mut controller);
+    let rig = rig_with(controller);
+    rig.pump();
+    assert_eq!(rig.app.get_analytics_state(), "rows");
+    assert_eq!(rig.app.get_analytics_rows().row_count(), 1);
+    assert!(overlap_bar(&rig).is_none(), "a lone frame has no pair");
+    assert_eq!(rig.app.get_analytics_segments().row_count(), 0);
+    assert_eq!(labelled(&rig, "Not enough images"), 1);
+    assert_eq!(labelled(&rig, "SHARP AREAS PER IMAGE"), 0);
+
+    // Two frames: the bar block sits above the list heading.
+    let mut controller = controller_with_identical_frames("analytics_overlap_two", 2);
+    count_now(&mut controller);
+    let rig = rig_with(controller);
+    rig.pump();
+    let bar = overlap_bar(&rig).expect("two frames show the bar");
+    assert_eq!(labelled(&rig, "Not enough images"), 0);
+    assert_eq!(list_heading_y(&rig) - bar.absolute_position().y, 54.0);
+}
+
+#[test]
+fn overlap_bar_settles_when_the_count_ends() {
+    let (rig, gate) = rig_counting(
+        "analytics_overlap_settle",
+        ["s0.tif", "s1.tif"],
+        CountState::Counting,
+    );
+    // Two frames: one pair, pending until the last tile.
+    assert_eq!(rig.app.get_analytics_state(), "counting");
+    assert_eq!(drawn_segments(&rig), 1);
+    let pending = shown_segments(&rig);
+    assert_eq!(pending.len(), 1);
+    assert!(
+        pending[0].percent.is_empty() && pending[0].tooltip.is_empty() && !pending[0].has_data,
+        "{pending:?}"
+    );
+    let bar = overlap_bar(&rig).expect("the bar shows while counting");
+    assert_eq!(
+        bar.query_descendants()
+            .match_type_name("FFSpinner")
+            .find_all()
+            .len(),
+        0,
+        "no spinner in the bar block"
+    );
+
+    for _ in 0..200 {
+        if rig.app.get_analytics_state() == "rows" {
+            break;
+        }
+        gate.settle_next(&rig);
+    }
+    assert_eq!(rig.app.get_analytics_state(), "rows", "the count ended");
+    assert_eq!(drawn_segments(&rig), 1);
+    let finished = segments_of(&rig.controller.lock().unwrap());
+    assert_eq!(shown_segments(&rig), finished);
+    assert_ne!(shown_segments(&rig), pending, "the final view replaced it");
+    gate.finish(&rig);
+}
+
+#[test]
+fn the_entry_runs_with_and_without_reduced_motion() {
+    // The percent text of the last pair shows once the segments have entered.
+    let shown = |rig: &Rig| labelled(rig, "100 %");
+    for reduced in [false, true] {
+        let mut controller = common::controller_with_frames_from(
+            "mantis-512",
+            &format!("analytics_overlap_entry_{reduced}"),
+            8,
+        );
+        count_now(&mut controller);
+        let rig = rig_with(controller);
+        Theme::get(&rig.app).set_reduce_motion(reduced);
+        rig.pump();
+        let at = format!("reduced motion {reduced}");
+        if reduced {
+            mock_elapsed_time(Duration::from_millis(1));
+            slint::platform::update_timers_and_animations();
+        } else {
+            assert_eq!(shown(&rig), 0, "{at}: the entry waits");
+            mock_elapsed_time(Duration::from_millis(100));
+            slint::platform::update_timers_and_animations();
+            assert_eq!(shown(&rig), 0, "{at}: still waiting at 100 ms");
+            mock_elapsed_time(Duration::from_millis(100));
+            slint::platform::update_timers_and_animations();
+        }
+        assert_eq!(shown(&rig), 1, "{at}: the segments entered");
+
+        rig.escape();
+        assert_eq!(shown(&rig), 0, "{at}: closing resets the entry");
+    }
 }

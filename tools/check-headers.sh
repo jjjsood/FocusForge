@@ -32,6 +32,8 @@ def covered(path: Path) -> bool:
     relative = path.relative_to(root)
     if relative.parts[0] == ".githooks":
         return path.is_file()
+    if "target" in relative.parts:
+        return False
     return relative.parts[0] in patterns and path.suffix in patterns[relative.parts[0]]
 
 

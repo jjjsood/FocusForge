@@ -30,6 +30,7 @@ import { FFToast } from "components/ff_toast.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
 import { FFCalculatorOverlay, CalculatorFieldView, SummaryCell } from "shell/calculator_overlay.slint";
 import { FFAnalyticsOverlay, AnalyticsRowView } from "shell/analytics_overlay.slint";
+import { OverlapSegmentView } from "components/ff_overlap_bar.slint";
 import { FFLoadingIndicator } from "shell/loading.slint";
 export { ProjectCardView, RecentRowView, ExportRowView, NotificationRowView, CalculatorFieldView, SummaryCell }
 
@@ -879,6 +880,7 @@ export component AppWindow inherits Window {
     in property <bool> analytics-open: false;
     in property <string> analytics-state: "waiting";
     in property <[AnalyticsRowView]> analytics-rows: [];
+    in property <[OverlapSegmentView]> analytics-segments: [];
     in property <string> analytics-error: "";
     callback analytics-toggled();
 
@@ -891,6 +893,7 @@ export component AppWindow inherits Window {
         open: root.analytics-open;
         state: root.analytics-state;
         rows: root.analytics-rows;
+        segments: root.analytics-segments;
         error: root.analytics-error;
 
         close-requested => { root.analytics-toggled(); }

@@ -16,6 +16,7 @@
 pub mod convert;
 pub mod pyramid;
 pub mod select;
+pub(crate) mod sharpness;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -85,6 +86,16 @@ fn shape_e() -> Vec<wgpu::BindGroupLayoutEntry> {
     entries
 }
 
+/// Shape for `peak::bin`: the peaks and the histogram, both read/write
+/// atomics, and one uniform.
+fn shape_peak_bin() -> Vec<wgpu::BindGroupLayoutEntry> {
+    vec![
+        storage_entry(1, false),
+        uniform_entry(2),
+        storage_entry(3, false),
+    ]
+}
+
 /// One `OnceLock<Pipeline>` per kernel entry point, built on first use.
 #[derive(Default)]
 pub struct FusionPipelines {
@@ -102,6 +113,8 @@ pub struct FusionPipelines {
     residual_accumulate: OnceLock<Pipeline>,
     eligibility_exclude: OnceLock<Pipeline>,
     eligibility_mean_by_count: OnceLock<Pipeline>,
+    peak_fold: OnceLock<Pipeline>,
+    peak_bin: OnceLock<Pipeline>,
 }
 
 macro_rules! pipeline_getter {
@@ -216,6 +229,20 @@ impl FusionPipelines {
         "focusforge-gpu-fuse-eligibility-mean-by-count",
         "mean_by_count",
         shape_e
+    );
+    pipeline_getter!(
+        peak_fold,
+        "peak.wgsl",
+        "focusforge-gpu-sharpness-peak-fold",
+        "fold",
+        shape_a
+    );
+    pipeline_getter!(
+        peak_bin,
+        "peak.wgsl",
+        "focusforge-gpu-sharpness-peak-bin",
+        "bin",
+        shape_peak_bin
     );
 }
 

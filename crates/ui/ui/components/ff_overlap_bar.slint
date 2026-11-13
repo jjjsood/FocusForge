@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// One segment per neighbour pair, image numbers on the boundaries beneath,
+// the hovered pair's tooltip above, one loading band while pending.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+import { FFOverlapSegment } from "ff_overlap_segment.slint";
+import { FFTooltip } from "ff_tooltip.slint";
+
+export struct OverlapSegmentView {
+    scale: float,
+    has-data: bool,
+    dimmed: bool,
+    percent: string,
+    tooltip: string,
+}
+
+export component FFOverlapBar inherits Rectangle {
+    in property <[OverlapSegmentView]> segments;
+    in property <bool> pending: false;
+    in property <bool> entered: true;
+    // The field the loading band crosses and where the bar's left edge sits
+    // in it, as for `FFProgressBar`.
+    in property <length> sweep-offset: 0px;
+    in property <length> sweep-span: root.width;
+
+    property <int> frames: root.segments.length + 1;
+    property <length> pitch: (root.width + ShellGeometry.overlap-segment-gap) / max(1, root.segments.length);
+    // The smallest of 1, 2, 5, 10, 20 that keeps shown numbers apart.
+    property <int> step: root.pitch >= ShellGeometry.overlap-number-spacing ? 1
+        : root.pitch * 2 >= ShellGeometry.overlap-number-spacing ? 2
+        : root.pitch * 5 >= ShellGeometry.overlap-number-spacing ? 5
+        : root.pitch * 10 >= ShellGeometry.overlap-number-spacing ? 10
+        : 20;
+    property <length> number-top: ShellGeometry.overlap-number-y - ShellGeometry.overlap-bar-y;
+    property <length> sweep-width: root.sweep-span * ShellGeometry.sweep-band-share;
+    // Reads the clock only while pending or fading out; a segment reads it
+    // only while its band shows.
+    property <length> sweep-x: root.pending || !root.entered
+        ? Theme.sweep-x(0ms, root.sweep-offset, root.sweep-span, root.sweep-width)
+        : 0px;
+    property <int> hover-index: !root.pending && root.entered && area.has-hover
+        ? clamp(floor(area.mouse-x / root.pitch), 0, root.segments.length - 1)
+        : -1;
+
+    height: ShellGeometry.overlap-block-height - ShellGeometry.overlap-bar-y;
+
+    // The boundary between the segments before and after image `k` (1-based):
+    // the first and last numbers always show, the others every `step`-th with
+    // room to both ends.
+    pure function shown(k: int) -> bool {
+        return k == 1 || k == root.frames
+            || (mod(k, root.step) == 0
+                && (k - 1) * root.pitch >= ShellGeometry.overlap-number-spacing
+                && (root.frames - k) * root.pitch >= ShellGeometry.overlap-number-spacing);
+    }
+    pure function tick-x(k: int) -> length {
+        return k == 1 ? 0px
+            : k == root.frames ? root.width - ShellGeometry.overlap-tick-width
+            : (k - 1) * root.pitch - ShellGeometry.overlap-segment-gap;
+    }
+
+    for segment[i] in root.segments: FFOverlapSegment {
+        x: i * root.pitch;
+        y: 0px;
+        width: root.pitch - ShellGeometry.overlap-segment-gap;
+        scale: segment.scale;
+        has-data: segment.has-data;
+        dimmed: segment.dimmed;
+        percent: segment.percent;
+        pending: root.pending;
+        hovered: root.hover-index == i;
+        sweep-x: root.sweep-x;
+        sweep-width: root.sweep-width;
+        entered: root.entered;
+        entry-delay: min(Theme.entry-zoom-stagger,
+            (Theme.entry-zoom-span - Theme.entry-zoom) / max(1, root.segments.length - 1)) * i;
+    }
+    for k in root.frames: Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 0px;
+        height: 0px;
+        if root.shown(k + 1): Rectangle {
+            x: root.tick-x(k + 1);
+            y: ShellGeometry.overlap-bar-height;
+            width: ShellGeometry.overlap-tick-width;
+            height: ShellGeometry.overlap-tick-height;
+            background: Theme.text-disabled;
+        }
+        if root.shown(k + 1): Text {
+            x: root.tick-x(k + 1) + (ShellGeometry.overlap-tick-width - ShellGeometry.overlap-number-width) / 2;
+            y: root.number-top;
+            width: ShellGeometry.overlap-number-width;
+            height: ShellGeometry.overlap-block-height - ShellGeometry.overlap-number-y;
+            text: k + 1;
+            color: Theme.text-muted;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            horizontal-alignment: center;
+        }
+    }
+    area := TouchArea {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: ShellGeometry.overlap-bar-height;
+    }
+    if root.hover-index >= 0 && root.segments[root.hover-index].tooltip != "": FFTooltip {
+        x: clamp(root.hover-index * root.pitch + (root.pitch - ShellGeometry.overlap-segment-gap - self.width) / 2,
+            0px, max(0px, root.width - self.width));
+        y: -Theme.space-1 - self.height;
+        text: root.segments[root.hover-index].tooltip;
+    }
+}

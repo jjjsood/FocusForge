@@ -94,6 +94,9 @@ export global Theme {
     out property <TypeRole> text-value: {
         size: 12px, weight: 500, line-height: 1.45, letter-spacing: 0px, uppercase: false,
     };
+    out property <TypeRole> text-value-strong: {
+        size: 12px, weight: 600, line-height: 1.45, letter-spacing: 0px, uppercase: false,
+    };
     out property <TypeRole> text-emphasis: {
         size: 13px, weight: 400, line-height: 1.4, letter-spacing: 0px, uppercase: false,
     };
@@ -138,16 +141,46 @@ export global Theme {
     // How long a checkpoint row's tint holds before it falls; reduced motion
     // leaves it, so the cue stays when the fall is a cut.
     out property <duration> flash-hold: 150ms;
-    // The loading clocks, read from `animation-tick()`. The spinner ring
-    // turns once per second; the indeterminate sweep switches sides every
-    // 900 ms. With Reduce motion on, the angle is 0deg and the sweep stays
-    // left.
+    // The Analytics entry motion: the wait before it starts, each overlap
+    // segment's zoom, the stagger between segments and the span the whole bar
+    // finishes within, then the same three for the row bars. All cuts under
+    // Reduce motion.
+    out property <duration> entry-wait: reduce-motion ? 0ms : 150ms;
+    out property <duration> entry-zoom: reduce-motion ? 0ms : 180ms;
+    out property <duration> entry-zoom-stagger: reduce-motion ? 0ms : 40ms;
+    out property <duration> entry-zoom-span: reduce-motion ? 0ms : 600ms;
+    out property <duration> entry-fill: reduce-motion ? 0ms : 350ms;
+    out property <duration> entry-fill-stagger: reduce-motion ? 0ms : 30ms;
+    out property <duration> entry-fill-span: reduce-motion ? 0ms : 500ms;
+    // The alpha of an overlap segment whose pair has too few sharp areas to
+    // be sure.
+    out property <float> overlap-dimmed-opacity: 0.45;
+    // The loading band: one pass across its field at a constant speed, how
+    // far each further row trails the one above, and its fade when the work
+    // ends.
+    out property <duration> sweep-pass: 1600ms;
+    out property <duration> sweep-stagger: reduce-motion ? 0ms : 15ms;
+    out property <duration> sweep-fade: reduce-motion ? 0ms : 150ms;
+    // The loading clocks, read from `animation-tick()`: the spinner ring
+    // turns once per second, the band's pass runs from 0 to 1 and starts
+    // again. With Reduce motion on, neither reads the clock.
     out property <angle> spinner-angle: reduce-motion
         ? 0deg
         : mod(animation-tick() / 1ms, 1000.0) / 1000.0 * 360deg;
-    out property <bool> sweep-right: reduce-motion
-        ? false
-        : mod(animation-tick() / 1ms, 1800.0) >= 900.0;
+    out property <float> sweep-progress: reduce-motion
+        ? 0.0
+        : mod(animation-tick() / 1ms, sweep-pass / 1ms) / (sweep-pass / 1ms);
+
+    // The x of a band `band` wide over a track whose left edge sits at
+    // `offset` in a field `span` wide, `lag` behind the field's pass: the
+    // band enters at the field's left edge and leaves past its right one, so
+    // tracks sharing a field show one band. At rest at the track's left
+    // under Reduce motion.
+    public pure function sweep-x(lag: duration, offset: length, span: length, band: length) -> length {
+        return reduce-motion
+            ? 0px
+            : mod(sweep-progress - (lag / 1ms) / (sweep-pass / 1ms), 1.0) * (span + band) - band - offset;
+    }
 }
 
 // Empty on purpose: a handle so a test can reach a global.

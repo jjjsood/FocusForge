@@ -49,10 +49,10 @@ use crate::viewport::{PaneDraw, PaneRect};
 use focusforge_ui::{
     AboutState, AnalyticsRowView, AppWindow, CalculatorFieldView,
     CheckpointEntryView as GeneratedCheckpointEntry, ExportRowView, FFManifestRow,
-    ImageRowView as GeneratedImageRow, NotificationRowView, PerformanceCap, PerformanceState,
-    ProjectCardView as GeneratedProjectCard, ProjectTabView, RecentRowView as GeneratedRecentRow,
-    SectionHeadView, SettingsRow as GeneratedSettingsRow, StoragePathState, StorageState,
-    SummaryCell, Theme, UpdateControlsState,
+    ImageRowView as GeneratedImageRow, NotificationRowView, OverlapSegmentView, PerformanceCap,
+    PerformanceState, ProjectCardView as GeneratedProjectCard, ProjectTabView,
+    RecentRowView as GeneratedRecentRow, SectionHeadView, SettingsRow as GeneratedSettingsRow,
+    StoragePathState, StorageState, SummaryCell, Theme, UpdateControlsState,
 };
 
 /// `slint::platform::PointerEventButton` -> `input_map::Button` -- the only
@@ -2846,8 +2846,9 @@ pub fn push_overlays(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     push_analytics(app, &controller);
 }
 
-/// Pushes the Analytics overlay's open flag and state; the rows go through
-/// `sync_rows`, so a row that did not change keeps its element tree.
+/// Pushes the Analytics overlay's open flag and state; the rows and overlap
+/// segments go through `sync_rows`, so one that did not change keeps its
+/// element tree.
 pub fn push_analytics(app: &AppWindow, controller: &AppController) {
     app.set_analytics_open(controller.analytics_open());
     let row_views = |rows: &[crate::analytics::AnalyticsRow]| -> Vec<AnalyticsRowView> {
@@ -2867,16 +2868,38 @@ pub fn push_analytics(app: &AppWindow, controller: &AppController) {
             })
             .collect()
     };
-    let (state, rows, error) = match controller.analytics_view() {
-        AnalyticsView::Waiting => ("waiting", Vec::new(), ""),
-        AnalyticsView::Counting(rows) => ("counting", row_views(rows), ""),
-        AnalyticsView::Rows(rows) => ("rows", row_views(rows), ""),
-        AnalyticsView::Failed(message) => ("failed", Vec::new(), message.as_str()),
+    let segment_views = |segments: &[crate::analytics::OverlapSegment]| -> Vec<OverlapSegmentView> {
+        segments
+            .iter()
+            .map(|segment| OverlapSegmentView {
+                scale: segment.scale,
+                has_data: segment.has_data,
+                dimmed: segment.dimmed,
+                percent: segment.percent.as_str().into(),
+                tooltip: segment.tooltip.as_str().into(),
+            })
+            .collect()
+    };
+    let (state, rows, segments, error) = match controller.analytics_view() {
+        AnalyticsView::Waiting => ("waiting", Vec::new(), Vec::new(), ""),
+        AnalyticsView::Counting(rows) => (
+            "counting",
+            row_views(rows),
+            vec![OverlapSegmentView::default(); rows.len().saturating_sub(1)],
+            "",
+        ),
+        AnalyticsView::Rows(rows, segments) => {
+            ("rows", row_views(rows), segment_views(segments), "")
+        }
+        AnalyticsView::Failed(message) => ("failed", Vec::new(), Vec::new(), message.as_str()),
     };
     app.set_analytics_state(state.into());
     app.set_analytics_error(error.into());
     sync_rows(app.get_analytics_rows(), rows, |model| {
         app.set_analytics_rows(model);
+    });
+    sync_rows(app.get_analytics_segments(), segments, |model| {
+        app.set_analytics_segments(model);
     });
 }
 
