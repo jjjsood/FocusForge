@@ -1599,6 +1599,10 @@ fn brush_preview_update_cost() {
                         PREVIEW_SOURCE_STEPS
                             * (1 + usize::from(expected_tier == PreviewTier::Backdrop)),
                     );
+                    assert_eq!(
+                        gaps, 0,
+                        "{label}: updates between the publishes keep the previous layer"
+                    );
                     if total.1 > FRAME_BUDGET.as_secs_f64() * 1e3 {
                         misses.push(format!("{label}: publish to preview p95 {:.2} ms", total.1));
                     }

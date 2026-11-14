@@ -1055,6 +1055,99 @@ mod tests {
         assert_eq!(grids.source.samples, samples, "the new frame is the source");
     }
 
+    /// A renderer whose backdrop tier answers `spec` at `draw`, stepped to
+    /// another frame whose exact pane has published and whose backdrop has not.
+    fn stepped_to_exact_published_gap(
+        shared: Shared,
+        spec: &BrushPreviewSpec,
+        draw: &PaneDraw,
+    ) -> CanvasRenderer {
+        let other_frame = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/mantis-512/frames/01.tif");
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        publish_all(&mut renderer);
+        assert!(
+            renderer.brush_preview_layer(spec, draw).is_some(),
+            "both backdrops published"
+        );
+        renderer
+            .set_frame(&other_frame, None, crate::job::host_budget())
+            .expect("the other frame opens");
+        let job = renderer
+            .request_frame(&draw_of((200, 200, 64, 64), 1))
+            .expect("frame job");
+        publish_pattern(&mut renderer, &job, 5);
+        renderer
+    }
+
+    #[test]
+    fn brush_preview_keeps_the_layer_until_the_new_source_can_be_drawn() {
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let spec = brush(24, 24, 10.0, BrushMode::Lighten);
+        let draw = draw_of((0, 0, SIDE, SIDE), 8);
+        let other_frame = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/mantis-512/frames/01.tif");
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        publish_all(&mut renderer);
+        assert_eq!(
+            renderer.brush_preview_grids(&spec).expect("answers").tier,
+            PreviewTier::Backdrop,
+            "the disc is outside the exact panes"
+        );
+        let (image, rect) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("both backdrops published");
+
+        renderer
+            .set_frame(&other_frame, None, crate::job::host_budget())
+            .expect("the other frame opens");
+        let (kept, kept_rect) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("the previous layer stays after the source step");
+        assert_eq!((kept.size(), kept_rect), (image.size(), rect));
+
+        let job = renderer
+            .request_frame(&draw_of((200, 200, 64, 64), 1))
+            .expect("frame job");
+        publish_pattern(&mut renderer, &job, 5);
+        let (kept, kept_rect) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("the previous layer stays after the exact frame publish");
+        assert_eq!((kept.size(), kept_rect), (image.size(), rect));
+
+        let job = renderer
+            .request_frame_backdrop(&draw_of((0, 0, SIDE, SIDE), 4))
+            .expect("frame backdrop job");
+        let samples = publish_pattern(&mut renderer, &job, 6);
+        assert!(
+            renderer.brush_preview_layer(&spec, &draw).is_some(),
+            "a layer from the new source"
+        );
+        let grids = renderer.brush_preview_grids(&spec).expect("answers");
+        assert_eq!(grids.tier, PreviewTier::Backdrop);
+        assert_eq!(
+            grids.source.samples, samples,
+            "the new backdrop is the source"
+        );
+
+        // The kept layer never outlives a changed brush or draw. Each check
+        // starts from its own gap, since an answer replaces the memo.
+        let mut gap = stepped_to_exact_published_gap(shared, &spec, &draw);
+        let moved = brush(25, 24, 10.0, BrushMode::Lighten);
+        assert!(
+            gap.brush_preview_layer(&moved, &draw).is_none(),
+            "a moved brush in the gap"
+        );
+        let mut gap = stepped_to_exact_published_gap(shared, &spec, &draw);
+        let panned = draw_of((8, 0, SIDE - 8, SIDE), 8);
+        assert!(
+            gap.brush_preview_layer(&spec, &panned).is_none(),
+            "a panned draw in the gap"
+        );
+    }
+
     #[test]
     fn brush_preview_draws_the_ring_alone_without_retained_samples() {
         let draw = draw_of((200, 200, 64, 64), 1);
@@ -2005,9 +2098,9 @@ impl CanvasRenderer {
     /// brush, or the device is missing or lost.
     ///
     /// The same `spec`, `draw` and retained samples return the last answer
-    /// without a dispatch. While the frame pane and its backdrop are empty
-    /// (the source was just changed), the composite still holds samples and
-    /// `spec` and `draw` are unchanged, the last layer stays.
+    /// without a dispatch. While the frame backdrop has not published since
+    /// the source changed, the composite still holds samples and `spec` and
+    /// `draw` are unchanged, the last layer stays.
     pub fn brush_preview_layer(
         &mut self,
         spec: &BrushPreviewSpec,
@@ -2019,12 +2112,11 @@ impl CanvasRenderer {
         if same_brush && last.is_some_and(|m| m.inputs == self.preview_inputs) {
             return kept;
         }
-        let source_empty = self.frame_pane.retained_grid().is_none()
-            && self.frame_backdrop.retained_grid().is_none();
+        let backdrop_pending = self.frame_backdrop.retained_grid().is_none();
         let result_held = self.composite_pane.retained_grid().is_some()
             || self.composite_backdrop.retained_grid().is_some();
         let layer = match self.build_brush_preview_layer(spec, draw) {
-            None if same_brush && source_empty && result_held => kept,
+            None if same_brush && backdrop_pending && result_held => kept,
             built => built,
         };
         self.brush_preview_last = Some(PreviewMemo {
