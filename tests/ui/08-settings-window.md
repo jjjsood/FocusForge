@@ -23,7 +23,7 @@ Start: --open fixtures/mantis-64/frames
 10. Click "MiB" (`FFMenuList::option-area` 0).
     Expect: the list is gone, the VRAM unit field reads "MiB" and the VRAM number field is still empty with the grey hint "Not probed yet".
 11. Type "512" into the VRAM number (`FFTextField::input` 1).
-    Expect: the field shows "512" in the neutral tone beside "MiB" and the grey hint is gone; Must not: the note "Caps only lower the probed budgets. Changes apply from the next start." appears below the LIMITS rows (it shows only after a run has probed the GPU).
+    Expect: the field shows "512" in the neutral tone beside "MiB" and the grey hint is gone; the note "Caps only lower the probed budgets. Changes apply from the next start." shows below the LIMITS rows (opening the frames already fixed this session's device budget, so an edited cap waits for the next start).
 12. Click **Close settings** (`FFSettingsModal::close`).
    Expect: the "Settings" window is gone; the canvas panes are visible again (within 3 s).
 13. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
@@ -37,13 +37,13 @@ Start: --open fixtures/mantis-64/frames
     Expect: Must not: the line under the row reads "Cleared"; the heading "CACHE" shows the row "Stage cache" with the grey text "Deletes cached fuse stages." and an enabled **Clear cache** button (read with `buttons AppWindow::settings-modal`), and the line under the row is empty.
 ## Input map
 17. Click **Input map** (`FFNavRailEntry::area` 3).
-    Expect: the heading "BINDINGS" shows a line under it that names either the built-in bindings ("Built-in bindings.") or the settings file ("Read from <path to settings.toml>: <n> bindings differ from the built-in ones."; which one depends on whether this machine already has a settings file) and no red line; below it a table header "INPUT", "STACKING", "EDITOR"; the INPUT column (`FFInputTableRow::input-cell`) holds ten rows, top to bottom "wheel", "ctrl+wheel", "shift+wheel", "middle-drag / space+left-drag", "ctrl+z / ctrl+shift+z", "alt+left-click", "1", "2", "3" and "4" (within 1 s).
+    Expect: the heading "BINDINGS" shows a line under it that names either the built-in bindings ("Built-in bindings.") or the settings file ("Read from <path to settings.toml>: <n> bindings differ from the built-in ones."; which one depends on whether this machine already has a settings file) and no red line; below it a table header "INPUT", "STACKING", "EDITOR"; the INPUT column (`FFInputTableRow::input-cell`) holds eleven rows, top to bottom "wheel", "ctrl+wheel", "shift+wheel", "middle-drag / space+left-drag", "ctrl+z / ctrl+shift+z", "alt+left-click", "1", "2", "3", "4" and "p" (within 1 s). The last row, "p", lies at the bottom edge of the table and may be cut off; `FFInputTableRow::input-cell` then has 12 matches, the header and eleven rows.
 18. Click the header "STACKING" (`FFInputTableRow::stacking-cell` 0).
-    Expect: the STACKING column holds ten rows, top to bottom "zoom-at-cursor", "step-source-frame", "pan-horizontal", "pan", "—", "pick-source-under-pointer" and four rows of "—".
+    Expect: the STACKING column holds eleven rows, top to bottom "zoom-at-cursor", "step-source-frame", "pan-horizontal", "pan", "—", "pick-source-under-pointer" and five rows of "—".
 19. Click the header "EDITOR" (`FFInputTableRow::editor-cell` 0).
-    Expect: the EDITOR column holds ten rows, top to bottom "zoom-at-cursor", "step-source-frame", "brush-size", "pan", "undo / redo", "pick-source-under-pointer", "brush-mode-normal", "brush-mode-lighten", "brush-mode-darken" and "brush-mode-detail".
+    Expect: the EDITOR column holds eleven rows, top to bottom "zoom-at-cursor", "step-source-frame", "brush-size", "pan", "undo / redo", "pick-source-under-pointer", "brush-mode-normal", "brush-mode-lighten", "brush-mode-darken", "brush-mode-detail" and "toggle-brush-preview" (the last row may be cut off, its text over two lines).
 20. Click the text "wheel" in the first row (`FFInputTableRow::input-cell` 1).
-    Expect: Must not: a field opens or a row changes; the table still shows ten rows.
+    Expect: Must not: a field opens or a row changes; the table still shows eleven rows.
 ## Diagnostics
 21. Click **Diagnostics** (`FFNavRailEntry::area` 4).
     Expect: (within 10 s) the heading "DIAGNOSTICS" shows a file list holding the rows "adapter.json", "configuration.json", "system.json" and "version.json", each followed by a size, and no "Collecting…" text; "BINDINGS" is gone.
@@ -55,7 +55,7 @@ Start: --open fixtures/mantis-64/frames
     Expect: the field shows a non-empty path text (the field is narrower than the path, so its end is cut off); the result line (`FFDiagnosticsPanel::message`) is empty and **Create bundle** is listed enabled (read with `buttons AppWindow::settings-modal`).
 ## About
 25. Click **About** (`FFNavRailEntry::area` 5).
-    Expect: the heading "FOCUSFORGE" shows "Version" with a number of the form "0.1.0" and "License" with "GPL-3.0"; the heading "NOTICE" shows the line "Copyright © 2026 Johannes Sood" and a paragraph starting "FocusForge is free software"; the row "Source" shows the accent-coloured text "github.com/jjjsood/FocusForge" (within 1 s).
+    Expect: the heading "FOCUSFORGE" shows "Version" with a number of the form "0.1.0", which may carry a pre-release suffix such as "-rc.1" and "License" with "GPL-3.0"; the heading "NOTICE" shows the line "Copyright © 2026 Johannes Sood" and a paragraph starting "FocusForge is free software"; the row "Source" shows the accent-coloured text "github.com/jjjsood/FocusForge" (within 1 s).
 ## The backend line after a fuse with the GPU switch off
 26. Press Escape (step 24 focused the "Save to" field and step 25 switched to About).
     Expect: the "Settings" window and its rail are gone; the canvas panes are visible again (within 1 s).
@@ -67,7 +67,7 @@ Start: --open fixtures/mantis-64/frames
     Expect: the "Settings" window is open (within 1 s).
 30. Click **Performance** (`FFNavRailEntry::area` 0).
     Expect: the "Backend" row reads "cpu — GPU processing is off" and the GPU switch knob is at the left end on a grey track (within 1 s).
-31. Click the GPU processing switch (`FFToggle::area` 1).
+31. Click the GPU processing switch (`FFToggle::area` 2; the editor is shown after the **Keep**, so match 0 is the editor toolbar's Preview switch and match 1 the bottom bar's overlay switch).
     Expect: the knob is at the right end on an accent-coloured track.
 32. Click **Close settings** (`FFSettingsModal::close`).
     Expect: the "Settings" window is gone (within 1 s).
