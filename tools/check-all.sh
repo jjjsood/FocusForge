@@ -37,12 +37,18 @@
 # Changed paths are those since the merge base with develop (FF_GATE_BASE
 # overrides the branch), committed or not. With --static and --quick the
 # selftests of the tooling itself run only when tools/, .githooks/, .github/
-# or .config/ changed; the full run always runs them.
+# or .config/ changed; the full run always runs them. The full run builds,
+# lints and tests the theme sheet (`theme sheet feature`) and checks its size
+# budget only when a path under crates/ui*/ or crates/gui/, or the root
+# Cargo.toml, Cargo.lock or rust-toolchain.toml, changed; it always does in CI
+# and when no merge base resolves.
 #
 # Green-tree cache: a full or quick run that passes on a clean tree records the
 # tree id in the common git dir, shared by every checkout. A later run on
 # the same clean tree whose mode a record covers (full covers quick and static,
 # quick covers static) prints `CACHED:` and exits 0 without running anything.
+# A full run that skipped the theme sheet stage records `full-partial`, which
+# covers quick and static but not a later full run.
 # Off in CI and with FF_GATE_NO_CACHE=1.
 #
 # Exit code: 0 all gates passed, 1 at least one failed.
@@ -122,7 +128,7 @@ if [ -z "${CI:-}" ] && [ -z "${FF_GATE_NO_CACHE:-}" ] \
   GREEN_TREES="$(cd "$common" && pwd)/focusforge-green-trees"
   CLEAN_TREE="$(git rev-parse 'HEAD^{tree}')"
   covers='full'
-  [ "$MODE" = full ] || covers='full|quick'
+  [ "$MODE" = full ] || covers='full|full-partial|quick'
   if hit="$(grep -E "^$CLEAN_TREE ($covers) " "$GREEN_TREES" 2>/dev/null | tail -n 1)" && [ -n "$hit" ]; then
     read -r _ hit_mode hit_at <<<"$hit"
     echo "CACHED: tree $CLEAN_TREE passed the $hit_mode gate at $hit_at; nothing ran (FF_GATE_NO_CACHE=1 forces a run)"
@@ -144,6 +150,13 @@ TOOLS_CHANGED=1
 if [ "$MODE" != full ] && [ "$CHANGED" != ALL ] \
   && ! grep -qE '^(tools/|\.githooks/|\.github/|\.config/)' <<<"$CHANGED"; then
   TOOLS_CHANGED=0
+fi
+
+# 1 when the theme sheet stages run: a UI crate, the GUI or a root workspace input changed.
+UI_CHANGED=0
+if [ "$CHANGED" = ALL ] \
+  || grep -qE '^(crates/(ui[^/]*|gui)/|Cargo\.(toml|lock)$|rust-toolchain\.toml$)' <<<"$CHANGED"; then
+  UI_CHANGED=1
 fi
 
 RUNLOG_ROOT="$REPO/.logs/gate"
@@ -343,15 +356,21 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
   [ "$QUICK" -eq 1 ] || run_gate "trace feature"  tools/with-lock.sh build -- \
                               cargo test -p focusforge-cli --features trace --test trace_cli
   # The theme sheet is built out of the stages above; this one lints it and runs
-  # its tests.
-  [ "$QUICK" -eq 1 ] || run_gate "theme sheet feature" tools/with-lock.sh build -- \
+  # its tests, when a UI path or workspace input changed.
+  if [ "$QUICK" -eq 0 ]; then
+    if [ "$UI_CHANGED" -eq 1 ]; then
+      run_gate "theme sheet feature" tools/with-lock.sh build -- \
                               sh -c 'cargo clippy -p focusforge-gui --features theme-sheet --all-targets -- -D warnings \
                                 && cargo nextest run -p focusforge-gui --features theme-sheet --test theme'
-  # Asks cargo for the builds above (a no-op) and compares the generated Slint files with
-  # their budgets. Linux only: the sizes come from the .slint sources, not the OS.
+    else
+      echo "SKIP theme sheet feature: no UI path or workspace input changed since the merge base"
+    fi
+  fi
+  # Asks cargo for the builds the stages above made and compares the generated Slint files
+  # with their budgets. Linux only: the sizes come from the .slint sources, not the OS.
   if [ "$(uname -s)" = Linux ]; then
     UI_SIZE_BUILDS="--build tests"
-    [ "$QUICK" -eq 1 ] || UI_SIZE_BUILDS="--build tests --build theme-sheet"
+    [ "$QUICK" -eq 0 ] && [ "$UI_CHANGED" -eq 1 ] && UI_SIZE_BUILDS="--build tests --build theme-sheet"
     # shellcheck disable=SC2086
     run_gate "generated UI size" tools/with-lock.sh build -- python3 tools/check-ui-size.py $UI_SIZE_BUILDS
   fi
@@ -378,6 +397,8 @@ runlog_summary gate
 
 if [ "$RUNLOG_FAILED" -eq 0 ] && [ -n "$CLEAN_TREE" ] && [ "$MODE" != static ] \
   && [ -z "$(git status --porcelain)" ] && [ "$(git rev-parse 'HEAD^{tree}')" = "$CLEAN_TREE" ]; then
-  echo "$CLEAN_TREE $MODE $(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$GREEN_TREES"
+  rec_mode="$MODE"
+  [ "$MODE" = full ] && [ "$UI_CHANGED" -eq 0 ] && rec_mode=full-partial
+  echo "$CLEAN_TREE $rec_mode $(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$GREEN_TREES"
 fi
 exit "$RUNLOG_FAILED"
