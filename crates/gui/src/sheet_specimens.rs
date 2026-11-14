@@ -5,10 +5,10 @@
 use std::path::Path;
 
 /// The sheet's brush preview specimens, built by the preview's CPU twin over a
-/// tile of the `mantis-512` fixture: the result image under
-/// `golden/`, source frame `07`. Each is a backdrop of the result's own display and the layer of
-/// a one-point stroke over it, both placed from the stroke's centre at
-/// `scale` screen pixels per image pixel.
+/// tile of the `mantis-512` fixture: the result image under `golden/`, source
+/// frame `07`. Each is a backdrop of the result's own display and the layer of
+/// a one-point stroke over it, both placed from the stroke's centre at `scale`
+/// screen pixels per image pixel.
 pub fn preview_specimens() -> Result<Vec<crate::theme_sheet::PreviewSpecimen>, String> {
     use crate::theme_sheet::PreviewSpecimen;
     use focusforge_core::io::TiffStack;

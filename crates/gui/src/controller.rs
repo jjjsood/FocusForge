@@ -4701,8 +4701,8 @@ impl AppController {
     }
 
     /// The brush the preview layer would draw: the one-point stroke a press
-    /// at the cursor's anchor would record. `None` with the preview off, outside the
-    /// editor, while [`Self::brush_cursor_view`] is `None` or picking (the
+    /// at the cursor's anchor would record. `None` with the preview off, outside
+    /// the editor, while [`Self::brush_cursor_view`] is `None` or picking (the
     /// pipette armed or `Alt` held), during a live stroke, and while the
     /// anchor's source point is off the image.
     pub fn brush_preview_spec(&self) -> Option<brush::BrushPreviewSpec> {
