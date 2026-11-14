@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The editor-mode toolbar: brush size, softness, blend mode and opacity, the pipette, undo/redo
-// and the checkpoint button.
+// The editor-mode toolbar: brush size, softness, blend mode and opacity, the preview switch, the
+// pipette, undo/redo and the checkpoint button.
 
 import { FFAppear } from "../components/ff_appear.slint";
 import { Theme } from "../theme.slint";
@@ -11,6 +11,7 @@ import { FFSlider } from "../components/ff_slider.slint";
 import { FFIconButton } from "../components/ff_icon_button.slint";
 import { FFButton } from "../components/ff_button.slint";
 import { FFRowText } from "../components/ff_row_text.slint";
+import { FFToggle } from "../components/ff_toggle.slint";
 
 export component FFEditorToolbar inherits FFAppear {
     in property <string> size-text: "";
@@ -22,6 +23,7 @@ export component FFEditorToolbar inherits FFAppear {
     in property <bool> mode-menu-open: false;
     in property <string> opacity-text: "";
     in property <float> opacity-fraction: 0.0;
+    in property <bool> preview: false;
     in property <bool> picking: false;
     in property <bool> can-undo: false;
     in property <bool> can-redo: false;
@@ -30,6 +32,7 @@ export component FFEditorToolbar inherits FFAppear {
     callback brush-softness-fraction-changed(float);
     callback brush-opacity-fraction-changed(float);
     callback brush-mode-menu-toggled();
+    callback brush-preview-toggled();
     callback pipette-toggled();
     callback undo-requested();
     callback redo-requested();
@@ -100,9 +103,22 @@ export component FFEditorToolbar inherits FFAppear {
         value-text: root.opacity-text;
         fraction-changed(f) => { root.brush-opacity-fraction-changed(f); }
     }
+    if !ShellGeometry.editor-toolbar-caption-hidden(root.width): FFRowText {
+        x: ShellGeometry.editor-toolbar-preview-caption-x - ShellGeometry.editor-toolbar-shift(root.width, 3);
+        height: parent.height;
+        text: "Preview";
+        muted: true;
+    }
+    preview-switch := FFToggle {
+        name: "Preview";
+        x: ShellGeometry.editor-toolbar-preview-x - ShellGeometry.editor-toolbar-tail-shift(root.width);
+        y: (root.height - self.height) / 2;
+        on: root.preview;
+        toggled => { root.brush-preview-toggled(); }
+    }
     pipette := FFIconButton {
         name: "Pipette";
-        x: ShellGeometry.editor-toolbar-pipette-x - ShellGeometry.editor-toolbar-shift(root.width, 3);
+        x: ShellGeometry.editor-toolbar-pipette-x - ShellGeometry.editor-toolbar-tail-shift(root.width);
         y: root.control-y;
         width: ShellGeometry.editor-toolbar-icon-width;
         height: ShellGeometry.toolbar-button-height;
@@ -113,7 +129,7 @@ export component FFEditorToolbar inherits FFAppear {
     }
     undo := FFIconButton {
         name: "Undo";
-        x: ShellGeometry.editor-toolbar-undo-x - ShellGeometry.editor-toolbar-shift(root.width, 3);
+        x: ShellGeometry.editor-toolbar-undo-x - ShellGeometry.editor-toolbar-tail-shift(root.width);
         y: root.control-y;
         width: ShellGeometry.editor-toolbar-icon-width;
         height: ShellGeometry.toolbar-button-height;
@@ -124,7 +140,7 @@ export component FFEditorToolbar inherits FFAppear {
     }
     redo := FFIconButton {
         name: "Redo";
-        x: ShellGeometry.editor-toolbar-redo-x - ShellGeometry.editor-toolbar-shift(root.width, 3);
+        x: ShellGeometry.editor-toolbar-redo-x - ShellGeometry.editor-toolbar-tail-shift(root.width);
         y: root.control-y;
         width: ShellGeometry.editor-toolbar-icon-width;
         height: ShellGeometry.toolbar-button-height;
@@ -136,7 +152,8 @@ export component FFEditorToolbar inherits FFAppear {
     FFButton {
         x: parent.width - ShellGeometry.editor-toolbar-save-checkpoint-right-inset - self.width;
         y: root.control-y;
-        width: ShellGeometry.editor-toolbar-save-checkpoint-width;
+        width: ShellGeometry.editor-toolbar-caption-hidden(root.width)
+            ? ShellGeometry.editor-toolbar-save-checkpoint-narrow-width : ShellGeometry.editor-toolbar-save-checkpoint-width;
         compact: true;
         text: "Save checkpoint";
         enabled: root.can-save-checkpoint;

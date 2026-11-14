@@ -120,6 +120,7 @@ pub mod export_settings;
 pub mod performance_settings;
 
 pub mod appearance_settings;
+pub mod editor_settings;
 pub mod source_previews;
 pub mod update_settings;
 

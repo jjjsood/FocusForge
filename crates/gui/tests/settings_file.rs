@@ -530,3 +530,147 @@ fn updates_save_round_trips_and_keeps_siblings() {
         "the hand-edited sibling table stays byte-identical: {saved}"
     );
 }
+
+#[test]
+fn editor_preview_invalid_values_read_as_default() {
+    use focusforge_gui::editor_settings::{self, EditorSettings};
+
+    let on = EditorSettings { preview: true };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.toml");
+
+    assert_eq!(editor_settings::load(dir.path()), EditorSettings::default());
+    assert!(!path.exists(), "load writes nothing when there is no file");
+
+    // A well-formed value is read, so the cases below are not defaults by
+    // accident.
+    fs::write(&path, "[editor]\npreview = true\n").unwrap();
+    assert_eq!(editor_settings::load(dir.path()), on);
+
+    let cases: [(&str, &[u8]); 7] = [
+        ("empty file", b""),
+        ("no [editor] table", b"[recent]\nx = 1\n"),
+        ("no preview key", b"[editor]\nother = true\n"),
+        ("string value", b"[editor]\npreview = \"yes\"\n"),
+        ("integer value", b"[editor]\npreview = 1\n"),
+        ("[editor] is not a table", b"editor = true\n"),
+        ("not TOML", b"[editor\npreview = true ===\n"),
+    ];
+    for (case, contents) in cases {
+        fs::write(&path, contents).unwrap();
+        assert_eq!(
+            editor_settings::load(dir.path()),
+            EditorSettings::default(),
+            "{case}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), contents, "{case}: file untouched");
+    }
+}
+
+#[test]
+fn editor_preview_round_trips() {
+    use focusforge_gui::editor_settings::{self, EditorSettings};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.toml");
+
+    for preview in [true, false, true] {
+        let settings = EditorSettings { preview };
+        editor_settings::save(dir.path(), settings).unwrap();
+        let table: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(
+            table["editor"]["preview"],
+            toml::Value::Boolean(preview),
+            "saved as a TOML boolean"
+        );
+        assert_eq!(editor_settings::load(dir.path()), settings);
+    }
+}
+
+#[test]
+fn saving_editor_preview_keeps_hand_edited_siblings() {
+    use focusforge_gui::editor_settings::{self, EditorSettings};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.toml");
+    let before = "# my notes\n[input]\n# rebinding kept\n\n[recent]\nkeep = \"yes\" # hand edited\n\n\
+                  [appearance]\npresentation = \"large\" # chosen\n\n[zzz]\n# unknown table\nx = [1, 2] # c\n";
+    fs::write(&path, before).unwrap();
+
+    editor_settings::save(dir.path(), EditorSettings { preview: true }).unwrap();
+    let saved = fs::read_to_string(&path).unwrap();
+    assert!(
+        saved.starts_with(before),
+        "siblings byte-identical: {saved}"
+    );
+    assert!(saved.contains("preview = true"), "{saved}");
+
+    // Rewriting an `[editor]` table that sits between siblings changes only
+    // that table.
+    let after = "# tail\n[zzz2]\n# unknown table\ny = [3] # c\n";
+    let middle = format!("{before}[editor]\npreview = true\n\n{after}");
+    fs::write(&path, &middle).unwrap();
+    editor_settings::save(dir.path(), EditorSettings { preview: false }).unwrap();
+    let saved = fs::read_to_string(&path).unwrap();
+    assert!(saved.starts_with(before), "leading siblings kept: {saved}");
+    assert!(saved.ends_with(after), "trailing sibling kept: {saved}");
+    assert!(saved.contains("preview = false"), "{saved}");
+    assert_eq!(saved.matches("[editor]").count(), 1, "{saved}");
+}
+
+#[test]
+fn editor_preview_save_failure_leaves_file_untouched() {
+    use focusforge_gui::editor_settings::{self, EditorSettings};
+    use focusforge_gui::settings::WriteError;
+
+    let on = EditorSettings { preview: true };
+    type Case<'a> = (&'a str, &'a [u8], fn(&WriteError) -> bool);
+    let files: [Case; 2] = [
+        ("unparseable", b"[editor\npreview = false ===\n", |e| {
+            matches!(e, WriteError::Parse { .. })
+        }),
+        ("non-UTF-8", b"[input]\n# \xff\xfe garbage\n", |e| {
+            matches!(e, WriteError::CouldNotRead { .. })
+        }),
+    ];
+    for (case, original, expected) in files {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        fs::write(&path, original).unwrap();
+
+        let err = editor_settings::save(dir.path(), on).expect_err(case);
+        assert!(expected(&err), "{case}: wrong error: {err:?}");
+
+        let mut controller = focusforge_gui::AppController::new();
+        controller.install_recent(Vec::new(), dir.path().to_path_buf());
+        controller.toggle_brush_preview();
+        assert!(
+            controller.brush_preview(),
+            "{case}: the session still flips"
+        );
+        assert_eq!(fs::read(&path).unwrap(), original, "{case}: file untouched");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("focusforge");
+        fs::create_dir_all(&sub).unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let err = editor_settings::save(&sub, on).expect_err("unwritable dir");
+        assert!(
+            matches!(err, WriteError::Write { .. }),
+            "unwritable dir: wrong error: {err:?}"
+        );
+        let mut controller = focusforge_gui::AppController::new();
+        controller.install_recent(Vec::new(), sub.clone());
+        controller.toggle_brush_preview();
+        assert!(controller.brush_preview(), "unwritable dir: session flips");
+        assert!(!sub.join("settings.toml").exists());
+
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}

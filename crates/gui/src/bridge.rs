@@ -2694,6 +2694,7 @@ pub fn push_editor_toolbar(app: &AppWindow, controller: &AppController) {
     app.set_brush_mode_menu_open(view.mode_menu_open);
     app.set_brush_opacity_text(format!("{:.0}%", view.opacity).into());
     app.set_brush_opacity_fraction(view.opacity_fraction);
+    app.set_brush_preview(view.preview);
     app.set_brush_picking(view.picking);
     app.set_can_undo(view.can_undo);
     app.set_can_redo(view.can_redo);
@@ -3720,6 +3721,10 @@ pub fn install(
                 controller.set_overlay_opacity_fraction(fraction);
             });
         }
+    });
+    app.on_brush_preview_toggled({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().toggle_brush_preview()
     });
     app.on_pipette_toggled({
         let controller = controller.clone();

@@ -825,6 +825,38 @@ fn edit_session_is_per_tab_and_survives_mode_switches() {
 }
 
 #[test]
+fn brush_preview_state_is_window_wide() {
+    let mut controller = scratch_controller("brush_preview_window_wide");
+    open_fused_tab(&mut controller, "brush_preview_a", 2);
+    assert!(controller.set_mode(ShellMode::Editor));
+    assert!(!controller.brush_preview(), "off until switched on");
+
+    // The switch's callback path.
+    controller.toggle_brush_preview();
+    assert!(controller.brush_preview());
+    assert!(controller.brush_toolbar_view().preview);
+
+    controller.set_mode(ShellMode::Stacking);
+    open_fused_tab(&mut controller, "brush_preview_b", 3);
+    controller.set_mode(ShellMode::Stacking);
+    assert!(controller.set_mode(ShellMode::Editor));
+    assert!(controller.brush_preview(), "a newly opened tab shares it");
+
+    controller.select_project(0);
+    assert!(controller.brush_preview(), "switching tabs keeps it");
+
+    // The key's path flips the same state.
+    controller.key(true, "p", focusforge_gui::input_map::Modifiers::NONE);
+    assert!(!controller.brush_preview());
+    controller.select_project(1);
+    assert!(!controller.brush_preview(), "the other tab sees the flip");
+    controller.toggle_brush_preview();
+    controller.select_project(0);
+    assert!(controller.brush_preview());
+    assert!(controller.brush_toolbar_view().preview);
+}
+
+#[test]
 fn edit_session_follows_the_newest_planes() {
     let mut controller = scratch_controller("edit_session_newest");
     open_fused_tab(&mut controller, "edit_session_newest", 3);
