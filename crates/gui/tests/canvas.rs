@@ -1202,6 +1202,418 @@ fn fit_zoom_redraw_reads_a_pane_sized_image() {
     }
 }
 
+/// One 60 Hz frame.
+const FRAME_BUDGET: Duration = Duration::from_micros(16_700);
+const PREVIEW_WARMUP_UPDATES: usize = 10;
+const PREVIEW_TIMED_UPDATES: usize = 120;
+const PREVIEW_SOURCE_STEPS: usize = 20;
+
+/// What one brush preview update cost and did.
+struct PreviewUpdate {
+    /// The layer's size in texels, `None` when no layer came back.
+    layer: Option<(u32, u32)>,
+    /// The preview call and the image bind.
+    call: Duration,
+    /// `call` plus the wait for the submitted GPU work.
+    total: Duration,
+    submits: u64,
+    buffers: u64,
+    uploaded: u64,
+}
+
+/// A renderer holding both published panes and their backdrops, and the
+/// window the preview image is bound into.
+struct PreviewRig<'a> {
+    renderer: focusforge_gui::gpu_canvas::CanvasRenderer,
+    app: &'a AppWindow,
+    device: slint::wgpu_29::wgpu::Device,
+}
+
+impl PreviewRig<'_> {
+    /// One update as the UI thread runs it: the preview layer, then its bind
+    /// into the composite pane, then (timed apart) the wait for the GPU.
+    fn update(
+        &mut self,
+        spec: &focusforge_gui::brush::BrushPreviewSpec,
+        draw: &focusforge_gui::viewport::PaneDraw,
+    ) -> PreviewUpdate {
+        use focusforge_core::timing::timing_snapshot;
+
+        let before = timing_snapshot().expect("trace accounting is enabled");
+        let start = Instant::now();
+        let layer = self.renderer.brush_preview_layer(spec, draw);
+        let size = layer.as_ref().map(|(image, _)| image.size());
+        focusforge_gui::bridge::show_brush_preview(self.app, None, None, layer);
+        let call = start.elapsed();
+        self.device
+            .poll(slint::wgpu_29::wgpu::PollType::wait_indefinitely())
+            .expect("the device finishes the preview's work");
+        let total = start.elapsed();
+        let after = timing_snapshot().expect("trace accounting is enabled");
+        PreviewUpdate {
+            layer: size.map(|s| (s.width, s.height)),
+            call,
+            total,
+            submits: after.cpu_submissions - before.cpu_submissions,
+            buffers: after.buffer_creations - before.buffer_creations,
+            uploaded: after.upload_bytes - before.upload_bytes,
+        }
+    }
+
+    /// Reads and publishes `job`; `false` when there was no job to run.
+    fn publish(&mut self, job: Option<focusforge_gui::canvas::PaneJob>) -> bool {
+        let Some(job) = job else {
+            return false;
+        };
+        let (width, height) = job.draw.extent();
+        let mut samples =
+            vec![0u16; width as usize * height as usize * job.reader.samples_per_pixel() as usize];
+        let (x, y, w, h) = job.draw.src;
+        let rect = focusforge_core::tile::Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        job.reader
+            .read_step_into(rect, job.draw.step, &mut samples)
+            .expect("the source reads");
+        self.renderer
+            .publish(&job, &samples)
+            .expect("a fresh job publishes");
+        true
+    }
+}
+
+/// Median, 95th percentile and worst of `times`, in milliseconds.
+fn preview_spread(times: &mut [Duration]) -> (f64, f64, f64) {
+    times.sort();
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    let p95 = (times.len() * 95).div_ceil(100) - 1;
+    (
+        ms(times[times.len() / 2]),
+        ms(times[p95]),
+        ms(times[times.len() - 1]),
+    )
+}
+
+/// The source frame and result image a preview case runs over.
+struct PreviewImage {
+    label: &'static str,
+    plane: PathBuf,
+    sources: [PathBuf; 2],
+    /// Stands in for a checkpoint's render, which the renderer opens as a
+    /// frame.
+    checkpoint: Option<PathBuf>,
+}
+
+/// The brush preview update cost: one update (the preview layer, its bind,
+/// the GPU wait) for the largest on-screen brush in each mode, and a source
+/// change followed by the preview, per image, pane and zoom.
+#[test]
+#[ignore = "reads the 16 GB reference stack"]
+fn brush_preview_update_cost() {
+    use focusforge_core::project::BrushMode;
+    use focusforge_core::retouch::preview::brush_preview_bounds;
+    use focusforge_core::timing::enable_trace_accounting;
+    use focusforge_gui::brush::preview_spec;
+    use focusforge_gui::gpu_canvas::{CanvasRenderer, PreviewTier};
+    use focusforge_gui::viewport::{ImageSize, backdrop_draw, fit};
+
+    const LAVAPIPE_ICD: &str = "/usr/share/vulkan/icd.d/lvp_icd.json";
+    let software = std::env::var_os("VK_DRIVER_FILES").is_some();
+    if software && !Path::new(LAVAPIPE_ICD).exists() {
+        println!("SKIP: lavapipe ICD missing");
+        return;
+    }
+    enable_trace_accounting();
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let adapter = shared.info().name.clone();
+    println!("{}", focusforge_gpu::device::adapter_report(shared.info()));
+    let llvmpipe = adapter.to_lowercase().contains("llvmpipe");
+    if software {
+        assert!(llvmpipe, "the software run selects llvmpipe, got {adapter}");
+    } else if llvmpipe {
+        println!("SKIP: no hardware adapter");
+        return;
+    }
+    if cfg!(debug_assertions) {
+        println!("SKIP: timing bound needs --release");
+    }
+
+    // The composite pane of a maximised 1080p window.
+    common::init_window_backend();
+    let app = AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1920, 1080));
+    app.set_project_loaded(true);
+    app.set_mode("editor".into());
+    slint::platform::update_timers_and_animations();
+    let big = ElementQuery::from_root(&app)
+        .match_id("FFCanvas::pane-right")
+        .find_first()
+        .expect("the composite pane exists")
+        .size();
+    let pane = |width: f32, height: f32| PaneRect {
+        x: 0.0,
+        y: 0.0,
+        width,
+        height,
+        scale_factor: 1.0,
+    };
+    let panes = [
+        ("566x377", pane(566.0, 377.0)),
+        ("1080p", pane(big.width, big.height)),
+    ];
+
+    let mut images = vec![PreviewImage {
+        label: "mantis-512",
+        plane: golden_plane_files().0,
+        sources: [
+            common::fixture_frame("mantis-512", 0),
+            common::fixture_frame("mantis-512", 1),
+        ],
+        checkpoint: Some(common::workspace_root().join("fixtures/mantis-512/reference.tif")),
+    }];
+    match common::reference_stack_dir() {
+        Some(stack_dir) => {
+            let mut frames = focusforge_core::io::frame_paths(&stack_dir)
+                .expect("frame_paths must enumerate the directory")
+                .into_iter()
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.contains("IMG_"))
+                });
+            let mut next = || {
+                frames
+                    .next()
+                    .expect("the reference stack holds three frames")
+            };
+            images.push(PreviewImage {
+                label: "reference-frame",
+                plane: next(),
+                sources: [next(), next()],
+                checkpoint: None,
+            });
+        }
+        None => println!("SKIP: FOCUSFORGE_REFERENCE_STACK is not set"),
+    }
+
+    let mut misses: Vec<String> = Vec::new();
+    for image in &images {
+        let header = TiffHeader::open(&image.plane).expect("the result image has a header");
+        let size = ImageSize {
+            width: header.width,
+            height: header.height,
+        };
+        // The size ceiling: the shorter side.
+        let radius = size.width.min(size.height) as f32 / 2.0;
+        for (pane_label, pane) in panes {
+            for full_disc in [false, true] {
+                let zoom = if full_disc { "disc covers pane" } else { "fit" };
+                let case = format!("{} {pane_label} {zoom}", image.label);
+                let mut view = fit(size, pane);
+                if full_disc {
+                    let half_diagonal = f64::from(pane.width).hypot(f64::from(pane.height)) / 2.0;
+                    let anchor = (pane.width / 2.0, pane.height / 2.0);
+                    let mut zoomed = 0;
+                    while f64::from(radius) * view.scale() < half_diagonal {
+                        assert!(zoomed < 64, "{case}: no zoom step covers the pane");
+                        view.zoom_steps(1, anchor, size, pane);
+                        zoomed += 1;
+                    }
+                }
+                let draw = view.draw(size, pane).expect("the view draws");
+                let backdrop = backdrop_draw(size, pane).expect("the pane has a backdrop");
+
+                let mut renderer = CanvasRenderer::new();
+                renderer.attach_device(shared.device().clone(), shared.queue().clone());
+                renderer
+                    .set_planes(&image.plane, None)
+                    .expect("the result image opens");
+                renderer
+                    .set_frame(&image.sources[0], None, job::host_budget())
+                    .expect("the source frame opens");
+                let mut rig = PreviewRig {
+                    renderer,
+                    app: &app,
+                    device: shared.device().clone(),
+                };
+                assert!(rig.renderer.redraw_planes(&draw, None, None).is_some());
+                assert!(rig.renderer.redraw_frame(&draw).is_some());
+                let job = rig.renderer.request_plane_backdrop(&backdrop, None, None);
+                rig.publish(job);
+                let job = rig.renderer.request_frame_backdrop(&backdrop);
+                rig.publish(job);
+
+                let (x, y, w, h) = draw.src;
+                let centre = (
+                    f64::from(x) + f64::from(w) / 2.0,
+                    f64::from(y) + f64::from(h) / 2.0,
+                );
+                let step = f64::from(draw.step.get());
+                let expected_tier = if full_disc {
+                    PreviewTier::Backdrop
+                } else {
+                    PreviewTier::Exact
+                };
+
+                for mode in [
+                    BrushMode::Normal,
+                    BrushMode::Lighten,
+                    BrushMode::Darken,
+                    BrushMode::Detail,
+                ] {
+                    let label = format!("{case} {mode:?}");
+                    // The centre alternates by one display step, so the memo
+                    // never answers.
+                    let spec = |i: usize| {
+                        let dx = if i.is_multiple_of(2) { step } else { -step };
+                        preview_spec((centre.0 + dx, centre.1), radius, 0.5, mode, 1.0)
+                    };
+                    let grids = rig
+                        .renderer
+                        .brush_preview_grids(&spec(0))
+                        .unwrap_or_else(|| panic!("{label}: the panes answer the brush"));
+                    assert_eq!(grids.tier, expected_tier, "{label}: the answering tier");
+                    let (tier, grid_step) = (grids.tier, grids.result.step);
+                    let bounds =
+                        brush_preview_bounds((size.width, size.height), &spec(0), grid_step)
+                            .expect("the brush has a footprint");
+
+                    let (mut calls, mut totals) = (Vec::new(), Vec::new());
+                    let (mut layer, mut submits, mut buffers, mut uploaded) = ((0, 0), 0, 0, 0);
+                    for i in 0..PREVIEW_WARMUP_UPDATES + PREVIEW_TIMED_UPDATES {
+                        let update = rig.update(&spec(i), &draw);
+                        assert!(
+                            update.layer.is_some(),
+                            "{label}: update {i} returns a layer"
+                        );
+                        assert!(
+                            update.submits >= 1,
+                            "{label}: update {i} submits GPU work (the memo missed)"
+                        );
+                        if i >= PREVIEW_WARMUP_UPDATES {
+                            calls.push(update.call);
+                            totals.push(update.total);
+                            layer = update.layer.expect("checked above");
+                            submits = update.submits;
+                            buffers = update.buffers;
+                            uploaded = update.uploaded;
+                        }
+                    }
+                    let call = preview_spread(&mut calls);
+                    let total = preview_spread(&mut totals);
+                    println!(
+                        "{} | {adapter} | {case} | {mode:?} | scale {:.3} | tier {tier:?} step {} \
+                         bounds {}x{} | layer {}x{} = {} texels | per update: {submits} submits, \
+                         {buffers} buffers, {uploaded} bytes uploaded | call ms median {:.2} p95 \
+                         {:.2} worst {:.2} | total ms median {:.2} p95 {:.2} worst {:.2}",
+                        image.label,
+                        view.scale(),
+                        grid_step,
+                        bounds.width,
+                        bounds.height,
+                        layer.0,
+                        layer.1,
+                        layer.0 * layer.1,
+                        call.0,
+                        call.1,
+                        call.2,
+                        total.0,
+                        total.1,
+                        total.2,
+                    );
+                    if total.1 > FRAME_BUDGET.as_secs_f64() * 1e3 {
+                        misses.push(format!("{label}: p95 {:.2} ms", total.1));
+                    }
+                }
+
+                // A source change in Detail mode: the app's order is the
+                // change, the update after it, the exact frame publish, the
+                // update, then the frame backdrop when it is the tier that
+                // answers.
+                let mut pairs = vec![("frame->frame", &image.sources[1])];
+                if let Some(checkpoint) = &image.checkpoint {
+                    pairs.push(("frame->checkpoint", checkpoint));
+                }
+                let detail = preview_spec(centre, radius, 0.5, BrushMode::Detail, 1.0);
+                for (kind, other) in pairs {
+                    let label = format!("{case} source change {kind}");
+                    let (mut to_publish, mut calls, mut totals) =
+                        (Vec::new(), Vec::new(), Vec::new());
+                    let mut gaps = 0;
+                    // The memo holds the detail brush's layer before the first change.
+                    assert!(rig.update(&detail, &draw).layer.is_some(), "{label}: seed");
+                    for i in 0..PREVIEW_SOURCE_STEPS {
+                        let next = if i.is_multiple_of(2) {
+                            other
+                        } else {
+                            &image.sources[0]
+                        };
+                        let start = Instant::now();
+                        rig.renderer
+                            .set_frame(next, None, job::host_budget())
+                            .expect("the next source opens");
+                        gaps += usize::from(rig.update(&detail, &draw).layer.is_none());
+                        let job = rig.renderer.request_frame(&draw);
+                        assert!(rig.publish(job), "{label}: the exact frame job runs");
+                        if expected_tier == PreviewTier::Backdrop {
+                            gaps += usize::from(rig.update(&detail, &draw).layer.is_none());
+                            let job = rig.renderer.request_frame_backdrop(&backdrop);
+                            assert!(rig.publish(job), "{label}: the backdrop job runs");
+                        }
+                        to_publish.push(start.elapsed());
+                        let update = rig.update(&detail, &draw);
+                        assert!(
+                            update.layer.is_some(),
+                            "{label}: step {i} shows the new source"
+                        );
+                        assert!(
+                            update.submits >= 1,
+                            "{label}: step {i} builds a fresh layer"
+                        );
+                        calls.push(update.call);
+                        totals.push(update.total);
+                    }
+                    let published = preview_spread(&mut to_publish);
+                    let call = preview_spread(&mut calls);
+                    let total = preview_spread(&mut totals);
+                    println!(
+                        "{} | {adapter} | {label} | change to publish ms median {:.2} p95 {:.2} worst \
+                         {:.2} | publish to preview call ms median {:.2} p95 {:.2} worst {:.2} | \
+                         publish to preview total ms median {:.2} p95 {:.2} worst {:.2} | in-between \
+                         updates with no layer: {gaps} of {}",
+                        image.label,
+                        published.0,
+                        published.1,
+                        published.2,
+                        call.0,
+                        call.1,
+                        call.2,
+                        total.0,
+                        total.1,
+                        total.2,
+                        PREVIEW_SOURCE_STEPS
+                            * (1 + usize::from(expected_tier == PreviewTier::Backdrop)),
+                    );
+                    if total.1 > FRAME_BUDGET.as_secs_f64() * 1e3 {
+                        misses.push(format!("{label}: publish to preview p95 {:.2} ms", total.1));
+                    }
+                }
+            }
+        }
+    }
+    if !cfg!(debug_assertions) {
+        assert!(
+            misses.is_empty(),
+            "p95 over the {FRAME_BUDGET:?} frame: {misses:#?}"
+        );
+    }
+}
+
 const GEOMETRY_EPS: f32 = 0.5;
 
 #[test]
