@@ -51,11 +51,11 @@ fn three_group_dump(dir: &Path) -> PathBuf {
     dir.to_path_buf()
 }
 
-/// The number of entries the align stage cache holds under
-/// `<cwd>/.scratch/stage-cache/align/` -- `crates/core/src/job/stage_cache.rs`'s
+/// The number of entries the stage cache holds for `stage` under
+/// `<cwd>/.scratch/stage-cache/<stage>/` -- `crates/core/src/job/stage_cache.rs`'s
 /// store path, `<scratch_base>/stage-cache/<stage>/<digest16>.json`.
-fn cache_entry_count(cwd: &Path) -> usize {
-    std::fs::read_dir(cwd.join(".scratch").join("stage-cache").join("align"))
+fn cache_entry_count(cwd: &Path, stage: &str) -> usize {
+    std::fs::read_dir(cwd.join(".scratch").join("stage-cache").join(stage))
         .into_iter()
         .flatten()
         .flatten()
@@ -291,7 +291,7 @@ fn no_cache_flag_forces_a_recompute() {
     a_args.extend_from_slice(&common_args);
     let a = run_cli_in(&cwd, &a_args);
     assert!(a.success, "stderr: {}", a.stderr);
-    let entries_after_a = cache_entry_count(&cwd);
+    let entries_after_a = cache_entry_count(&cwd, "align");
     assert_eq!(
         entries_after_a, 1,
         "the first run must populate the cache exactly once"
@@ -319,7 +319,7 @@ fn no_cache_flag_forces_a_recompute() {
     );
 
     assert_eq!(
-        cache_entry_count(&cwd),
+        cache_entry_count(&cwd, "align"),
         entries_after_a,
         "--no-cache must leave no entry behind"
     );
@@ -386,7 +386,7 @@ fn cache_clear_removes_entries_and_nothing_else() {
     );
     assert!(run.success, "stderr: {}", run.stderr);
     assert_eq!(
-        cache_entry_count(&cwd),
+        cache_entry_count(&cwd, "align"),
         1,
         "the run must have written one cache entry"
     );
@@ -417,7 +417,7 @@ fn cache_clear_removes_entries_and_nothing_else() {
     assert_eq!(clear_report["removed"], 1);
 
     assert_eq!(
-        cache_entry_count(&cwd),
+        cache_entry_count(&cwd, "align"),
         0,
         "cache clear must empty the stage cache"
     );
@@ -439,7 +439,7 @@ fn cache_clear_removes_entries_and_nothing_else() {
     let multiple_report: serde_json::Value =
         serde_json::from_str(&multiple.stdout).expect("--json");
     assert_eq!(multiple_report["removed"], 2);
-    assert_eq!(cache_entry_count(&cwd), 0);
+    assert_eq!(cache_entry_count(&cwd, "align"), 0);
 
     assert_eq!(
         std::fs::read(ledger_dir.join("job.json")).unwrap(),
@@ -698,7 +698,7 @@ fn the_cache_stays_in_the_scratch_directory() {
         cwd.join(".scratch").join("stage-cache").is_dir(),
         "the store must sit at .scratch/stage-cache/"
     );
-    assert_eq!(cache_entry_count(&cwd), 1);
+    assert_eq!(cache_entry_count(&cwd, "align"), 1);
 
     for entry in walk(&out) {
         assert!(
@@ -716,4 +716,99 @@ fn the_cache_stays_in_the_scratch_directory() {
             .any(|window| window == needle),
         "no byte sequence naming the cache may appear inside the sealed project"
     );
+}
+
+// --- equalization estimate ---------------------------------------------
+
+/// One `dummy-stack` / `dummy-align` run over `fixtures/mantis-512` with
+/// equalization on, under `cwd`; `extra` is appended to the arguments.
+fn equalized_run(cwd: &Path, label: &str, extra: &[&str]) -> (CliOutput, serde_json::Value) {
+    let input = mantis_512_dir();
+    let out = cwd.join(format!("out_{label}"));
+    std::fs::create_dir_all(&out).unwrap();
+    let mut args = vec![
+        "stack",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--algorithm",
+        "dummy-stack",
+        "--align-algorithm",
+        "dummy-align",
+        "--set",
+        "equalize=true",
+        "--json",
+    ];
+    args.extend_from_slice(extra);
+    let run = run_cli_in(cwd, &common::push_no_gpu(args));
+    assert!(run.success, "{label} stderr: {}", run.stderr);
+    let report = serde_json::from_str(&run.stdout).expect("--json");
+    (run, report)
+}
+
+#[test]
+fn an_unchanged_rerun_reuses_the_equalization_estimate() {
+    let cwd = tmp_dir("cache_cli_equalization_reuse");
+
+    let (first, first_report) = equalized_run(&cwd, "a", &[]);
+    assert_eq!(first_report["equalization_cached"], false);
+    assert!(
+        first
+            .stderr
+            .lines()
+            .any(|l| l == "prepare 8 frames (brightness)"),
+        "stderr: {}",
+        first.stderr
+    );
+
+    let (second, second_report) = equalized_run(&cwd, "b", &[]);
+    assert_eq!(
+        second_report["equalization_cached"], true,
+        "{second_report}"
+    );
+    assert_eq!(
+        second_report["equalization"], first_report["equalization"],
+        "the cached estimate reports exactly what the fresh one did"
+    );
+    assert!(
+        second
+            .stderr
+            .lines()
+            .any(|l| l == "prepare 8 frames (reused from the stage cache)"),
+        "stderr: {}",
+        second.stderr
+    );
+    assert!(
+        !second.stderr.contains("prepare 8 frames (brightness)"),
+        "a hit must not print the computed-estimate stage line: {}",
+        second.stderr
+    );
+}
+
+#[test]
+fn equalization_entry_honours_no_cache_and_clear() {
+    let cwd = tmp_dir("cache_cli_equalization_no_cache");
+
+    let (_, bypassed) = equalized_run(&cwd, "no_cache", &["--no-cache"]);
+    assert_eq!(bypassed["equalization_cached"], false);
+    assert_eq!(
+        cache_entry_count(&cwd, "equalize"),
+        0,
+        "--no-cache writes no entry"
+    );
+
+    let (_, seeded) = equalized_run(&cwd, "seed", &[]);
+    assert_eq!(seeded["equalization_cached"], false);
+    assert_eq!(cache_entry_count(&cwd, "equalize"), 1);
+
+    let (_, rerun) = equalized_run(&cwd, "no_cache_again", &["--no-cache"]);
+    assert_eq!(
+        rerun["equalization_cached"], false,
+        "--no-cache does not read the entry"
+    );
+    assert_eq!(cache_entry_count(&cwd, "equalize"), 1);
+
+    let clear = run_cli_in(&cwd, &["cache", "clear"]);
+    assert!(clear.success, "stderr: {}", clear.stderr);
+    assert_eq!(cache_entry_count(&cwd, "equalize"), 0);
 }

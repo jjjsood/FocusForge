@@ -40,9 +40,9 @@ use crate::io::{
 };
 use crate::job::prediction::{RawSource, fuse_tile_cost, predict_run};
 use crate::job::{
-    AlignIdentity, ControlState, FrameFingerprint, Job, JobControl, JobOutcome, JobProgress,
-    JobRecord, JobStage, RecordingConsumer, Resumable, ResumeStore, StackFingerprint, StageCache,
-    StageKey, TimingConsumer, read_alignment,
+    AlignIdentity, ControlState, EqualizeKey, FrameFingerprint, Job, JobControl, JobOutcome,
+    JobProgress, JobRecord, JobStage, RecordingConsumer, Resumable, ResumeStore, StackFingerprint,
+    StageCache, StageKey, TimingConsumer, read_alignment,
 };
 use crate::params::{self, ParamValue, ParamValues, Provenance, ResolvedParams};
 use crate::project::{
@@ -223,6 +223,9 @@ pub struct FuseReport {
     pub align: Option<FuseAlignReport>,
     /// The brightness equalization's estimate; `None` when it was off.
     pub equalization: Option<EqualizationReport>,
+    /// The brightness estimate came from the stage cache; `false` when it was
+    /// computed or equalization was off.
+    pub equalization_cached: bool,
     pub align_cached: bool,
     pub align_source: String,
     pub align_workers: Option<usize>,
@@ -422,10 +425,11 @@ pub enum RunStage {
     },
     /// Brightness preparation of `frames` sources, before alignment. The
     /// stage counts to `units`: one per strip read, or one per frame for a
-    /// RAW source.
+    /// RAW source. An estimate taken from the stage cache counts no units.
     Prepare {
         frames: usize,
         units: usize,
+        source: PrepareSource,
     },
     Align {
         frames: usize,
@@ -473,6 +477,14 @@ pub enum AlignSource {
     Computed,
     Cached,
     Resumed,
+}
+
+/// How the brightness estimate is about to be satisfied: read from the
+/// sources, or taken from the stage cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareSource {
+    Computed,
+    Cached,
 }
 
 /// A front end's presentational hooks into [`run`]. Every method has a
@@ -972,37 +984,74 @@ pub fn run(
         }
     }
 
+    // The sources' content hashes, one frame at a time through the memo the
+    // background hash thread fills; a frame that cannot be hashed is a miss,
+    // and the seal reports the failure itself.
+    let frame_hash = |i: usize| {
+        project::source_hash_change_checked(&request.frames[i])
+            .ok()
+            .map(|(_, hash)| hash)
+    };
+    let mut equalization_cached = false;
+    // A fresh estimate, written to the stage cache once every hash is memoised.
+    let mut pending_estimate: Option<(EqualizeKey, EqualizationReport)> = None;
     let equalization = match request.equalize {
         Some(settings) => {
-            let units =
-                equalize::prepare_units(frame_reader, frame_reader.len(), (width, height), spp)?;
-            let frames_done = control.begin_prepare(units);
-            control.set_stage(JobStage::Prepare);
-            observer.stage(RunStage::Prepare {
-                frames: frame_reader.len(),
-                units,
-            });
-            let estimated = with_progress_ticks(observer, &control, request.poll, || {
-                let _prepare = equalize_scope();
-                equalize::estimate(
+            // A RAW stack's estimate reads no frame, so there is nothing to reuse.
+            let estimate_key =
+                (request.cache && stage_cache.is_some() && frame_reader.linear_means(0)?.is_none())
+                    .then(|| EqualizeKey::new(&fingerprint, settings));
+            let cached = estimate_key
+                .as_ref()
+                .zip(stage_cache)
+                .and_then(|(key, cache)| cache.get_equalization(key, frame_hash));
+            let report = if let Some(report) = cached {
+                equalization_cached = true;
+                control.set_stage(JobStage::Prepare);
+                observer.stage(RunStage::Prepare {
+                    frames: frame_reader.len(),
+                    units: 0,
+                    source: PrepareSource::Cached,
+                });
+                report
+            } else {
+                let units = equalize::prepare_units(
                     frame_reader,
                     frame_reader.len(),
                     (width, height),
                     spp,
-                    settings,
-                    workers,
-                    &frames_done,
-                    &cancel_requested,
-                )
-            });
-            let report = match estimated {
-                Err(AlgorithmError::Cancelled) => {
-                    return Ok(FuseOutcome::Cancelled {
-                        units_done: 0,
-                        unit_total: 0,
-                    });
-                }
-                other => other?,
+                )?;
+                let frames_done = control.begin_prepare(units);
+                control.set_stage(JobStage::Prepare);
+                observer.stage(RunStage::Prepare {
+                    frames: frame_reader.len(),
+                    units,
+                    source: PrepareSource::Computed,
+                });
+                let estimated = with_progress_ticks(observer, &control, request.poll, || {
+                    let _prepare = equalize_scope();
+                    equalize::estimate(
+                        frame_reader,
+                        frame_reader.len(),
+                        (width, height),
+                        spp,
+                        settings,
+                        workers,
+                        &frames_done,
+                        &cancel_requested,
+                    )
+                });
+                let report = match estimated {
+                    Err(AlgorithmError::Cancelled) => {
+                        return Ok(FuseOutcome::Cancelled {
+                            units_done: 0,
+                            unit_total: 0,
+                        });
+                    }
+                    other => other?,
+                };
+                pending_estimate = estimate_key.map(|key| (key, report.clone()));
+                report
             };
             for (frame, notice) in report.notices() {
                 observer.frame_notice(frame, &notice);
@@ -1083,14 +1132,6 @@ pub fn run(
             alignment_result = Some((align_req.algorithm, align_resolved, policy, alignment));
         } else {
             let stage_key = StageKey::align(&fingerprint, &identity);
-            // The sources' content hashes, one frame at a time through the
-            // memo the background hash thread fills; a frame that cannot be
-            // hashed is a miss, and the seal reports the failure itself.
-            let frame_hash = |i: usize| {
-                project::source_hash_change_checked(&request.frames[i])
-                    .ok()
-                    .map(|(_, hash)| hash)
-            };
             let cache_hit = if request.cache {
                 stage_cache.and_then(|cache| cache.get_alignment(&stage_key, frame_hash))
             } else {
@@ -1550,6 +1591,17 @@ pub fn run(
 
     observer.stage(RunStage::Seal);
     let _ = source_hashes.join();
+    // A cache write failure costs a missed optimisation next run, never this
+    // one.
+    if let Some((key, report)) = &pending_estimate
+        && let Some(cache) = stage_cache
+        && let Some(content) = (0..request.frames.len())
+            .map(frame_hash)
+            .collect::<Option<Vec<_>>>()
+        && let Err(err) = cache.put_equalization(key, &request.frames, &content, report)
+    {
+        observer.notice(&format!("warning: {err}"));
+    }
     let metrics = measure_metrics(&staged_composite, frame_reader, &gain_reader, workers);
     let align_record =
         alignment_result
@@ -1685,6 +1737,7 @@ pub fn run(
         description,
         align: align_report,
         equalization,
+        equalization_cached,
         align_cached,
         align_source,
         align_workers,

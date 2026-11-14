@@ -290,6 +290,11 @@ const BINS: usize = 1 << 16;
 /// Samples held by one strip buffer, about.
 const STRIP_SAMPLES: usize = 1 << 21;
 
+/// The estimator's revision. Bump it on any change that can move a gain or a
+/// figure of an [`EqualizationReport`], so reports computed before the change
+/// are not reused from the stage cache.
+pub const EQUALIZE_ESTIMATE_VERSION: u32 = 1;
+
 /// One gain per frame bringing its whole-image mean (every sample of every
 /// channel) to `neutral * 2^target_stops`, `neutral` being the mean of the
 /// frames' means. The gain is `target / mean` limited to

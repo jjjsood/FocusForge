@@ -484,6 +484,7 @@ mod stage_tests {
         observer.stage(RunStage::Prepare {
             frames: 2,
             units: 2,
+            source: focusforge_core::pipeline::PrepareSource::Computed,
         });
         observer.stage(RunStage::Fuse);
         assert_eq!(

@@ -34,7 +34,7 @@ use focusforge_core::job::{
 use focusforge_core::params::{ParamDesc, ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{
     AlignRequest, FreeSpaceProbe, FuseOutcome, FuseOutput, FuseProduct, FuseReport, FuseRequest,
-    PipelineError, RunStage, StageObserver, VolumeShortfall, VolumeSpace,
+    PipelineError, PrepareSource, RunStage, StageObserver, VolumeShortfall, VolumeSpace,
 };
 use focusforge_core::project::{self, Project};
 use focusforge_core::registry;
@@ -1246,7 +1246,7 @@ impl PrepareTickLog {
 
 impl StageObserver for PrepareTickLog {
     fn stage(&self, stage: RunStage) {
-        if let RunStage::Prepare { frames, units } = stage {
+        if let RunStage::Prepare { frames, units, .. } = stage {
             *self.announced.lock().expect("no panic while logging") = Some((frames, units));
         }
         if matches!(stage, RunStage::Align { .. }) {
@@ -3099,7 +3099,14 @@ fn an_unhashable_frame_is_a_stage_cache_miss() {
     ));
     assert!(!populated.align_cached);
     assert_eq!(entry_count(), 1, "the readable run populates the cache");
+    // A cached estimate would map no frame before the notice, and the lock
+    // would then fail the run's own tile reads.
+    std::fs::remove_dir_all(root.join("scratch/stage-cache/equalize")).unwrap();
     let report = locked_run("second").expect("the frame is still unreadable");
+    assert!(
+        !report.equalization_cached,
+        "the estimate must run again so the frames are mapped before the lock"
+    );
     assert!(
         !report.align_cached,
         "a frame that cannot be hashed must not hit"
@@ -3914,6 +3921,325 @@ fn sharpness_heatmap_backend_path() {
         assert!(
             last.rgba == expected.rgba,
             "lost={lost}: differs from the CPU run"
+        );
+    }
+}
+
+/// Logs what a run says about its brightness estimate: the Prepare
+/// announcement and the notices.
+#[derive(Default)]
+struct EstimateLog {
+    announced: Mutex<Option<(usize, usize, PrepareSource)>>,
+    notices: Mutex<Vec<String>>,
+    frame_notices: Mutex<Vec<(usize, String)>>,
+}
+
+impl StageObserver for EstimateLog {
+    fn stage(&self, stage: RunStage) {
+        if let RunStage::Prepare {
+            frames,
+            units,
+            source,
+        } = stage
+        {
+            *self.announced.lock().unwrap() = Some((frames, units, source));
+        }
+    }
+
+    fn notice(&self, message: &str) {
+        self.notices.lock().unwrap().push(message.to_string());
+    }
+
+    fn frame_notice(&self, frame: usize, message: &str) {
+        self.frame_notices
+            .lock()
+            .unwrap()
+            .push((frame, message.to_string()));
+    }
+}
+
+impl EstimateLog {
+    fn announced(&self) -> (usize, usize, PrepareSource) {
+        self.announced
+            .lock()
+            .unwrap()
+            .expect("the Prepare stage is announced")
+    }
+
+    fn warnings(&self) -> Vec<String> {
+        let notices = self.notices.lock().unwrap();
+        notices
+            .iter()
+            .filter(|n| n.starts_with("warning:"))
+            .cloned()
+            .collect()
+    }
+}
+
+/// One held run over `frames` with `dummy-align` and equalization on, the
+/// stage cache under `root` when `cache` is given and off otherwise. Returns
+/// the report with the composite's bytes.
+fn estimate_run(
+    label: &str,
+    frames: &[PathBuf],
+    root: &Path,
+    equalize: Option<EqualizeSettings>,
+    cache: Option<&StageCache>,
+    observer: &dyn StageObserver,
+) -> (FuseReport, Vec<u8>) {
+    estimate_run_controlled(
+        label,
+        frames,
+        root,
+        equalize,
+        cache,
+        observer,
+        JobControl::new(),
+    )
+}
+
+/// [`estimate_run`] under `control`, which keeps the run's progress tally.
+fn estimate_run_controlled(
+    label: &str,
+    frames: &[PathBuf],
+    root: &Path,
+    equalize: Option<EqualizeSettings>,
+    cache: Option<&StageCache>,
+    observer: &dyn StageObserver,
+    control: Arc<JobControl>,
+) -> (FuseReport, Vec<u8>) {
+    let mut request = base_request(label, frames.to_vec(), ParamValues::new());
+    request.scratch_root = root.join("scratch");
+    request.align = Some(dummy_align_request());
+    request.equalize = equalize;
+    request.cache = cache.is_some();
+    request.output = FuseOutput::Hold(root.join(label));
+    let report = completed(focusforge_core::pipeline::run(
+        &request, observer, control, cache,
+    ));
+    let FuseProduct::Held(held) = &report.product else {
+        panic!("a hold request must report a held checkpoint");
+    };
+    let composite = std::fs::read(&held.composite).expect("composite must be readable");
+    (report, composite)
+}
+
+#[test]
+fn equalization_estimate_is_reused_bit_identical() {
+    let frames = brightness_stack("eq_reuse", 3, &[0.6, 1.0, 1.55]);
+    let root = scratch("eq_reuse_root");
+    let cache = StageCache::open(&root.join("scratch")).expect("the stage cache opens");
+    let settings = eq_settings(1.25, 0.0);
+
+    let first_log = EstimateLog::default();
+    let first_control = JobControl::new();
+    let (first, first_composite) = estimate_run_controlled(
+        "eq_reuse_1",
+        &frames,
+        &root,
+        settings,
+        Some(&cache),
+        &first_log,
+        Arc::clone(&first_control),
+    );
+    let second_log = EstimateLog::default();
+    let second_control = JobControl::new();
+    let (second, second_composite) = estimate_run_controlled(
+        "eq_reuse_2",
+        &frames,
+        &root,
+        settings,
+        Some(&cache),
+        &second_log,
+        Arc::clone(&second_control),
+    );
+
+    assert!(!first.equalization_cached, "the first run estimates");
+    assert!(
+        second.equalization_cached,
+        "the re-run takes the cached estimate"
+    );
+    assert!(!first.align_cached && second.align_cached);
+
+    let first_report = first
+        .equalization
+        .as_ref()
+        .expect("an equalized run reports");
+    let second_report = second
+        .equalization
+        .as_ref()
+        .expect("an equalized run reports");
+    assert_eq!(
+        common::equalization_bits(second_report),
+        common::equalization_bits(first_report)
+    );
+    assert!(
+        first_report.frames.iter().any(|f| f.clamped),
+        "the stack must exercise the clamp"
+    );
+    assert_eq!(
+        second_report.recorded(),
+        first_report.recorded(),
+        "the recorded gains match"
+    );
+    assert!(
+        second_composite == first_composite,
+        "the composite is unchanged"
+    );
+
+    let first_frame_notices = first_log.frame_notices.lock().unwrap();
+    assert!(!first_frame_notices.is_empty());
+    assert_eq!(
+        *second_log.frame_notices.lock().unwrap(),
+        *first_frame_notices
+    );
+
+    let (frames_n, first_units, first_source) = first_log.announced();
+    assert_eq!((frames_n, first_source), (3, PrepareSource::Computed));
+    assert!(first_units > 0);
+    assert!(first_control.progress().prepare_total > 0);
+    assert_eq!(second_log.announced(), (3, 0, PrepareSource::Cached));
+    assert_eq!(
+        second_control.progress().prepare_total,
+        0,
+        "a hit opens no Prepare tally, so no tick can carry a total"
+    );
+}
+
+#[test]
+fn a_corrupt_equalization_entry_falls_back_to_a_fresh_estimate() {
+    let frames = brightness_stack("eq_corrupt", 3, &[0.6, 1.0, 1.55]);
+    let root = scratch("eq_corrupt_root");
+    let scratch_base = root.join("scratch");
+    let cache = StageCache::open(&scratch_base).expect("the stage cache opens");
+    let settings = eq_settings(1.25, 0.0);
+
+    let (uncached, _) = estimate_run(
+        "eq_corrupt_ref",
+        &frames,
+        &root,
+        settings,
+        None,
+        &NoopObserver,
+    );
+    let expected = common::equalization_bits(uncached.equalization.as_ref().unwrap());
+
+    let (seed, _) = estimate_run(
+        "eq_corrupt_seed",
+        &frames,
+        &root,
+        settings,
+        Some(&cache),
+        &NoopObserver,
+    );
+    assert!(!seed.equalization_cached);
+    let equalize_dir = scratch_base.join("stage-cache/equalize");
+    let entries: Vec<PathBuf> = std::fs::read_dir(&equalize_dir)
+        .expect("the first run writes an entry")
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    let intact = std::fs::read(entry).unwrap();
+    let align_entry = std::fs::read_dir(scratch_base.join("stage-cache/align"))
+        .unwrap()
+        .next()
+        .expect("the first run wrote an align entry")
+        .unwrap()
+        .path();
+
+    let mut broken: Vec<(&str, Vec<u8>)> = vec![
+        ("truncated", intact[..intact.len() / 2].to_vec()),
+        (
+            "an align entry's bytes",
+            std::fs::read(&align_entry).unwrap(),
+        ),
+        ("empty", Vec::new()),
+    ];
+    for (what, bytes) in broken.drain(..) {
+        std::fs::write(entry, bytes).unwrap();
+        let log = EstimateLog::default();
+        let (run, _) = estimate_run(
+            "eq_corrupt_run",
+            &frames,
+            &root,
+            settings,
+            Some(&cache),
+            &log,
+        );
+        assert!(!run.equalization_cached, "{what}: a miss");
+        assert_eq!(
+            common::equalization_bits(run.equalization.as_ref().unwrap()),
+            expected,
+            "{what}: the fresh estimate equals an uncached run's"
+        );
+        assert_eq!(log.announced().2, PrepareSource::Computed, "{what}");
+        assert_eq!(
+            std::fs::read(entry).unwrap(),
+            intact,
+            "{what}: the miss rewrites the entry"
+        );
+    }
+
+    std::fs::remove_dir_all(&equalize_dir).unwrap();
+    std::fs::write(&equalize_dir, b"not a directory").unwrap();
+    let log = EstimateLog::default();
+    let (run, _) = estimate_run(
+        "eq_corrupt_blocked",
+        &frames,
+        &root,
+        settings,
+        Some(&cache),
+        &log,
+    );
+    assert!(!run.equalization_cached);
+    assert_eq!(
+        common::equalization_bits(run.equalization.as_ref().unwrap()),
+        expected
+    );
+    let warnings = log.warnings();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "one warning, no failed run: {warnings:?}"
+    );
+}
+
+#[test]
+fn raw_equalization_bypasses_the_estimate_cache() {
+    let frames = raw_frames(&scratch("raw_eq_cache_frames"), 3, 64, 64);
+    let root = scratch("raw_eq_cache_root");
+    let scratch_base = root.join("scratch");
+    let cache = StageCache::open(&scratch_base).expect("the stage cache opens");
+    let settings = eq_settings(2.0, 0.0);
+
+    let (uncached, _) = estimate_run("raw_eq_ref", &frames, &root, settings, None, &NoopObserver);
+    let expected = uncached
+        .equalization
+        .as_ref()
+        .expect("a RAW stack reports")
+        .recorded();
+
+    for run_index in 0..2 {
+        let log = EstimateLog::default();
+        let (run, _) = estimate_run(
+            &format!("raw_eq_run_{run_index}"),
+            &frames,
+            &root,
+            settings,
+            Some(&cache),
+            &log,
+        );
+        assert!(!run.equalization_cached, "run {run_index}");
+        assert_eq!(
+            log.announced(),
+            (3, 3, PrepareSource::Computed),
+            "run {run_index}: one unit per frame, computed"
+        );
+        assert_eq!(run.equalization.as_ref().unwrap().recorded(), expected);
+        assert!(
+            std::fs::read_dir(scratch_base.join("stage-cache/equalize")).is_err(),
+            "run {run_index}: no entry directory for a RAW stack"
         );
     }
 }

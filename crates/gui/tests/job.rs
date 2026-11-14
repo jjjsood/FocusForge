@@ -1640,6 +1640,7 @@ fn prepare_stage_announcement_records_the_unit_total() {
     observer.stage(RunStage::Prepare {
         frames: 7,
         units: 21,
+        source: focusforge_core::pipeline::PrepareSource::Computed,
     });
     let recorded = observer.last_progress().expect("a Prepare snapshot");
     assert_eq!(recorded.stage, JobStage::Prepare);
@@ -1662,6 +1663,7 @@ fn stage_announcement_carries_the_last_total_run_estimate_forward() {
                 RunStage::Prepare {
                     frames: 7,
                     units: 7,
+                    source: focusforge_core::pipeline::PrepareSource::Computed,
                 },
                 JobStage::Prepare,
             ),
@@ -1714,6 +1716,7 @@ fn a_cached_alignment_reads_as_reused() {
     after_prepare.stage(RunStage::Prepare {
         frames: 5,
         units: 5,
+        source: focusforge_core::pipeline::PrepareSource::Computed,
     });
     after_prepare.stage(cached());
 
@@ -1746,6 +1749,7 @@ fn a_computed_alignment_shows_no_reuse_text() {
     observer.stage(RunStage::Prepare {
         frames: 8,
         units: 8,
+        source: focusforge_core::pipeline::PrepareSource::Computed,
     });
     observer.stage(RunStage::Align {
         frames: 8,
@@ -8126,6 +8130,7 @@ fn stage_view_leaves_the_bottom_bar_unchanged() {
             o.stage(RunStage::Prepare {
                 frames: 3,
                 units: 3,
+                source: focusforge_core::pipeline::PrepareSource::Computed,
             });
         },
         &[],
