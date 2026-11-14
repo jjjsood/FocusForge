@@ -54,8 +54,8 @@ pub fn eta_display_enabled(value: Option<&OsStr>) -> bool {
     value == Some(OsStr::new("1"))
 }
 
-/// `develop`/`prepare`/`align <done>/<total> frames` while that stage counts
-/// frames; otherwise `fuse <done>/<total> tiles <pct>%`. With `show_eta`, each
+/// `develop`/`align <done>/<total> frames` or `prepare <done>/<total> strips`
+/// while that stage counts; otherwise `fuse <done>/<total> tiles <pct>%`. With `show_eta`, each
 /// line ends in ` eta <eta>`: the time left in the whole run, not just the
 /// current stage. `<eta>` reads `--` only while no prediction exists, and a
 /// sub-second estimate renders as `<1s` rather than a `0s` that would read as
@@ -74,7 +74,7 @@ pub fn format_line(progress: &JobProgress, show_eta: bool) -> String {
     }
     if progress.stage == JobStage::Prepare && progress.prepare_total > 0 {
         return format!(
-            "prepare {}/{} frames{eta}",
+            "prepare {}/{} strips{eta}",
             progress.prepare_done, progress.prepare_total
         );
     }
@@ -314,17 +314,17 @@ mod tests {
     }
 
     #[test]
-    fn prepare_line_counts_frames_and_names_the_eta() {
+    fn prepare_line_counts_strips_and_names_the_eta() {
         let at =
             |done, total, eta| format_line(&with_eta(prepare_progress(done, total), eta), true);
-        assert_eq!(at(0, 8, None), "prepare 0/8 frames eta --");
+        assert_eq!(at(0, 8, None), "prepare 0/8 strips eta --");
         assert_eq!(
             at(7, 8, Some(Duration::from_millis(400))),
-            "prepare 7/8 frames eta <1s"
+            "prepare 7/8 strips eta <1s"
         );
         assert_eq!(
             at(3, 61, Some(Duration::from_secs(42))),
-            "prepare 3/61 frames eta 42s"
+            "prepare 3/61 strips eta 42s"
         );
     }
 
@@ -395,7 +395,7 @@ mod tests {
             (
                 "prepare",
                 prepare_progress(2, 9),
-                "prepare 2/9 frames eta 2:05",
+                "prepare 2/9 strips eta 2:05",
             ),
             ("align", align_progress(3, 8), "align 3/8 frames eta 2:05"),
             (
@@ -469,7 +469,7 @@ mod tests {
                 with_eta(develop_progress(2, 9), total),
             ),
             (
-                "prepare 2/9 frames",
+                "prepare 2/9 strips",
                 with_eta(prepare_progress(2, 9), total),
             ),
             ("align 3/8 frames", with_eta(align_progress(3, 8), total)),

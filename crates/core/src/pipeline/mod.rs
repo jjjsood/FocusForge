@@ -420,9 +420,12 @@ pub enum RunStage {
     Develop {
         frames: usize,
     },
-    /// Brightness preparation of `frames` sources, before alignment.
+    /// Brightness preparation of `frames` sources, before alignment. The
+    /// stage counts to `units`: one per strip read, or one per frame for a
+    /// RAW source.
     Prepare {
         frames: usize,
+        units: usize,
     },
     Align {
         frames: usize,
@@ -971,10 +974,13 @@ pub fn run(
 
     let equalization = match request.equalize {
         Some(settings) => {
-            let frames_done = control.begin_prepare(frame_reader.len());
+            let units =
+                equalize::prepare_units(frame_reader, frame_reader.len(), (width, height), spp)?;
+            let frames_done = control.begin_prepare(units);
             control.set_stage(JobStage::Prepare);
             observer.stage(RunStage::Prepare {
                 frames: frame_reader.len(),
+                units,
             });
             let estimated = with_progress_ticks(observer, &control, request.poll, || {
                 let _prepare = equalize_scope();

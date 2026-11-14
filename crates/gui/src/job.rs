@@ -481,7 +481,10 @@ mod stage_tests {
     #[test]
     fn fuse_stage_replaces_the_aligned_frame_with_the_fusing_phase_at_once() {
         let observer = GuiObserver::with_previews(PreviewKinds::default(), HeatRamp::default());
-        observer.stage(RunStage::Prepare { frames: 2 });
+        observer.stage(RunStage::Prepare {
+            frames: 2,
+            units: 2,
+        });
         observer.stage(RunStage::Fuse);
         assert_eq!(
             progress_phase(observer.last_progress().as_ref()),
@@ -1196,7 +1199,7 @@ impl StageObserver for GuiObserver {
         };
         match stage {
             RunStage::Develop { frames } => self.tick(&snapshot(JobStage::Develop, 0, frames)),
-            RunStage::Prepare { frames } => self.tick(&snapshot(JobStage::Prepare, frames, 0)),
+            RunStage::Prepare { units, .. } => self.tick(&snapshot(JobStage::Prepare, units, 0)),
             RunStage::Align {
                 source: AlignSource::Cached,
                 ..
@@ -1305,10 +1308,12 @@ impl Phase {
         }
     }
 
-    /// `Some((done, total))` while `self` works per frame and `progress`
+    /// `Some((done, total))` while `self` counts work and `progress`
     /// carries a non-zero total for it, `None` otherwise -- a cached or
     /// resumed alignment included, since its total is `0`. `Developing`,
-    /// `Preparing` and `Aligning` are the phases with a frame total.
+    /// `Preparing` and `Aligning` are the phases with a total; the Preparing
+    /// count is in strips read (frames for a RAW source), the others in
+    /// frames.
     pub fn frames(self, progress: &JobProgress) -> Option<(usize, usize)> {
         match self {
             Phase::Developing if progress.develop_total > 0 => {
@@ -1417,7 +1422,7 @@ pub fn current_phase(state: &RunState, progress: Option<&JobProgress>) -> Option
 }
 
 /// The bottom bar's step-text slot: `"<done> of <total>"` while the current
-/// phase works per frame and `progress` carries a total for it
+/// phase counts work and `progress` carries a total for it
 /// ([`Phase::frames`]), `"from cache"` while the align stage has no total
 /// (the alignment is served from the stage cache), empty for any other
 /// name-only phase, outside a running state, or with no progress to derive a

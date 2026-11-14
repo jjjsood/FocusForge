@@ -1414,7 +1414,7 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
                 renderer.stage(&format!("develop {frames} frames (RAW)"));
                 renderer.start(&self.control.progress());
             }
-            RunStage::Prepare { frames } => {
+            RunStage::Prepare { frames, .. } => {
                 renderer.stage(&format!("prepare {frames} frames (brightness)"));
                 renderer.start(&self.control.progress());
             }
@@ -1711,7 +1711,7 @@ fn render(report: &StackReport) -> String {
     lines.push(match &report.equalization {
         None => "equalization=off".to_string(),
         Some(eq) => format!(
-            "equalization=on max_gain={} target_stops={} neutral={:.1} target={:.1} clamped={} black={} clipped={} (scales encoded code values, not a linear-light correction)",
+            "equalization=on max_gain={} target_stops={} neutral={:.1} target={:.1} clamped={} black={} clipped={} ({})",
             eq.max_gain,
             eq.target_stops,
             eq.neutral,
@@ -1719,6 +1719,11 @@ fn render(report: &StackReport) -> String {
             eq.frames.iter().filter(|f| f.clamped).count(),
             eq.frames.iter().filter(|f| f.black).count(),
             eq.frames.iter().filter(|f| f.clipped_samples > 0).count(),
+            if report.working_space == "encoded-srgb" {
+                "a linear-light correction, applied before encoding"
+            } else {
+                "scales encoded code values, not a linear-light correction"
+            },
         ),
     });
     lines.push(format!("backend: {}", report.backend));
@@ -1957,6 +1962,37 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
         }
+    }
+
+    #[test]
+    fn render_names_the_equalization_space() {
+        let equalization_line = |working_space: &'static str| {
+            let mut sample = sample_report();
+            sample.working_space = working_space;
+            sample.equalization = Some(EqualizationReport {
+                max_gain: 1.25,
+                target_stops: 0.0,
+                neutral: 100.0,
+                target: 100.0,
+                frames: Vec::new(),
+            });
+            render(&sample)
+                .lines()
+                .find(|line| line.starts_with("equalization=on"))
+                .expect("an equalized run names its equalization")
+                .to_string()
+        };
+        let raw = equalization_line("encoded-srgb");
+        assert!(
+            raw.ends_with("(a linear-light correction, applied before encoding)"),
+            "{raw}"
+        );
+        assert!(!raw.contains("encoded code values"), "{raw}");
+        let tiff = equalization_line("encoded-unknown-transfer");
+        assert!(
+            tiff.ends_with("(scales encoded code values, not a linear-light correction)"),
+            "{tiff}"
+        );
     }
 
     #[test]

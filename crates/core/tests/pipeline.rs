@@ -1222,10 +1222,11 @@ fn total_run_eta() {
     assert_eq!(control.progress().total_eta, Some(Duration::ZERO));
 }
 
-/// Logs the Prepare-stage tally of every tick, and the control's tally at
-/// the moment the align stage is announced.
+/// Logs the announced Prepare stage, the Prepare-stage tally of every tick,
+/// and the control's tally at the moment the align stage is announced.
 struct PrepareTickLog {
     control: Arc<JobControl>,
+    announced: Mutex<Option<(usize, usize)>>,
     prepare_ticks: Mutex<Vec<(usize, usize)>>,
     all_ticks: Mutex<Vec<(usize, usize)>>,
     at_align: Mutex<Option<(usize, usize)>>,
@@ -1235,6 +1236,7 @@ impl PrepareTickLog {
     fn new(control: &Arc<JobControl>) -> Self {
         PrepareTickLog {
             control: Arc::clone(control),
+            announced: Mutex::default(),
             prepare_ticks: Mutex::default(),
             all_ticks: Mutex::default(),
             at_align: Mutex::default(),
@@ -1244,6 +1246,9 @@ impl PrepareTickLog {
 
 impl StageObserver for PrepareTickLog {
     fn stage(&self, stage: RunStage) {
+        if let RunStage::Prepare { frames, units } = stage {
+            *self.announced.lock().expect("no panic while logging") = Some((frames, units));
+        }
         if matches!(stage, RunStage::Align { .. }) {
             let p = self.control.progress();
             *self.at_align.lock().expect("no panic while logging") =
@@ -1274,38 +1279,118 @@ fn prepare_request(label: &str, count: usize, equalize: Option<EqualizeSettings>
     request
 }
 
+/// Runs `request` and checks the Prepare tally: every tick's total is the
+/// announced unit count, `done` never exceeds it or decreases, and the stage
+/// is complete when Align is announced. Returns the announced
+/// `(frames, units)`.
+fn run_and_check_prepare_tally(request: &FuseRequest) -> (usize, usize) {
+    let control = JobControl::new();
+    let observer = PrepareTickLog::new(&control);
+    let outcome = focusforge_core::pipeline::run(request, &observer, Arc::clone(&control), None)
+        .unwrap_or_else(|err| panic!("the run must complete: {err}"));
+    assert!(matches!(outcome, FuseOutcome::Completed(_)));
+
+    let (frames, units) = observer
+        .announced
+        .lock()
+        .expect("no panic while logging")
+        .expect("the Prepare stage is announced");
+    assert_eq!(
+        *observer.at_align.lock().expect("no panic while logging"),
+        Some((units, units)),
+        "Prepare is complete when Align is announced"
+    );
+    let ticks = observer
+        .prepare_ticks
+        .lock()
+        .expect("no panic while logging");
+    assert!(!ticks.is_empty(), "the Prepare stage ticks");
+    let mut previous = 0;
+    for &(done, total) in ticks.iter() {
+        assert_eq!(
+            total, units,
+            "the total is the announced unit count on every tick"
+        );
+        assert!(done <= total, "done must never exceed total");
+        assert!(done >= previous, "done must never decrease");
+        previous = done;
+    }
+    (frames, units)
+}
+
 #[test]
-fn prepare_progress_counts_every_frame() {
+fn prepare_progress_counts_every_unit() {
     for count in [2, 5] {
         let request = prepare_request(
             &format!("prepare_progress_{count}"),
             count,
             eq_settings(1.25, 0.0),
         );
-        let control = JobControl::new();
-        let observer = PrepareTickLog::new(&control);
-        let outcome =
-            focusforge_core::pipeline::run(&request, &observer, Arc::clone(&control), None)
-                .unwrap_or_else(|err| panic!("a {count}-frame run must complete: {err}"));
-        assert!(matches!(outcome, FuseOutcome::Completed(_)));
-
-        assert_eq!(
-            *observer.at_align.lock().expect("no panic while logging"),
-            Some((count, count)),
-            "Prepare is complete when Align is announced"
-        );
-        let ticks = observer
-            .prepare_ticks
-            .lock()
-            .expect("no panic while logging");
-        let mut previous = 0;
-        for &(done, total) in ticks.iter() {
-            assert_eq!(total, count, "the total is the frame count on every tick");
-            assert!(done <= total, "done must never exceed total");
-            assert!(done >= previous, "done must never decrease");
-            previous = done;
-        }
+        let (frames, units) = run_and_check_prepare_tally(&request);
+        assert_eq!(frames, count);
+        assert_eq!(units, count, "a 64x64 frame is one strip");
     }
+}
+
+#[test]
+fn prepare_progress_counts_the_strips_of_a_tall_frame() {
+    // 1024 x 1024 x 3 samples exceed one strip (2^21 samples), so every frame
+    // is read in two.
+    let size = 1024u32;
+    let dir = scratch("prepare_progress_strips_frames");
+    let full = Rect {
+        x: 0,
+        y: 0,
+        width: size,
+        height: size,
+    };
+    let frames: Vec<PathBuf> = [1.0, 1.1]
+        .iter()
+        .enumerate()
+        .map(|(i, factor)| {
+            let path = dir.join(format!("{i:02}.tif"));
+            let samples: Vec<u16> = (0..size * size * 3)
+                .map(|n| {
+                    let hash = (n / 3)
+                        .wrapping_mul(2_654_435_761)
+                        .wrapping_add(n % 3 * 977)
+                        >> 16;
+                    let texture = 12_000 + hash % 30_000;
+                    (f64::from(texture) * factor).round() as u16
+                })
+                .collect();
+            let mut writer = TiffWriter::create(
+                &path,
+                TiffSpec {
+                    width: size,
+                    height: size,
+                    samples_per_pixel: 3,
+                    description: None,
+                },
+            )
+            .expect("writer must create the frame");
+            writer.write_tile(full, &samples).expect("frame samples");
+            writer.finish().expect("frame must finish");
+            path
+        })
+        .collect();
+    let stack = focusforge_core::io::TiffStack::open_files(&frames).expect("the frames open");
+    let expected = focusforge_core::equalize::prepare_units(
+        &stack,
+        frames.len(),
+        stack.dimensions(),
+        stack.header(0).samples_per_pixel,
+    )
+    .expect("the unit count is known");
+
+    let mut request = base_request("prepare_progress_strips", frames, ParamValues::new());
+    request.align = Some(dummy_align_request());
+    request.equalize = eq_settings(1.25, 0.0);
+    request.poll = Duration::from_millis(1);
+    let (announced_frames, units) = run_and_check_prepare_tally(&request);
+    assert_eq!(announced_frames, 2);
+    assert_eq!(units, 4, "two frames of two strips");
+    assert_eq!(units, expected);
 }
 
 #[test]

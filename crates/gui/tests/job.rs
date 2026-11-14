@@ -1632,15 +1632,22 @@ fn eta_text_holds_a_dash_outside_a_running_state_whatever_the_total() {
 }
 
 #[test]
-fn prepare_stage_announcement_records_the_frame_total() {
+fn prepare_stage_announcement_records_the_unit_total() {
     use focusforge_core::job::JobStage;
     use focusforge_core::pipeline::{RunStage, StageObserver};
 
     let observer = job::GuiObserver::new();
-    observer.stage(RunStage::Prepare { frames: 7 });
+    observer.stage(RunStage::Prepare {
+        frames: 7,
+        units: 21,
+    });
     let recorded = observer.last_progress().expect("a Prepare snapshot");
     assert_eq!(recorded.stage, JobStage::Prepare);
-    assert_eq!((recorded.prepare_done, recorded.prepare_total), (0, 7));
+    assert_eq!((recorded.prepare_done, recorded.prepare_total), (0, 21));
+    assert_eq!(
+        job::phase_line(&job::RunState::Running, Some(&recorded)).as_deref(),
+        Some("preparing, 0 of 21")
+    );
 }
 
 #[test]
@@ -1651,7 +1658,13 @@ fn stage_announcement_carries_the_last_total_run_estimate_forward() {
     let announcements = || {
         [
             (RunStage::Fuse, JobStage::Fuse),
-            (RunStage::Prepare { frames: 7 }, JobStage::Prepare),
+            (
+                RunStage::Prepare {
+                    frames: 7,
+                    units: 7,
+                },
+                JobStage::Prepare,
+            ),
             (
                 RunStage::Align {
                     frames: 9,
@@ -1698,7 +1711,10 @@ fn a_cached_alignment_reads_as_reused() {
     let alone = job::GuiObserver::new();
     alone.stage(cached());
     let after_prepare = job::GuiObserver::new();
-    after_prepare.stage(RunStage::Prepare { frames: 5 });
+    after_prepare.stage(RunStage::Prepare {
+        frames: 5,
+        units: 5,
+    });
     after_prepare.stage(cached());
 
     for observer in [&alone, &after_prepare] {
@@ -1727,7 +1743,10 @@ fn a_computed_alignment_shows_no_reuse_text() {
     use focusforge_gui::job::{RunState, progress_text};
 
     let observer = job::GuiObserver::new();
-    observer.stage(RunStage::Prepare { frames: 8 });
+    observer.stage(RunStage::Prepare {
+        frames: 8,
+        units: 8,
+    });
     observer.stage(RunStage::Align {
         frames: 8,
         source: AlignSource::Computed,
@@ -8102,7 +8121,15 @@ fn stage_view_leaves_the_bottom_bar_unchanged() {
         assert_eq!(bar(&plain), bar(&shown));
     };
 
-    step(&|o| o.stage(RunStage::Prepare { frames: 3 }), &[]);
+    step(
+        &|o| {
+            o.stage(RunStage::Prepare {
+                frames: 3,
+                units: 3,
+            });
+        },
+        &[],
+    );
     step(
         &|o| {
             o.stage(RunStage::Align {
