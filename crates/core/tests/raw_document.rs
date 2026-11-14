@@ -1361,15 +1361,12 @@ fn raw_highlight_clip_below_white_level() {
             let at = ((y * width + x) * 3) as usize..((y * width + x) * 3 + 3) as usize;
             if deep_in_patch(x, y) {
                 at_99 += 1;
-                assert_ne!(&clipped[at.clone()], &plain[at.clone()], "({x}, {y})");
-            } else if deep_in(second_x.clone(), PATCH_Y, x, y)
-                || (far_from_patch(x, y, (width, height)) && !near_second(x, y))
-            {
-                if deep_in(second_x.clone(), PATCH_Y, x, y) {
-                    at_97 += 1;
-                } else {
-                    texture += 1;
-                }
+                assert_ne!(&clipped[at.clone()], &plain[at], "({x}, {y})");
+            } else if deep_in(second_x.clone(), PATCH_Y, x, y) {
+                at_97 += 1;
+                assert_eq!(&clipped[at.clone()], &plain[at], "({x}, {y})");
+            } else if far_from_patch(x, y, (width, height)) && !near_second(x, y) {
+                texture += 1;
                 assert_eq!(&clipped[at.clone()], &plain[at], "({x}, {y})");
             }
         }
