@@ -1848,7 +1848,7 @@ dependencies = [
 
 [[package]]
 name = "focusforge-ui-comparison"
-version = "0.2.1-rc.1"
+version = "0.2.1"
 dependencies = [
  "slint",
  "slint-build",
@@ -1856,7 +1856,7 @@ dependencies = [
 
 [[package]]
 name = "focusforge-ui-theme-sheet"
-version = "0.2.1-rc.1"
+version = "0.2.1"
 dependencies = [
  "slint",
  "slint-build",
