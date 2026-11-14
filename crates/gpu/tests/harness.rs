@@ -31,6 +31,8 @@ mod parity_f32;
 mod parity_fusion;
 #[path = "harness/parity_pipeline.rs"]
 mod parity_pipeline;
+#[path = "harness/parity_preview.rs"]
+mod parity_preview;
 #[path = "harness/parity_tonemap.rs"]
 mod parity_tonemap;
 #[path = "harness/parity_warp.rs"]

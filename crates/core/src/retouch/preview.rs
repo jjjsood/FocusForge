@@ -152,6 +152,103 @@ pub fn brush_preview_bounds(
     Some(blend::grow(footprint, reach, info))
 }
 
+/// Where [`brush_preview`] draws on the result grid's lattice: the output box
+/// and the boxes it is computed from, all in lattice samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrushPreviewLayout {
+    /// The output box: it starts on a multiple of 4 samples on both axes and
+    /// ends with the footprint.
+    pub column: u32,
+    pub row: u32,
+    pub width: u32,
+    pub height: u32,
+    /// The lattice samples of the brush's footprint, in the lattice's own
+    /// coordinates, at least one of them with a nonzero mask.
+    pub footprint: Rect,
+    /// Detail only: the lattice window its blur reads, grown from `footprint`
+    /// by three passes and kept to the samples inside the map, and the width
+    /// of each pass in samples.
+    pub detail: Option<(Rect, u32)>,
+}
+
+/// The [`BrushPreviewLayout`] of `spec` on `result`'s lattice, with the
+/// geometry [`brush_preview`] draws by. `None` when `result` is not inside
+/// the image or does not hold the footprint (plus Detail's window), the
+/// footprint holds no lattice sample with a nonzero mask, or the brush is out
+/// of range. The buffer behind `result` is not read.
+pub fn brush_preview_layout(
+    image_size: (u32, u32),
+    result: &BrushPreviewGrid,
+    spec: &BrushPreviewSpec,
+) -> Option<BrushPreviewLayout> {
+    let info = ZMapInfo::new(image_size.0, image_size.1, 1).ok()?;
+    if !info.contains(result.rect) {
+        return None;
+    }
+    let op = one_point_stroke(spec);
+    let footprint = blend::footprint(&op, info).ok()??;
+    if result.rect.intersect(footprint) != Some(footprint) {
+        return None;
+    }
+
+    let step = result.step.get();
+    let lattice = |from: u32, origin: u32| (from - origin).div_ceil(step);
+    let (i0, i1) = (
+        lattice(footprint.x, result.rect.x),
+        lattice(footprint.x + footprint.width, result.rect.x),
+    );
+    let (j0, j1) = (
+        lattice(footprint.y, result.rect.y),
+        lattice(footprint.y + footprint.height, result.rect.y),
+    );
+    if i0 >= i1 || j0 >= j1 {
+        return None;
+    }
+
+    // The mask falls with distance from the one-point path's centre, and the
+    // squared distance separates by axis: the largest mask in the box is at
+    // one of the samples around the centre, kept to the box.
+    let around = |origin: u32, centre: i32, (from, to): (u32, u32)| {
+        let below = (i64::from(centre) - i64::from(origin)).div_euclid(i64::from(step));
+        [below, below + 1].map(|i| i.clamp(i64::from(from), i64::from(to) - 1) as u32)
+    };
+    let (columns, rows) = (
+        around(result.rect.x, spec.centre.x, (i0, i1)),
+        around(result.rect.y, spec.centre.y, (j0, j1)),
+    );
+    let mut covered = false;
+    for j in rows {
+        for i in columns {
+            let (x, y) = (result.rect.x + i * step, result.rect.y + j * step);
+            covered |= blend::alpha(&op, info, x, y).ok()? != 0;
+        }
+    }
+    if !covered {
+        return None;
+    }
+
+    let footprint = Rect {
+        x: i0,
+        y: j0,
+        width: i1 - i0,
+        height: j1 - j0,
+    };
+    let detail = if spec.mode == BrushMode::Detail {
+        Some(detail_window(&op, info, result, footprint)?)
+    } else {
+        None
+    };
+    let (column, row) = (i0 / DITHER * DITHER, j0 / DITHER * DITHER);
+    Some(BrushPreviewLayout {
+        column,
+        row,
+        width: i1 - column,
+        height: j1 - row,
+        footprint,
+        detail,
+    })
+}
+
 /// RGBA8 texels, row-major, over `width` x `height` lattice samples of the
 /// result grid starting at lattice sample (`column`, `row`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,32 +293,23 @@ pub fn brush_preview(
             return None;
         }
     }
+    let layout = brush_preview_layout(image_size, result, spec)?;
     let info = ZMapInfo::new(image_size.0, image_size.1, 1).ok()?;
-    if !info.contains(result.rect) {
-        return None;
-    }
     let op = one_point_stroke(spec);
-    let footprint = blend::footprint(&op, info).ok()??;
-    if result.rect.intersect(footprint) != Some(footprint) {
-        return None;
-    }
-
     let step = result.step.get();
     let columns = result.columns() as usize;
-    let lattice = |from: u32, origin: u32| (from - origin).div_ceil(step);
-    let (i0, i1) = (
-        lattice(footprint.x, result.rect.x),
-        lattice(footprint.x + footprint.width, result.rect.x),
+    let BrushPreviewLayout {
+        column,
+        row,
+        width,
+        height,
+        footprint,
+        detail,
+    } = layout;
+    let (i1, j1) = (
+        footprint.x + footprint.width,
+        footprint.y + footprint.height,
     );
-    let (j0, j1) = (
-        lattice(footprint.y, result.rect.y),
-        lattice(footprint.y + footprint.height, result.rect.y),
-    );
-    if i0 >= i1 || j0 >= j1 {
-        return None;
-    }
-    let (column, row) = (i0 / DITHER * DITHER, j0 / DITHER * DITHER);
-    let (width, height) = (i1 - column, j1 - row);
     let pixel = |i: u32, j: u32| (result.rect.x + i * step, result.rect.y + j * step);
     let result_at = |i: u32, j: u32| (j as usize * columns + i as usize) * 3;
 
@@ -232,25 +320,10 @@ pub fn brush_preview(
             mask.push(blend::alpha(&op, info, x, y).ok()?);
         }
     }
-    if mask.iter().all(|&m| m == 0) {
-        return None;
-    }
-
     // Detail mixes toward its own target, over the footprint's samples.
-    let target = if spec.mode == BrushMode::Detail {
-        Some(detail_target(
-            &op,
-            info,
-            (result, source),
-            Rect {
-                x: i0,
-                y: j0,
-                width: i1 - i0,
-                height: j1 - j0,
-            },
-        )?)
-    } else {
-        None
+    let target = match detail {
+        Some(blur) => Some(detail_target((result, source), blur, footprint)?),
+        None => None,
     };
 
     let mut tile = Vec::with_capacity(mask.len() * 3);
@@ -266,7 +339,9 @@ pub fn brush_preview(
         let pixel_at = k * 3;
         let src = match &target {
             Some(target) => {
-                let at = ((j - j0) as usize * (i1 - i0) as usize + (i - i0) as usize) * 3;
+                let at = ((j - footprint.y) as usize * footprint.width as usize
+                    + (i - footprint.x) as usize)
+                    * 3;
                 &target[at..at + 3]
             }
             None => {
@@ -293,16 +368,16 @@ pub fn brush_preview(
     })
 }
 
-/// Detail's target over `at`, a box of result lattice samples: the blur window
-/// grows by 3 passes of `max(1, (p + step / 2) / step)` samples, kept to the
-/// samples inside the map, and both grids are resampled onto that box. `None`
-/// when `result` lacks a sample of the box or `source` answers for none.
-fn detail_target(
+/// The lattice window Detail's blur reads for the output box `at`: grown by 3
+/// passes of `max(1, (p + step / 2) / step)` samples, kept to the samples
+/// inside the map, with the pass width in samples. `None` when `result` lacks
+/// a sample of the window.
+fn detail_window(
     op: &Op,
     info: ZMapInfo,
-    (result, source): (&BrushPreviewGrid, &BrushPreviewGrid),
+    result: &BrushPreviewGrid,
     at: Rect,
-) -> Option<Vec<u16>> {
+) -> Option<(Rect, u32)> {
     let step = i64::from(result.step.get());
     let pass_samples = pass_samples(blend::pass_radius(op, info).ok()?, result.step);
     let reach = 3 * i64::from(pass_samples);
@@ -332,6 +407,16 @@ fn detail_target(
         width: (gi1 - gi0) as u32,
         height: (gj1 - gj0) as u32,
     };
+    Some((window, pass_samples))
+}
+
+/// Detail's target over `at`, a box of result lattice samples, from both grids
+/// resampled onto `window`. `None` when `source` answers for no sample of it.
+fn detail_target(
+    (result, source): (&BrushPreviewGrid, &BrushPreviewGrid),
+    (window, pass_samples): (Rect, u32),
+    at: Rect,
+) -> Option<Vec<u16>> {
     let columns = result.columns() as usize;
     let capacity = window.width as usize * window.height as usize * 3;
     let (mut from_result, mut from_source) =

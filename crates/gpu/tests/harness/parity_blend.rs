@@ -4,7 +4,6 @@
 //! `fixtures/mantis-512`. Integer throughout on both sides, so the expected
 //! worst |delta| is exactly 0.
 
-use focusforge_core::algorithm::TileReader;
 use focusforge_core::io::TiffStack;
 use focusforge_core::project::{BrushMode, Op, Point, StrokeSource};
 use focusforge_core::retouch::blend;
@@ -13,7 +12,7 @@ use focusforge_core::zmap::ZMapInfo;
 use focusforge_gpu::blend::{BlendError, Blender};
 use focusforge_gpu::device::{SharedDevice, shared_device_or_skip};
 
-use crate::common::{self, worst_delta};
+use crate::common::{self, frame_samples, worst_delta};
 
 const OUT_FRAME: usize = 1;
 const SRC_FRAME: usize = 6;
@@ -37,28 +36,6 @@ fn stroke(path: Vec<Point>, radius: f32, softness: f32) -> Op {
 
 fn blender(shared: &SharedDevice) -> Blender {
     Blender::new(shared.device(), shared.queue())
-}
-
-/// `rect`'s samples of `frame`, at `spp` samples a pixel: the fixture's own,
-/// or its first channel alone.
-fn frame_samples(
-    stack: &impl TileReader,
-    frame: usize,
-    rect: Rect,
-    spp: usize,
-    native: usize,
-) -> Vec<u16> {
-    let mut all = vec![0u16; rect.width as usize * rect.height as usize * native];
-    stack
-        .read_tile_into(frame, rect, &mut all)
-        .expect("read fixture tile");
-    if spp == native {
-        all
-    } else {
-        all.chunks_exact(native)
-            .flat_map(|px| px[..spp].to_vec())
-            .collect()
-    }
 }
 
 /// What one device-versus-CPU blend left behind.

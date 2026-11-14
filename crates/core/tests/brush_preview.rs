@@ -13,7 +13,7 @@ use focusforge_core::project::{BrushMode, Op, Point, StrokeSource};
 use focusforge_core::retouch::blend;
 use focusforge_core::retouch::preview::{
     BRUSH_PREVIEW_STRENGTH_Q16, BrushPreview, BrushPreviewGrid, BrushPreviewSpec, brush_preview,
-    brush_preview_bounds,
+    brush_preview_bounds, brush_preview_layout,
 };
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::ZMapInfo;
@@ -735,4 +735,63 @@ fn brush_preview_bounds_is_the_box_the_preview_needs() {
     }
     let brush = spec((10, 10), 5.0, 0.3, BrushMode::Lighten, 1.0);
     assert_eq!(brush_preview_bounds((0, 0), &brush, nz(1)), None);
+}
+
+#[test]
+fn brush_preview_layout_is_the_box_brush_preview_draws() {
+    let image = (120, 100);
+    let mut compared = 0;
+    for mode in MODES {
+        for step in [1u32, 2, 3, 4] {
+            for origin in [0u32, 3, 5] {
+                let area = rect(origin, origin, image.0 - origin, image.1 - origin);
+                let result = Owned::new(area, step, 5);
+                let source = Owned::new(area, step, 6);
+                for (centre, radius) in [
+                    ((60, 50), 9.5),
+                    ((60, 50), 1.5),
+                    ((1, 2), 12.0),
+                    ((119, 99), 12.0),
+                    ((-4, 50), 8.0),
+                    ((300, 50), 8.0),
+                    ((61, 51), 0.02),
+                ] {
+                    let brush = spec(centre, radius, 0.5, mode, 1.0);
+                    let layout = brush_preview_layout(image, &result.grid(), &brush);
+                    let drawn = make(image, &result, &source, &brush, OPAQUE);
+                    let cells = |c, r, w, h| (c, r, w, h);
+                    assert_eq!(
+                        layout.map(|l| cells(l.column, l.row, l.width, l.height)),
+                        drawn
+                            .as_ref()
+                            .map(|d| cells(d.column, d.row, d.width, d.height)),
+                        "{mode:?} step {step} origin {origin} centre {centre:?} radius {radius}"
+                    );
+                    if let Some(l) = layout {
+                        assert_eq!((l.column % 4, l.row % 4), (0, 0));
+                        let f = l.footprint;
+                        assert!(
+                            f.x >= l.column
+                                && f.y >= l.row
+                                && f.x + f.width == l.column + l.width
+                                && f.y + f.height == l.row + l.height,
+                            "the footprint lies inside the output box"
+                        );
+                        assert_eq!(l.detail.is_some(), mode == BrushMode::Detail);
+                    }
+                    compared += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(compared, 4 * 4 * 3 * 7);
+
+    // A disc between two lattice samples holds none.
+    let area = rect(0, 0, 40, 40);
+    let sparse = Owned::new(area, 4, 1);
+    let between = spec((2, 2), 0.02, 0.5, BrushMode::Normal, 1.0);
+    assert_eq!(
+        brush_preview_layout((40, 40), &sparse.grid(), &between),
+        None
+    );
 }

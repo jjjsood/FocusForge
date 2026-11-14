@@ -15,9 +15,12 @@ use focusforge_core::timing::measurement_scope;
 
 use focusforge_core::TiffError;
 use focusforge_core::io::{FrameError, TiffStack};
-use focusforge_core::retouch::preview::{BrushPreviewGrid, BrushPreviewSpec, brush_preview_bounds};
+use focusforge_core::retouch::preview::{
+    BRUSH_PREVIEW_STRENGTH_Q16, BrushPreviewGrid, BrushPreviewSpec, brush_preview_bounds,
+};
 use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::zmap::ZMapReader;
+use focusforge_gpu::display::preview::{BrushPreviewRenderer, plan as plan_brush_preview};
 use focusforge_gpu::display::{DisplayRenderer, DisplayTexture, render_overlay};
 use slint::wgpu_29::wgpu;
 
@@ -531,8 +534,8 @@ mod tests {
             assert!(renderer.display_renderer.is_some());
             assert_eq!(
                 after.pipeline_creations - before.pipeline_creations,
-                1,
-                "attach {attach} builds exactly one display pipeline"
+                4,
+                "attach {attach} builds the display pipeline and the three brush-preview ones"
             );
             assert_eq!(
                 after.allocation_operations - before.allocation_operations,
@@ -577,6 +580,10 @@ mod tests {
             .set_frame(&fixture_frame(), None, crate::job::host_budget())
             .expect("fixture frame opens");
 
+        let draw = draw_of((200, 200, 64, 64), 1);
+        let mut preview = renderer_with(shared, &fixture_512_frame());
+        publish_exact(&mut preview, &draw);
+
         focusforge_gpu::errors::install_handlers(shared.device());
         shared.device().destroy();
         // wgpu delivers the device-lost callback from a later poll, and a
@@ -590,6 +597,14 @@ mod tests {
             focusforge_gpu::errors::device_lost(),
             "a destroyed device reports itself lost"
         );
+
+        assert!(
+            preview
+                .brush_preview_layer(&brush(232, 232, 10.0, BrushMode::Lighten), &draw)
+                .is_none(),
+            "no preview layer on a lost device"
+        );
+        assert!(preview.brush_preview_pane.display_texture.is_none());
 
         let before = accounting_snapshot();
         let _ = renderer.redraw_frame(&square_draw(8));
@@ -615,7 +630,9 @@ mod tests {
 
     use focusforge_core::io::{TiffSpec, TiffWriter};
     use focusforge_core::project::{BrushMode, Point};
-    use focusforge_core::retouch::preview::{BRUSH_PREVIEW_STRENGTH_Q16, brush_preview};
+    use focusforge_core::retouch::preview::{
+        BRUSH_PREVIEW_STRENGTH_Q16, brush_preview, brush_preview_layout,
+    };
 
     const SIDE: u32 = 512;
 
@@ -862,6 +879,121 @@ mod tests {
         assert_ne!(merged, sealed, "the edit changes samples");
         let grids = renderer.brush_preview_grids(&spec).expect("answers");
         assert_eq!(grids.result.samples, merged, "the merged samples");
+    }
+
+    /// Publishes pattern samples for `draw` to both exact panes.
+    fn publish_exact(renderer: &mut CanvasRenderer, draw: &PaneDraw) {
+        let frame_job = renderer.request_frame(draw).expect("frame job");
+        publish_pattern(renderer, &frame_job, 1);
+        let job = renderer
+            .request_planes(draw, None, None)
+            .expect("composite job");
+        publish_pattern(renderer, &job, 2);
+    }
+
+    #[test]
+    fn brush_preview_kernel_draws_on_the_calling_thread() {
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        let draw = draw_of((200, 200, 64, 64), 1);
+        publish_exact(&mut renderer, &draw);
+        let spec = brush(232, 232, 10.0, BrushMode::Lighten);
+
+        let (image, place) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("the layer draws");
+        let grids = renderer
+            .brush_preview_grids(&spec)
+            .expect("the panes answer");
+        let layout = brush_preview_layout(grids.image_size, &grids.result, &spec)
+            .expect("the brush has a layout");
+        assert_eq!((layout.column % 4, layout.row % 4), (0, 0));
+        assert_eq!(
+            (image.size().width, image.size().height),
+            (layout.width, layout.height),
+            "the image is the layout's texel size"
+        );
+        let step = grids.result.step.get();
+        let (x, y) = (
+            grids.result.rect.x + layout.column * step,
+            grids.result.rect.y + layout.row * step,
+        );
+        assert_eq!(
+            place,
+            (
+                (x - 200) as f32,
+                (y - 200) as f32,
+                (layout.width * step) as f32,
+                (layout.height * step) as f32
+            ),
+            "the layer lands on its pixels under the draw"
+        );
+
+        let texture = |renderer: &CanvasRenderer| {
+            renderer
+                .brush_preview_pane
+                .display_texture
+                .as_ref()
+                .expect("the layer has a texture")
+                .texture()
+                .clone()
+        };
+        let first = texture(&renderer);
+        renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("the layer draws again");
+        assert!(
+            texture(&renderer) == first,
+            "the same texel size reuses the texture"
+        );
+    }
+
+    #[test]
+    fn brush_preview_kernel_returns_none_on_refusal_or_lost_device() {
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let draw = draw_of((200, 200, 64, 64), 1);
+        let spec = brush(232, 232, 10.0, BrushMode::Lighten);
+
+        // A one-sample frame has no layer, and allocates no texture.
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let mut grey = renderer_with(shared, &one_spp_frame(scratch.path()));
+        publish_exact(&mut grey, &draw);
+        assert!(
+            grey.brush_preview_grids(&spec).is_some(),
+            "the panes answer"
+        );
+        assert!(grey.brush_preview_layer(&spec, &draw).is_none());
+        assert!(grey.brush_preview_pane.display_texture.is_none());
+
+        // A brush outside the retained grids keeps the previous image.
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        publish_exact(&mut renderer, &draw);
+        let (image, _) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("the layer draws");
+        let before = renderer
+            .brush_preview_pane
+            .display_texture
+            .as_ref()
+            .expect("the layer has a texture")
+            .texture()
+            .clone();
+        let outside = brush(400, 400, 10.0, BrushMode::Lighten);
+        assert!(renderer.brush_preview_grids(&outside).is_none());
+        assert!(renderer.brush_preview_layer(&outside, &draw).is_none());
+        let after = renderer
+            .brush_preview_pane
+            .display_texture
+            .as_ref()
+            .expect("the texture stays")
+            .texture()
+            .clone();
+        assert!(after == before, "the texture is the previous one");
+        assert_eq!(renderer.brush_preview_pane.image().size(), image.size());
     }
 
     #[test]
@@ -1223,6 +1355,9 @@ pub struct CanvasRenderer {
     device: Option<wgpu::Device>,
     queue: Option<wgpu::Queue>,
     display_renderer: Option<DisplayRenderer>,
+    brush_preview: Option<BrushPreviewRenderer>,
+    /// The texture [`Self::brush_preview_layer`] draws into.
+    brush_preview_pane: PaneTexture,
     sample_scratch: Vec<u16>,
     composite: Option<Arc<TiffStack>>,
     zmap: Option<Arc<ZMapReader>>,
@@ -1253,6 +1388,8 @@ impl CanvasRenderer {
             device: None,
             queue: None,
             display_renderer: None,
+            brush_preview: None,
+            brush_preview_pane: PaneTexture::default(),
             sample_scratch: Vec::new(),
             composite: None,
             zmap: None,
@@ -1324,6 +1461,7 @@ impl CanvasRenderer {
     pub fn attach_device(&mut self, device: wgpu::Device, queue: wgpu::Queue) {
         self.detach_device();
         self.display_renderer = Some(DisplayRenderer::new(&device));
+        self.brush_preview = Some(BrushPreviewRenderer::new(&device));
         self.device = Some(device);
         self.queue = Some(queue);
     }
@@ -1333,6 +1471,8 @@ impl CanvasRenderer {
         self.reset_planes();
         self.reset_frame();
         self.display_renderer = None;
+        self.brush_preview = None;
+        self.brush_preview_pane = PaneTexture::default();
         self.device = None;
         self.queue = None;
     }
@@ -1664,14 +1804,28 @@ impl CanvasRenderer {
     /// two backdrops do, else `None`. Each half keeps its own source rect,
     /// step and samples per pixel; the image is the composite's.
     pub fn brush_preview_grids(&self, spec: &BrushPreviewSpec) -> Option<PreviewGrids<'_>> {
-        let image_size = self.source_size(Pane::Composite)?;
-        [
-            (PreviewTier::Exact, &self.composite_pane, &self.frame_pane),
-            (
-                PreviewTier::Backdrop,
+        Self::preview_grids(
+            self.source_size(Pane::Composite)?,
+            [
+                &self.composite_pane,
+                &self.frame_pane,
                 &self.composite_backdrop,
                 &self.frame_backdrop,
-            ),
+            ],
+            spec,
+        )
+    }
+
+    /// [`Self::brush_preview_grids`] over the four panes: the composite and
+    /// frame panes, then their backdrops.
+    fn preview_grids<'a>(
+        image_size: (u32, u32),
+        [composite, frame, composite_backdrop, frame_backdrop]: [&'a PaneTexture; 4],
+        spec: &BrushPreviewSpec,
+    ) -> Option<PreviewGrids<'a>> {
+        [
+            (PreviewTier::Exact, composite, frame),
+            (PreviewTier::Backdrop, composite_backdrop, frame_backdrop),
         ]
         .into_iter()
         .find_map(|(tier, result, source)| {
@@ -1689,6 +1843,78 @@ impl CanvasRenderer {
                 source,
             })
         })
+    }
+
+    /// The brush-preview layer of `spec` over the panes' last published
+    /// pixels, drawn on the calling thread into a texture reused while the
+    /// texel size holds, with its place under `draw`. It submits and returns:
+    /// no readback, no wait. `None`, the previous image untouched, when the
+    /// panes lack the brush's pixels, the kernel has no layer or refuses the
+    /// brush, or the device is missing or lost.
+    pub fn brush_preview_layer(
+        &mut self,
+        spec: &BrushPreviewSpec,
+        draw: &PaneDraw,
+    ) -> Option<(slint::Image, (f32, f32, f32, f32))> {
+        let _scope = measurement_scope("gui_brush_preview_layer");
+        let (device, queue) = self.device_queue()?;
+        let image_size = self.source_size(Pane::Composite)?;
+        let Self {
+            composite_pane,
+            frame_pane,
+            composite_backdrop,
+            frame_backdrop,
+            brush_preview,
+            brush_preview_pane,
+            ..
+        } = self;
+        let renderer = brush_preview.as_mut()?;
+        let grids = Self::preview_grids(
+            image_size,
+            [
+                composite_pane,
+                frame_pane,
+                composite_backdrop,
+                frame_backdrop,
+            ],
+            spec,
+        )?;
+        let max_binding = device.limits().max_storage_buffer_binding_size;
+        let planned = match plan_brush_preview(
+            grids.image_size,
+            &grids.result,
+            &grids.source,
+            spec,
+            BRUSH_PREVIEW_STRENGTH_Q16,
+            max_binding,
+        ) {
+            Ok(planned) => planned?,
+            Err(refusal) => {
+                tracing::debug!(%refusal, "no brush preview layer");
+                return None;
+            }
+        };
+        let layout = planned.layout;
+        let texture = brush_preview_pane.ensure_texture(&device, layout.width, layout.height)?;
+        renderer.render(
+            &device,
+            &queue,
+            texture,
+            &planned,
+            &grids.result,
+            &grids.source,
+        );
+
+        let (rect, step) = (grids.result.rect, grids.result.step.get());
+        let (x, y) = (rect.x + layout.column * step, rect.y + layout.row * step);
+        let clipped = |from: u32, cells: u32, end: u32| (cells * step).min(end - from);
+        let pixels = (
+            x,
+            y,
+            clipped(x, layout.width, rect.x + rect.width),
+            clipped(y, layout.height, rect.y + rect.height),
+        );
+        Some((brush_preview_pane.image(), draw.place(pixels)))
     }
 
     /// The image `pane` currently holds and where it lands under `draw`:
