@@ -150,7 +150,9 @@ temporary directory rather than a shared one.
 Under `cargo nextest` (`.config/nextest.toml`) the default profile kills each
 test after 15 minutes (30 for `stack_cli`) and reports a named TIMEOUT. The
 `quick` profile, used by `tools/check-all.sh --quick`, skips four memory and
-reference-cache binaries and kills any test after 180 s. The
+reference-cache binaries and kills any test after 180 s. The align
+determinism test is six tests that nextest starts first (`.config/nextest.toml`);
+the `quick` profile leaves exactly those to the full gate. The
 `hit_cap_behaviour` tests are `measurement:` ignores, run by hand with
 `--ignored`.
 
@@ -309,7 +311,10 @@ byte budget per generated file: 17.4 MB main window, 1.1 MB comparison
 window, 24.4 MB theme sheet). The sheet is built, tested and checked only when
 a path under `crates/ui*/` or `crates/gui/`, or the root `Cargo.toml`,
 `Cargo.lock` or `rust-toolchain.toml`, changed since the merge base, and always
-in CI or when no base resolves; otherwise the stage prints `SKIP`.
+in CI or when no base resolves; otherwise the stage prints `SKIP`, and the
+skipped full run is cached as `full-partial`, which answers later `--quick` and
+`--static` runs but not a later full run. The no-default-features stage
+(`check (no default features)`) is a `cargo check`.
 Raise a budget on purpose by editing its line in the `BUDGETS` table in that
 script.
 Read `tools/README.md` for what each script does before running cargo
