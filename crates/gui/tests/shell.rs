@@ -176,6 +176,8 @@ fn checkpoint_panel_touches_no_storage() {
     // which builds the stored stroke's path in core's own point type.
     // `performance_settings.rs` parses its cap strings with core's size
     // syntax. `calculator.rs` plans through core's step calculator.
+    // `sheet_specimens.rs` reads fixture frames for the theme sheet and is not
+    // compiled without that feature.
     // Excluded by name: this test's own subject is the checkpoint
     // panel, not the whole crate. Source preview reductions also read frames.
     let canvas_files = [
@@ -196,6 +198,7 @@ fn checkpoint_panel_touches_no_storage() {
         "analytics.rs",
         "recent.rs",
         "settings.rs",
+        "sheet_specimens.rs",
     ];
     for path in common::find_rust_files(&common::src_dir()) {
         if path

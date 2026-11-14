@@ -318,6 +318,40 @@ component ResultsColumnView inherits VerticalLayout {
     }
 }
 
+// A brush preview specimen: the result's backdrop and the stroke layer over
+// it, each as an offset and size from the stage's centre, in logical px.
+export struct PreviewSpecimen {
+    backdrop: image,
+    backdrop-x: length,
+    backdrop-y: length,
+    backdrop-width: length,
+    backdrop-height: length,
+    layer: image,
+    layer-x: length,
+    layer-y: length,
+    layer-width: length,
+    layer-height: length,
+}
+
+component PreviewStage inherits Rectangle {
+    in property <PreviewSpecimen> specimen;
+    in property <bool> pixelated: false;
+    width: 210px;
+    height: 210px;
+    clip: true;
+
+    Image {
+        x: root.width / 2 + root.specimen.backdrop-x;
+        y: root.height / 2 + root.specimen.backdrop-y;
+        width: root.specimen.backdrop-width;
+        height: root.specimen.backdrop-height;
+        source: root.specimen.backdrop;
+        image-fit: fill;
+        image-rendering: root.pixelated ? ImageRendering.pixelated : ImageRendering.smooth;
+    }
+    @children
+}
+
 struct DemoRow {
     chip: color,
     name: string,
@@ -331,6 +365,7 @@ export component ThemeSheet inherits Window {
     in property <image> stage-complete;
     in property <image> stage-heat;
     in property <[StageTile]> stage-tiles;
+    in property <[PreviewSpecimen]> preview-specimens;
     // The motion demos below show and hide together.
     in-out property <bool> demo-shown: true;
     in-out property <bool> demo-loop: true;
@@ -1069,7 +1104,7 @@ export component ThemeSheet inherits Window {
             SheetGroup {
                 title: "Brush cursors";
 
-                GroupHeading { text: "Brush cursor: hard / soft 55 % at radius 64 and 22 with mode tags N / L / D / T, picking"; }
+                GroupHeading { text: "Brush cursor: hard / soft 55 % at radius 64 and 22 with mode tags N / L / D / T, picking, checkpoint-source ring"; }
                 Rectangle {
                     height: 170px;
                     background: Theme.text-muted;
@@ -1117,29 +1152,82 @@ export component ThemeSheet inherits Window {
                         }
                         FFBrushCursor {
                             y: (parent.height - self.height) / 2;
-                            extent: 52.97px;
-                            core-commands: "M 14.49 26.49 A 12.00 12.00 0 1 1 38.49 26.49 A 12.00 12.00 0 1 1 14.49 26.49";
-                            mode-tag: "N";
-                            tag-origin: 36.97px;
-                            checkpoint-source: true;
-                            glyph-color: Theme.status-success;
-                        }
-                        FFBrushCursor {
-                            y: (parent.height - self.height) / 2;
                             extent: 113.54px;
                             core-commands: "M 4.77 56.77 A 52.00 52.00 0 1 1 108.77 56.77 A 52.00 52.00 0 1 1 4.77 56.77";
                             mode-tag: "N";
                             tag-origin: 95.54px;
                             checkpoint-source: true;
-                            glyph-color: Theme.accent-default;
                         }
+                    }
+                }
+            }
+
+            SheetGroup {
+                title: "Brush cursor over the stroke preview";
+
+                GroupHeading { text: "Preview at 80 % under the soft ring and mode tag: scale 1 (Normal), scale 3 pixelated (Normal), checkpoint source (Lighten at 60 %)"; }
+                Rectangle {
+                    height: 242px;
+                    background: Theme.text-muted;
+
+                    HorizontalLayout {
+                        padding: Theme.space-4;
+                        spacing: Theme.space-6;
+                        alignment: start;
+
+                        PreviewStage {
+                            specimen: root.preview-specimens[0];
                         FFBrushCursor {
+                            x: (parent.width - self.width) / 2;
                             y: (parent.height - self.height) / 2;
-                            extent: 67.11px;
-                            picking: true;
-                            pick-color: Theme.status-warning;
+                            extent: 130px;
+                            ring-commands: "M 65.00 1.00 A 64.00 64.00 0 0 1 76.11 1.97 M 86.89 4.86 A 64.00 64.00 0 0 1 97.00 9.57 M 106.14 15.97 A 64.00 64.00 0 0 1 114.03 23.86 M 120.43 33.00 A 64.00 64.00 0 0 1 125.14 43.11 M 128.03 53.89 A 64.00 64.00 0 0 1 129.00 65.00 M 128.03 76.11 A 64.00 64.00 0 0 1 125.14 86.89 M 120.43 97.00 A 64.00 64.00 0 0 1 114.03 106.14 M 106.14 114.03 A 64.00 64.00 0 0 1 97.00 120.43 M 86.89 125.14 A 64.00 64.00 0 0 1 76.11 128.03 M 65.00 129.00 A 64.00 64.00 0 0 1 53.89 128.03 M 43.11 125.14 A 64.00 64.00 0 0 1 33.00 120.43 M 23.86 114.03 A 64.00 64.00 0 0 1 15.97 106.14 M 9.57 97.00 A 64.00 64.00 0 0 1 4.86 86.89 M 1.97 76.11 A 64.00 64.00 0 0 1 1.00 65.00 M 1.97 53.89 A 64.00 64.00 0 0 1 4.86 43.11 M 9.57 33.00 A 64.00 64.00 0 0 1 15.97 23.86 M 23.86 15.97 A 64.00 64.00 0 0 1 33.00 9.57 M 43.11 4.86 A 64.00 64.00 0 0 1 53.89 1.97";
+                            core-commands: "M 36.20 65.00 A 28.80 28.80 0 1 1 93.80 65.00 A 28.80 28.80 0 1 1 36.20 65.00";
+                            mode-tag: "N";
+                            tag-origin: 112.25px;
+                            preview: root.preview-specimens[0].layer;
+                            preview-x: self.extent / 2 + root.preview-specimens[0].layer-x;
+                            preview-y: self.extent / 2 + root.preview-specimens[0].layer-y;
+                            preview-width: root.preview-specimens[0].layer-width;
+                            preview-height: root.preview-specimens[0].layer-height;
+                        }
+                        }
+                        PreviewStage {
+                            specimen: root.preview-specimens[1];
+                            pixelated: true;
+                        FFBrushCursor {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            extent: 130px;
+                            ring-commands: "M 65.00 1.00 A 64.00 64.00 0 0 1 76.11 1.97 M 86.89 4.86 A 64.00 64.00 0 0 1 97.00 9.57 M 106.14 15.97 A 64.00 64.00 0 0 1 114.03 23.86 M 120.43 33.00 A 64.00 64.00 0 0 1 125.14 43.11 M 128.03 53.89 A 64.00 64.00 0 0 1 129.00 65.00 M 128.03 76.11 A 64.00 64.00 0 0 1 125.14 86.89 M 120.43 97.00 A 64.00 64.00 0 0 1 114.03 106.14 M 106.14 114.03 A 64.00 64.00 0 0 1 97.00 120.43 M 86.89 125.14 A 64.00 64.00 0 0 1 76.11 128.03 M 65.00 129.00 A 64.00 64.00 0 0 1 53.89 128.03 M 43.11 125.14 A 64.00 64.00 0 0 1 33.00 120.43 M 23.86 114.03 A 64.00 64.00 0 0 1 15.97 106.14 M 9.57 97.00 A 64.00 64.00 0 0 1 4.86 86.89 M 1.97 76.11 A 64.00 64.00 0 0 1 1.00 65.00 M 1.97 53.89 A 64.00 64.00 0 0 1 4.86 43.11 M 9.57 33.00 A 64.00 64.00 0 0 1 15.97 23.86 M 23.86 15.97 A 64.00 64.00 0 0 1 33.00 9.57 M 43.11 4.86 A 64.00 64.00 0 0 1 53.89 1.97";
+                            core-commands: "M 36.20 65.00 A 28.80 28.80 0 1 1 93.80 65.00 A 28.80 28.80 0 1 1 36.20 65.00";
+                            mode-tag: "N";
+                            tag-origin: 112.25px;
+                            preview: root.preview-specimens[1].layer;
+                            preview-x: self.extent / 2 + root.preview-specimens[1].layer-x;
+                            preview-y: self.extent / 2 + root.preview-specimens[1].layer-y;
+                            preview-width: root.preview-specimens[1].layer-width;
+                            preview-height: root.preview-specimens[1].layer-height;
+                            preview-pixelated: true;
+                        }
+                        }
+                        PreviewStage {
+                            specimen: root.preview-specimens[2];
+                        FFBrushCursor {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            extent: 130px;
+                            ring-commands: "M 65.00 1.00 A 64.00 64.00 0 0 1 76.11 1.97 M 86.89 4.86 A 64.00 64.00 0 0 1 97.00 9.57 M 106.14 15.97 A 64.00 64.00 0 0 1 114.03 23.86 M 120.43 33.00 A 64.00 64.00 0 0 1 125.14 43.11 M 128.03 53.89 A 64.00 64.00 0 0 1 129.00 65.00 M 128.03 76.11 A 64.00 64.00 0 0 1 125.14 86.89 M 120.43 97.00 A 64.00 64.00 0 0 1 114.03 106.14 M 106.14 114.03 A 64.00 64.00 0 0 1 97.00 120.43 M 86.89 125.14 A 64.00 64.00 0 0 1 76.11 128.03 M 65.00 129.00 A 64.00 64.00 0 0 1 53.89 128.03 M 43.11 125.14 A 64.00 64.00 0 0 1 33.00 120.43 M 23.86 114.03 A 64.00 64.00 0 0 1 15.97 106.14 M 9.57 97.00 A 64.00 64.00 0 0 1 4.86 86.89 M 1.97 76.11 A 64.00 64.00 0 0 1 1.00 65.00 M 1.97 53.89 A 64.00 64.00 0 0 1 4.86 43.11 M 9.57 33.00 A 64.00 64.00 0 0 1 15.97 23.86 M 23.86 15.97 A 64.00 64.00 0 0 1 33.00 9.57 M 43.11 4.86 A 64.00 64.00 0 0 1 53.89 1.97";
+                            core-commands: "M 36.20 65.00 A 28.80 28.80 0 1 1 93.80 65.00 A 28.80 28.80 0 1 1 36.20 65.00";
+                            mode-tag: "L";
+                            tag-origin: 112.25px;
                             checkpoint-source: true;
-                            glyph-color: Theme.accent-default;
+                            preview: root.preview-specimens[2].layer;
+                            preview-x: self.extent / 2 + root.preview-specimens[2].layer-x;
+                            preview-y: self.extent / 2 + root.preview-specimens[2].layer-y;
+                            preview-width: root.preview-specimens[2].layer-width;
+                            preview-height: root.preview-specimens[2].layer-height;
+                        }
                         }
                     }
                 }

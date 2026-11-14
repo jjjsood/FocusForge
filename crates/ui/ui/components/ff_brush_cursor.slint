@@ -2,8 +2,7 @@
 //
 // The brush cursor: a dashed ring at the radius around a solid core, or,
 // while picking, the pipette icon beside a swatch of the colour it would pick.
-// A checkpoint source draws the ring in `text-primary` with a layers glyph at
-// the centre.
+// A checkpoint source draws the ring in `text-primary`. A preview image, when set, sits under all of it.
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
@@ -21,16 +20,33 @@ export component FFBrushCursor inherits Rectangle {
     // axes of the square.
     in property <string> mode-tag: "";
     in property <length> tag-origin;
-    // The brush source is a checkpoint: a `text-primary` ring around the
-    // layers glyph in `glyph-color`. Picking takes precedence.
+    // The brush source is a checkpoint: the ring is `text-primary`. Picking
+    // takes precedence.
     in property <bool> checkpoint-source: false;
-    in property <color> glyph-color;
+    // The stroke preview layer and its rectangle in the square's own
+    // coordinates; a zero width draws none.
+    in property <image> preview;
+    in property <length> preview-x;
+    in property <length> preview-y;
+    in property <length> preview-width;
+    in property <length> preview-height;
+    in property <bool> preview-pixelated: false;
 
     property <bool> checkpoint-look: root.checkpoint-source && !root.picking;
     property <color> ink: root.checkpoint-look ? Theme.text-primary : Theme.cursor-ink;
 
     width: root.extent;
     height: root.extent;
+
+    if root.preview-width > 0px: preview := Image {
+        x: root.preview-x;
+        y: root.preview-y;
+        width: root.preview-width;
+        height: root.preview-height;
+        source: root.preview;
+        image-fit: fill;
+        image-rendering: root.preview-pixelated ? ImageRendering.pixelated : ImageRendering.smooth;
+    }
 
     if !root.picking: Path {
         width: root.extent;
@@ -53,15 +69,6 @@ export component FFBrushCursor inherits Rectangle {
         commands: root.core-commands;
         stroke: root.ink;
         stroke-width: 1px;
-    }
-
-    if root.checkpoint-look: Image {
-        x: (root.width - self.width) / 2;
-        y: (root.height - self.height) / 2;
-        width: ShellGeometry.cursor-glyph-side;
-        height: ShellGeometry.cursor-glyph-side;
-        source: @image-url("../../../../assets/icons/layers.svg");
-        colorize: root.glyph-color;
     }
 
     // The active brush mode's one-letter chip, outside the ring at its

@@ -3932,15 +3932,13 @@ fn images_in(app: &AppWindow, id: &str) -> Vec<(f32, f32)> {
 }
 
 #[test]
-fn checkpoint_source_view_cursor_glyph() {
+fn checkpoint_source_cursor_draws_no_centre_image() {
     common::init_window_backend();
     let app = AppWindow::new().unwrap();
     app.window().set_size(slint::PhysicalSize::new(1440, 900));
     app.set_project_loaded(true);
     app.set_mode("editor".into());
     app.set_cursor_visible(true);
-    app.set_cursor_checkpoint_source(true);
-    app.set_cursor_glyph_color(slint::Color::from_rgb_u8(200, 120, 40));
     let pane = ElementQuery::from_root(&app)
         .match_id("FFCanvas::pane-left")
         .find_first()
@@ -3951,33 +3949,25 @@ fn checkpoint_source_view_cursor_glyph() {
     app.set_cursor_composite_x(40.0);
     app.set_cursor_composite_y(size.height / 2.0);
 
-    let glyph = (10.0, 10.0);
     let pipette = (20.0, 20.0);
     for extent in [24.0, 104.0] {
         app.set_cursor_extent(extent);
         for id in ["brush-cursor-left", "brush-cursor-right"] {
-            app.set_cursor_picking(false);
-            assert_eq!(
-                images_in(&app, id),
-                [glyph],
-                "{id} at {extent}: the glyph only"
-            );
-            app.set_cursor_picking(true);
-            assert_eq!(
-                images_in(&app, id),
-                [pipette],
-                "{id} at {extent}: the pipette only"
-            );
+            for checkpoint in [false, true] {
+                app.set_cursor_checkpoint_source(checkpoint);
+                app.set_cursor_picking(false);
+                assert!(
+                    images_in(&app, id).is_empty(),
+                    "{id} at {extent}, checkpoint source {checkpoint}: no image at the centre"
+                );
+                app.set_cursor_picking(true);
+                assert_eq!(
+                    images_in(&app, id),
+                    [pipette],
+                    "{id} at {extent}, checkpoint source {checkpoint}: the pipette only"
+                );
+            }
         }
-    }
-
-    app.set_cursor_picking(false);
-    app.set_cursor_checkpoint_source(false);
-    for id in ["brush-cursor-left", "brush-cursor-right"] {
-        assert!(
-            images_in(&app, id).is_empty(),
-            "{id}: a frame source draws no glyph"
-        );
     }
 }
 

@@ -4700,6 +4700,44 @@ impl AppController {
         })
     }
 
+    /// The brush the preview layer would draw: the one-point stroke a press
+    /// at the cursor's anchor would record. `None` with the preview off, outside the
+    /// editor, while [`Self::brush_cursor_view`] is `None` or picking (the
+    /// pipette armed or `Alt` held), during a live stroke, and while the
+    /// anchor's source point is off the image.
+    pub fn brush_preview_spec(&self) -> Option<brush::BrushPreviewSpec> {
+        if !self.editor.preview || self.mode() != ShellMode::Editor {
+            return None;
+        }
+        if self.brush_cursor_view()?.picking {
+            return None;
+        }
+        let tab = self.state.active()?;
+        let edit = tab.edit.as_ref().filter(|edit| edit.stroke.is_none())?;
+        let (pane, local) = self.anchor_pane();
+        let (sx, sy) = tab
+            .viewport
+            .as_ref()?
+            .to_source_in(local, self.pane_rect(pane)?);
+        let info = edit.info();
+        if sx < 0.0
+            || sy < 0.0
+            || sx.floor() as u32 >= info.width()
+            || sy.floor() as u32 >= info.height()
+        {
+            return None;
+        }
+        let (radius, softness) = self.brush_radius_softness();
+        let (mode, opacity) = self.brush_mode_opacity();
+        Some(brush::preview_spec(
+            (sx, sy),
+            radius,
+            softness,
+            mode,
+            opacity,
+        ))
+    }
+
     /// The slider's own callback: `fraction` is `0.0..=1.0` along the
     /// logarithmic track.
     pub fn set_brush_size_fraction(&mut self, fraction: f32) {

@@ -94,12 +94,18 @@ export component FFCanvas inherits Rectangle {
     in property <string> cursor-mode-tag: "";
     in property <length> cursor-tag-origin;
     in property <bool> cursor-checkpoint-source: false;
-    in property <color> cursor-glyph-color;
     in property <bool> cursor-visible: false;
     in property <length> cursor-frame-x;
     in property <length> cursor-frame-y;
     in property <length> cursor-composite-x;
     in property <length> cursor-composite-y;
+    // The stroke preview layer over the composite cursor, its rectangle in
+    // that cursor's own square.
+    in property <image> cursor-preview;
+    in property <length> cursor-preview-x;
+    in property <length> cursor-preview-y;
+    in property <length> cursor-preview-width;
+    in property <length> cursor-preview-height;
     out property <bool> pane-hovered: hit-area.has-hover
         && ((pane-left.visible && hit-area.mouse-x >= pane-left.x
                 && hit-area.mouse-x <= pane-left.x + pane-left.width
@@ -319,7 +325,6 @@ export component FFCanvas inherits Rectangle {
             mode-tag: root.cursor-mode-tag;
             tag-origin: root.cursor-tag-origin;
             checkpoint-source: root.cursor-checkpoint-source;
-            glyph-color: root.cursor-glyph-color;
         }
     }
 
@@ -342,7 +347,12 @@ export component FFCanvas inherits Rectangle {
             mode-tag: root.cursor-mode-tag;
             tag-origin: root.cursor-tag-origin;
             checkpoint-source: root.cursor-checkpoint-source;
-            glyph-color: root.cursor-glyph-color;
+            preview: root.cursor-preview;
+            preview-x: root.cursor-preview-x;
+            preview-y: root.cursor-preview-y;
+            preview-width: root.cursor-preview-width;
+            preview-height: root.cursor-preview-height;
+            preview-pixelated: root.pixelated;
         }
     }
 

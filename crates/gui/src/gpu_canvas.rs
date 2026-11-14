@@ -997,6 +997,140 @@ mod tests {
     }
 
     #[test]
+    fn brush_preview_follows_a_source_step_on_the_next_frame_publish() {
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let other_frame = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/mantis-512/frames/01.tif");
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        let draw = draw_of((200, 200, 64, 64), 1);
+        let spec = brush(232, 232, 10.0, BrushMode::Lighten);
+        publish_exact(&mut renderer, &draw);
+        let (image, rect) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("both panes published");
+
+        // The same inputs answer from the memo: with the kernel gone a rebuild
+        // would find none.
+        let kernel = renderer.brush_preview.take();
+        let (again, again_rect) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("the memo answers");
+        assert_eq!(again_rect, rect, "the same rect");
+        assert_eq!(again.size(), image.size(), "the same image");
+        renderer.brush_preview = kernel;
+
+        // A source step empties the frame pane and its backdrop.
+        renderer
+            .set_frame(&other_frame, None, crate::job::host_budget())
+            .expect("the other frame opens");
+        assert!(renderer.brush_preview_grids(&spec).is_none(), "no source");
+        let (kept, kept_rect) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("the previous layer stays while the new frame has not published");
+        assert_eq!(kept_rect, rect, "the previous rect");
+        assert_eq!(kept.size(), image.size(), "the previous image");
+
+        // Another brush or draw would put the old layer in the wrong place.
+        let moved = brush(233, 232, 10.0, BrushMode::Lighten);
+        assert!(
+            renderer.brush_preview_layer(&moved, &draw).is_none(),
+            "a moved brush in the gap"
+        );
+        let panned = draw_of((201, 200, 64, 64), 1);
+        assert!(
+            renderer.brush_preview_layer(&spec, &panned).is_none(),
+            "a panned draw in the gap"
+        );
+
+        // The new frame's first publish builds from its own samples.
+        let frame_job = renderer.request_frame(&draw).expect("frame job");
+        let samples = publish_pattern(&mut renderer, &frame_job, 5);
+        let (_, rebuilt_rect) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("rebuilt after the publish");
+        assert_eq!(rebuilt_rect, rect, "the same brush lands in the same place");
+        let grids = renderer.brush_preview_grids(&spec).expect("answers");
+        assert_eq!(grids.source.samples, samples, "the new frame is the source");
+    }
+
+    #[test]
+    fn brush_preview_draws_the_ring_alone_without_retained_samples() {
+        let draw = draw_of((200, 200, 64, 64), 1);
+        let spec = brush(232, 232, 10.0, BrushMode::Lighten);
+        let mut bare = CanvasRenderer::new();
+        assert!(
+            bare.brush_preview_layer(&spec, &draw).is_none(),
+            "no device"
+        );
+
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        assert!(
+            renderer.brush_preview_layer(&spec, &draw).is_none(),
+            "before any publish"
+        );
+
+        publish_exact(&mut renderer, &draw);
+        renderer.clear_frame();
+        assert!(
+            renderer.brush_preview_layer(&spec, &draw).is_none(),
+            "after clear_frame, nothing built yet"
+        );
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        publish_exact(&mut renderer, &draw);
+        assert!(renderer.brush_preview_layer(&spec, &draw).is_some());
+        renderer.clear_planes();
+        assert!(
+            renderer.brush_preview_layer(&spec, &draw).is_none(),
+            "after clear_planes the layer goes, the frame still holds samples"
+        );
+        renderer.clear_frame();
+        assert!(
+            renderer.brush_preview_layer(&spec, &draw).is_none(),
+            "nothing left to keep"
+        );
+        let mut detached = renderer_with(shared, &fixture_512_frame());
+        publish_exact(&mut detached, &draw);
+        assert!(detached.brush_preview_layer(&spec, &draw).is_some());
+        detached.detach_device();
+        assert!(
+            detached.brush_preview_layer(&spec, &draw).is_none(),
+            "after the device detaches"
+        );
+
+        // A disc near the image's lower-right corner ends at the image edge.
+        let corner = draw_of((448, 448, 64, 64), 1);
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        publish_exact(&mut renderer, &corner);
+        let near = brush(505, 505, 10.0, BrushMode::Lighten);
+        let (_, rect) = renderer
+            .brush_preview_layer(&near, &corner)
+            .expect("the corner brush draws");
+        let edge = corner.place((0, 0, SIDE, SIDE));
+        assert_eq!(
+            (rect.0 + rect.2, rect.1 + rect.3),
+            (edge.0 + edge.2, edge.1 + edge.3),
+            "the layer ends at the image's placed edge"
+        );
+
+        // A disc outside the exact panes but inside both backdrops.
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        publish_all(&mut renderer);
+        let outside = brush(24, 24, 10.0, BrushMode::Lighten);
+        let backdrop_draw = draw_of((0, 0, SIDE, SIDE), 8);
+        assert!(
+            renderer
+                .brush_preview_layer(&outside, &backdrop_draw)
+                .is_some(),
+            "built from the backdrops"
+        );
+    }
+
+    #[test]
     fn retained_query_falls_back_to_the_backdrops_then_to_nothing() {
         let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
             return;
@@ -1343,6 +1477,14 @@ impl PlaneFile {
     }
 }
 
+/// What a [`CanvasRenderer::brush_preview_layer`] answer was built from.
+struct PreviewMemo {
+    spec: BrushPreviewSpec,
+    draw: PaneDraw,
+    inputs: u64,
+    layer: Option<(slint::Image, (f32, f32, f32, f32))>,
+}
+
 /// The composite pane's GPU-owned state, the frame pane's own, the one
 /// [`DisplayRenderer`] every pane renders through, and the CPU scratch the
 /// synchronous redraws read into. A pane's read is a [`PaneJob`] (none when
@@ -1358,6 +1500,10 @@ pub struct CanvasRenderer {
     brush_preview: Option<BrushPreviewRenderer>,
     /// The texture [`Self::brush_preview_layer`] draws into.
     brush_preview_pane: PaneTexture,
+    /// Counts every change to the retained samples the preview reads.
+    preview_inputs: u64,
+    /// The last [`Self::brush_preview_layer`] answer and what it was built from.
+    brush_preview_last: Option<PreviewMemo>,
     sample_scratch: Vec<u16>,
     composite: Option<Arc<TiffStack>>,
     zmap: Option<Arc<ZMapReader>>,
@@ -1390,6 +1536,8 @@ impl CanvasRenderer {
             display_renderer: None,
             brush_preview: None,
             brush_preview_pane: PaneTexture::default(),
+            preview_inputs: 0,
+            brush_preview_last: None,
             sample_scratch: Vec::new(),
             composite: None,
             zmap: None,
@@ -1411,6 +1559,7 @@ impl CanvasRenderer {
     /// Empties the composite pane and its backdrop and refuses every job
     /// issued so far for them.
     fn reset_planes(&mut self) {
+        self.preview_inputs += 1;
         let stamp = self.next_stamp();
         self.composite_pane = PaneTexture::fresh(stamp);
         self.composite_backdrop = PaneTexture::fresh(stamp);
@@ -1418,6 +1567,7 @@ impl CanvasRenderer {
 
     /// Empties the frame pane and refuses every job issued so far for it.
     fn reset_frame(&mut self) {
+        self.preview_inputs += 1;
         let stamp = self.next_stamp();
         self.frame_pane = PaneTexture::fresh(stamp);
         self.frame_backdrop = PaneTexture::fresh(stamp);
@@ -1473,6 +1623,7 @@ impl CanvasRenderer {
         self.display_renderer = None;
         self.brush_preview = None;
         self.brush_preview_pane = PaneTexture::default();
+        self.brush_preview_last = None;
         self.device = None;
         self.queue = None;
     }
@@ -1793,6 +1944,7 @@ impl CanvasRenderer {
             }
         };
         texture.retain(merged, samples, samples_per_pixel);
+        self.preview_inputs += 1;
         texture.mark_covered(job.draw.src, job.draw.step, job.state.clone());
         Some(texture.image())
     }
@@ -1851,7 +2003,40 @@ impl CanvasRenderer {
     /// no readback, no wait. `None`, the previous image untouched, when the
     /// panes lack the brush's pixels, the kernel has no layer or refuses the
     /// brush, or the device is missing or lost.
+    ///
+    /// The same `spec`, `draw` and retained samples return the last answer
+    /// without a dispatch. While the frame pane and its backdrop are empty
+    /// (the source was just changed), the composite still holds samples and
+    /// `spec` and `draw` are unchanged, the last layer stays.
     pub fn brush_preview_layer(
+        &mut self,
+        spec: &BrushPreviewSpec,
+        draw: &PaneDraw,
+    ) -> Option<(slint::Image, (f32, f32, f32, f32))> {
+        let last = self.brush_preview_last.as_ref();
+        let same_brush = last.is_some_and(|m| m.spec == *spec && m.draw == *draw);
+        let kept = last.and_then(|m| m.layer.clone());
+        if same_brush && last.is_some_and(|m| m.inputs == self.preview_inputs) {
+            return kept;
+        }
+        let source_empty = self.frame_pane.retained_grid().is_none()
+            && self.frame_backdrop.retained_grid().is_none();
+        let result_held = self.composite_pane.retained_grid().is_some()
+            || self.composite_backdrop.retained_grid().is_some();
+        let layer = match self.build_brush_preview_layer(spec, draw) {
+            None if same_brush && source_empty && result_held => kept,
+            built => built,
+        };
+        self.brush_preview_last = Some(PreviewMemo {
+            spec: *spec,
+            draw: *draw,
+            inputs: self.preview_inputs,
+            layer: layer.clone(),
+        });
+        layer
+    }
+
+    fn build_brush_preview_layer(
         &mut self,
         spec: &BrushPreviewSpec,
         draw: &PaneDraw,

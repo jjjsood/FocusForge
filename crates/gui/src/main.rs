@@ -1317,6 +1317,12 @@ fn preview_row(chip: [u8; 3], name: &str, time: &str) -> focusforge_gui::ImageRo
 fn run_sheet(args: &Args, inspection: &Inspection) -> i32 {
     let sheet = ThemeSheet::new().expect("failed to instantiate ThemeSheet");
     fill_stage_sheet(&sheet);
+    match focusforge_gui::sheet_specimens::preview_specimens() {
+        Ok(specimens) => {
+            sheet.set_preview_specimens(slint::ModelRc::new(slint::VecModel::from(specimens)));
+        }
+        Err(e) => eprintln!("brush preview specimens: {e}"),
+    }
     run_window(sheet, args, None, None, None, inspection)
 }
 

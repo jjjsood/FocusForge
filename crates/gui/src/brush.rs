@@ -8,6 +8,29 @@
 use focusforge_core::project::{BrushMode, Point, StrokeSource};
 use focusforge_core::tile::Rect;
 
+pub use focusforge_core::retouch::preview::BrushPreviewSpec;
+
+/// The preview brush of the one-point stroke a press at the source point
+/// `(sx, sy)` would record: its centre is the integer point the stroke stores.
+pub fn preview_spec(
+    (sx, sy): (f64, f64),
+    radius: f32,
+    softness: f32,
+    mode: BrushMode,
+    opacity: f32,
+) -> BrushPreviewSpec {
+    BrushPreviewSpec {
+        centre: Point {
+            x: (sx - 0.5).round() as i32,
+            y: (sy - 0.5).round() as i32,
+        },
+        radius,
+        softness,
+        mode,
+        opacity,
+    }
+}
+
 /// One freehand stroke while its drag is still live: the raw `f32` trace in
 /// image coordinates, the index of the last point a tick has already
 /// consumed, and the footprint of each tick applied so far (for the commit

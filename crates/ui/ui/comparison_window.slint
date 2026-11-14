@@ -50,10 +50,16 @@ export component ComparisonWindow inherits Window {
     in property <string> cursor-mode-tag: "";
     in property <length> cursor-tag-origin;
     in property <bool> cursor-checkpoint-source: false;
-    in property <color> cursor-glyph-color;
     in property <bool> cursor-visible: false;
     in property <length> cursor-x;
     in property <length> cursor-y;
+    // The stroke preview layer under the cursor, its rectangle in the
+    // cursor's own square.
+    in property <image> cursor-preview;
+    in property <length> cursor-preview-x;
+    in property <length> cursor-preview-y;
+    in property <length> cursor-preview-width;
+    in property <length> cursor-preview-height;
     in property <bool> window-maximized: false;
     // The live stage view of a Composite pane in this window.
     in property <bool> stage-visible: false;
@@ -220,7 +226,12 @@ export component ComparisonWindow inherits Window {
             mode-tag: root.cursor-mode-tag;
             tag-origin: root.cursor-tag-origin;
             checkpoint-source: root.cursor-checkpoint-source;
-            glyph-color: root.cursor-glyph-color;
+            preview: root.cursor-preview;
+            preview-x: root.cursor-preview-x;
+            preview-y: root.cursor-preview-y;
+            preview-width: root.cursor-preview-width;
+            preview-height: root.cursor-preview-height;
+            preview-pixelated: root.pixelated;
         }
     }
 }
