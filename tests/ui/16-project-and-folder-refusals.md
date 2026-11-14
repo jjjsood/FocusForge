@@ -1,5 +1,6 @@
 # Open folders and projects that are refused, mismatched, missing or grouped, then fuse a stack that fails
 Start: --open fixtures/open-rejected --open fixtures/open-root-and-subfolder --open fixtures/projects/missing.ffp --open fixtures/projects/mismatch.ffp --open fixtures/open-two-stacks --open fixtures/projects/corrupt.ffp
+Use a fresh settings directory and a fresh data directory. Before the launch, write `[updates]` and `check_on_start = false` as two lines into `focusforge/settings.toml` inside that settings directory (create the folder), so the window makes no release check at start and no "FocusForge … is available" record appears.
 ## Four dialogs stand stacked, dismissed from the top
 1. Click **Projects** (`FFTabStrip::projects-button`) while the launch's dialogs are up.
    Expect: (within 30 s) Must not: the Projects overview opens; a dialog titled "This project cannot be opened" with the text "This file is not a FocusForge project." and a **Close** button stays on top.
@@ -44,6 +45,6 @@ Start: --open fixtures/open-rejected --open fixtures/open-root-and-subfolder --o
 19. Click **Retry** (`FFToolbar::retry-button`).
     Expect: (within 30 s) the bottom bar status reads "Failed", the toolbar button still reads "Retry" and the bell shows the number 2; Must not: a composite is filled or the dialog "Keep this fused result?" appears.
 20. Click **Notifications** (`FFIconBar::bell`).
-    Expect: the center reads "3 notifications · this session" and lists two rows titled "Preparing failed" above the row "Some images were skipped".
+    Expect: the center reads "3 notifications · this session" and lists two rows titled "Alignment failed" above the row "Some images were skipped".
 21. Click **Notifications** (`FFIconBar::bell`).
     Expect: the center is gone, **Retry** is still shown and no dialog is on screen.
