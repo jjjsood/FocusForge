@@ -1237,12 +1237,24 @@ fn dng_refused() {
 const PATCH_X: std::ops::Range<u32> = 5..13;
 const PATCH_Y: std::ops::Range<u32> = 4..12;
 
-fn white_patch(spec: &mut DngSpec) {
-    for y in PATCH_Y {
-        for x in PATCH_X {
-            spec.samples[(y * spec.width + x) as usize] = 4095;
+/// Writes `[red, green, blue]` sensor values into the RGGB mosaic over
+/// `xs` by `ys`.
+fn fill_patch(
+    spec: &mut DngSpec,
+    xs: std::ops::Range<u32>,
+    ys: std::ops::Range<u32>,
+    [red, green, blue]: [u16; 3],
+) {
+    for y in ys {
+        for x in xs.clone() {
+            spec.samples[(y * spec.width + x) as usize] =
+                [red, green, blue][(x % 2 + y % 2) as usize];
         }
     }
+}
+
+fn white_patch(spec: &mut DngSpec) {
+    fill_patch(spec, PATCH_X, PATCH_Y, [4095; 3]);
 }
 
 /// `count` textured 37x23 frames with the white patch at sensor saturation.
@@ -1252,8 +1264,12 @@ fn patch_frames(count: usize) -> Vec<tempfile::NamedTempFile> {
 
 /// Pixels two or more pixels inside the patch.
 fn deep_in_patch(x: u32, y: u32) -> bool {
-    (PATCH_X.start + 2..PATCH_X.end - 2).contains(&x)
-        && (PATCH_Y.start + 2..PATCH_Y.end - 2).contains(&y)
+    deep_in(PATCH_X, PATCH_Y, x, y)
+}
+
+/// Pixels two or more pixels inside the patch spanning `xs` by `ys`.
+fn deep_in(xs: std::ops::Range<u32>, ys: std::ops::Range<u32>, x: u32, y: u32) -> bool {
+    (xs.start + 2..xs.end - 2).contains(&x) && (ys.start + 2..ys.end - 2).contains(&y)
 }
 
 /// Pixels two or more pixels outside the patch and clear of the last two rows
@@ -1310,6 +1326,55 @@ fn raw_highlight_clip_document() {
         above_white > 0,
         "the texture must carry samples above white"
     );
+}
+
+/// A patch whose green stops at 99 % of the white level (4055 = 64 + 0.99 *
+/// 4031) is clipped; a patch with green at 97 % (3974) and red well below it,
+/// and the texture, stay as `u16::narrow` leaves them. A mixed-value mosaic
+/// demosaics to camera values that differ with pixel parity, so neutrality of
+/// the first patch is shown at the look level.
+#[test]
+fn raw_highlight_clip_below_white_level() {
+    let (width, height) = (37u32, 23u32);
+    let second_x = 20..28;
+    let frames = dng_frames_with(3, width, height, |spec| {
+        fill_patch(spec, PATCH_X, PATCH_Y, [4055, 4055, 4000]);
+        fill_patch(spec, second_x.clone(), PATCH_Y, [2700, 3974, 3974]);
+    });
+    let dir = tmp_dir("raw_highlight_clip_below_white_level");
+    let held = common::fuse_held(&paths(&frames), "weighted-average", false, &dir);
+    let samples = read_f32(&held.composite);
+    let clip = highlight_clip(&paths(&frames)[0], &[])
+        .unwrap()
+        .expect("a colour RAW source has a clip");
+    let mut clipped = vec![0u16; samples.len()];
+    clip.narrow_band(&samples, &mut clipped);
+    let plain = narrowed(&samples);
+
+    let near_second = |x: u32, y: u32| {
+        (second_x.start - 1..second_x.end + 1).contains(&x)
+            && (PATCH_Y.start - 1..PATCH_Y.end + 1).contains(&y)
+    };
+    let (mut at_99, mut at_97, mut texture) = (0, 0, 0);
+    for y in 0..height {
+        for x in 0..width {
+            let at = ((y * width + x) * 3) as usize..((y * width + x) * 3 + 3) as usize;
+            if deep_in_patch(x, y) {
+                at_99 += 1;
+                assert_ne!(&clipped[at.clone()], &plain[at.clone()], "({x}, {y})");
+            } else if deep_in(second_x.clone(), PATCH_Y, x, y)
+                || (far_from_patch(x, y, (width, height)) && !near_second(x, y))
+            {
+                if deep_in(second_x.clone(), PATCH_Y, x, y) {
+                    at_97 += 1;
+                } else {
+                    texture += 1;
+                }
+                assert_eq!(&clipped[at.clone()], &plain[at], "({x}, {y})");
+            }
+        }
+    }
+    assert!(at_99 > 0 && at_97 > 0 && texture > 0);
 }
 
 #[test]

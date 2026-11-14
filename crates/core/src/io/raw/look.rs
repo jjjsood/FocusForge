@@ -135,10 +135,11 @@ impl LookTransform {
 const WHITE: f64 = 65535.0;
 
 /// A sensor channel counts as clipped from this fraction of the saturation
-/// point up: a saturated sample returns from the `f32` store through
-/// [`LookTransform::inverse`] within about 1e-5 relative, and demosaiced
-/// borders sit a little under the saturation point.
-const DETECTION_FRACTION: f64 = 1.0 - 1e-4;
+/// point up. A camera's practical clip can sit below its declared white level
+/// (0.99365 of it on a 6960x4640 linear DNG), and demosaiced borders sit a
+/// little under the clip, so the band is 2 %; a saturated sample returns from
+/// the `f32` store within about 1e-5 relative.
+const DETECTION_FRACTION: f64 = 1.0 - 0.02;
 
 /// Narrows look-space samples of a RAW document to `u16`, clipping pixels
 /// whose sensor saturated in camera space so they come out neutral instead of
@@ -157,11 +158,11 @@ impl HighlightClip {
         Self { look, saturation }
     }
 
-    /// Narrows one look-space triple on the 16-bit scale. A pixel with a
-    /// sensor channel at the saturation point has its white-balanced channels
-    /// clamped to the least-amplified channel's saturation point, so a fully
-    /// saturated pixel comes out neutral. Every other pixel, and any triple
-    /// with a non-finite value, narrows as `u16::narrow` does.
+    /// Narrows one look-space triple on the 16-bit scale. A channel within the
+    /// detection tolerance of the saturation point counts as clipped at it, and
+    /// the balanced channels clamp to the least-amplified one's saturation
+    /// point, so a fully saturated pixel comes out neutral. Every other pixel,
+    /// and any triple with a non-finite value, narrows as `u16::narrow` does.
     pub fn narrow(&self, rgb: [f32; 3]) -> [u16; 3] {
         let plain = rgb.map(<u16 as Sample>::narrow);
         if !rgb.iter().all(|value| value.is_finite()) {
@@ -174,7 +175,13 @@ impl HighlightClip {
         }
         let balance = self.look.balance;
         let level = self.saturation * balance.iter().copied().fold(f64::INFINITY, f64::min);
-        let clipped = std::array::from_fn(|c| (camera[c] * balance[c]).min(level) / balance[c]);
+        let clipped = std::array::from_fn(|c| {
+            if camera[c] >= threshold {
+                level / balance[c]
+            } else {
+                camera[c].min(level / balance[c])
+            }
+        });
         self.look
             .forward(clipped)
             .map(|channel| <u16 as Sample>::narrow((channel * WHITE) as f32))
@@ -470,17 +477,26 @@ mod raw_highlight_clip {
             for saturation in SATURATIONS {
                 let clip = HighlightClip::new(look.clone(), saturation);
                 let threshold = saturation * DETECTION_FRACTION;
+                let mut near_threshold = 0;
                 for rgb in triples() {
                     let plain = rgb.map(<u16 as Sample>::narrow);
                     let finite = rgb.iter().all(|v| v.is_finite());
-                    let below = camera_of(&look, rgb).iter().all(|c| *c < threshold);
+                    let camera = camera_of(&look, rgb);
+                    let below = camera.iter().all(|c| *c < threshold);
                     if !finite || below {
                         assert_eq!(clip.narrow(rgb), plain, "{rgb:?} at {saturation}");
                         compared += 1;
+                        if finite && camera.iter().any(|c| *c >= 0.97 * saturation) {
+                            near_threshold += 1;
+                        }
                     } else if clip.narrow(rgb) != plain {
                         clipped += 1;
                     }
                 }
+                assert!(
+                    near_threshold > 0,
+                    "no compared triple sits just under the threshold at {saturation}"
+                );
             }
         }
         assert!(
@@ -498,7 +514,7 @@ mod raw_highlight_clip {
                 let clip = HighlightClip::new(look.clone(), saturation);
                 let expected =
                     <u16 as Sample>::narrow((encode(saturation * lowest) * WHITE) as f32);
-                for scale in [1.0, 1.2] {
+                for scale in [0.9801, 0.99, 0.99365, 1.0, 1.2] {
                     let triple = look
                         .forward([saturation * scale; 3])
                         .map(|v| (v * WHITE) as f32);
@@ -516,10 +532,13 @@ mod raw_highlight_clip {
             let lowest = look.balance.iter().copied().fold(f64::INFINITY, f64::min);
             for saturation in SATURATIONS {
                 let clip = HighlightClip::new(look.clone(), saturation);
-                for channel in (0..3).filter(|c| look.balance[*c] > lowest) {
+                for (channel, top) in (0..3)
+                    .filter(|c| look.balance[*c] > lowest)
+                    .flat_map(|c| [0.99, 1.0].map(|top| (c, top)))
+                {
                     let mut camera: [f64; 3] =
                         std::array::from_fn(|c| 0.9 * saturation / look.balance[c]);
-                    camera[channel] = saturation;
+                    camera[channel] = top * saturation;
                     let triple = look.forward(camera).map(|v| (v * WHITE) as f32);
                     let narrowed = clip.narrow(triple);
                     assert_ne!(narrowed, triple.map(<u16 as Sample>::narrow));
