@@ -1204,7 +1204,7 @@ pub fn highlight_clip(
 /// `F32` document, `None` for anything else, for a source whose clip cannot be
 /// built (missing, moved or unreadable) and when there is no source. A
 /// 16-bit document opens no file.
-pub(crate) fn document_clip(
+pub fn document_clip(
     first_frame: Option<&Path>,
     gains: &[u32],
     format: SampleFormat,

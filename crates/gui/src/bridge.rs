@@ -174,11 +174,18 @@ impl Canvas {
     /// crashing the window over. `tab` is recorded even when the open
     /// fails, so an unreadable plane file is not retried on every gesture.
     /// Reuses the renderer's own frame half, which may hold the tab's frame.
-    fn load(&mut self, tab: usize, composite: &Path, zmap: Option<&Path>) {
+    fn load(
+        &mut self,
+        tab: usize,
+        composite: &Path,
+        zmap: Option<&Path>,
+        clip_source: Option<(&Path, &[u32])>,
+    ) {
         self.tab = Some(tab);
         let renderer = self.renderer_mut();
-        if let Err(err) = renderer.set_planes(composite, zmap) {
-            tracing::error!("failed to open the project's planes: {err}");
+        match renderer.set_planes(composite, zmap) {
+            Ok(()) => renderer.set_clip_source(clip_source),
+            Err(err) => tracing::error!("failed to open the project's planes: {err}"),
         }
     }
 
@@ -715,7 +722,15 @@ pub fn repaint(
             tab,
             composite,
             zmap,
-        } => canvas.borrow_mut().load(tab, &composite, zmap.as_deref()),
+            clip_source,
+        } => canvas.borrow_mut().load(
+            tab,
+            &composite,
+            zmap.as_deref(),
+            clip_source
+                .as_ref()
+                .map(|(first, gains)| (first.as_path(), gains.as_slice())),
+        ),
     }
 
     let (
