@@ -16,6 +16,13 @@ slow-timeout = { period = "60s", terminate-after = 15 }
 filter = 'binary_id(focusforge-cli::stack_cli)'
 slow-timeout = { period = "60s", terminate-after = 30 }
 
+# The align_parallel `identical_output_*` tests take 50-110 s each under the
+# full gate's parallel load, the longest of the run; started first, they run
+# beside the bulk of the suite instead of after it.
+[[profile.default.overrides]]
+filter = 'binary_id(focusforge-core::align_parallel) & test(/^identical_output_/)'
+priority = 100
+
 # The GPU parity suite: one test at a time (they share one device), a SLOW
 # line every minute so a long test is told apart from a hung one, and a
 # per-test kill so a hang ends as a named TIMEOUT instead of a silent wait.
@@ -46,13 +53,13 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 #   tile_scheduler_memory: peak in-flight tile memory (counting allocator).
 #   checkpoint_render_memory: peak memory of a full-size checkpoint render and encode.
 # Left to the full gate, one reason per test:
-#   align_parallel `output_is_identical_across_worker_counts_and_budgets`: 14 aligner
-#   runs at the shipped defaults over mantis-512 (chain and anchor, four worker
-#   counts and three budgets each), 185 s in a debug build.
+#   align_parallel `identical_output_*`: six tests of three aligner runs each at the
+#   shipped defaults over mantis-512 (chain and anchor, worker counts and budgets),
+#   21 s to 56 s per test in a debug build.
 [profile.quick]
 default-filter = '''
 not (
-  (binary_id(focusforge-core::align_parallel) & test(=output_is_identical_across_worker_counts_and_budgets))
+  (binary_id(focusforge-core::align_parallel) & test(/^identical_output_/))
   | binary_id(focusforge-core::align_parallel_memory)
   | binary_id(focusforge-core::align_reference_cache)
   | binary_id(focusforge-core::tile_scheduler_memory)
