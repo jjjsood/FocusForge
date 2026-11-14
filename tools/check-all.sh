@@ -14,8 +14,8 @@
 #                nextest `quick` profile (.config/nextest.toml) instead of the
 #                whole workspace, clippy only over the crates with a changed
 #                path, and none of the stages that only the full run needs:
-#                both `build` stages, `fixture e2e`, `cargo test --doc`,
-#                `rustdoc`, `trace feature`, `advisories`.
+#                `build`, `check (no default features)`, `fixture e2e`,
+#                `cargo test --doc`, `rustdoc`, `trace feature`, `advisories`.
 #   --verbose    also stream every gate's output to the terminal. Unbounded:
 #                a caller with a fixed output budget will lose the summary.
 #   --tail N     lines of a failing gate's log to print inline (default 40,
@@ -24,8 +24,7 @@
 #
 # Output contract: gate output goes to per-gate logs; stdout stays two
 # lines per gate. `fixture e2e` runs the built binary in the background,
-# cargo-free, after `build`. `build (no default features)` runs first so
-# `build`'s GPU-enabled binary is written last, the one later stages use.
+# cargo-free, after `build`.
 # Cargo and direct binary runs go through tools/with-lock.sh build; clippy
 # stays out of --static because it compiles; RUSTFLAGS is never set here.
 # Every cargo stage runs with CARGO_BUILD_JOBS=min(24, cores) unless the caller
@@ -271,25 +270,22 @@ run_gate "manual coverage" python3 tools/check-manual-coverage.py
 tool_selftest "manual coverage selftest" python3 tools/check-manual-coverage.py --selftest
 
 if [ "$STATIC_ONLY" -eq 0 ]; then
-  # Build-only: proves the no-GPU path still compiles, test targets included.
-  # Must run BEFORE `build` -- see the header comment above for why the order
-  # is load-bearing. `--exclude focusforge-gui --exclude 'focusforge-ui*'`: the
-  # Slint backend is wgpu-only by construction (the UI crates' Cargo.toml pin
-  # `renderer-femtovg-wgpu` unconditionally, not behind the `gpu` feature),
-  # so these crates always compile wgpu regardless of
-  # `--no-default-features` -- with them included this stage would still link
-  # wgpu and would prove nothing about the no-GPU path.
-  [ "$QUICK" -eq 1 ] || run_gate "build (no default features)" \
+  # Type-checks the no-GPU path, test targets included, and writes no binary.
+  # The UI crates are excluded: their Cargo.toml pins the wgpu-only Slint
+  # backend (`renderer-femtovg-wgpu`) unconditionally, not behind the `gpu`
+  # feature, so with them in this stage would still compile wgpu and prove
+  # nothing about the no-GPU path.
+  [ "$QUICK" -eq 1 ] || run_gate "check (no default features)" \
                              tools/with-lock.sh build -- \
-                             cargo build --workspace --all-targets \
+                             cargo check --workspace --all-targets \
                              --no-default-features --exclude focusforge-gui \
                              --exclude 'focusforge-ui*'
 
   # Must come first among the GPU-enabled stages: it produces the binary the
   # background stage runs, and it holds the target/ lock the cargo gates below
   # queue on anyway.
-  # --quick leaves both builds and this stage to the full run: nextest builds
-  # what the tests need, and clippy type-checks the remaining targets.
+  # --quick leaves this stage and the no-GPU check to the full run: nextest
+  # builds what the tests need, and clippy type-checks the remaining targets.
   if [ "$QUICK" -eq 0 ]; then
     run_gate "build"          tools/with-lock.sh build -- cargo build --workspace --all-targets
 
