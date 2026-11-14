@@ -6,13 +6,13 @@
 //! counting reader -- the behavioural counterpart of `align_parallel_memory.rs`'s
 //! memory test.
 //!
-//! Apart from `output_is_identical_across_worker_counts_and_budgets`, the
+//! Apart from the `identical_output_` tests, the
 //! fixture-driven tests lower `max-iterations` from the shipped 400 to 40: the
 //! ordering property needs no more, and some frames then diverge. Those tests
 //! assert no literal worker count -- `available_parallelism` is the host's --
 //! only that the parallel arm engaged (`worker_limit > 1`) and matches the
-//! serial arm exactly. The determinism test runs at the shipped defaults and
-//! compares each anchor `worker_limit` with the host's parallelism.
+//! serial arm exactly. The `identical_output_` tests run at the shipped defaults and
+//! compare each `worker_limit` with the host's parallelism.
 
 mod common;
 
@@ -190,21 +190,29 @@ fn chain_hops_engage_the_pool_at_the_default_budget() {
     );
 }
 
-/// Chain and anchor runs at the shipped defaults over `fixtures/mantis-512`
-/// return the same frames, reference and policy for every requested worker
-/// count and every memory budget. The worker-count budgets are the driver's own
-/// sum: the shared reference data and `N` registrations for anchor, one frame
-/// build and `N` hops (each its own shared data, registration and level-0
-/// windows) for chain, so each lands on `N` workers whatever the
-/// per-registration figure.
-#[test]
-fn output_is_identical_across_worker_counts_and_budgets() {
+/// One cell of the determinism check: a worker count or a memory budget.
+#[derive(Clone, Copy)]
+enum Cell {
+    Workers(usize),
+    OneByte,
+    Mib2400,
+    HostDerived,
+}
+
+/// Chain or anchor runs at the shipped defaults over `fixtures/mantis-512`
+/// return the same frames, reference and policy for every requested cell as the
+/// policy's 1-worker baseline, which runs first and is checked too. Worker-count
+/// budgets are the driver's own sum (shared data, registration and level-0
+/// windows per worker, plus one frame build for chain), so each lands on `N`
+/// workers whatever the per-registration figure.
+fn assert_identical_output(policy: &str, cells: &[Cell]) {
     let stack = open_fixture();
     let stack_ctx = stack_context(&stack);
     let (width, _) = stack.dimensions();
     let per_worker = bytes_per_registration(stack_ctx, DEFAULT_TILE_SIZE)
         + stack.read_scratch_bytes(width, DEFAULT_TILE_SIZE);
-    let sized_for = |workers: u64, anchor: bool| {
+    let anchor = policy == "anchor";
+    let sized_for = |workers: u64| {
         HostBudget::explicit(if anchor {
             bytes_shared_reference(stack_ctx) + workers * per_worker
         } else {
@@ -216,72 +224,102 @@ fn output_is_identical_across_worker_counts_and_budgets() {
     };
     let parallelism = std::thread::available_parallelism().map_or(1, usize::from);
     let registrations = stack_ctx.frame_count - 1;
-    let host_derived = HostBudget::host_derived(&focusforge_core::host::snapshot());
+    let cfg = if anchor {
+        anchor_defaults(&stack_ctx)
+    } else {
+        resolved_defaults(&stack_ctx)
+    };
 
-    for (policy, cfg) in [
-        ("chain", resolved_defaults(&stack_ctx)),
-        ("anchor", anchor_defaults(&stack_ctx)),
-    ] {
-        let anchor = policy == "anchor";
-        let mut cells: Vec<(String, HostBudget, Option<usize>)> = [1usize, 2, 4, 8]
-            .iter()
-            .map(|&n| {
+    let mut baseline = None;
+    for &cell in std::iter::once(&Cell::Workers(1)).chain(cells) {
+        let (label, budget, expected_workers) = match cell {
+            Cell::Workers(n) => {
                 let expected = n.min(parallelism).min(registrations);
-                (
-                    format!("{n} workers"),
-                    sized_for(n as u64, anchor),
-                    Some(expected),
-                )
-            })
-            .collect();
-        cells.push((
-            "1-byte budget".to_string(),
-            HostBudget::explicit(1),
-            Some(1),
-        ));
-        cells.push((
-            "2400 MiB budget".to_string(),
-            HostBudget::explicit(2400 * 1024 * 1024),
-            None,
-        ));
-        cells.push(("host-derived budget".to_string(), host_derived, None));
-
-        let mut baseline = None;
-        for (cell, budget, expected_workers) in cells {
-            let run = align_stack_with(
-                &PyramidalEcc,
-                stack_ctx,
-                &stack,
-                &cfg,
-                FailurePolicy::Strict,
-                &AlignDriverOptions {
-                    budget,
-                    ..Default::default()
-                },
-            )
-            .unwrap_or_else(|err| panic!("{policy}, {cell}: the run completes: {err}"));
-            if let Some(expected) = expected_workers {
-                assert_eq!(
-                    run.worker_limit, expected,
-                    "{policy}, {cell}: worker limit (host parallelism {parallelism}, \
-                     {registrations} registrations)"
-                );
+                (format!("{n} workers"), sized_for(n as u64), Some(expected))
             }
-            let first = baseline.get_or_insert_with(|| run.alignment.clone());
+            Cell::OneByte => (
+                "1-byte budget".to_string(),
+                HostBudget::explicit(1),
+                Some(1),
+            ),
+            Cell::Mib2400 => (
+                "2400 MiB budget".to_string(),
+                HostBudget::explicit(2400 * 1024 * 1024),
+                None,
+            ),
+            Cell::HostDerived => (
+                "host-derived budget".to_string(),
+                HostBudget::host_derived(&focusforge_core::host::snapshot()),
+                None,
+            ),
+        };
+        let run = align_stack_with(
+            &PyramidalEcc,
+            stack_ctx,
+            &stack,
+            &cfg,
+            FailurePolicy::Strict,
+            &AlignDriverOptions {
+                budget,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|err| panic!("{policy}, {label}: the run completes: {err}"));
+        if let Some(expected) = expected_workers {
             assert_eq!(
-                run.alignment.reference, first.reference,
-                "{policy}, {cell}: reference frame against the 1-worker run"
-            );
-            assert_eq!(
-                run.alignment.policy, first.policy,
-                "{policy}, {cell}: policy against the 1-worker run"
-            );
-            assert_eq!(
-                run.alignment.frames, first.frames,
-                "{policy}, {cell}: every FrameAlignment field against the 1-worker run"
+                run.worker_limit, expected,
+                "{policy}, {label}: worker limit (host parallelism {parallelism}, \
+                 {registrations} registrations)"
             );
         }
+        let first = baseline.get_or_insert_with(|| run.alignment.clone());
+        assert_eq!(
+            run.alignment.reference, first.reference,
+            "{policy}, {label}: reference frame against the 1-worker run"
+        );
+        assert_eq!(
+            run.alignment.policy, first.policy,
+            "{policy}, {label}: policy against the 1-worker run"
+        );
+        assert_eq!(
+            run.alignment.frames, first.frames,
+            "{policy}, {label}: every FrameAlignment field against the 1-worker run"
+        );
     }
+}
+
+// Each test below repeats its policy's 1-worker run so nextest can schedule the
+// slices in parallel: three aligner runs per test, 21 s (anchor) to 56 s (chain)
+// per test in a debug build, against 195 s for all 14 runs in one test.
+
+#[test]
+fn identical_output_chain_at_2_and_4_workers() {
+    assert_identical_output("chain", &[Cell::Workers(2), Cell::Workers(4)]);
+}
+
+#[test]
+fn identical_output_anchor_at_2_and_4_workers() {
+    assert_identical_output("anchor", &[Cell::Workers(2), Cell::Workers(4)]);
+}
+
+#[test]
+fn identical_output_chain_at_8_workers_and_a_1_byte_budget() {
+    assert_identical_output("chain", &[Cell::Workers(8), Cell::OneByte]);
+}
+
+#[test]
+fn identical_output_anchor_at_8_workers_and_a_1_byte_budget() {
+    assert_identical_output("anchor", &[Cell::Workers(8), Cell::OneByte]);
+}
+
+#[test]
+fn identical_output_chain_at_2400_mib_and_host_derived_budgets() {
+    assert_identical_output("chain", &[Cell::Mib2400, Cell::HostDerived]);
+}
+
+#[test]
+fn identical_output_anchor_at_2400_mib_and_host_derived_budgets() {
+    assert_identical_output("anchor", &[Cell::Mib2400, Cell::HostDerived]);
 }
 
 /// The frames are a centred 128 px crop of fixture frame 3: frame 1 is the same
