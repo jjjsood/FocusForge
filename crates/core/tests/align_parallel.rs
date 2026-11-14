@@ -6,13 +6,11 @@
 //! counting reader -- the behavioural counterpart of `align_parallel_memory.rs`'s
 //! memory test.
 //!
-//! Apart from the `identical_output_` tests, the
-//! fixture-driven tests lower `max-iterations` from the shipped 400 to 40: the
-//! ordering property needs no more, and some frames then diverge. Those tests
-//! assert no literal worker count -- `available_parallelism` is the host's --
+//! The fixture-driven tests lower `max-iterations` from the shipped 400 to 40
+//! (the ordering property needs no more; some frames then diverge) and assert
 //! only that the parallel arm engaged (`worker_limit > 1`) and matches the
-//! serial arm exactly. The `identical_output_` tests run at the shipped defaults and
-//! compare each `worker_limit` with the host's parallelism.
+//! serial arm, never a literal worker count. The `identical_output_` tests run
+//! at the shipped defaults and compare `worker_limit` with the host's parallelism.
 
 mod common;
 
@@ -290,7 +288,7 @@ fn assert_identical_output(policy: &str, cells: &[Cell]) {
 
 // Each test below repeats its policy's 1-worker run so nextest can schedule the
 // slices in parallel: three aligner runs per test, 21 s (anchor) to 56 s (chain)
-// per test in a debug build, against 195 s for all 14 runs in one test.
+// per test in a debug build.
 
 #[test]
 fn identical_output_chain_at_2_and_4_workers() {
