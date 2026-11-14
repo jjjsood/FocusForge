@@ -52,8 +52,7 @@ fn three_group_dump(dir: &Path) -> PathBuf {
 }
 
 /// The number of entries the stage cache holds for `stage` under
-/// `<cwd>/.scratch/stage-cache/<stage>/` -- `crates/core/src/job/stage_cache.rs`'s
-/// store path, `<scratch_base>/stage-cache/<stage>/<digest16>.json`.
+/// `<cwd>/.scratch/stage-cache/<stage>/`, one `<digest16>.json` each.
 fn cache_entry_count(cwd: &Path, stage: &str) -> usize {
     std::fs::read_dir(cwd.join(".scratch").join("stage-cache").join(stage))
         .into_iter()
