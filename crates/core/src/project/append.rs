@@ -20,6 +20,7 @@ use super::error::ProjectError;
 use super::manifest::{
     AlignRecord, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
 };
+use super::render::unpaintable_reason;
 use super::seal::{composite_blob, now_unix, record, source_ref};
 use super::{HASH_ALGORITHM, Op, Project, SealedProject, full_blob, fused_extent};
 use crate::align::Registration;
@@ -59,7 +60,7 @@ pub fn append_at(
     created_at: i64,
 ) -> Result<SealedProject, ProjectError> {
     let mut project = Project::open(request.project_path)?;
-    let sealed = append_onto(&mut project, &request, None, created_at, None)?;
+    let sealed = append_onto(&mut project, &request, None, created_at, None, None)?;
     project.commit()?;
     Ok(sealed)
 }
@@ -67,13 +68,15 @@ pub fn append_at(
 /// [`append_at`] onto an open project, under an explicit `parent` checkpoint
 /// instead of the project's head; `None` is the head. The caller has checked
 /// that `parent` exists and commits the project. A `composite` blob already
-/// staged is written as it is and stays where it is.
+/// staged is written as it is and stays where it is. `colour_index` is the
+/// checkpoint's colour number; `None` is the next free one.
 pub(super) fn append_onto(
     project: &mut Project,
     request: &AppendRequest<'_>,
     parent: Option<&str>,
     created_at: i64,
     composite: Option<&StagedBlob>,
+    colour_index: Option<u32>,
 ) -> Result<SealedProject, ProjectError> {
     let staging = request
         .staged_composite
@@ -88,6 +91,7 @@ pub(super) fn append_onto(
         parent,
         created_at,
         composite,
+        colour_index,
         &staging,
         &mut staged,
     );
@@ -97,12 +101,14 @@ pub(super) fn append_onto(
     result
 }
 
+#[allow(clippy::too_many_arguments)] // the staging directory and its blob list travel with the request's own inputs
 fn append_staged(
     project: &mut Project,
     request: &AppendRequest<'_>,
     parent: Option<&str>,
     created_at: i64,
     composite: Option<&StagedBlob>,
+    colour_index: Option<u32>,
     staging: &Path,
     staged: &mut Vec<StagedBlob>,
 ) -> Result<SealedProject, ProjectError> {
@@ -138,6 +144,7 @@ fn append_staged(
             label: request.label.clone(),
             metrics: request.metrics,
             created_at,
+            colour_index,
         },
     )
 }
@@ -159,6 +166,8 @@ struct FusedWrite<'a> {
     label: Option<String>,
     metrics: Metrics,
     created_at: i64,
+    /// `None` is the next free colour number.
+    colour_index: Option<u32>,
 }
 
 fn write_fused(
@@ -179,6 +188,7 @@ fn write_fused(
         label,
         metrics,
         created_at,
+        colour_index,
     } = write;
     let stack_fingerprint = blob::stack_fingerprint(&sources);
     let composite_record = record(composite);
@@ -226,6 +236,7 @@ fn write_fused(
         blobs,
         metrics,
         checkpoint: checkpoint_id.clone(),
+        format_version: project.manifest().format_version,
     };
 
     let checkpoint = Checkpoint {
@@ -246,6 +257,7 @@ fn write_fused(
             metrics: manifest.metrics,
         }),
         hidden: false,
+        colour_index: Some(colour_index.unwrap_or_else(|| project.history().next_colour_index())),
     };
 
     project.put_blob(composite)?;
@@ -264,7 +276,9 @@ fn write_fused(
 /// Records `ops` as a new checkpoint onto `project_path`'s head, stamping the
 /// current wall clock. Refuses an empty list ([`ProjectError::EmptyOpList`])
 /// and a list holding anything but a valid brush stroke
-/// ([`ProjectError::Op`], naming the first bad op) before writing. Sources are
+/// ([`ProjectError::Op`], naming the first bad op, or
+/// [`ProjectError::CheckpointSourceRefused`] for a stroke painted from a
+/// checkpoint it cannot be rendered with) before writing. Sources are
 /// never opened or rehashed: the new checkpoint's `stack_fingerprint`,
 /// `algorithm` and `params` are carried forward from the head unchanged, and
 /// its `zmap_blob` and the manifest's planes name the fused ancestor's. The
@@ -312,7 +326,7 @@ fn append_ops_saved(
 ) -> Result<SealedProject, ProjectError> {
     let mut project = Project::open(project_path)?;
     let parent = parent.map_or_else(|| project.checkpoint().id.clone(), str::to_string);
-    let sealed = append_ops_on(&mut project, &parent, ops, label, created_at)?;
+    let sealed = append_ops_on(&mut project, &parent, ops, label, created_at, None)?;
     project.commit()?;
     Ok(sealed)
 }
@@ -321,8 +335,10 @@ fn append_ops_saved(
 /// child, the first under `parent` (`None` is the head), and commits once.
 /// The ids come back in order and `label` names the last state only. Every op
 /// is checked before anything is written: the first invalid one is
-/// [`ProjectError::Op`] with its position and the file is left as it was; an
-/// empty list is [`ProjectError::EmptyOpList`].
+/// [`ProjectError::Op`] with its position, or
+/// [`ProjectError::CheckpointSourceRefused`] when it paints from a checkpoint
+/// that is unknown, deleted or cannot render under `parent`, and the file is
+/// left as it was; an empty list is [`ProjectError::EmptyOpList`].
 pub fn append_op_chain(
     project_path: &Path,
     parent: Option<&str>,
@@ -342,7 +358,7 @@ pub fn append_op_chain(
     let mut ids = Vec::with_capacity(ops.len());
     for (index, op) in ops.into_iter().enumerate() {
         let label = if index == last { label.clone() } else { None };
-        let sealed = append_ops_on(&mut project, &parent, vec![op], label, created_at)?;
+        let sealed = append_ops_on(&mut project, &parent, vec![op], label, created_at, None)?;
         parent.clone_from(&sealed.checkpoint);
         ids.push(sealed.checkpoint);
     }
@@ -351,12 +367,15 @@ pub fn append_op_chain(
 }
 
 /// [`append_ops_onto`] on an open project, left for the caller to commit.
+/// `colour_index` is the checkpoint's colour number; `None` is the next free
+/// one.
 pub(super) fn append_ops_on(
     project: &mut Project,
     parent: &str,
     ops: Vec<Op>,
     label: Option<String>,
     created_at: i64,
+    colour_index: Option<u32>,
 ) -> Result<SealedProject, ProjectError> {
     if ops.is_empty() {
         return Err(ProjectError::EmptyOpList {
@@ -408,6 +427,7 @@ pub(super) fn append_ops_on(
         metrics: fuse.metrics,
         checkpoint: checkpoint_id.clone(),
         registration: fuse.registration.clone(),
+        format_version: manifest.format_version,
     };
 
     let checkpoint = Checkpoint {
@@ -422,6 +442,7 @@ pub(super) fn append_ops_on(
         label,
         fuse: None,
         hidden: false,
+        colour_index: Some(colour_index.unwrap_or_else(|| project.history().next_colour_index())),
     };
     project.put_checkpoint(&checkpoint)?;
     project.set_manifest(new_manifest)?;
@@ -436,7 +457,10 @@ pub(super) fn append_ops_on(
 
 /// `parent`'s checkpoint, once every op of `ops` is valid against the Z-Map
 /// geometry of `parent`'s fused ancestor: the first op that is not is
-/// [`ProjectError::Op`] with its position.
+/// [`ProjectError::Op`] with its position. A stroke painted from a checkpoint
+/// that is not in the project, was deleted, or cannot be rendered under
+/// `parent` (another pixel grid or sample type) is
+/// [`ProjectError::CheckpointSourceRefused`] with its position.
 fn checked_parent(project: &Project, parent: &str, ops: &[Op]) -> Result<Checkpoint, ProjectError> {
     let head = project.history().get(parent)?.clone();
     let (width, height, frame_count) = fused_extent(project, parent)?;
@@ -447,6 +471,21 @@ fn checked_parent(project: &Project, parent: &str, ops: &[Op]) -> Result<Checkpo
             index,
             source: Box::new(source),
         })?;
+        if let Some(reference) = op.checkpoint_source() {
+            let reason = match project.history().get(reference) {
+                Err(_) => Some("is not in this project".to_string()),
+                Ok(named) if named.hidden => Some("was deleted".to_string()),
+                Ok(_) => unpaintable_reason(project, parent, reference)?,
+            };
+            if let Some(reason) = reason {
+                return Err(ProjectError::CheckpointSourceRefused {
+                    path: project.path().to_path_buf(),
+                    index,
+                    checkpoint: reference.to_string(),
+                    reason,
+                });
+            }
+        }
     }
     Ok(head)
 }
@@ -458,34 +497,40 @@ pub struct Deleted {
     pub hidden: String,
     /// Every checkpoint the project no longer lists: `hidden` and the
     /// checkpoints hidden earlier, whichever have no visible checkpoint built
-    /// on them. Their bytes stay in the file as dead data.
+    /// on them and no stroke of a listed checkpoint painting from them. Their
+    /// bytes stay in the file as dead data.
     pub removed: Vec<String>,
     pub head: String,
+    /// How many stored strokes paint from `hidden`.
+    pub strokes_using: usize,
 }
 
 /// Hides `id`, then stops listing every hidden checkpoint no visible one is
-/// built on, with the blobs only those needed; nothing is re-parented.
+/// built on and no stroke of a listed checkpoint paints from, with the blobs
+/// only those needed; nothing is re-parented.
 /// Refuses an unknown or hidden `id` ([`ProjectError::UnknownCheckpoint`]) and
 /// the last visible checkpoint ([`ProjectError::LastVisibleDelete`]) before
 /// writing. When the head goes, the newest visible checkpoint becomes the head
 /// and the manifest is rebuilt from it ([`Project::fuse_state`]).
 pub fn delete_checkpoint(project_path: &Path, id: &str) -> Result<Deleted, ProjectError> {
     let mut project = Project::open(project_path)?;
+    let strokes_using = project.history().strokes_using(id);
     let (removed, head) = hide_and_collect(&mut project, Some(id), None)?;
     project.commit()?;
     Ok(Deleted {
         hidden: id.to_string(),
         removed,
         head,
+        strokes_using,
     })
 }
 
 /// [`delete_checkpoint`]'s body on an open project, left for the caller to
 /// commit: hides `hide` when given, then stops listing every hidden
-/// checkpoint nothing visible is built on, returning the ids dropped and the
-/// head. `keep` counts as visible for that, so it and its ancestors stay
-/// listed even when hidden. With nothing to hide and nothing to drop, nothing
-/// is written.
+/// checkpoint nothing visible is built on and no kept checkpoint's stroke
+/// paints from, returning the ids dropped and the head. `keep` counts as
+/// visible for that, so it and its ancestors stay listed even when hidden.
+/// With nothing to hide and nothing to drop, nothing is written.
 pub(super) fn hide_and_collect(
     project: &mut Project,
     hide: Option<&str>,
@@ -509,24 +554,33 @@ pub(super) fn hide_and_collect(
         }
     }
 
-    let hidden_set: HashSet<&str> = history
+    // Needed: every visible checkpoint and `keep`, closed under "built on"
+    // (parent) and "painted from" (a stroke's checkpoint source).
+    let mut needed: HashSet<&str> = history
         .all()
         .into_iter()
-        .filter(|c| c.hidden)
+        .filter(|c| !c.hidden && Some(c.id.as_str()) != hide)
         .map(|c| c.id.as_str())
-        .chain(hide)
-        .filter(|id| Some(*id) != keep)
+        .chain(keep)
         .collect();
+    let mut pending: Vec<&str> = needed.iter().copied().collect();
+    while let Some(id) = pending.pop() {
+        let checkpoint = history.get(id)?;
+        let links = checkpoint
+            .parent
+            .as_deref()
+            .into_iter()
+            .chain(checkpoint.ops.iter().filter_map(Op::checkpoint_source));
+        for link in links {
+            if needed.insert(link) {
+                pending.push(link);
+            }
+        }
+    }
     let removed: Vec<String> = history
         .all()
         .into_iter()
-        .filter(|c| {
-            hidden_set.contains(c.id.as_str())
-                && history
-                    .descendants(&c.id)
-                    .iter()
-                    .all(|d| hidden_set.contains(d.id.as_str()))
-        })
+        .filter(|c| !needed.contains(c.id.as_str()))
         .map(|c| c.id.clone())
         .collect();
     let removed_set: HashSet<&str> = removed.iter().map(String::as_str).collect();

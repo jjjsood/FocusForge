@@ -106,7 +106,13 @@ when the graphics card is shared with your display. A limit can only lower
 what FocusForge would use, never raise it. A lower limit can make a fuse
 slower but never changes the result.
 
-- **Host memory** applies from the next fuse you start.
+- **Host memory** applies from the next fuse you start. A retouch or edit
+  session stays within it too, and a limit below what one frame needs refuses
+  the session and names the limit. A changed limit reaches an open session at
+  once: if it is too small for that session's frames, the session keeps the
+  frames it has and a warning names the limit. On camera RAW frames, Lighten and
+  Darken strokes read the session's own developed frames, so they need no extra
+  memory.
 - **VRAM** shows "Not probed yet" until a fuse has used the graphics card, and
   you can enter a number before that. Once the card's memory is known, a
   changed **VRAM** limit counts from the next start of FocusForge, and the

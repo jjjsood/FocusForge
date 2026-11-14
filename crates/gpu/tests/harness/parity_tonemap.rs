@@ -8,7 +8,7 @@
 use focusforge_core::display::{overlay_cpu, tonemap_cpu, zmap_index_scale};
 use focusforge_core::io::TiffStack;
 use focusforge_core::project::{Op, Point};
-use focusforge_core::retouch::overlay_colors;
+use focusforge_core::retouch::{ModeConditions, overlay_colors};
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{NO_SOURCE, ZMapReader, overlay_table};
 use focusforge_gpu::device::shared_device_or_skip;
@@ -315,12 +315,12 @@ fn overlay_parity_matches_cpu() {
     indices[5] = NO_SOURCE;
 
     let sources = zmap.frame_count();
-    let stroke = Op::BrushStroke {
-        source_id: 2,
-        path: vec![Point { x: 0, y: 12 }, Point { x: 30, y: 20 }],
-        radius: 9.0,
-        softness: 0.6,
-    };
+    let stroke = Op::frame_stroke(
+        2,
+        vec![Point { x: 0, y: 12 }, Point { x: 30, y: 20 }],
+        9.0,
+        0.6,
+    );
     for alpha in [0u8, 166, 255] {
         for solo in [None, Some(3u16)] {
             let table = overlay_table(sources, solo);
@@ -330,7 +330,9 @@ fn overlay_parity_matches_cpu() {
                 zmap.info(),
                 crop,
                 std::num::NonZeroU32::MIN,
+                &ModeConditions::default(),
                 &table,
+                &|_| None,
                 &indices,
                 &mut colors,
             );

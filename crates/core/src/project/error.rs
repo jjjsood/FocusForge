@@ -49,6 +49,17 @@ pub enum ProjectError {
         source: Box<crate::retouch::RetouchError>,
     },
 
+    /// The stroke at op `index` is painted from `checkpoint`, which cannot
+    /// be rendered under the checkpoint being rendered; `reason` finishes the
+    /// sentence ("has different alignment", "is not in this project", ...).
+    #[error("op #{index} is painted from checkpoint {checkpoint}, which {reason}")]
+    CheckpointSourceRefused {
+        path: PathBuf,
+        index: usize,
+        checkpoint: String,
+        reason: String,
+    },
+
     /// [`super::append::append_ops`] was handed an empty op list -- a
     /// checkpoint sealing nothing is not a real record.
     #[error("{}: an empty op list cannot be sealed", path.display())]
@@ -67,6 +78,26 @@ pub enum ProjectError {
     /// already on the path -- a cycle rather than a chain.
     #[error("{}: checkpoint {checkpoint} sits in a parent cycle", path.display())]
     ParentCycle { path: PathBuf, checkpoint: String },
+
+    /// A stroke of `checkpoint` is painted from the checkpoint `referenced`,
+    /// which no checkpoint in the project carries.
+    #[error("{}: checkpoint {checkpoint} has a stroke painted from checkpoint {referenced}, which is not in this project", path.display())]
+    DanglingStrokeSource {
+        path: PathBuf,
+        checkpoint: String,
+        referenced: String,
+    },
+
+    /// A stroke of `checkpoint` is painted from `referenced`, and following
+    /// parent and stroke-source links from `referenced` leads back to
+    /// `checkpoint` (or to a checkpoint already on the way): the sources
+    /// never end.
+    #[error("{}: checkpoint {checkpoint} has a stroke painted from checkpoint {referenced}, which is built on it, so following the sources never ends", path.display())]
+    StrokeSourceCycle {
+        path: PathBuf,
+        checkpoint: String,
+        referenced: String,
+    },
 
     /// An id handed to [`super::checkpoint::History::get`] names no
     /// checkpoint in this project.

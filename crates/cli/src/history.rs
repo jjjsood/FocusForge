@@ -19,7 +19,8 @@ pub enum HistoryCommand {
     /// List every visible checkpoint, newest first.
     List(ListArgs),
     /// Delete one checkpoint: it is hidden, and dropped from the project once no
-    /// visible checkpoint is built on it; its space is reclaimed by
+    /// visible checkpoint is built on it and no stroke paints from it (a
+    /// checkpoint a stroke paints from stays stored); its space is reclaimed by
     /// `history compact`. Refuses the last visible checkpoint.
     Delete(DeleteArgs),
     /// Rewrite the project to its live checkpoints only and report the bytes
@@ -78,8 +79,9 @@ pub fn run(command: HistoryCommand) -> ExitCode {
 
 /// Maps a refusal to its own exit code: 3 not a project, 4 truncated, 6 a
 /// missing entry, 7 a blob hash mismatch, 8 a structural link failure (a
-/// dangling parent, a parent cycle, a fingerprint disagreement, ops with no
-/// parent to record them against). Anything else stays the generic 1.
+/// dangling parent or stroke source, a parent or stroke-source cycle, a
+/// fingerprint disagreement, ops with no parent to record them against).
+/// Anything else stays the generic 1.
 pub(crate) fn exit_code_for(err: &ProjectError) -> u8 {
     match err {
         ProjectError::NotAProject { .. } => 3,
@@ -88,6 +90,8 @@ pub(crate) fn exit_code_for(err: &ProjectError) -> u8 {
         ProjectError::HashMismatch { .. } => 7,
         ProjectError::DanglingParent { .. }
         | ProjectError::ParentCycle { .. }
+        | ProjectError::DanglingStrokeSource { .. }
+        | ProjectError::StrokeSourceCycle { .. }
         | ProjectError::FingerprintDisagrees { .. }
         | ProjectError::OpsWithoutParent { .. } => 8,
         _ => 1,
@@ -255,6 +259,7 @@ struct DeleteReport {
     hidden: String,
     removed: Vec<String>,
     head: String,
+    strokes_using: usize,
 }
 
 fn delete(
@@ -285,6 +290,7 @@ fn delete(
         hidden: deleted.hidden,
         removed: deleted.removed,
         head: deleted.head,
+        strokes_using: deleted.strokes_using,
     };
     if json {
         match serde_json::to_string_pretty(&report) {
@@ -293,10 +299,11 @@ fn delete(
         }
     } else {
         println!(
-            "{}\nhidden: {}\nremoved: {}\nhead: {}",
+            "{}\nhidden: {}\nremoved: {}\nstrokes using it: {}\nhead: {}",
             report.project,
             report.hidden,
             report.removed.join(", "),
+            report.strokes_using,
             report.head
         );
     }

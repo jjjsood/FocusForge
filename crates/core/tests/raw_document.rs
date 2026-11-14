@@ -206,17 +206,18 @@ fn stroked_raw(name: &str) -> StrokedRaw {
     );
     let project_path = dir.join(format!("saved.{}", project::PROJECT_EXTENSION));
     let root = seal_held(&project_path, &held);
-    let stroke = Op::BrushStroke {
-        source_id: 1,
-        path: vec![Point { x: 4, y: 11 }, Point { x: 32, y: 11 }],
-        radius: 40.0,
-        softness: 0.5,
-    };
+    let stroke = Op::frame_stroke(
+        1,
+        vec![Point { x: 4, y: 11 }, Point { x: 32, y: 11 }],
+        40.0,
+        0.5,
+    );
     let edited = project::append_ops_onto(&project_path, &root, vec![stroke.clone()], None, 1)
         .expect("the stroke must append")
         .checkpoint;
     let mut project = Project::open(&project_path).unwrap();
     let pending = PendingState {
+        held: Vec::new(),
         composite: held.composite.clone(),
         ops: vec![stroke],
         sources: held.sources.clone(),
@@ -369,13 +370,13 @@ fn raw_exports_clip_once() {
 
     let pending = raw.pending.clone();
     let wide = render_f32(
-        &CheckpointImage::prepare_pending(&pending).unwrap(),
+        &CheckpointImage::prepare_pending(&pending, None).unwrap(),
         None,
         full(size.0, size.1),
     );
     assert_eq!(bits(&wide), bits(&raw.edited_f32), "pending equals saved");
     check_exports(&dir, "pending", &wide, size, &mut |path, options| {
-        project::export_pending(&pending, path, options, &meta).unwrap();
+        project::export_pending(&pending, None, path, options, &meta).unwrap();
     });
 
     let wide = raw.edited_f32.clone();
@@ -390,12 +391,21 @@ fn raw_view_render_keeps_headroom() {
     let mut raw = stroked_raw("raw_document_view");
     let dir = tmp_dir("raw_document_view_out");
     let view = dir.join("view.tif");
-    project::render_checkpoint(&mut raw.project, &raw.edited, &view).unwrap();
+    project::render_checkpoint(&mut raw.project, &raw.edited, &view, None).unwrap();
     assert_eq!(
         bits(&read_f32(&view)),
         bits(&raw.edited_f32),
         "the view render is the f32 render"
     );
+
+    let capped = dir.join("capped.tif");
+    let err = project::render_checkpoint(&mut raw.project, &raw.edited, &capped, Some(1))
+        .expect_err("a cap below the decode reservation refuses the render");
+    assert!(
+        err.to_string().contains("memory limit allows"),
+        "the refusal names the cap: {err}"
+    );
+    assert!(!capped.exists(), "a refused render leaves no file");
 }
 
 #[test]
@@ -464,18 +474,19 @@ fn one_render_for_held_saved_and_pending() {
 
     let project_path = dir.join(format!("saved.{}", project::PROJECT_EXTENSION));
     let root = seal_held(&project_path, &held);
-    let stroke = Op::BrushStroke {
-        source_id: 1,
-        path: vec![Point { x: 4, y: 11 }, Point { x: 32, y: 11 }],
-        radius: 40.0,
-        softness: 0.5,
-    };
+    let stroke = Op::frame_stroke(
+        1,
+        vec![Point { x: 4, y: 11 }, Point { x: 32, y: 11 }],
+        40.0,
+        0.5,
+    );
     let edited = project::append_ops_onto(&project_path, &root, vec![stroke.clone()], None, 1)
         .expect("the stroke must append")
         .checkpoint;
     let mut project = Project::open(&project_path).unwrap();
 
     let pending = PendingState {
+        held: Vec::new(),
         composite: held.composite.clone(),
         ops: Vec::new(),
         sources: held.sources.clone(),
@@ -484,12 +495,13 @@ fn one_render_for_held_saved_and_pending() {
         description: held.composite_description.clone(),
     };
     let pending_stroked = PendingState {
+        held: Vec::new(),
         ops: vec![stroke],
         ..pending.clone()
     };
     let held_image = CheckpointImage::prepare_held(&held).unwrap();
-    let pending_image = CheckpointImage::prepare_pending(&pending).unwrap();
-    let pending_stroked_image = CheckpointImage::prepare_pending(&pending_stroked).unwrap();
+    let pending_image = CheckpointImage::prepare_pending(&pending, None).unwrap();
+    let pending_stroked_image = CheckpointImage::prepare_pending(&pending_stroked, None).unwrap();
     let root_image = CheckpointImage::prepare(&project, &root).unwrap();
     let edited_image = CheckpointImage::prepare(&project, &edited).unwrap();
 
@@ -1023,9 +1035,16 @@ fn dng_same_document_as_render() {
     assert_within(&held, &camera_16bit(&look, &staged), 1, "held");
 
     let pending_path = dir.join("pending.dng");
-    project::export_pending(&raw.pending, &pending_path, &ExportOptions::Dng, &meta).unwrap();
+    project::export_pending(
+        &raw.pending,
+        None,
+        &pending_path,
+        &ExportOptions::Dng,
+        &meta,
+    )
+    .unwrap();
     let pending_wide = render_f32(
-        &CheckpointImage::prepare_pending(&raw.pending).unwrap(),
+        &CheckpointImage::prepare_pending(&raw.pending, None).unwrap(),
         None,
         size,
     );

@@ -35,5 +35,7 @@ mod parity_pipeline;
 mod parity_tonemap;
 #[path = "harness/parity_warp.rs"]
 mod parity_warp;
+#[path = "harness/sharpness.rs"]
+mod sharpness;
 #[path = "harness/transfer.rs"]
 mod transfer;

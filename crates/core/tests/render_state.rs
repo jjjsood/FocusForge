@@ -179,9 +179,9 @@ fn build(name: &str) -> Built {
     let edited = project::append_ops_onto(
         &project_path,
         &sealed.checkpoint,
-        vec![Op::BrushStroke {
-            source_id: 1,
-            path: vec![
+        vec![Op::frame_stroke(
+            1,
+            vec![
                 Point {
                     x: 350,
                     y: BAND_ROWS as i32 - 2,
@@ -191,9 +191,9 @@ fn build(name: &str) -> Built {
                     y: BAND_ROWS as i32 + 2,
                 },
             ],
-            radius: 40.0,
-            softness: 0.5,
-        }],
+            40.0,
+            0.5,
+        )],
         None,
         1,
     )
@@ -313,7 +313,7 @@ fn view_and_export_are_pixel_identical() {
     for (label, id) in [("fused", &built.root), ("op-bearing", &built.edited)] {
         let view = dir.join(format!("{label}-view.tif"));
         let export = dir.join(format!("{label}-export.tif"));
-        project::render_checkpoint(&mut project, id, &view).unwrap();
+        project::render_checkpoint(&mut project, id, &view, None).unwrap();
         project::export_checkpoint(
             &mut project,
             id,
@@ -402,12 +402,12 @@ const PENDING_CROP: Rect = Rect {
 };
 
 fn pending_stroke(source_id: u16, path: &[(i32, i32)], radius: f32, softness: f32) -> Op {
-    Op::BrushStroke {
+    Op::frame_stroke(
         source_id,
-        path: path.iter().map(|&(x, y)| Point { x, y }).collect(),
+        path.iter().map(|&(x, y)| Point { x, y }).collect(),
         radius,
         softness,
-    }
+    )
 }
 
 #[test]
@@ -485,12 +485,13 @@ fn pending_state_export_equals_the_saved_export() {
     let mut project = Project::open(&project_path).unwrap();
     let record = project.fuse_state(&saved).unwrap();
     let base = dir.join("base.tif");
-    project::render_checkpoint(&mut project, &saved, &base).unwrap();
+    project::render_checkpoint(&mut project, &saved, &base, None).unwrap();
     let pending_ops = vec![
         pending_stroke(2, &[(1, 1), (4, 3)], 1.5, 0.5),
         pending_stroke(0, &[(3, 0), (3, 4)], 2.0, 0.0),
     ];
     let state = project::PendingState {
+        held: Vec::new(),
         composite: base.clone(),
         ops: pending_ops.clone(),
         sources: sources.clone(),
@@ -503,6 +504,7 @@ fn pending_state_export_equals_the_saved_export() {
     let pending_out = dir.join("pending.tif");
     project::export_pending(
         &state,
+        None,
         &pending_out,
         &ExportOptions::default(),
         &MetadataOptions::default(),
@@ -542,6 +544,7 @@ fn pending_state_export_equals_the_saved_export() {
     let refused = dir.join("refused.tif");
     let err = project::export_pending(
         &state,
+        None,
         &refused,
         &ExportOptions::default(),
         &MetadataOptions::default(),
@@ -655,12 +658,12 @@ fn f32_held_saved_and_pending_render_agree() {
     })
     .expect("a float staged composite must seal")
     .checkpoint;
-    let stroke = Op::BrushStroke {
-        source_id: 1,
-        path: vec![Point { x: 6, y: 11 }, Point { x: 30, y: 11 }],
-        radius: 6.0,
-        softness: 0.5,
-    };
+    let stroke = Op::frame_stroke(
+        1,
+        vec![Point { x: 6, y: 11 }, Point { x: 30, y: 11 }],
+        6.0,
+        0.5,
+    );
     let edited = project::append_ops_onto(&project_path, &root, vec![stroke.clone()], None, 1)
         .expect("the stroke must append")
         .checkpoint;
@@ -697,6 +700,7 @@ fn f32_held_saved_and_pending_render_agree() {
         compressed_composite: None,
     };
     let pending = project::PendingState {
+        held: Vec::new(),
         composite: composite.clone(),
         ops: Vec::new(),
         sources: sources.clone(),
@@ -705,12 +709,13 @@ fn f32_held_saved_and_pending_render_agree() {
         description: "staged composite".to_string(),
     };
     let pending_stroked = project::PendingState {
+        held: Vec::new(),
         ops: vec![stroke.clone()],
         ..pending.clone()
     };
     let held_image = CheckpointImage::prepare_held(&held).unwrap();
-    let pending_image = CheckpointImage::prepare_pending(&pending).unwrap();
-    let pending_stroked_image = CheckpointImage::prepare_pending(&pending_stroked).unwrap();
+    let pending_image = CheckpointImage::prepare_pending(&pending, None).unwrap();
+    let pending_stroked_image = CheckpointImage::prepare_pending(&pending_stroked, None).unwrap();
     let root_image = CheckpointImage::prepare(&project, &root).unwrap();
     let edited_image = CheckpointImage::prepare(&project, &edited).unwrap();
 

@@ -1,0 +1,86 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// One neighbour pair's overlap: a track filled with the scale colour, hollow
+// when the pair has no data, neutral with a loading band while pending.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+export component FFOverlapSegment inherits Rectangle {
+    // 0 at 0 % overlap, 1 at 5 %, 2 at 20 % and above.
+    in property <float> scale: 0.0;
+    in property <bool> has-data: true;
+    // Too few sharp areas to be sure: the fill at a lower alpha.
+    in property <bool> dimmed: false;
+    in property <bool> pending: false;
+    in property <bool> hovered: false;
+    in property <string> percent: "";
+    // The loading band, in the bar's coordinates.
+    in property <length> sweep-x: 0px;
+    in property <length> sweep-width: 0px;
+    // Zooms in after `entry-delay`. Leaving `entered` fades it out in the
+    // pending look, so a count that ends never flashes the final colour.
+    in property <bool> entered: true;
+    in property <duration> entry-delay: 0ms;
+
+    property <float> presence: root.entered ? 1.0 : 0.0;
+    property <bool> neutral: root.pending || !root.entered;
+    property <bool> solid: root.has-data && !root.neutral;
+    property <bool> hollow: !root.has-data && !root.neutral;
+    property <color> fill-colour: root.scale <= 1.0
+        ? Theme.status-warning.mix(Theme.status-failure, root.scale)
+        : Theme.status-success.mix(Theme.status-warning, root.scale - 1.0);
+
+    height: ShellGeometry.overlap-bar-height;
+    border-radius: Theme.radius-xs;
+    background: Theme.surface-overlay;
+    clip: true;
+    opacity: root.presence;
+    // Grows from 0.6 with the fade in, keeps its size while fading out.
+    transform-scale: root.entered ? 0.6 + 0.4 * root.presence : 1.0;
+
+    animate presence {
+        delay: root.entered ? root.entry-delay : 0ms;
+        duration: root.entered ? Theme.entry-zoom : Theme.sweep-fade;
+        easing: ease-out;
+    }
+
+    if root.solid: Rectangle {
+        background: root.fill-colour.with-alpha(root.dimmed ? Theme.overlap-dimmed-opacity : 1.0);
+    }
+    if root.hollow: Rectangle {
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        border-radius: Theme.radius-xs;
+    }
+    if root.neutral && root.presence > 0.0: Rectangle {
+        x: root.sweep-x - root.x;
+        width: root.sweep-width;
+        background: @linear-gradient(90deg,
+            Theme.accent-default.with-alpha(0.0) 0%,
+            Theme.accent-default ShellGeometry.sweep-band-edge,
+            Theme.accent-default 1.0 - ShellGeometry.sweep-band-edge,
+            Theme.accent-default.with-alpha(0.0) 100%);
+    }
+    if root.solid && root.width >= ShellGeometry.overlap-text-from: Text {
+        text: root.percent;
+        color: root.dimmed ? Theme.text-primary : Theme.text-on-accent;
+        font-size: Theme.text-value-strong.size;
+        font-weight: Theme.text-value-strong.weight;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    if root.hollow && root.width >= ShellGeometry.overlap-dash-from: Text {
+        text: "\u{2013}";
+        color: Theme.text-muted;
+        font-size: Theme.text-body.size;
+        font-weight: Theme.text-body.weight;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    if root.hovered: Rectangle {
+        border-width: 1px;
+        border-color: Theme.text-primary;
+        border-radius: Theme.radius-xs;
+    }
+}

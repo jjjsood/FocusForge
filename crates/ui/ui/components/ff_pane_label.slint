@@ -5,18 +5,51 @@ import { ShellGeometry } from "../geometry.slint";
 
 export component FFPaneLabel inherits Rectangle {
     in property <string> label: "";
+    // A leading layers icon in `icon-color`; the label then hugs its text up to
+    // `pane-label-max-width` and elides.
+    in property <bool> show-icon: false;
+    // A leading filled square in `icon-color` in the icon's slot instead; the
+    // label hugs its text like a plain one.
+    in property <bool> show-swatch: false;
+    in property <color> icon-color;
 
-    width: max(ShellGeometry.pane-label-width, label-text.preferred-width + 2 * Theme.space-2);
+    property <bool> leading: root.show-icon || root.show-swatch;
+    property <length> text-start: root.leading ? 28px : Theme.space-2;
+    property <length> hugged: max(ShellGeometry.pane-label-width, root.text-start + label-text.preferred-width + Theme.space-2);
+
+    width: root.show-icon ? min(ShellGeometry.pane-label-max-width, root.hugged) : root.hugged;
     height: ShellGeometry.pane-label-height;
     background: Theme.surface-overlay;
     border-radius: Theme.radius-sm;
 
+    if root.show-swatch: Rectangle {
+        x: Theme.space-2;
+        y: (root.height - self.height) / 2;
+        width: ShellGeometry.pane-label-swatch-side;
+        height: ShellGeometry.pane-label-swatch-side;
+        background: root.icon-color;
+        border-radius: Theme.radius-xs;
+    }
+
+    if root.show-icon: Image {
+        x: Theme.space-2;
+        y: (root.height - self.height) / 2;
+        width: Theme.icon-sm;
+        height: Theme.icon-sm;
+        source: @image-url("../../../../assets/icons/layers.svg");
+        colorize: root.icon-color;
+    }
+
     label-text := Text {
+        x: root.leading ? root.text-start : 0px;
+        width: root.leading ? root.width - root.text-start - Theme.space-2 : root.width;
+        height: root.height;
         text: root.label;
         color: Theme.text-primary;
         font-size: Theme.text-body.size;
         font-weight: Theme.text-body.weight;
-        horizontal-alignment: center;
+        overflow: elide;
+        horizontal-alignment: root.leading ? left : center;
         vertical-alignment: center;
     }
 }

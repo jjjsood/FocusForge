@@ -26,18 +26,60 @@ export component FFSectionHeading inherits Rectangle {
     in property <bool> flat: false;
     // The label in the secondary text colour instead of the muted one.
     in property <bool> strong: false;
+    // A collapsible group heading in an image list: chevron, label in body
+    // type, `count` at the trailing edge, no rule. Clicking it emits `toggled`.
+    in property <bool> group: false;
+    in property <bool> collapsed: false;
+    in property <string> count: "";
+    callback toggled();
 
-    background: root.opaque && !root.flat ? Theme.surface-raised : transparent;
+    background: root.opaque && !root.flat && !root.group ? Theme.surface-raised : transparent;
     // The label/badge band's own height -- every child below positions
     // against this, never against `height`, which also carries the
     // trailing gap to the section's first field. One fixed height for
     // every state: the badge is the only thing that ever changes, and it
     // never changes this row's own size.
     property <length> head-height: root.compact ? ShellGeometry.day-separator-height : ShellGeometry.section-heading-height;
-    height: root.flat ? ShellGeometry.settings-heading-height
+    height: root.group ? ShellGeometry.group-heading-height
+        : root.flat ? ShellGeometry.settings-heading-height
         : root.head-height + (root.compact ? 0px : ShellGeometry.section-heading-bottom-gap);
 
-    Text {
+    if root.group: TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.toggled(); }
+
+        Image {
+            x: root.inset;
+            y: (parent.height - self.height) / 2;
+            width: Theme.icon-sm;
+            height: Theme.icon-sm;
+            source: root.collapsed ? @image-url("../../../../assets/icons/chevron-right.svg")
+                : @image-url("../../../../assets/icons/chevron-down.svg");
+            colorize: Theme.text-muted;
+        }
+        Text {
+            x: root.inset + Theme.icon-sm + Theme.space-1;
+            width: parent.width - self.x - count-text.width - Theme.space-2 - root.inset-end;
+            height: parent.height;
+            text: root.label;
+            color: Theme.text-secondary;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        count-text := Text {
+            x: parent.width - self.width - root.inset-end;
+            height: parent.height;
+            text: root.count;
+            color: Theme.text-muted;
+            font-size: Theme.text-body.size;
+            font-weight: Theme.text-body.weight;
+            vertical-alignment: center;
+        }
+    }
+
+    if !root.group: Text {
         x: root.inset;
         // Centered the same way the badge below centers its own text: by the
         // glyph's own natural height against `head-height`, not by handing a
@@ -53,7 +95,7 @@ export component FFSectionHeading inherits Rectangle {
         letter-spacing: Theme.text-section.letter-spacing;
     }
 
-    if !root.compact && !root.flat && root.provenance == "default": badge := Rectangle {
+    if !root.compact && !root.flat && !root.group && root.provenance == "default": badge := Rectangle {
         x: parent.width - self.width - root.inset-end;
         y: (root.head-height - self.height) / 2;
         width: badge-text.width + 2 * Theme.space-2;
@@ -72,7 +114,7 @@ export component FFSectionHeading inherits Rectangle {
         }
     }
 
-    if !root.flat: Rectangle {
+    if !root.flat && !root.group: Rectangle {
         x: 0px;
         y: root.head-height - 1px;
         width: parent.width;

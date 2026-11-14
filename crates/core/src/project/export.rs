@@ -748,20 +748,22 @@ pub fn export_held(
 
 /// [`export_checkpoint`] for a [`PendingState`], strokes not yet saved: the
 /// same render, validation, metadata resolution and `.partial` discipline
-/// through the one shared `encode` path, with no project read or written.
-/// A missing source is [`ProjectError::ExportSourcesUnavailable`].
+/// through the one shared `encode` path. `project` is read, never written, and
+/// only for a stroke painted from a checkpoint, which needs it. A missing
+/// source is [`ProjectError::ExportSourcesUnavailable`].
 pub fn export_pending(
     state: &PendingState,
+    project: Option<&mut Project>,
     path: &Path,
     options: &ExportOptions,
     metadata_options: &MetadataOptions,
 ) -> Result<MetadataOutcome, ProjectError> {
-    let image = CheckpointImage::prepare_pending(state)?;
+    let image = CheckpointImage::prepare_pending(state, project.as_deref())?;
     let frame = state.reference;
     let frame_path = state.sources[frame].clone();
     encode(
         &image,
-        None,
+        project,
         frame,
         &frame_path,
         &state.sources[0],

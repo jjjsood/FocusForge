@@ -7,7 +7,10 @@ pub mod blend;
 use crate::tile::Rect;
 use crate::zmap::ZMapError;
 
-pub use blend::{footprint, overlay_colors, top_source};
+pub use blend::{
+    ModeConditions, footprint, needs_mode_conditions, overlay_colors, replay_mode_conditions,
+    source_frame, top_source,
+};
 
 /// Failures validating a stroke against the fused map's extent and frame count.
 #[derive(Debug, thiserror::Error)]
@@ -26,9 +29,17 @@ pub enum RetouchError {
     #[error("softness {softness} is not in 0.0..=1.0")]
     InvalidSoftness { softness: f32 },
 
+    /// `opacity` is outside `0 < x <= 1` (also true for `NaN`).
+    #[error("opacity {opacity} is not in 0 < x ≤ 1")]
+    InvalidOpacity { opacity: f32 },
+
     /// A stroke's path holds no points.
     #[error("path is empty")]
     EmptyPath,
+
+    /// A stroke is painted from a checkpoint, which this path cannot read.
+    #[error("a stroke painted from checkpoint {checkpoint} cannot be rendered here")]
+    CheckpointSource { checkpoint: String },
 
     /// An op other than a brush stroke was handed to this apply path.
     #[error("this op is not supported here")]

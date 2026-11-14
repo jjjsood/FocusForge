@@ -161,12 +161,7 @@ fn build_synth(name: &str, spp: u32) -> Synth {
     let child = project::append_ops_onto(
         &project_path,
         &root,
-        vec![Op::BrushStroke {
-            source_id: 0,
-            path: vec![Point { x: 2, y: 2 }],
-            radius: 1.5,
-            softness: 0.0,
-        }],
+        vec![Op::frame_stroke(0, vec![Point { x: 2, y: 2 }], 1.5, 0.0)],
         None,
         1,
     )
@@ -1070,12 +1065,7 @@ fn build_metadata_synth(
     let child = project::append_ops_onto(
         &project_path,
         &root,
-        vec![Op::BrushStroke {
-            source_id: 0,
-            path: vec![Point { x: 2, y: 2 }],
-            radius: 1.5,
-            softness: 0.0,
-        }],
+        vec![Op::frame_stroke(0, vec![Point { x: 2, y: 2 }], 1.5, 0.0)],
         None,
         1,
     )

@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "sharpness-gpu"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bytemuck = "1"
+focusforge-core = { path = "../../crates/core" }
+focusforge-gpu = { path = "../../crates/gpu", features = ["gpu"] }
+rayon = "1"
+wgpu = "=29.0.4"

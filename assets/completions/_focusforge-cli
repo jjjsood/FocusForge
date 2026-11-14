@@ -79,6 +79,21 @@ normal\:"As many frames at once as the host has threads"))' \
 ':dir -- Directory of frames to count (non-recursive, descending into a `frames` subdirectory):_files' \
 && ret=0
 ;;
+(sharpness-map)
+_arguments "${_arguments_options[@]}" : \
+'--out=[Directory the maps are written to; created if missing]:OUT:_files' \
+'--composite=[A composite image of the frames'\'' size to map on the frames'\'' scale]:COMPOSITE:_files' \
+'--priority=[How many frames are read at once; the maps are the same at either value]:PRIORITY:((low\:"One frame at a time, leaving the other cores to other work"
+normal\:"As many frames at once as the host has threads"))' \
+'--json[Print the scale and the written maps as one JSON object]' \
+'*-v[Increase log detail (repeatable)]' \
+'-q[Log errors only]' \
+'--quiet[Log errors only]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+':dir -- Directory of frames to map (non-recursive, descending into a `frames` subdirectory):_files' \
+&& ret=0
+;;
 (stack)
 _arguments "${_arguments_options[@]}" : \
 '-o+[Directory to collect this run'\''s projects into. Omit to write each project beside its own frames]:DIR:_files' \
@@ -144,7 +159,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (retouch)
 _arguments "${_arguments_options[@]}" : \
-'--ops=[The op list\: a JSON array of ops in the persisted \`Op\` shape. A brush stroke blends frame \`source_id\` over the image along its path\: fully within \`radius * (1 - softness)\`, fading linearly to nothing at \`radius\`. Every op is checked before anything is written; positions in error messages count from 0 in list order]:FILE:_files' \
+'--ops=[The op list\: a JSON array of ops in the persisted \`Op\` shape. The source of a brush stroke is \`"source"\: {"frame"\: n}\`, a source frame, or \`"source"\: {"checkpoint"\: "<id prefix>"}\`, a checkpoint'\''s own render; \`"source_id"\: n\` reads as frame n. A checkpoint is named by any unique prefix of a visible checkpoint'\''s id, is stored as its full id, and must share the edited state'\''s pixel grid and sample type. A brush stroke blends its source over the image along its path\: fully within \`radius * (1 - softness)\`, fading linearly to nothing at \`radius\`. A stroke may also carry \`mode\` (\`normal\`, \`lighten\`, \`darken\` or \`detail\`; default \`normal\`) and \`opacity\` (0 < x ≤ 1; default 1.0). An opacity too small to register still records a state but changes no sample. \`lighten\` changes a pixel only where the source'\''s sum over all its samples is greater than the image'\''s there, \`darken\` only where it is smaller; either then blends every sample by the same amount. \`detail\` keeps the image'\''s own brightness and takes only the source'\''s fine detail, over a reach about the brush radius. Every op is checked before anything is written; positions in error messages count from 0 in list order]:FILE:_files' \
 '--from=[The state to append under -- any unique prefix of its id. Defaults to the project'\''s current head]:FROM:_default' \
 '--name=[Name the last appended state]:NAME:_default' \
 '--json[Emit the JSON report instead of human-readable text]' \
@@ -385,6 +400,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(sharpness-map)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (stack)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -481,6 +500,7 @@ _focusforge-cli_commands() {
 'algorithms:List every registered algorithm, or print one named algorithm'\''s full parameter schema' \
 'step-plan:Compute the focus step, frame count, duration and disk need of a focus stack' \
 'sharp-areas:Count the areas of the image that are sharpest in each frame of a stack' \
+'sharpness-map:Write the focus score of every frame of a stack, and of a composite, as maps on one scale' \
 'stack:Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run \`focusforge-cli export\` for that' \
 'export:Turn a project into an image file\: the image with \`-o\`, the Z-Map with \`--zmap\`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image' \
 'retouch:Append an op list to a project as new states, one per op, each the previous one'\''s child\: on the current head, or on \`--from\` as a branch. \`export --checkpoint\` writes any of them' \
@@ -557,6 +577,7 @@ _focusforge-cli__subcmd__help_commands() {
 'algorithms:List every registered algorithm, or print one named algorithm'\''s full parameter schema' \
 'step-plan:Compute the focus step, frame count, duration and disk need of a focus stack' \
 'sharp-areas:Count the areas of the image that are sharpest in each frame of a stack' \
+'sharpness-map:Write the focus score of every frame of a stack, and of a composite, as maps on one scale' \
 'stack:Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run \`focusforge-cli export\` for that' \
 'export:Turn a project into an image file\: the image with \`-o\`, the Z-Map with \`--zmap\`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image' \
 'retouch:Append an op list to a project as new states, one per op, each the previous one'\''s child\: on the current head, or on \`--from\` as a branch. \`export --checkpoint\` writes any of them' \
@@ -616,7 +637,7 @@ _focusforge-cli__subcmd__help__subcmd__help_commands() {
 _focusforge-cli__subcmd__help__subcmd__history_commands() {
     local commands; commands=(
 'list:List every visible checkpoint, newest first' \
-'delete:Delete one checkpoint\: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by \`history compact\`. Refuses the last visible checkpoint' \
+'delete:Delete one checkpoint\: it is hidden, and dropped from the project once no visible checkpoint is built on it and no stroke paints from it (a checkpoint a stroke paints from stays stored); its space is reclaimed by \`history compact\`. Refuses the last visible checkpoint' \
 'compact:Rewrite the project to its live checkpoints only and report the bytes reclaimed' \
     )
     _describe -t commands 'focusforge-cli help history commands' commands "$@"
@@ -656,6 +677,11 @@ _focusforge-cli__subcmd__help__subcmd__sharp-areas_commands() {
     local commands; commands=()
     _describe -t commands 'focusforge-cli help sharp-areas commands' commands "$@"
 }
+(( $+functions[_focusforge-cli__subcmd__help__subcmd__sharpness-map_commands] )) ||
+_focusforge-cli__subcmd__help__subcmd__sharpness-map_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli help sharpness-map commands' commands "$@"
+}
 (( $+functions[_focusforge-cli__subcmd__help__subcmd__stack_commands] )) ||
 _focusforge-cli__subcmd__help__subcmd__stack_commands() {
     local commands; commands=()
@@ -670,7 +696,7 @@ _focusforge-cli__subcmd__help__subcmd__step-plan_commands() {
 _focusforge-cli__subcmd__history_commands() {
     local commands; commands=(
 'list:List every visible checkpoint, newest first' \
-'delete:Delete one checkpoint\: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by \`history compact\`. Refuses the last visible checkpoint' \
+'delete:Delete one checkpoint\: it is hidden, and dropped from the project once no visible checkpoint is built on it and no stroke paints from it (a checkpoint a stroke paints from stays stored); its space is reclaimed by \`history compact\`. Refuses the last visible checkpoint' \
 'compact:Rewrite the project to its live checkpoints only and report the bytes reclaimed' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -690,7 +716,7 @@ _focusforge-cli__subcmd__history__subcmd__delete_commands() {
 _focusforge-cli__subcmd__history__subcmd__help_commands() {
     local commands; commands=(
 'list:List every visible checkpoint, newest first' \
-'delete:Delete one checkpoint\: it is hidden, and dropped from the project once no visible checkpoint is built on it; its space is reclaimed by \`history compact\`. Refuses the last visible checkpoint' \
+'delete:Delete one checkpoint\: it is hidden, and dropped from the project once no visible checkpoint is built on it and no stroke paints from it (a checkpoint a stroke paints from stays stored); its space is reclaimed by \`history compact\`. Refuses the last visible checkpoint' \
 'compact:Rewrite the project to its live checkpoints only and report the bytes reclaimed' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -740,6 +766,11 @@ _focusforge-cli__subcmd__review_commands() {
 _focusforge-cli__subcmd__sharp-areas_commands() {
     local commands; commands=()
     _describe -t commands 'focusforge-cli sharp-areas commands' commands "$@"
+}
+(( $+functions[_focusforge-cli__subcmd__sharpness-map_commands] )) ||
+_focusforge-cli__subcmd__sharpness-map_commands() {
+    local commands; commands=()
+    _describe -t commands 'focusforge-cli sharpness-map commands' commands "$@"
 }
 (( $+functions[_focusforge-cli__subcmd__stack_commands] )) ||
 _focusforge-cli__subcmd__stack_commands() {

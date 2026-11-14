@@ -25,38 +25,41 @@ export component FFDialogFooter inherits Rectangle {
     callback confirmed();
 
     height: 34px;
-    opacity: root.dimmed ? 0.5 : 1.0;
 
-    HorizontalLayout {
-        alignment: space-between;
-
-        FFButton {
-            width: 70px;
-            kind: "quiet";
-            text: root.cancel-label;
-            clicked => { root.cancelled(); }
-        }
+    Rectangle {
+        opacity: root.dimmed ? 0.5 : 1.0;
 
         HorizontalLayout {
-            spacing: Theme.space-2;
+            alignment: space-between;
 
-            if root.tertiary-label != "": FFButton {
-                width: 160px;
-                kind: "default";
-                text: root.tertiary-label;
-                clicked => { root.tertiary-pressed(); }
+            FFButton {
+                width: 70px;
+                kind: "quiet";
+                text: root.cancel-label;
+                clicked => { root.cancelled(); }
             }
-            if root.secondary-label != "": FFButton {
-                width: 160px;
-                kind: "default";
-                text: root.secondary-label;
-                clicked => { root.secondary-pressed(); }
-            }
-            if root.confirm-label != "": FFButton {
-                width: 160px;
-                kind: root.confirm-kind;
-                text: root.confirm-label;
-                clicked => { root.confirmed(); }
+
+            HorizontalLayout {
+                spacing: Theme.space-2;
+
+                if root.tertiary-label != "": FFButton {
+                    width: 160px;
+                    kind: "default";
+                    text: root.tertiary-label;
+                    clicked => { root.tertiary-pressed(); }
+                }
+                if root.secondary-label != "": FFButton {
+                    width: 160px;
+                    kind: "default";
+                    text: root.secondary-label;
+                    clicked => { root.secondary-pressed(); }
+                }
+                if root.confirm-label != "": FFButton {
+                    width: 160px;
+                    kind: root.confirm-kind;
+                    text: root.confirm-label;
+                    clicked => { root.confirmed(); }
+                }
             }
         }
     }

@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use focusforge_core::project::{self, Op, Project};
+use focusforge_core::project::{self, History, Op, Project, StrokeSource};
 use serde::Serialize;
 
 use crate::history::{compact_after_save, resolve_checkpoint};
@@ -28,11 +28,40 @@ struct RetouchReport {
     wall_seconds: f64,
 }
 
-/// Reads the op list: a bare JSON array of ops.
+/// Reads the op list: a bare JSON array of ops. An element that does not
+/// decode as an op is reported by its 0-based position.
 fn read_ops(path: &Path) -> Result<Vec<Op>, String> {
     let file = std::fs::File::open(path).map_err(|err| format!("{}: {err}", path.display()))?;
-    serde_json::from_reader(std::io::BufReader::new(file))
-        .map_err(|err| format!("{}: {err}", path.display()))
+    let values: Vec<serde_json::Value> = serde_json::from_reader(std::io::BufReader::new(file))
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            serde_json::from_value(value)
+                .map_err(|err| format!("{}: op #{index}: {err}", path.display()))
+        })
+        .collect()
+}
+
+/// Rewrites each checkpoint source of `ops` from the prefix typed to the full
+/// id of the visible checkpoint it names, so a stored reference never turns
+/// ambiguous as the history grows. A prefix that names none, or several, is
+/// refused with its op position.
+fn resolve_sources(history: &History, project_path: &Path, ops: &mut [Op]) -> Result<(), String> {
+    for (index, op) in ops.iter_mut().enumerate() {
+        let Op::BrushStroke {
+            source: StrokeSource::Checkpoint(named),
+            ..
+        } = op
+        else {
+            continue;
+        };
+        let resolved = resolve_checkpoint(history, project_path, named)
+            .map_err(|message| format!("op #{index}: {message}"))?;
+        named.clone_from(&resolved.id);
+    }
+    Ok(())
 }
 
 /// Runs the subcommand: nothing is written unless every op is valid.
@@ -44,7 +73,7 @@ pub fn run(
     json: bool,
 ) -> ExitCode {
     let start = Instant::now();
-    let ops = match read_ops(ops_path) {
+    let mut ops = match read_ops(ops_path) {
         Ok(ops) => ops,
         Err(message) => return fail(message),
     };
@@ -55,6 +84,9 @@ pub fn run(
             Ok(project) => project,
             Err(err) => return crate::fail_with_code(&err, crate::history::exit_code_for(&err)),
         };
+        if let Err(message) = resolve_sources(project.history(), project_path, &mut ops) {
+            return fail(message);
+        }
         match from {
             Some(prefix) => match resolve_checkpoint(project.history(), project_path, prefix) {
                 Ok(checkpoint) => checkpoint.id.clone(),

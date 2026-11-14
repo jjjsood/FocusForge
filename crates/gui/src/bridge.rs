@@ -24,10 +24,11 @@ use crate::canvas::{
     CanvasFeed, EditedView, OverlayDraw, Pane, PaneJob, PaneSource, Preparer, RepaintGate,
     truncate_pane_label, truncate_tail,
 };
+use crate::comparison::{self, ComparisonWindow};
 use crate::controller::{
-    AppController, ChromeKey, DockTab, GroupingQuestion, GuardSecondary, JobView, LocateTarget,
-    OpenAs, OpenOutcome, RefusalAction, SaveAsk, SettingsSection, ShellEvent, ShellMode,
-    StoragePath, WindowChromeIntent, WindowTarget,
+    AppController, ChromeKey, DockTab, FramePane, GroupingQuestion, GuardSecondary, JobView,
+    LabelMark, LocateTarget, OpenAs, OpenOutcome, RefusalAction, SaveAsk, SettingsSection,
+    ShellEvent, ShellMode, StoragePath, WindowChromeIntent, WindowTarget,
 };
 use crate::diagnostics::{
     DiagnosticsStatus, InputBatch, InputSurface, finish_input_batches, input_trace_incomplete,
@@ -47,11 +48,11 @@ use crate::settings_panel::{HeadingState, PanelModel, RowKind};
 use crate::viewport::{PaneDraw, PaneRect};
 use focusforge_ui::{
     AboutState, AnalyticsRowView, AppWindow, CalculatorFieldView,
-    CheckpointEntryView as GeneratedCheckpointEntry, ComparisonWindow, ExportRowView,
-    FFManifestRow, ImageRowView as GeneratedImageRow, NotificationRowView, PerformanceCap,
+    CheckpointEntryView as GeneratedCheckpointEntry, ExportRowView, FFManifestRow,
+    ImageRowView as GeneratedImageRow, NotificationRowView, OverlapSegmentView, PerformanceCap,
     PerformanceState, ProjectCardView as GeneratedProjectCard, ProjectTabView,
     RecentRowView as GeneratedRecentRow, SectionHeadView, SettingsRow as GeneratedSettingsRow,
-    StageTile, StoragePathState, StorageState, SummaryCell, Theme, UpdateControlsState,
+    StoragePathState, StorageState, SummaryCell, Theme, UpdateControlsState,
 };
 
 /// `slint::platform::PointerEventButton` -> `input_map::Button` -- the only
@@ -215,6 +216,30 @@ impl Canvas {
         }
     }
 
+    /// Shows what the controller says the left pane holds: a frame or the
+    /// checkpoint's render, the refusal lines of an unrenderable checkpoint,
+    /// or nothing while it renders. A checkpoint render that fails to open is
+    /// refused as the checkpoint `label` names.
+    pub fn show_frame_pane(&mut self, pane: Option<FramePane>, label: &str) {
+        match pane {
+            Some(FramePane::Frame(path, view)) => self.set_frame(Some(&path), view),
+            Some(FramePane::Checkpoint(path)) => {
+                self.set_frame(Some(&path), None);
+                if self.failed_frame.as_deref() == Some(path.as_path()) {
+                    self.frame_refusal = job::checkpoint_refusal_lines(label);
+                }
+            }
+            Some(FramePane::Refused(lines)) => self.refuse_frame(lines),
+            Some(FramePane::Rendering) | None => self.set_frame(None, None),
+        }
+    }
+
+    /// Drops whatever frame was open and shows `lines` in its place.
+    pub fn refuse_frame(&mut self, lines: Vec<String>) {
+        self.set_frame(None, None);
+        self.frame_refusal = lines;
+    }
+
     /// Hands the worker one request for every pane whose texture does not
     /// yet show its draw; a request still pending is replaced by it. Each
     /// pane's backdrop read is queued behind it, once per content change;
@@ -276,12 +301,7 @@ impl Canvas {
                     false,
                     0,
                 );
-                renderer.publish_edited(
-                    &prepared.job,
-                    &prepared.samples,
-                    &prepared.indices,
-                    edited,
-                );
+                renderer.publish_edited(&prepared.job, &prepared.samples, &prepared.colors, edited);
             }
         }
         if let Some(preparer) = self.preparer.as_ref() {
@@ -464,11 +484,13 @@ fn show_comparison_pane(
     plane_draw: Option<PaneDraw>,
 ) {
     let cursor_hovered = cursor_hovered(app);
-    let (detached, frame_label, project_loaded, editor_mode, messages, cursor) = {
+    let (detached, frame_label, label_mark, project_loaded, editor_mode, messages, cursor) = {
         let controller = controller.lock().unwrap();
+        let label_mark = controller.frame_pane_label_mark();
         (
             controller.detached_pane(),
-            truncate_pane_label(&controller.frame_pane_label()),
+            pane_label_text(&controller.frame_pane_label(), label_mark),
+            label_mark,
             controller.active_project().is_some(),
             controller.mode() == ShellMode::Editor,
             controller.composite_message_lines(),
@@ -489,6 +511,10 @@ fn show_comparison_pane(
             window.set_cursor_ring_commands(cursor.ring_commands.into());
             window.set_cursor_core_commands(cursor.core_commands.into());
             window.set_cursor_picking(cursor.picking);
+            window.set_cursor_mode_tag(cursor.mode_tag.into());
+            window.set_cursor_tag_origin(cursor.tag_origin);
+            window.set_cursor_checkpoint_source(cursor.checkpoint_colour.is_some());
+            window.set_cursor_glyph_color(glyph_color(cursor.checkpoint_colour));
             window.set_cursor_pick_color(slint::Color::from_rgb_u8(
                 cursor.pick_color[0],
                 cursor.pick_color[1],
@@ -524,6 +550,9 @@ fn show_comparison_pane(
         match detached {
             PaneSource::Frame => {
                 window.set_pane_label(frame_label.into());
+                window.set_pane_label_icon(matches!(label_mark, Some(LabelMark::Icon(_))));
+                window.set_pane_label_swatch(matches!(label_mark, Some(LabelMark::Swatch(_))));
+                window.set_pane_label_icon_color(label_mark_color(label_mark));
                 window.set_bar_title("FocusForge — Frame".into());
                 window.set_message_lines(string_model(canvas.frame_refusal()));
                 match frame_draw
@@ -551,6 +580,8 @@ fn show_comparison_pane(
                 }
             }
             PaneSource::Composite => {
+                window.set_pane_label_icon(false);
+                window.set_pane_label_swatch(false);
                 window.set_bar_title("FocusForge — Composite".into());
                 window.set_message_lines(string_model(&messages));
                 match plane_draw
@@ -580,6 +611,30 @@ fn show_comparison_pane(
         }
         window.window().request_redraw();
     });
+}
+
+/// The left pane label as the window shows it: a frame's file name is cut to
+/// the pill, a checkpoint label (with its icon) is left whole for the pill to
+/// elide.
+fn pane_label_text(label: &str, mark: Option<LabelMark>) -> String {
+    if matches!(mark, Some(LabelMark::Icon(_))) {
+        label.to_string()
+    } else {
+        truncate_pane_label(label)
+    }
+}
+
+fn label_mark_color(mark: Option<LabelMark>) -> slint::Color {
+    let Some(LabelMark::Icon([r, g, b]) | LabelMark::Swatch([r, g, b])) = mark else {
+        return slint::Color::default();
+    };
+    slint::Color::from_rgb_u8(r, g, b)
+}
+
+fn set_frame_label_mark(app: &AppWindow, mark: Option<LabelMark>) {
+    app.set_frame_label_icon(matches!(mark, Some(LabelMark::Icon(_))));
+    app.set_frame_label_swatch(matches!(mark, Some(LabelMark::Swatch(_))));
+    app.set_frame_label_icon_color(label_mark_color(mark));
 }
 
 /// A fresh model for `lines`, or `None` when `current` already holds them:
@@ -624,15 +679,17 @@ pub fn repaint(
             batch.publication,
         )
     });
-    let (feed, render_started, session_started, message_lines) = {
+    let (feed, render_started, session_started, origin_started, message_lines) = {
         let loaded = canvas.borrow().tab();
         let mut controller = controller.lock().unwrap();
         controller.fit_if_unfitted();
         let feed = controller.canvas_feed(loaded);
+        controller.ensure_origin_readers();
         (
             feed,
             controller.take_render_started(),
             controller.take_session_started(),
+            controller.take_origin_started(),
             controller.composite_message_lines(),
         )
     };
@@ -641,6 +698,9 @@ pub fn repaint(
     }
     if session_started {
         poll_edit_session(app.as_weak(), controller.clone(), canvas.clone());
+    }
+    if origin_started {
+        poll_origin_readers(app.as_weak(), controller.clone(), canvas.clone());
     }
     if controller.lock().unwrap().take_thumbnails_started() {
         poll_thumbnails(app.as_weak(), controller.clone());
@@ -659,9 +719,9 @@ pub fn repaint(
     }
 
     let (
-        frame_path,
-        frame_view,
+        frame_pane,
         frame_label,
+        frame_label_mark,
         frame_draw,
         plane_draw,
         readout,
@@ -671,9 +731,9 @@ pub fn repaint(
     ) = {
         let controller = controller.lock().unwrap();
         (
-            controller.selected_frame_path(),
-            controller.selected_frame_view(),
+            controller.frame_pane(),
             controller.frame_pane_label(),
+            controller.frame_pane_label_mark(),
             controller.frame_draw(),
             controller.plane_draw(),
             controller.zoom_readout(),
@@ -684,11 +744,12 @@ pub fn repaint(
     };
     canvas
         .borrow_mut()
-        .set_frame(frame_path.as_deref(), frame_view);
+        .show_frame_pane(frame_pane, &frame_label);
 
     app.set_zoom_readout(readout.into());
     app.set_project_loaded(project_loaded);
-    app.set_frame_label(truncate_pane_label(&frame_label).into());
+    app.set_frame_label(pane_label_text(&frame_label, frame_label_mark).into());
+    set_frame_label_mark(app, frame_label_mark);
     if let Some(lines) = changed_lines(
         app.get_frame_message_lines(),
         canvas.borrow().frame_refusal(),
@@ -777,6 +838,26 @@ fn poll_edit_session(
             repaint(&app, &controller, &canvas);
         } else {
             poll_edit_session(app_weak, controller, canvas);
+        }
+    });
+}
+
+/// Polls [`AppController::settle_origin_readers`] every [`job::POLL`] until no
+/// origin readers are being opened, then repaints -- their arrival changes
+/// what the composite overlay shows.
+fn poll_origin_readers(
+    app_weak: slint::Weak<AppWindow>,
+    controller: Arc<Mutex<AppController>>,
+    canvas: Rc<RefCell<Canvas>>,
+) {
+    slint::Timer::single_shot(job::POLL, move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if controller.lock().unwrap().settle_origin_readers() {
+            repaint(&app, &controller, &canvas);
+        } else {
+            poll_origin_readers(app_weak, controller, canvas);
         }
     });
 }
@@ -1145,7 +1226,7 @@ fn open_comparison(
 ) -> Result<(), slint::PlatformError> {
     let window = Rc::new(ComparisonWindow::new()?);
     window
-        .global::<Theme>()
+        .global::<comparison::Theme>()
         .set_reduce_motion(controller.lock().unwrap().reduce_motion());
     window.on_dock_requested({
         let app_weak = app.as_weak();
@@ -1487,13 +1568,21 @@ pub fn push_performance_view(app: &AppWindow, controller: &Arc<Mutex<AppControll
 fn performance_change(
     app_weak: &slint::Weak<AppWindow>,
     controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
     change: impl FnOnce(&mut AppController),
 ) {
     record_surface_input(InputSurface::Other);
-    change(&mut controller.lock().unwrap());
+    let session_started = {
+        let mut controller = controller.lock().unwrap();
+        change(&mut controller);
+        controller.take_session_started()
+    };
     if let Some(app) = app_weak.upgrade() {
         push_performance_view(&app, controller);
         direct_publication_scope(InputSurface::Other);
+        if session_started {
+            poll_edit_session(app.as_weak(), controller.clone(), canvas.clone());
+        }
     }
 }
 
@@ -1858,16 +1947,11 @@ pub fn push_job(app: &AppWindow, view: &JobView) {
     app.set_fuse_enabled(view.fuse_enabled);
 }
 
-/// The sharpness ramp the theme's colour tokens define.
-pub fn heat_ramp(theme: &Theme<'_>) -> job::HeatRamp {
-    let rgb = |c: slint::Color| [c.red(), c.green(), c.blue()];
-    job::HeatRamp::new([
-        rgb(theme.get_surface_canvas()),
-        rgb(theme.get_accent_subtle()),
-        rgb(theme.get_accent_pressed()),
-        rgb(theme.get_accent_default()),
-        rgb(theme.get_text_primary()),
-    ])
+/// The sharpness ramp from the theme's five colour tokens, darkest stop
+/// first: canvas surface, subtle accent, pressed accent, default accent,
+/// primary text.
+pub fn heat_ramp(stops: [slint::Color; 5]) -> job::HeatRamp {
+    job::HeatRamp::new(stops.map(|c| [c.red(), c.green(), c.blue()]))
 }
 
 /// [`push_stage_view`] once `show_panes` has run: a Composite pane that now
@@ -1903,12 +1987,23 @@ struct StageProps {
     source: slint::Image,
     heat: slint::Image,
     rect: (f32, f32, f32, f32),
-    tiles: Vec<StageTile>,
+    tiles: Vec<TileRect>,
 }
 
-/// Sets `$props` on `$target`, a window with the `stage-*` properties.
+/// One stage-view tile; each window's generated `StageTile` is built from it.
+#[derive(Clone)]
+struct TileRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    front: bool,
+}
+
+/// Sets `$props` on `$target`, a window with the `stage-*` properties, whose
+/// tile type is the generated `StageTile` named by the path `$tile`.
 macro_rules! apply_stage {
-    ($target:expr, $props:expr) => {{
+    ($target:expr, $props:expr, $($tile:ident)::+) => {{
         let (t, p) = (&$target, &$props);
         t.set_stage_card_title(p.card.0.into());
         t.set_stage_card_body(p.card.1.into());
@@ -1923,7 +2018,18 @@ macro_rules! apply_stage {
         t.set_stage_image_y(p.rect.1);
         t.set_stage_image_w(p.rect.2);
         t.set_stage_image_h(p.rect.3);
-        t.set_stage_tiles(slint::ModelRc::new(slint::VecModel::from(p.tiles.clone())));
+        let tiles: Vec<$($tile)::+> = p
+            .tiles
+            .iter()
+            .map(|r| $($tile)::+ {
+                x: r.x,
+                y: r.y,
+                width: r.width,
+                height: r.height,
+                front: r.front,
+            })
+            .collect();
+        t.set_stage_tiles(slint::ModelRc::new(slint::VecModel::from(tiles)));
     }};
 }
 
@@ -1960,7 +2066,7 @@ fn stage_props(controller: &AppController) -> StageProps {
                         let r = mark.rect;
                         let x0 = scale(r.x, x, w, extent.width);
                         let y0 = scale(r.y, y, h, extent.height);
-                        StageTile {
+                        TileRect {
                             x: x0,
                             y: y0,
                             width: scale(r.x + r.width, x, w, extent.width) - x0,
@@ -1989,12 +2095,12 @@ fn stage_props(controller: &AppController) -> StageProps {
 pub fn push_stage_view(app: &AppWindow, controller: &AppController) {
     let props = stage_props(controller);
     app.set_composite_label(props.label.as_str().into());
-    apply_stage!(app, props);
+    apply_stage!(app, props, focusforge_ui::StageTile);
     if controller.detached_pane() == Some(PaneSource::Composite) {
         COMPARISON_WINDOW.with(|slot| {
             if let Some(window) = slot.borrow().as_ref() {
                 window.set_pane_label(props.label.as_str().into());
-                apply_stage!(window, props);
+                apply_stage!(window, props, comparison::StageTile);
             }
         });
     }
@@ -2211,7 +2317,13 @@ fn sync_image_rows(
             model.push(row);
             updates += 1;
         } else if let Some(previous) = model.row_data(index)
-            && (previous.chip != row.chip
+            && (previous.kind != row.kind
+                || previous.method != row.method
+                || previous.strokes != row.strokes
+                || previous.badges.iter().ne(row.badges.iter())
+                || previous.collapsed != row.collapsed
+                || previous.height != row.height
+                || previous.chip != row.chip
                 || previous.name != row.name
                 || previous.time_text != row.time_text
                 || previous.capture_stamp != row.capture_stamp
@@ -2342,12 +2454,15 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
     let rows: Vec<GeneratedImageRow> = panel
         .rows
         .iter()
-        .enumerate()
-        .map(|(index, row)| {
-            let visible = controller.source_preview_row_visible(index);
-            let preview = visible
-                .then(|| controller.source_preview(&row.path))
+        .map(|row| {
+            let frame = row.kind == crate::images::RowKind::Frame;
+            let visible = controller.source_preview_row_visible(row);
+            let source = visible
+                .then(|| controller.row_preview_source(row))
                 .flatten();
+            let preview = source
+                .as_ref()
+                .and_then(|source| controller.source_preview(source));
             if let Some(pixels) = preview
                 && native_previews.insert(Arc::as_ptr(pixels))
             {
@@ -2355,9 +2470,37 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
                     native_preview_bytes.saturating_add(pixels.rgba.len() as u64);
             }
             GeneratedImageRow {
+                kind: match row.kind {
+                    crate::images::RowKind::Frame => "frame",
+                    crate::images::RowKind::Checkpoint => "checkpoint",
+                    crate::images::RowKind::Hidden => "hidden",
+                    crate::images::RowKind::ResultsHeading
+                    | crate::images::RowKind::FramesHeading => "heading",
+                }
+                .into(),
+                method: row.method.clone().into(),
+                strokes: row.strokes.clone().into(),
+                badges: slint::ModelRc::new(slint::VecModel::from(
+                    row.badges
+                        .iter()
+                        .map(|badge| badge.as_str().into())
+                        .collect::<Vec<slint::SharedString>>(),
+                )),
+                collapsed: row.collapsed,
+                height: row.height,
                 chip: slint::Color::from_rgb_u8(row.chip[0], row.chip[1], row.chip[2]),
-                name: truncate_tail(&row.name, name_max).into(),
-                full_name: row.name.clone().into(),
+                name: if frame {
+                    truncate_tail(&row.name, name_max)
+                } else {
+                    row.name.clone()
+                }
+                .into(),
+                full_name: if frame {
+                    row.name.clone()
+                } else {
+                    String::new()
+                }
+                .into(),
                 time_text: row.trailing_text.clone().into(),
                 capture_stamp: row.capture_stamp.clone().into(),
                 excluded: row.excluded,
@@ -2367,8 +2510,8 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
                 focused: false,
                 job_disabled: false,
                 preview: source_preview_image(preview),
-                preview_state: if visible {
-                    controller.source_preview_state(&row.path, row.unresolved)
+                preview_state: if let Some(source) = &source {
+                    controller.source_preview_state(source, row.unresolved)
                 } else if row.unresolved {
                     "missing"
                 } else {
@@ -2383,8 +2526,8 @@ pub fn push_images_panel(app: &AppWindow, controller: &AppController) {
     });
     controller.set_published_preview_bytes(native_preview_bytes);
     record_timing(TimingCounter::RowUpdates, updates as u64);
+    app.set_images_list_viewport_y(-controller.images_scroll_y_in(panel.content_height()));
     app.set_images_header_text(panel.header_text.into());
-    app.set_images_list_viewport_y(-controller.images_scroll_y());
     let sort = match controller.frame_sort() {
         Some(crate::images::FrameSort::Name) => "name",
         Some(crate::images::FrameSort::CaptureTime) => "capture-time",
@@ -2504,6 +2647,38 @@ pub fn push_checkpoint_panel(app: &AppWindow, controller: &mut AppController) {
     app.set_checkpoint_scroll_y(panel.scroll_y);
 }
 
+fn brush_mode_label(mode: crate::job::BrushMode) -> &'static str {
+    use crate::job::BrushMode;
+    match mode {
+        BrushMode::Normal => "Normal",
+        BrushMode::Lighten => "Lighten",
+        BrushMode::Darken => "Darken",
+        BrushMode::Detail => "Detail",
+    }
+}
+
+fn brush_mode_id(mode: crate::job::BrushMode) -> &'static str {
+    use crate::job::BrushMode;
+    match mode {
+        BrushMode::Normal => "normal",
+        BrushMode::Lighten => "lighten",
+        BrushMode::Darken => "darken",
+        BrushMode::Detail => "detail",
+    }
+}
+
+fn brush_mode_from_id(id: &str) -> Option<crate::job::BrushMode> {
+    use crate::job::BrushMode;
+    [
+        BrushMode::Normal,
+        BrushMode::Lighten,
+        BrushMode::Darken,
+        BrushMode::Detail,
+    ]
+    .into_iter()
+    .find(|mode| brush_mode_id(*mode) == id)
+}
+
 /// Pushes the editor toolbar's own state -- `AppController::brush_toolbar_view`
 /// -- the one place `ShellEvent::EditorChanged` is performed. Numeric
 /// readouts are formatted here, never in `.slint`.
@@ -2514,6 +2689,11 @@ pub fn push_editor_toolbar(app: &AppWindow, controller: &AppController) {
     app.set_brush_size_ceiling(view.size_ceiling as i32);
     app.set_brush_soft_text(format!("{:.0}%", view.soft).into());
     app.set_brush_soft_fraction(view.soft_fraction);
+    app.set_brush_mode_label(brush_mode_label(view.mode).into());
+    app.set_brush_mode_id(brush_mode_id(view.mode).into());
+    app.set_brush_mode_menu_open(view.mode_menu_open);
+    app.set_brush_opacity_text(format!("{:.0}%", view.opacity).into());
+    app.set_brush_opacity_fraction(view.opacity_fraction);
     app.set_brush_picking(view.picking);
     app.set_can_undo(view.can_undo);
     app.set_can_redo(view.can_redo);
@@ -2531,6 +2711,13 @@ fn push_overlay_controls(app: &AppWindow, controller: &AppController) {
     app.set_overlay_text(format!("{:.0}%", overlay.opacity * 100.0).into());
 }
 
+/// The cursor glyph's colour: the checkpoint's, transparent without one.
+fn glyph_color(colour: Option<[u8; 3]>) -> slint::Color {
+    colour.map_or(slint::Color::from_argb_u8(0, 0, 0, 0), |[r, g, b]| {
+        slint::Color::from_rgb_u8(r, g, b)
+    })
+}
+
 /// Pushes the brush cursor overlay's own view -- every repaint, since its
 /// extent also depends on the active tab's current zoom, which
 /// [`push_editor_toolbar`]'s own `EditorChanged` trigger does not cover.
@@ -2544,6 +2731,10 @@ fn push_brush_cursor(app: &AppWindow, controller: &AppController) {
     app.set_cursor_ring_commands(view.ring_commands.into());
     app.set_cursor_core_commands(view.core_commands.into());
     app.set_cursor_picking(view.picking);
+    app.set_cursor_mode_tag(view.mode_tag.into());
+    app.set_cursor_tag_origin(view.tag_origin);
+    app.set_cursor_checkpoint_source(view.checkpoint_colour.is_some());
+    app.set_cursor_glyph_color(glyph_color(view.checkpoint_colour));
     app.set_cursor_pick_color(slint::Color::from_rgb_u8(
         view.pick_color[0],
         view.pick_color[1],
@@ -2655,8 +2846,9 @@ pub fn push_overlays(app: &AppWindow, controller: &Arc<Mutex<AppController>>) {
     push_analytics(app, &controller);
 }
 
-/// Pushes the Analytics overlay's open flag and state; the rows go through
-/// `sync_rows`, so a row that did not change keeps its element tree.
+/// Pushes the Analytics overlay's open flag and state; the rows and overlap
+/// segments go through `sync_rows`, so one that did not change keeps its
+/// element tree.
 pub fn push_analytics(app: &AppWindow, controller: &AppController) {
     app.set_analytics_open(controller.analytics_open());
     let row_views = |rows: &[crate::analytics::AnalyticsRow]| -> Vec<AnalyticsRowView> {
@@ -2676,16 +2868,38 @@ pub fn push_analytics(app: &AppWindow, controller: &AppController) {
             })
             .collect()
     };
-    let (state, rows, error) = match controller.analytics_view() {
-        AnalyticsView::Waiting => ("waiting", Vec::new(), ""),
-        AnalyticsView::Counting(rows) => ("counting", row_views(rows), ""),
-        AnalyticsView::Rows(rows) => ("rows", row_views(rows), ""),
-        AnalyticsView::Failed(message) => ("failed", Vec::new(), message.as_str()),
+    let segment_views = |segments: &[crate::analytics::OverlapSegment]| -> Vec<OverlapSegmentView> {
+        segments
+            .iter()
+            .map(|segment| OverlapSegmentView {
+                scale: segment.scale,
+                has_data: segment.has_data,
+                dimmed: segment.dimmed,
+                percent: segment.percent.as_str().into(),
+                tooltip: segment.tooltip.as_str().into(),
+            })
+            .collect()
+    };
+    let (state, rows, segments, error) = match controller.analytics_view() {
+        AnalyticsView::Waiting => ("waiting", Vec::new(), Vec::new(), ""),
+        AnalyticsView::Counting(rows) => (
+            "counting",
+            row_views(rows),
+            vec![OverlapSegmentView::default(); rows.len().saturating_sub(1)],
+            "",
+        ),
+        AnalyticsView::Rows(rows, segments) => {
+            ("rows", row_views(rows), segment_views(segments), "")
+        }
+        AnalyticsView::Failed(message) => ("failed", Vec::new(), Vec::new(), message.as_str()),
     };
     app.set_analytics_state(state.into());
     app.set_analytics_error(error.into());
     sync_rows(app.get_analytics_rows(), rows, |model| {
         app.set_analytics_rows(model);
+    });
+    sync_rows(app.get_analytics_segments(), segments, |model| {
+        app.set_analytics_segments(model);
     });
 }
 
@@ -3131,10 +3345,16 @@ pub fn install(
     toast_timer: Rc<RefCell<Option<slint::Timer>>>,
 ) -> Installed {
     TOAST_SLOT.with(|slot| *slot.borrow_mut() = Rc::downgrade(&toast_timer));
-    controller
-        .lock()
-        .unwrap()
-        .set_heat_ramp(heat_ramp(&app.global::<Theme>()));
+    controller.lock().unwrap().set_heat_ramp({
+        let theme = app.global::<Theme>();
+        heat_ramp([
+            theme.get_surface_canvas(),
+            theme.get_accent_subtle(),
+            theme.get_accent_pressed(),
+            theme.get_accent_default(),
+            theme.get_text_primary(),
+        ])
+    });
     let job_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
     let load_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
     let preview_timer = slint::Timer::default();
@@ -3452,6 +3672,31 @@ pub fn install(
                 .lock()
                 .unwrap()
                 .set_brush_softness_fraction(fraction)
+        }
+    });
+    app.on_brush_opacity_fraction_changed({
+        let controller = controller.clone();
+        move |fraction| {
+            controller
+                .lock()
+                .unwrap()
+                .set_brush_opacity_fraction(fraction)
+        }
+    });
+    app.on_brush_mode_menu_toggled({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().toggle_brush_mode_menu()
+    });
+    app.on_brush_mode_menu_dismissed({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().close_brush_mode_menu()
+    });
+    app.on_brush_mode_selected({
+        let controller = controller.clone();
+        move |id| {
+            if let Some(mode) = brush_mode_from_id(id.as_str()) {
+                controller.lock().unwrap().set_brush_mode(mode);
+            }
         }
     });
     // The bottom bar's overlay controls: both change what the `Composite`
@@ -3896,17 +4141,25 @@ pub fn install(
     app.on_settings_section_selected({
         let controller = controller.clone();
         let app_weak = app.as_weak();
+        let canvas = canvas.clone();
         move |section| {
             record_settings_input();
             let Some(parsed) = SettingsSection::from_slug(section.as_str()) else {
                 return;
             };
-            controller.lock().unwrap().select_settings_section(parsed);
+            let session_started = {
+                let mut controller = controller.lock().unwrap();
+                controller.select_settings_section(parsed);
+                controller.take_session_started()
+            };
             if let Some(app) = app_weak.upgrade() {
                 app.set_settings_section(parsed.slug().into());
                 push_performance_view(&app, &controller);
                 push_storage_view(&app, &controller);
                 direct_publication_scope(InputSurface::Settings);
+                if session_started {
+                    poll_edit_session(app.as_weak(), controller.clone(), canvas.clone());
+                }
             }
         }
     });
@@ -3965,7 +4218,7 @@ pub fn install(
             }
             COMPARISON_WINDOW.with(|slot| {
                 if let Some(window) = slot.borrow().as_ref() {
-                    window.global::<Theme>().set_reduce_motion(on);
+                    window.global::<comparison::Theme>().set_reduce_motion(on);
                 }
             });
         }
@@ -4068,32 +4321,54 @@ pub fn install(
     app.on_performance_cap_committed({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move || performance_change(&app_weak, &controller, |c| c.commit_cap_drafts())
+        let canvas = canvas.clone();
+        move || performance_change(&app_weak, &controller, &canvas, |c| c.commit_cap_drafts())
     });
     app.on_performance_host_unit_toggled({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move || performance_change(&app_weak, &controller, |c| c.toggle_host_unit_list())
+        let canvas = canvas.clone();
+        move || {
+            performance_change(&app_weak, &controller, &canvas, |c| {
+                c.toggle_host_unit_list()
+            })
+        }
     });
     app.on_performance_vram_unit_toggled({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move || performance_change(&app_weak, &controller, |c| c.toggle_vram_unit_list())
+        let canvas = canvas.clone();
+        move || {
+            performance_change(&app_weak, &controller, &canvas, |c| {
+                c.toggle_vram_unit_list()
+            })
+        }
     });
     app.on_performance_host_unit_selected({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move |unit| performance_change(&app_weak, &controller, |c| c.set_host_cap_unit(&unit))
+        let canvas = canvas.clone();
+        move |unit| {
+            performance_change(&app_weak, &controller, &canvas, |c| {
+                c.set_host_cap_unit(&unit)
+            })
+        }
     });
     app.on_performance_vram_unit_selected({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move |unit| performance_change(&app_weak, &controller, |c| c.set_vram_cap_unit(&unit))
+        let canvas = canvas.clone();
+        move |unit| {
+            performance_change(&app_weak, &controller, &canvas, |c| {
+                c.set_vram_cap_unit(&unit)
+            })
+        }
     });
     app.on_performance_unit_dismissed({
         let controller = controller.clone();
         let app_weak = app.as_weak();
-        move || performance_change(&app_weak, &controller, |c| c.close_unit_lists())
+        let canvas = canvas.clone();
+        move || performance_change(&app_weak, &controller, &canvas, |c| c.close_unit_lists())
     });
     app.on_performance_host_cap_cursor_moved({
         let controller = controller.clone();
@@ -4590,17 +4865,21 @@ pub fn install(
             }
         }
     });
-    // A plain wheel over the `Images` list steps the selected/brush-source
-    // frame -- the same effect `Ctrl + Wheel` over the canvas has, so this
-    // also needs a repaint.
+    // A plain wheel over an `Images` row steps the source row, which also
+    // needs a repaint; a refused wheel is the list's own scroll and gets none.
     app.on_images_frame_wheel({
         let controller = controller.clone();
         let canvas = canvas.clone();
         let app_weak = app.as_weak();
-        move |delta| {
-            dispatch(&controller, &canvas, &app_weak, |controller| {
-                controller.images_list_wheel(delta);
-            });
+        move |row, delta| {
+            let used = controller
+                .lock()
+                .unwrap()
+                .images_list_wheel(row as usize, delta);
+            if used {
+                dispatch(&controller, &canvas, &app_weak, |_| {});
+            }
+            used
         }
     });
     app.on_images_scrollbar_pointer({
@@ -4777,7 +5056,7 @@ pub fn install(
         let app_weak = app.as_weak();
         move |i| {
             dispatch(&controller, &canvas, &app_weak, |controller| {
-                controller.select_frame(i as usize);
+                controller.select_image_row(i as usize);
             });
         }
     });
@@ -4788,7 +5067,7 @@ pub fn install(
         move |delta| {
             record_images_input();
             dispatch(&controller, &canvas, &app_weak, |controller| {
-                controller.select_adjacent_resolved_frame(delta);
+                controller.select_adjacent_image_row(delta);
             });
         }
     });
@@ -5423,6 +5702,7 @@ fn perform(app: &AppWindow, controller: &Arc<Mutex<AppController>>, event: Shell
             let mut controller = controller.lock().unwrap();
             push_checkpoint_panel(app, &mut controller);
             app.set_projects_save_enabled(controller.save_enabled());
+            push_images_panel(app, &controller);
         }
         ShellEvent::EditorChanged => {
             let controller = controller.lock().unwrap();
@@ -6074,19 +6354,33 @@ mod tests {
         let detached = super::COMPARISON_WINDOW
             .with(|slot| slot.borrow().as_ref().cloned())
             .expect("the detached window is kept");
-        let fade = || detached.global::<super::Theme>().get_motion_fast();
+        let fade = || {
+            detached
+                .global::<super::comparison::Theme>()
+                .get_motion_fast()
+        };
         assert!(
-            detached.global::<super::Theme>().get_reduce_motion(),
+            detached
+                .global::<super::comparison::Theme>()
+                .get_reduce_motion(),
             "a window opened under reduced motion starts with it"
         );
         assert_eq!(fade(), 0);
 
         rig.app.invoke_appearance_reduce_motion_toggled(false);
-        assert!(!detached.global::<super::Theme>().get_reduce_motion());
+        assert!(
+            !detached
+                .global::<super::comparison::Theme>()
+                .get_reduce_motion()
+        );
         assert_eq!(fade(), 150);
 
         rig.app.invoke_appearance_reduce_motion_toggled(true);
-        assert!(detached.global::<super::Theme>().get_reduce_motion());
+        assert!(
+            detached
+                .global::<super::comparison::Theme>()
+                .get_reduce_motion()
+        );
         assert!(rig.app.global::<super::Theme>().get_reduce_motion());
         assert!(rig.controller.lock().unwrap().reduce_motion());
         super::hide_comparison();

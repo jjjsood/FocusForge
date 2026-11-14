@@ -12,7 +12,8 @@ crates/core/   TIFF and RAW I/O, tiles, stacking and alignment algorithms, the
                composite, image export in TIFF, PNG and JPEG), the update check
                (`update`: version comparison and one HTTPS GET through `ureq`;
                tests and `FOCUSFORGE_RELEASE_URL` point it at a local server)
-crates/gpu/    the shared wgpu device, WGSL fusion/warp/blend kernels and the
+crates/gpu/    the shared wgpu device, WGSL fusion/warp/blend and sharpness (scale, map tiles, sharp-area and
+               overlap scoring) kernels, each with a CPU twin, and the
                tile-scheduler pipeline that runs them, behind the `gpu`
                feature (on by default). An allocate-and-back-off probe at
                startup discovers the device's usable VRAM budget, mirroring
@@ -26,8 +27,13 @@ crates/diagnostics/ the shared `tracing` subscriber (stderr sink, rotating
                recorder, the native-crash monitor process and the
                diagnostics bundle writer -- linked only by `crates/cli` and
                `crates/gui`, never by `crates/core` or `crates/gpu`
-crates/ui/     focusforge-ui: the `.slint` sources and their generated Rust
-               bindings, compiled once and depending on nothing but `slint`
+crates/ui/     focusforge-ui: the main window's `.slint` sources and their
+               generated Rust bindings (and the test-theme probe), compiled
+               once and depending on nothing but `slint`
+crates/ui-comparison/   focusforge-ui-comparison: the detached comparison
+               window, generated in its own crate
+crates/ui-theme-sheet/  focusforge-ui-theme-sheet: the developer theme sheet,
+               compiled only behind `focusforge-gui`'s `theme-sheet` feature
 crates/gui/    focusforge-gui: a Slint window shell (toolbar, dock, tab
                strip, projects overlay, settings modal), a wgpu-backed
                canvas that renders a composite/Z-Map pair and, in editor
@@ -109,7 +115,7 @@ the reader, the tile scheduler's memory budget, the Z-Map reader and
 writer, each stacking algorithm's fusion output, the pyramidal ECC solver
 and its warp and auto-crop stages, the job engine's pause/resume/cancel
 control loop, the stage cache, grouping proposals and the `.ffp` project
-container's read/write round trip, the retouch op log (brush strokes, the
+container's read/write round trip, the retouch op log (brush strokes with their blend mode and opacity, the
 rainbow overlay palette) and the render of a checkpoint's state, the
 checkpoint history (append-only saves,
 branching, delete and import validation, the export formats), and the
@@ -144,7 +150,9 @@ temporary directory rather than a shared one.
 Under `cargo nextest` (`.config/nextest.toml`) the default profile kills each
 test after 15 minutes (30 for `stack_cli`) and reports a named TIMEOUT. The
 `quick` profile, used by `tools/check-all.sh --quick`, skips four memory and
-reference-cache binaries and kills any test after 180 s. The
+reference-cache binaries and kills any test after 180 s. The align
+determinism test is six tests that nextest starts first (`.config/nextest.toml`);
+the `quick` profile leaves exactly those to the full gate. The
 `hit_cap_behaviour` tests are `measurement:` ignores, run by hand with
 `--ignored`.
 
@@ -262,6 +270,23 @@ Every image in `docs/assets/manual/` is generated, never hand-taken:
 A change to the window that moves a documented control or changes its text
 should come with the matching page edit and regenerated screenshots.
 
+## Building the UI
+
+The Slint UI is generated in three crates so no single compiler process holds
+all of it: `focusforge-ui`, `focusforge-ui-comparison` and
+`focusforge-ui-theme-sheet`. Each is `[lib] test/doctest/bench = false`, and
+the workspace dev profile sets `debug = false` and `incremental = false` on
+all three. A cold `cargo build --workspace --tests` at 24 jobs peaks near 6 GB
+and takes about two minutes.
+
+Slint's per-element debug info is emitted only behind the UI crates'
+`element-debug-info` feature. `focusforge-gui`'s `mcp` feature and its
+dev-dependencies turn it on; a default build leaves it off.
+
+The theme sheet is built with `cargo build -p focusforge-gui --features
+theme-sheet`. A default build given `--theme-sheet` exits with code 2 and a
+message naming the feature.
+
 ## Before you send a change
 
 Branch from `develop` and open the pull request against `develop`. `main` holds released versions only; a pull request from `develop` to `main` is a release.
@@ -278,6 +303,20 @@ while editing; `--log-dir DIR` writes the gate logs to `DIR` instead of
 Run this local gate before acceptance and merge. GitHub Actions calls the same
 gate on Linux, macOS and Windows as additional evidence; a green hosted run
 does not replace a required local run.
+Cargo's jobs are capped at min(24, cores) through `tools/lib/cargo-jobs.sh`
+unless `CARGO_BUILD_JOBS` is set. A full run also builds, lints and tests the theme sheet
+(`theme sheet feature` stage) and checks the size of each generated Slint
+source (`generated UI size` stage, `tools/check-ui-size.py`, which holds a
+byte budget per generated file: 17.4 MB main window, 1.1 MB comparison
+window, 24.4 MB theme sheet). The sheet is built, tested and checked only when
+a path under `crates/ui*/` or `crates/gui/`, or the root `Cargo.toml`,
+`Cargo.lock` or `rust-toolchain.toml`, changed since the merge base, and always
+in CI or when no base resolves; otherwise the stage prints `SKIP`, and the
+skipped full run is cached as `full-partial`, which answers later `--quick` and
+`--static` runs but not a later full run. The no-default-features stage
+(`check (no default features)`) is a `cargo check`.
+Raise a budget on purpose by editing its line in the `BUDGETS` table in that
+script.
 Read `tools/README.md` for what each script does before running cargo
 commands by hand.
 

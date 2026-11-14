@@ -23,6 +23,7 @@ focusforge-cli [OPTIONS] <COMMAND>
 | [`algorithms`](#algorithms) | lists the stacking and alignment methods and their settings |
 | [`step-plan`](#step-plan) | plans a focus bracket: step, frame count, duration, disk need |
 | [`sharp-areas`](#sharp-areas) | counts the sharpest areas per frame |
+| [`sharpness-map`](#sharpness-map) | writes the focus score of each frame, and of a composite, as maps on one scale |
 | [`cache`](#cache) | clears the saved alignment results |
 | [`diagnostics`](#diagnostics) | packs logs and crash reports into one ZIP |
 | [`check-update`](#check-update) | tells you whether a newer release exists |
@@ -270,6 +271,21 @@ Write the result with [`export --checkpoint`](#export).
 | `--name <NAME>` | name the last checkpoint added |
 | `--json` | print the report as JSON |
 
+A stroke takes its pixels from a source frame, `"source": {"frame": 3}`, or from
+a checkpoint's own picture, `"source": {"checkpoint": "5b71"}`: an id or a unique
+start of one, naming a visible checkpoint of the same pixel size and sample type
+as the checkpoint being edited. `"source_id": 3` reads as frame 3.
+
+A stroke may carry two more fields. `mode` is `normal` (the default), `lighten`,
+`darken` or `detail`: `lighten` changes a pixel only where the source's sum over
+all samples exceeds the image's there, `darken` only where it is smaller, and
+`detail` keeps the image's brightness and takes only the source's fine detail.
+`opacity`, `0 < x <= 1` (default `1.0`), scales the stroke's coverage. An
+opacity outside that range refuses the run; one too small to register still
+records a checkpoint but changes no sample. A project that holds a stroke with
+another mode than `normal` or another opacity than `1.0` is refused by builds
+that predate those fields.
+
 ```bash
 focusforge-cli retouch frames.ffp --ops stroke-list.json --name "halo fixed"
 ```
@@ -483,24 +499,59 @@ focusforge-cli sharp-areas [OPTIONS] <DIR>
 
 Divides the image into square cells and counts, per frame, in how many cells
 that frame is the sharpest. Frames are counted as they are, without
-alignment. The text output has one row per frame: index, file name, count.
+alignment. The text output has one row per frame (index, file name, count),
+then one line per neighbouring pair with its overlap in percent, or `no data`.
+A pair's overlap is twice the counted cells sharp in both frames, divided by
+the sum of the counted cells sharp in each; a frame is sharp in a cell when its
+score there is at least `overlap-threshold` times the cell's best.
 
 | option | meaning |
 |---|---|
 | `--set <KEY=VALUE>` | set one of the values below; repeatable |
-| `--json` | print the counts as one JSON object |
+| `--json` | print the counts and the overlaps as one JSON object; an overlap with no data is `null` |
 | `--priority <low\|normal>` | `low` reads one frame at a time and leaves the other cores free; the counts are the same. Default `normal` |
 
 | id | meaning | default | allowed |
 |---|---|---|---|
 | `cell-size` | side of a cell (px) | `64` | 16 to 512 |
 | `contrast` | how much sharper the peak must be than the cell's weakest frame | `2` | 1 to 10 |
+| `overlap-threshold` | share of the cell's best score at which a frame is sharp there | `0.8` | 0.5 to 1 |
 
 A value out of range, a folder without frames, a frame that cannot be read and
 frames of different sizes all exit `1`.
 
 ```bash
 focusforge-cli sharp-areas frames/ --set cell-size=128
+```
+
+## `sharpness-map`
+
+```
+focusforge-cli sharpness-map [OPTIONS] --out <OUT> <DIR>
+```
+
+Writes, for each frame, a map of its focus score on one scale for the whole
+stack, so the same value means the same sharpness in every map. Frames are
+read without alignment. A map holds each pixel's focus score divided by the
+scale, the 99th percentile of the pixels' peak scores over the frames; a value
+above 1 is sharper than the scale. A stack with no detail has scale 0 and maps
+of zeros. Each map is an `f32` TIFF of the frames' size,
+`<frame>-sharpness.tif`. The text output is the scale, then one row per frame
+(index, file name, map) and, with `--composite`, a `composite` row.
+
+| option | meaning |
+|---|---|
+| `--out <OUT>` | the folder the maps are written to; created if missing; required |
+| `--composite <COMPOSITE>` | a composite image of the frames' size, written as `composite-sharpness.tif` on the frames' scale |
+| `--json` | print the scale and the written maps as one JSON object |
+| `--priority <low\|normal>` | `low` reads one frame at a time and leaves the other cores free; the maps are the same. Default `normal` |
+
+A composite of another size or samples per pixel, a folder without frames, a
+frame that cannot be read and an output folder that cannot be created exit `1`;
+a failed run leaves no map behind.
+
+```bash
+focusforge-cli sharpness-map frames/ --out maps --composite result.tif
 ```
 
 ## `cache`

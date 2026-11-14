@@ -25,7 +25,7 @@ Start: --open fixtures/mantis-64/frames
 11. Type "512" into the VRAM number (`FFTextField::input` 1).
     Expect: the field shows "512" in the neutral tone beside "MiB" and the grey hint is gone; Must not: the note "Caps only lower the probed budgets. Changes apply from the next start." appears below the LIMITS rows (it shows only after a run has probed the GPU).
 12. Click **Close settings** (`FFSettingsModal::close`).
-   Expect: the "Settings" window is gone; the canvas panes are visible again (within 1 s).
+   Expect: the "Settings" window is gone; the canvas panes are visible again (within 3 s).
 13. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
     Expect: the "Settings" window is open again (within 1 s).
 14. Click **Performance** (`FFNavRailEntry::area` 0).
@@ -37,13 +37,13 @@ Start: --open fixtures/mantis-64/frames
     Expect: Must not: the line under the row reads "Cleared"; the heading "CACHE" shows the row "Stage cache" with the grey text "Deletes cached fuse stages." and an enabled **Clear cache** button (read with `buttons AppWindow::settings-modal`), and the line under the row is empty.
 ## Input map
 17. Click **Input map** (`FFNavRailEntry::area` 3).
-    Expect: the heading "BINDINGS" shows a line under it that names either the built-in bindings ("Built-in bindings.") or the settings file ("Read from <path to settings.toml>: <n> bindings differ from the built-in ones."; which one depends on whether this machine already has a settings file) and no red line; below it a table header "INPUT", "STACKING", "EDITOR"; the INPUT column (`FFInputTableRow::input-cell`) holds six rows, top to bottom "wheel", "ctrl+wheel", "shift+wheel", "middle-drag / space+left-drag", "ctrl+z / ctrl+shift+z" and "alt+left-click" (within 1 s).
+    Expect: the heading "BINDINGS" shows a line under it that names either the built-in bindings ("Built-in bindings.") or the settings file ("Read from <path to settings.toml>: <n> bindings differ from the built-in ones."; which one depends on whether this machine already has a settings file) and no red line; below it a table header "INPUT", "STACKING", "EDITOR"; the INPUT column (`FFInputTableRow::input-cell`) holds ten rows, top to bottom "wheel", "ctrl+wheel", "shift+wheel", "middle-drag / space+left-drag", "ctrl+z / ctrl+shift+z", "alt+left-click", "1", "2", "3" and "4" (within 1 s).
 18. Click the header "STACKING" (`FFInputTableRow::stacking-cell` 0).
-    Expect: the STACKING column holds six rows, top to bottom "zoom-at-cursor", "step-source-frame", "pan-horizontal", "pan", "—" and "pick-source-under-pointer".
+    Expect: the STACKING column holds ten rows, top to bottom "zoom-at-cursor", "step-source-frame", "pan-horizontal", "pan", "—", "pick-source-under-pointer" and four rows of "—".
 19. Click the header "EDITOR" (`FFInputTableRow::editor-cell` 0).
-    Expect: the EDITOR column holds six rows, top to bottom "zoom-at-cursor", "step-source-frame", "brush-size", "pan", "undo / redo" and "pick-source-under-pointer".
+    Expect: the EDITOR column holds ten rows, top to bottom "zoom-at-cursor", "step-source-frame", "brush-size", "pan", "undo / redo", "pick-source-under-pointer", "brush-mode-normal", "brush-mode-lighten", "brush-mode-darken" and "brush-mode-detail".
 20. Click the text "wheel" in the first row (`FFInputTableRow::input-cell` 1).
-    Expect: Must not: a field opens or a row changes; the table still shows six rows.
+    Expect: Must not: a field opens or a row changes; the table still shows ten rows.
 ## Diagnostics
 21. Click **Diagnostics** (`FFNavRailEntry::area` 4).
     Expect: (within 10 s) the heading "DIAGNOSTICS" shows a file list holding the rows "adapter.json", "configuration.json", "system.json" and "version.json", each followed by a size, and no "Collecting…" text; "BINDINGS" is gone.

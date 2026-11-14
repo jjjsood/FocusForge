@@ -16,6 +16,12 @@ struct Params {
     radius_16: u32,
     core_16: u32,
     segments: u32,
+    // 0 mixes toward `src`; 1 mixes only where its channel sum is above
+    // `out`'s (Lighten), 2 only where it is below (Darken).
+    mode: u32,
+    opacity_q16: u32,
+    pad0: u32,
+    pad1: u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> out: array<u32>;
@@ -141,12 +147,31 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     for (var i = 0u; i < params.segments; i = i + 1u) {
         d2 = min(d2, segment_d2_256(px, py, segs[i]));
     }
-    let alpha = alpha_at(isqrt(d2));
+    var alpha = alpha_at(isqrt(d2));
+    // alpha <= 65536 and a scaling opacity <= 65535, so the product plus the
+    // rounding term stays below 2^32.
+    if (params.opacity_q16 != OPAQUE) {
+        alpha = (alpha * params.opacity_q16 + 32768u) >> 16u;
+    }
     if (alpha == 0u) {
         return;
     }
-    // max(out, src) * 65536 + 32768 < 2^32 for 16-bit samples.
     let base = (global_id.y * params.width + global_id.x) * params.spp;
+    if (params.mode != 0u) {
+        // The host bounds spp by 65537, so a channel sum of 16-bit samples
+        // stays within u32.
+        var out_sum = 0u;
+        var src_sum = 0u;
+        for (var k = 0u; k < params.spp; k = k + 1u) {
+            out_sum = out_sum + out[base + k];
+            src_sum = src_sum + src[base + k];
+        }
+        let acts = select((src_sum < out_sum), (src_sum > out_sum), params.mode == 1u);
+        if (!acts) {
+            return;
+        }
+    }
+    // max(out, src) * 65536 + 32768 < 2^32 for 16-bit samples.
     for (var k = 0u; k < params.spp; k = k + 1u) {
         let o = out[base + k];
         let s = src[base + k];

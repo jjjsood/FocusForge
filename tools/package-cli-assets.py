@@ -12,7 +12,7 @@ from pathlib import Path
 
 MANUALS = (
     "focusforge-cli.1", "focusforge-cli-info.1", "focusforge-cli-algorithms.1",
-    "focusforge-cli-step-plan.1", "focusforge-cli-sharp-areas.1", "focusforge-cli-stack.1", "focusforge-cli-export.1",
+    "focusforge-cli-step-plan.1", "focusforge-cli-sharp-areas.1", "focusforge-cli-sharpness-map.1", "focusforge-cli-stack.1", "focusforge-cli-export.1",
     "focusforge-cli-retouch.1",
     "focusforge-cli-history.1", "focusforge-cli-align.1", "focusforge-cli-review.1",
     "focusforge-cli-cache.1", "focusforge-cli-diagnostics.1", "focusforge-cli-check-update.1",

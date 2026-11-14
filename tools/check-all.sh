@@ -14,8 +14,8 @@
 #                nextest `quick` profile (.config/nextest.toml) instead of the
 #                whole workspace, clippy only over the crates with a changed
 #                path, and none of the stages that only the full run needs:
-#                both `build` stages, `fixture e2e`, `cargo test --doc`,
-#                `rustdoc`, `trace feature`, `advisories`.
+#                `build`, `check (no default features)`, `fixture e2e`,
+#                `cargo test --doc`, `rustdoc`, `trace feature`, `advisories`.
 #   --verbose    also stream every gate's output to the terminal. Unbounded:
 #                a caller with a fixed output budget will lose the summary.
 #   --tail N     lines of a failing gate's log to print inline (default 40,
@@ -24,22 +24,30 @@
 #
 # Output contract: gate output goes to per-gate logs; stdout stays two
 # lines per gate. `fixture e2e` runs the built binary in the background,
-# cargo-free, after `build`. `build (no default features)` runs first so
-# `build`'s GPU-enabled binary is written last, the one later stages use.
+# cargo-free, after `build`.
 # Cargo and direct binary runs go through tools/with-lock.sh build; clippy
 # stays out of --static because it compiles; RUSTFLAGS is never set here.
+# Every cargo stage runs with CARGO_BUILD_JOBS=min(24, cores) unless the caller
+# sets it (tools/lib/cargo-jobs.sh holds the cap). A cold
+# `cargo build --workspace --all-targets` at 24 jobs peaks at 13.0 GB.
 # `manual book` (mdBook build plus link check) runs only when mdbook is on PATH;
 # otherwise it prints a SKIP line.
 #
 # Changed paths are those since the merge base with develop (FF_GATE_BASE
 # overrides the branch), committed or not. With --static and --quick the
 # selftests of the tooling itself run only when tools/, .githooks/, .github/
-# or .config/ changed; the full run always runs them.
+# or .config/ changed; the full run always runs them. The full run builds,
+# lints and tests the theme sheet (`theme sheet feature`) and checks its size
+# budget only when a path under crates/ui*/ or crates/gui/, or the root
+# Cargo.toml, Cargo.lock or rust-toolchain.toml, changed; it always does in CI
+# and when no merge base resolves.
 #
 # Green-tree cache: a full or quick run that passes on a clean tree records the
 # tree id in the common git dir, shared by every checkout. A later run on
 # the same clean tree whose mode a record covers (full covers quick and static,
 # quick covers static) prints `CACHED:` and exits 0 without running anything.
+# A full run that skipped the theme sheet stage records `full-partial`, which
+# covers quick and static but not a later full run.
 # Off in CI and with FF_GATE_NO_CACHE=1.
 #
 # Exit code: 0 all gates passed, 1 at least one failed.
@@ -76,6 +84,11 @@ done
 case "$TAIL_LINES" in
   ''|*[!0-9]*) usage ;;
 esac
+
+# shellcheck source=lib/cargo-jobs.sh
+. "$REPO/tools/lib/cargo-jobs.sh"
+CARGO_BUILD_JOBS="$(cargo_jobs)"
+export CARGO_BUILD_JOBS
 
 # On a Linux desktop the test stages briefly saturate every core and push
 # memory into swap, which freezes the session. A building run therefore
@@ -114,7 +127,7 @@ if [ -z "${CI:-}" ] && [ -z "${FF_GATE_NO_CACHE:-}" ] \
   GREEN_TREES="$(cd "$common" && pwd)/focusforge-green-trees"
   CLEAN_TREE="$(git rev-parse 'HEAD^{tree}')"
   covers='full'
-  [ "$MODE" = full ] || covers='full|quick'
+  [ "$MODE" = full ] || covers='full|full-partial|quick'
   if hit="$(grep -E "^$CLEAN_TREE ($covers) " "$GREEN_TREES" 2>/dev/null | tail -n 1)" && [ -n "$hit" ]; then
     read -r _ hit_mode hit_at <<<"$hit"
     echo "CACHED: tree $CLEAN_TREE passed the $hit_mode gate at $hit_at; nothing ran (FF_GATE_NO_CACHE=1 forces a run)"
@@ -136,6 +149,13 @@ TOOLS_CHANGED=1
 if [ "$MODE" != full ] && [ "$CHANGED" != ALL ] \
   && ! grep -qE '^(tools/|\.githooks/|\.github/|\.config/)' <<<"$CHANGED"; then
   TOOLS_CHANGED=0
+fi
+
+# 1 when the theme sheet stages run: a UI crate, the GUI or a root workspace input changed.
+UI_CHANGED=0
+if [ "$CHANGED" = ALL ] \
+  || grep -qE '^(crates/(ui[^/]*|gui)/|Cargo\.(toml|lock)$|rust-toolchain\.toml$)' <<<"$CHANGED"; then
+  UI_CHANGED=1
 fi
 
 RUNLOG_ROOT="$REPO/.logs/gate"
@@ -236,6 +256,7 @@ tool_selftest "release smoke selftest" tools/smoke-release-selftest.sh
 run_gate "fixture manifest" tools/check-fixtures.sh
 tool_selftest "fixture manifest selftest" tools/check-fixtures-selftest.sh
 tool_selftest "lock directory selftest" tools/with-lock-selftest.sh
+tool_selftest "cargo jobs selftest" tools/cargo-jobs-selftest.sh
 tool_selftest "tiff-diff selftest" python3 tools/tiff-diff.py --selftest
 tool_selftest "image-metrics selftest" python3 tools/image-metrics.py --selftest
 tool_selftest "rawtiff selftest" python3 tools/lib/rawtiff.py --selftest
@@ -243,30 +264,28 @@ tool_selftest "download selftest" python3 tools/lib/download.py --selftest
 tool_selftest "make-fixtures selftest" python3 tools/lib/make_fixtures.py --selftest
 run_gate "test bodies"      python3 tools/check-test-bodies.py
 tool_selftest "test bodies selftest" python3 tools/check-test-bodies.py --selftest
+tool_selftest "generated UI size selftest" python3 tools/check-ui-size.py --selftest
 tool_selftest "manual screenshot lists" python3 tools/manual-screenshots.py --selftest
 run_gate "manual coverage" python3 tools/check-manual-coverage.py
 tool_selftest "manual coverage selftest" python3 tools/check-manual-coverage.py --selftest
 
 if [ "$STATIC_ONLY" -eq 0 ]; then
-  # Build-only: proves the no-GPU path still compiles, test targets included.
-  # Must run BEFORE `build` -- see the header comment above for why the order
-  # is load-bearing. `--exclude focusforge-gui --exclude focusforge-ui`: the
-  # Slint backend is wgpu-only by construction (crates/ui/Cargo.toml pins
-  # `renderer-femtovg-wgpu` unconditionally, not behind the `gpu` feature),
-  # so these two crates always compile wgpu regardless of
-  # `--no-default-features` -- with them included this stage would still link
-  # wgpu and would prove nothing about the no-GPU path.
-  [ "$QUICK" -eq 1 ] || run_gate "build (no default features)" \
+  # Type-checks the no-GPU path, test targets included, and writes no binary.
+  # The UI crates are excluded: their Cargo.toml pins the wgpu-only Slint
+  # backend (`renderer-femtovg-wgpu`) unconditionally, not behind the `gpu`
+  # feature, so with them in this stage would still compile wgpu and prove
+  # nothing about the no-GPU path.
+  [ "$QUICK" -eq 1 ] || run_gate "check (no default features)" \
                              tools/with-lock.sh build -- \
-                             cargo build --workspace --all-targets \
+                             cargo check --workspace --all-targets \
                              --no-default-features --exclude focusforge-gui \
-                             --exclude focusforge-ui
+                             --exclude 'focusforge-ui*'
 
   # Must come first among the GPU-enabled stages: it produces the binary the
   # background stage runs, and it holds the target/ lock the cargo gates below
   # queue on anyway.
-  # --quick leaves both builds and this stage to the full run: nextest builds
-  # what the tests need, and clippy type-checks the remaining targets.
+  # --quick leaves this stage and the no-GPU check to the full run: nextest
+  # builds what the tests need, and clippy type-checks the remaining targets.
   if [ "$QUICK" -eq 0 ]; then
     run_gate "build"          tools/with-lock.sh build -- cargo build --workspace --all-targets
 
@@ -332,6 +351,25 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
   # one real stack run over fixtures/mantis-512.
   [ "$QUICK" -eq 1 ] || run_gate "trace feature"  tools/with-lock.sh build -- \
                               cargo test -p focusforge-cli --features trace --test trace_cli
+  # The theme sheet is built out of the stages above; this one lints it and runs
+  # its tests, when a UI path or workspace input changed.
+  if [ "$QUICK" -eq 0 ]; then
+    if [ "$UI_CHANGED" -eq 1 ]; then
+      run_gate "theme sheet feature" tools/with-lock.sh build -- \
+                              sh -c 'cargo clippy -p focusforge-gui --features theme-sheet --all-targets -- -D warnings \
+                                && cargo nextest run -p focusforge-gui --features theme-sheet --test theme'
+    else
+      echo "SKIP theme sheet feature: no UI path or workspace input changed since the merge base"
+    fi
+  fi
+  # Asks cargo for the builds the stages above made and compares the generated Slint files
+  # with their budgets. Linux only: the sizes come from the .slint sources, not the OS.
+  if [ "$(uname -s)" = Linux ]; then
+    UI_SIZE_BUILDS="--build tests"
+    [ "$QUICK" -eq 0 ] && [ "$UI_CHANGED" -eq 1 ] && UI_SIZE_BUILDS="--build tests --build theme-sheet"
+    # shellcheck disable=SC2086
+    run_gate "generated UI size" tools/with-lock.sh build -- python3 tools/check-ui-size.py $UI_SIZE_BUILDS
+  fi
   [ "$QUICK" -eq 1 ] || run_gate "rustdoc"        tools/with-lock.sh build -- \
                               env RUSTDOCFLAGS="-D warnings" \
                               cargo doc --workspace --no-deps --document-private-items
@@ -355,6 +393,8 @@ runlog_summary gate
 
 if [ "$RUNLOG_FAILED" -eq 0 ] && [ -n "$CLEAN_TREE" ] && [ "$MODE" != static ] \
   && [ -z "$(git status --porcelain)" ] && [ "$(git rev-parse 'HEAD^{tree}')" = "$CLEAN_TREE" ]; then
-  echo "$CLEAN_TREE $MODE $(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$GREEN_TREES"
+  rec_mode="$MODE"
+  [ "$MODE" = full ] && [ "$UI_CHANGED" -eq 0 ] && rec_mode=full-partial
+  echo "$CLEAN_TREE $rec_mode $(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$GREEN_TREES"
 fi
 exit "$RUNLOG_FAILED"

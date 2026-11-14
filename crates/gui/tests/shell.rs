@@ -1185,6 +1185,30 @@ fn input_map_cells(tab: &ElementHandle) -> Vec<[String; 3]> {
         .collect()
 }
 
+/// Like `input_map_cells`, for a table taller than the tab's viewport: the
+/// query does not return rows clipped below the viewport, so the top is read, the tab is
+/// scrolled to its end and read again, and the second read adds the rows
+/// whose input the first lacks (inputs are unique in a table).
+fn input_map_cells_scrolled(app: &AppWindow, tab: &ElementHandle) -> Vec<[String; 3]> {
+    let mut cells = input_map_cells(tab);
+    let (pos, size) = (tab.absolute_position(), tab.size());
+    app.window()
+        .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+            position: slint::LogicalPosition::new(
+                pos.x + size.width / 2.0,
+                pos.y + size.height / 2.0,
+            ),
+            delta_x: 0.0,
+            delta_y: -10_000.0,
+        });
+    let rest: Vec<[String; 3]> = input_map_cells(tab)
+        .into_iter()
+        .filter(|row| cells.iter().all(|seen| seen[0] != row[0]))
+        .collect();
+    cells.extend(rest);
+    cells
+}
+
 /// With the section open, the tab shows its heading, the column header and
 /// then exactly the controller's rows in order, cell for cell. Run on the
 /// shipped table and on one with a binding changed, so a table written into
@@ -1344,7 +1368,11 @@ fn input_map_tab_names_a_refused_table() {
             .into_iter()
             .map(|row| [row.input, row.stacking, row.editor])
             .collect();
-        assert_eq!(&input_map_cells(&tab)[1..], rows, "{label}: built-in rows");
+        assert_eq!(
+            &input_map_cells_scrolled(&app, &tab)[1..],
+            rows,
+            "{label}: built-in rows"
+        );
     }
 }
 
@@ -4558,6 +4586,36 @@ mod dialog_close {
         assert!(
             controller.lock().unwrap().export_view().is_none(),
             "the click reaches AppController::cancel_export"
+        );
+    }
+
+    // tier: synthetic; layer: GUI view
+    #[test]
+    fn export_footer_buttons_dim_to_half_opacity_while_writing() {
+        let app = app_at(1440, 900);
+        let export = &INCLUDED[5];
+        (export.open)(&app);
+        // A button's computed opacity includes the footer's own dimming.
+        let opacities = |stage: &str| {
+            app.set_export_stage(stage.into());
+            let footer = dialog_root(&app, export.type_name)
+                .query_descendants()
+                .match_type_name("FFDialogFooter")
+                .find_first()
+                .expect("the export dialog shows its footer");
+            footer
+                .query_descendants()
+                .match_type_name("FFButton")
+                .find_all()
+                .iter()
+                .map(|button| button.computed_opacity())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(opacities("ready"), [1.0, 1.0], "cancel and export at ready");
+        assert_eq!(
+            opacities("writing"),
+            [0.5, 0.5],
+            "cancel and export at writing"
         );
     }
 

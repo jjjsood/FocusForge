@@ -1,0 +1,48 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH focusforge-cli-sharpness-map 1  "sharpness-map 0.2.1" 
+.SH NAME
+focusforge\-cli\-sharpness\-map \- Write the focus score of every frame of a stack, and of a composite, as maps on one scale
+.SH SYNOPSIS
+\fBfocusforge\-cli sharpness\-map\fR [\fB\-\-composite\fR] [\fB\-\-json\fR] [\fB\-\-priority\fR] [\fB\-v \fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fB\-\-out\fR> <\fIDIR\fR> 
+.SH DESCRIPTION
+Write the focus score of every frame of a stack, and of a composite, as maps on one scale.
+.PP
+The scale is the 99th percentile of each pixel\*(Aqs peak focus score over the frames, so a value means the same sharpness in every map; a map holds the focus score divided by it, and a value above 1 is sharper than the scale. Frames are read without alignment; `\-\-composite` adds the composite\*(Aqs own focus score on the frames\*(Aq scale.
+.SH OPTIONS
+.TP
+\fB\-\-out\fR \fI<OUT>\fR
+Directory the maps are written to; created if missing
+.TP
+\fB\-\-composite\fR \fI<COMPOSITE>\fR
+A composite image of the frames\*(Aq size to map on the frames\*(Aq scale
+.TP
+\fB\-\-json\fR
+Print the scale and the written maps as one JSON object
+.TP
+\fB\-\-priority\fR \fI<PRIORITY>\fR [default: normal]
+How many frames are read at once; the maps are the same at either value
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+low: One frame at a time, leaving the other cores to other work
+.IP \(bu 2
+normal: As many frames at once as the host has threads
+.RE
+.TP
+\fB\-v\fR
+Increase log detail (repeatable)
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Log errors only
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fIDIR\fR>
+Directory of frames to map (non\-recursive, descending into a `frames` subdirectory)
+.SH VERSION
+v0.2.1

@@ -1817,6 +1817,8 @@ dependencies = [
  "focusforge-diagnostics",
  "focusforge-gpu",
  "focusforge-ui",
+ "focusforge-ui-comparison",
+ "focusforge-ui-theme-sheet",
  "i-slint-backend-testing",
  "jpeg-encoder",
  "notify-rust",
@@ -1838,6 +1840,22 @@ dependencies = [
 
 [[package]]
 name = "focusforge-ui"
+version = "0.2.1"
+dependencies = [
+ "slint",
+ "slint-build",
+]
+
+[[package]]
+name = "focusforge-ui-comparison"
+version = "0.2.1"
+dependencies = [
+ "slint",
+ "slint-build",
+]
+
+[[package]]
+name = "focusforge-ui-theme-sheet"
 version = "0.2.1"
 dependencies = [
  "slint",

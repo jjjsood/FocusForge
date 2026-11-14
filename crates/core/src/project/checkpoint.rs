@@ -44,6 +44,12 @@ pub struct Checkpoint {
     /// Set by a delete: the checkpoint no longer shows in a listing, but
     /// stays stored while a visible checkpoint is built on it.
     pub hidden: bool,
+    /// The checkpoint's number on the colour wheel, counted from 0 in creation
+    /// order. A delete leaves every other checkpoint's number as it was. A
+    /// record without one reads with a number derived from creation order
+    /// ([`History::colour_index`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colour_index: Option<u32>,
 }
 
 /// One fused checkpoint's own planes: what [`super::seal::seal_at`] and a
@@ -111,33 +117,280 @@ pub struct Point {
     pub y: i32,
 }
 
+/// Where a brush stroke blends its pixels from: a frame of the stack or a
+/// checkpoint's result. Serialized as `{"frame": n}` or `{"checkpoint": "<id>"}`;
+/// inside a stroke a frame is written as the plain `source_id: n` and a
+/// checkpoint as `source: {"checkpoint": "<id>"}`; a stroke record holding both
+/// fields, or neither, is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StrokeSource {
+    Frame(u16),
+    Checkpoint(String),
+}
+
 /// One edit in a checkpoint's op log. **Externally tagged** -- the serde
 /// default, stated here because it is frozen: an untagged enum would make
 /// deserialization buffered and slow (serde-rs/serde#2101).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(try_from = "OpRepr", into = "OpRepr")]
 #[non_exhaustive]
 pub enum Op {
-    /// Blend frame `source_id` into the result along `path` through a soft
-    /// round mask of `radius` pixels and `softness` in `0.0..=1.0`. Strokes
-    /// apply in list order; the result image is the document.
+    /// Blend `source` into the result along `path` through a soft round mask
+    /// of `radius` pixels and `softness` in `0.0..=1.0`. Strokes apply in
+    /// list order; the result image is the document.
+    ///
+    /// `mode` and `opacity` read as [`BrushMode::Normal`] and `1.0` when
+    /// absent and are left out of the serialized stroke while they hold that
+    /// default, so a default stroke keeps its bytes (and the id hashed from
+    /// them). `opacity` scales the stroke's coverage.
     BrushStroke {
-        source_id: u16,
+        source: StrokeSource,
         path: Vec<Point>,
         radius: f32,
         softness: f32,
+        mode: BrushMode,
+        opacity: f32,
     },
 }
 
+impl Op {
+    /// A [`BrushMode::Normal`] stroke at full opacity painted from frame `frame`.
+    pub fn frame_stroke(frame: u16, path: Vec<Point>, radius: f32, softness: f32) -> Op {
+        Op::BrushStroke {
+            source: StrokeSource::Frame(frame),
+            path,
+            radius,
+            softness,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
+        }
+    }
+
+    /// The id of the checkpoint this stroke paints from, `None` for a stroke
+    /// painted from a frame.
+    pub fn checkpoint_source(&self) -> Option<&str> {
+        let Op::BrushStroke { source, .. } = self;
+        match source {
+            StrokeSource::Checkpoint(id) => Some(id),
+            StrokeSource::Frame(_) => None,
+        }
+    }
+}
+
+/// The stored shape of [`Op`]: a stroke's source is two optional fields so
+/// that the `source_id` and the `source` record both read.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum OpRepr {
+    BrushStroke {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<StrokeSource>,
+        path: Vec<Point>,
+        radius: f32,
+        softness: f32,
+        #[serde(default, skip_serializing_if = "BrushMode::is_normal")]
+        mode: BrushMode,
+        #[serde(default = "full_opacity", skip_serializing_if = "is_full_opacity")]
+        opacity: f32,
+    },
+}
+
+impl From<Op> for OpRepr {
+    fn from(op: Op) -> OpRepr {
+        let Op::BrushStroke {
+            source,
+            path,
+            radius,
+            softness,
+            mode,
+            opacity,
+        } = op;
+        let (source_id, source) = match source {
+            StrokeSource::Frame(n) => (Some(n), None),
+            checkpoint => (None, Some(checkpoint)),
+        };
+        OpRepr::BrushStroke {
+            source_id,
+            source,
+            path,
+            radius,
+            softness,
+            mode,
+            opacity,
+        }
+    }
+}
+
+impl TryFrom<OpRepr> for Op {
+    type Error = &'static str;
+
+    fn try_from(repr: OpRepr) -> Result<Op, Self::Error> {
+        let OpRepr::BrushStroke {
+            source_id,
+            source,
+            path,
+            radius,
+            softness,
+            mode,
+            opacity,
+        } = repr;
+        let source = match (source_id, source) {
+            (Some(n), None) => StrokeSource::Frame(n),
+            (None, Some(source)) => source,
+            (Some(_), Some(_)) => return Err("a brush stroke names both `source_id` and `source`"),
+            (None, None) => return Err("missing field `source_id` (or `source`)"),
+        };
+        Ok(Op::BrushStroke {
+            source,
+            path,
+            radius,
+            softness,
+            mode,
+            opacity,
+        })
+    }
+}
+
+/// The blend mode a stroke records. `Detail` keeps the result's own
+/// brightness and takes only the source's fine structure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BrushMode {
+    #[default]
+    Normal,
+    Lighten,
+    Darken,
+    Detail,
+}
+
+impl BrushMode {
+    fn is_normal(&self) -> bool {
+        *self == BrushMode::Normal
+    }
+}
+
+fn full_opacity() -> f32 {
+    1.0
+}
+
+fn is_full_opacity(opacity: &f32) -> bool {
+    *opacity == 1.0
+}
+
+/// The checkpoints `checkpoint`'s strokes are painted from, in op order.
+fn stroke_sources(checkpoint: &Checkpoint) -> impl Iterator<Item = &str> {
+    checkpoint.ops.iter().filter_map(Op::checkpoint_source)
+}
+
+/// Refuses a stroke painted from a checkpoint `by_id` lacks, and any chain of
+/// parent and stroke-source links that returns to where it started. Parent
+/// links are already known to be sound, so every cycle found holds a source
+/// link. The walk is iterative and visits checkpoints in id order, so the
+/// error does not depend on input order.
+fn refuse_bad_stroke_sources(
+    by_id: &HashMap<String, Checkpoint>,
+    path: &Path,
+) -> Result<(), ProjectError> {
+    let mut ids: Vec<&str> = by_id.keys().map(String::as_str).collect();
+    ids.sort_unstable();
+    for &id in &ids {
+        if let Some(missing) = stroke_sources(&by_id[id]).find(|s| !by_id.contains_key(*s)) {
+            return Err(ProjectError::DanglingStrokeSource {
+                path: path.to_path_buf(),
+                checkpoint: id.to_string(),
+                referenced: missing.to_string(),
+            });
+        }
+    }
+
+    // One frame per checkpoint on the current path: its out-links, each
+    // flagged when it is a stroke source, and how far they are walked.
+    struct Frame<'a> {
+        id: &'a str,
+        entered_by_source: bool,
+        links: Vec<(&'a str, bool)>,
+        next: usize,
+    }
+    fn frame<'a>(
+        by_id: &'a HashMap<String, Checkpoint>,
+        id: &'a str,
+        entered_by_source: bool,
+    ) -> Frame<'a> {
+        let checkpoint = &by_id[id];
+        Frame {
+            id,
+            entered_by_source,
+            links: checkpoint
+                .parent
+                .as_deref()
+                .map(|p| (p, false))
+                .into_iter()
+                .chain(stroke_sources(checkpoint).map(|s| (s, true)))
+                .collect(),
+            next: 0,
+        }
+    }
+
+    let mut on_path: HashSet<&str> = HashSet::new();
+    let mut done: HashSet<&str> = HashSet::new();
+    for &start in &ids {
+        if done.contains(start) {
+            continue;
+        }
+        let mut stack = vec![frame(by_id, start, false)];
+        on_path.insert(start);
+        while let Some(top) = stack.last_mut() {
+            let Some(&(to, is_source)) = top.links.get(top.next) else {
+                on_path.remove(top.id);
+                done.insert(top.id);
+                stack.pop();
+                continue;
+            };
+            top.next += 1;
+            let from = top.id;
+            if on_path.contains(to) {
+                // The cycle is `to` .. `from` along the path, closed by this link.
+                let first = stack
+                    .iter()
+                    .position(|f| f.id == to)
+                    .expect("`to` is on the path");
+                let (holder, referenced) = if is_source {
+                    (from, to)
+                } else {
+                    let k = (first + 1..stack.len())
+                        .find(|&k| stack[k].entered_by_source)
+                        .expect("a cycle of parent links alone was refused earlier");
+                    (stack[k - 1].id, stack[k].id)
+                };
+                return Err(ProjectError::StrokeSourceCycle {
+                    path: path.to_path_buf(),
+                    checkpoint: holder.to_string(),
+                    referenced: referenced.to_string(),
+                });
+            }
+            if !done.contains(to) {
+                on_path.insert(to);
+                stack.push(frame(by_id, to, is_source));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Every checkpoint of a project, indexed by id, with each one's parent and
-/// children resolved. `parent` is validated at construction: a checkpoint
-/// naming a `parent` no checkpoint carries, or a parent cycle, is refused
-/// there rather than walked into later.
+/// children resolved. Links are validated at construction: a checkpoint
+/// naming a `parent` or a stroke source no checkpoint carries, or a cycle of
+/// parent and stroke-source links, is refused there rather than walked into
+/// later.
 #[derive(Debug)]
 pub struct History {
     path: PathBuf,
     by_id: HashMap<String, Checkpoint>,
     children: HashMap<String, Vec<String>>,
+    colours: HashMap<String, u32>,
 }
 
 impl History {
@@ -175,6 +428,8 @@ impl History {
             }
         }
 
+        refuse_bad_stroke_sources(&by_id, path)?;
+
         let mut children: HashMap<String, Vec<String>> = HashMap::new();
         for checkpoint in by_id.values() {
             if let Some(parent) = &checkpoint.parent {
@@ -185,11 +440,44 @@ impl History {
             }
         }
 
-        Ok(History {
+        let mut history = History {
             path: path.to_path_buf(),
             by_id,
             children,
-        })
+            colours: HashMap::new(),
+        };
+        history.colours = history.resolve_colours();
+        Ok(history)
+    }
+
+    /// Each checkpoint's colour number: the stored one, else the next number
+    /// above everything before it in creation order.
+    fn resolve_colours(&self) -> HashMap<String, u32> {
+        let mut next = 0;
+        let mut colours = HashMap::with_capacity(self.by_id.len());
+        for checkpoint in self.all().into_iter().rev() {
+            let colour = checkpoint.colour_index.unwrap_or(next);
+            next = next.max(colour.saturating_add(1));
+            colours.insert(checkpoint.id.clone(), colour);
+        }
+        colours
+    }
+
+    /// The colour number of checkpoint `id`, or
+    /// [`ProjectError::UnknownCheckpoint`].
+    pub fn colour_index(&self, id: &str) -> Result<u32, ProjectError> {
+        self.get(id)?;
+        Ok(self.colours[id])
+    }
+
+    /// The colour number a checkpoint written next takes: one above the
+    /// largest number among the checkpoints the history holds, 0 for none.
+    pub fn next_colour_index(&self) -> u32 {
+        self.colours
+            .values()
+            .map(|c| c.saturating_add(1))
+            .max()
+            .unwrap_or(0)
     }
 
     /// The checkpoint named `id`, or [`ProjectError::UnknownCheckpoint`].
@@ -290,6 +578,40 @@ impl History {
         }
         result
     }
+
+    /// How many strokes, across every stored checkpoint (hidden ones too),
+    /// paint from the checkpoint `id`; 0 for an id nothing paints from.
+    pub fn strokes_using(&self, id: &str) -> usize {
+        strokes_using_in(id, self.op_groups().map(|(_, ops)| ops)).0
+    }
+
+    /// The id and ops of every stored checkpoint (hidden ones too), in no
+    /// particular order.
+    pub fn op_groups(&self) -> impl Iterator<Item = (&str, &[Op])> {
+        self.by_id
+            .iter()
+            .map(|(id, c)| (id.as_str(), c.ops.as_slice()))
+    }
+}
+
+/// How many strokes in `groups` paint from the checkpoint named `key`, and
+/// how many of the groups hold at least one of them: `(strokes, containers)`.
+/// A group is the ops of one checkpoint or of the live edit; `key` is a
+/// stored checkpoint's id or an unsaved one's `held:<index>` key, the form a
+/// stroke carries for its source (see [`Op::checkpoint_source`]).
+pub fn strokes_using_in<'a>(
+    key: &str,
+    groups: impl IntoIterator<Item = &'a [Op]>,
+) -> (usize, usize) {
+    groups
+        .into_iter()
+        .map(|ops| {
+            ops.iter()
+                .filter(|op| op.checkpoint_source() == Some(key))
+                .count()
+        })
+        .filter(|&n| n > 0)
+        .fold((0, 0), |(strokes, groups), n| (strokes + n, groups + 1))
 }
 
 #[cfg(test)]
@@ -334,6 +656,7 @@ mod tests {
             label: None,
             fuse: None,
             hidden: false,
+            colour_index: None,
         };
         let text = serde_json::to_string(&checkpoint).unwrap();
         assert_eq!(
@@ -355,6 +678,7 @@ mod tests {
             label: None,
             fuse: None,
             hidden: false,
+            colour_index: None,
         }
     }
 
@@ -450,6 +774,169 @@ mod tests {
         assert!(matches!(two_cycle, ProjectError::ParentCycle { .. }));
     }
 
+    /// `checkpoint` with one default stroke painted from each of `sources`.
+    fn painting_from(mut checkpoint: Checkpoint, sources: &[&str]) -> Checkpoint {
+        for source in sources {
+            checkpoint.ops.push(Op::BrushStroke {
+                source: StrokeSource::Checkpoint((*source).to_string()),
+                path: vec![Point { x: 1, y: 2 }],
+                radius: 3.0,
+                softness: 0.5,
+                mode: BrushMode::Normal,
+                opacity: 1.0,
+            });
+        }
+        checkpoint
+    }
+
+    #[test]
+    fn strokes_using_in_counts_strokes_and_the_groups_holding_them() {
+        let stored = "0123456789abcdef0123456789abcdef";
+        let from = |sources: &[&str]| painting_from(bare("x", None, 1), sources).ops;
+        let frame = Op::frame_stroke(0, vec![Point { x: 0, y: 0 }], 1.0, 0.0);
+        let stored_group = from(&[stored, stored, "held:0"]);
+        let held_group = from(&["held:0", stored]);
+        let live_group = [from(&["held:0"]), vec![frame.clone()]].concat();
+        let none = from(&[]);
+
+        let count = |key: &str, groups: &[&[Op]]| strokes_using_in(key, groups.iter().copied());
+        let groups: [&[Op]; 4] = [&stored_group, &held_group, &live_group, &none];
+        assert_eq!(count(stored, &groups), (3, 2), "a stored id, two groups");
+        assert_eq!(count("held:0", &groups), (3, 3), "the held:<i> key form");
+        assert_eq!(count("held:1", &groups), (0, 0), "no stroke names it");
+        assert_eq!(
+            count(stored, &[&none, &[frame]]),
+            (0, 0),
+            "frames never use it"
+        );
+        assert_eq!(count(stored, &[]), (0, 0), "no groups");
+    }
+
+    fn build_err(checkpoints: Vec<Checkpoint>) -> ProjectError {
+        History::build(checkpoints, Path::new("p")).unwrap_err()
+    }
+
+    fn assert_cycle(err: ProjectError, holder: &str, named: &str) {
+        match err {
+            ProjectError::StrokeSourceCycle {
+                checkpoint,
+                referenced,
+                ..
+            } => assert_eq!((checkpoint.as_str(), referenced.as_str()), (holder, named)),
+            other => panic!("expected StrokeSourceCycle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stroke_source_dangling_names_both_ids() {
+        let err = build_err(vec![
+            bare("root", None, 1),
+            painting_from(bare("child", Some("root"), 2), &["ghost"]),
+        ]);
+        assert!(matches!(
+            err,
+            ProjectError::DanglingStrokeSource { checkpoint, referenced, .. }
+                if checkpoint == "child" && referenced == "ghost"
+        ));
+    }
+
+    #[test]
+    fn stroke_source_naming_its_own_checkpoint_is_a_cycle() {
+        let err = build_err(vec![
+            bare("root", None, 1),
+            painting_from(bare("a", Some("root"), 2), &["a"]),
+        ]);
+        assert_cycle(err, "a", "a");
+    }
+
+    #[test]
+    fn stroke_source_naming_a_descendant_is_a_cycle() {
+        let err = build_err(vec![
+            painting_from(bare("root", None, 1), &["leaf"]),
+            bare("mid", Some("root"), 2),
+            bare("leaf", Some("mid"), 3),
+        ]);
+        assert_cycle(err, "root", "leaf");
+    }
+
+    #[test]
+    fn stroke_source_two_checkpoints_naming_each_other_is_a_cycle() {
+        let err = build_err(vec![
+            painting_from(bare("a", None, 1), &["b"]),
+            painting_from(bare("b", None, 2), &["a"]),
+        ]);
+        assert!(matches!(err, ProjectError::StrokeSourceCycle { .. }));
+    }
+
+    #[test]
+    fn stroke_source_cycle_through_parent_and_source_links_is_refused() {
+        // a -source-> b -parent-> c -source-> a.
+        let err = build_err(vec![
+            painting_from(bare("a", None, 1), &["b"]),
+            bare("b", Some("c"), 2),
+            painting_from(bare("c", None, 3), &["a"]),
+        ]);
+        assert!(matches!(err, ProjectError::StrokeSourceCycle { .. }));
+    }
+
+    #[test]
+    fn stroke_source_naming_an_ancestor_a_sibling_or_the_same_one_twice_is_accepted() {
+        let history = History::build(
+            vec![
+                bare("root", None, 1),
+                bare("x", Some("root"), 2),
+                painting_from(bare("y", Some("root"), 3), &["x", "root", "x"]),
+                painting_from(bare("z", Some("y"), 4), &["root", "x"]),
+            ],
+            Path::new("p"),
+        );
+        assert!(history.is_ok(), "{history:?}");
+    }
+
+    #[test]
+    fn stroke_source_verdict_does_not_depend_on_the_input_order() {
+        let cyclic = || {
+            vec![
+                painting_from(bare("a", None, 1), &["b"]),
+                bare("b", Some("c"), 2),
+                painting_from(bare("c", None, 3), &["a"]),
+                bare("d", Some("a"), 4),
+            ]
+        };
+        let sound = || {
+            vec![
+                bare("a", None, 1),
+                painting_from(bare("b", Some("a"), 2), &["a"]),
+                painting_from(bare("c", Some("b"), 3), &["a", "b"]),
+            ]
+        };
+        for build in [cyclic, sound] {
+            let forward = build();
+            let mut reversed = build();
+            reversed.reverse();
+            let verdict = |v| {
+                History::build(v, Path::new("p"))
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            };
+            assert_eq!(verdict(forward), verdict(reversed));
+        }
+        assert!(History::build(cyclic(), Path::new("p")).is_err());
+        assert!(History::build(sound(), Path::new("p")).is_ok());
+    }
+
+    #[test]
+    fn stroke_source_cycle_over_a_long_parent_chain_does_not_overflow_the_stack() {
+        let mut chain: Vec<Checkpoint> = (0..5_000)
+            .map(|i| {
+                let parent = (i > 0).then(|| format!("c{}", i - 1));
+                bare(&format!("c{i}"), parent.as_deref(), i)
+            })
+            .collect();
+        chain[0] = painting_from(chain[0].clone(), &["c4999"]);
+        assert_cycle(build_err(chain), "c0", "c4999");
+    }
+
     #[test]
     fn history_visible_skips_a_hidden_checkpoint_the_other_walks_keep() {
         let mut mid = bare("mid", Some("root"), 2);
@@ -466,6 +953,95 @@ mod tests {
             ids(history.ancestors("leaf").unwrap()),
             ["leaf", "mid", "root"]
         );
+    }
+
+    fn numbered(mut checkpoint: Checkpoint, colour: u32) -> Checkpoint {
+        checkpoint.colour_index = Some(colour);
+        checkpoint
+    }
+
+    fn colours(history: &History, ids: &[&str]) -> Vec<u32> {
+        ids.iter()
+            .map(|id| history.colour_index(id).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn colour_index_is_derived_in_creation_order_for_records_without_one() {
+        // Input order is not creation order; the sibling shares its second.
+        let history = History::build(
+            vec![
+                bare("c", Some("b"), 30),
+                bare("root", None, 10),
+                bare("b", Some("root"), 20),
+                bare("d", Some("root"), 20),
+            ],
+            Path::new("p"),
+        )
+        .unwrap();
+        let derived = colours(&history, &["root", "b", "d", "c"]);
+        assert_eq!(derived[0], 0);
+        assert_eq!(derived[3], 3, "the newest takes the highest number");
+        let mut middle = [derived[1], derived[2]];
+        middle.sort();
+        assert_eq!(middle, [1, 2]);
+        assert_eq!(history.next_colour_index(), 4);
+    }
+
+    #[test]
+    fn colour_index_stored_numbers_win_and_derived_ones_never_collide() {
+        // A legacy record first, then a stored one: the legacy one takes 0.
+        let legacy_first = History::build(
+            vec![bare("a", None, 1), numbered(bare("b", Some("a"), 2), 5)],
+            Path::new("p"),
+        )
+        .unwrap();
+        assert_eq!(colours(&legacy_first, &["a", "b"]), [0, 5]);
+        assert_eq!(legacy_first.next_colour_index(), 6);
+
+        // A stored one first, then a legacy record: it continues above it.
+        let stored_first = History::build(
+            vec![numbered(bare("a", None, 1), 3), bare("b", Some("a"), 2)],
+            Path::new("p"),
+        )
+        .unwrap();
+        assert_eq!(colours(&stored_first, &["a", "b"]), [3, 4]);
+        assert_eq!(stored_first.next_colour_index(), 5);
+
+        // A gap left by a dropped checkpoint stays a gap.
+        let gap = History::build(
+            vec![
+                numbered(bare("a", None, 1), 0),
+                numbered(bare("c", Some("a"), 3), 2),
+            ],
+            Path::new("p"),
+        )
+        .unwrap();
+        assert_eq!(colours(&gap, &["a", "c"]), [0, 2]);
+        assert_eq!(gap.next_colour_index(), 3);
+    }
+
+    #[test]
+    fn colour_index_next_is_zero_for_an_empty_history_and_an_unknown_id_is_refused() {
+        let empty = History::build(Vec::new(), Path::new("p")).unwrap();
+        assert_eq!(empty.next_colour_index(), 0);
+        assert!(matches!(
+            empty.colour_index("ghost"),
+            Err(ProjectError::UnknownCheckpoint { id, .. }) if id == "ghost"
+        ));
+    }
+
+    #[test]
+    fn colour_index_is_written_only_when_stored() {
+        let stored = serde_json::to_string(&numbered(bare("a", None, 1), 7)).unwrap();
+        assert!(stored.contains(r#""colour_index":7"#), "{stored}");
+        let read: Checkpoint = serde_json::from_str(&stored).unwrap();
+        assert_eq!(read.colour_index, Some(7));
+
+        let without = serde_json::to_string(&bare("a", None, 1)).unwrap();
+        assert!(!without.contains("colour_index"), "{without}");
+        let read: Checkpoint = serde_json::from_str(&without).unwrap();
+        assert_eq!(read.colour_index, None);
     }
 
     #[test]

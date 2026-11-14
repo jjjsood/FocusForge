@@ -8,8 +8,6 @@ import { Theme, TypeRole, ThemeProbe } from "theme.slint";
 // unreachable outside `theme.slint`.
 export { Theme, TypeRole, ThemeProbe }
 
-import { ThemeSheet } from "theme_sheet.slint";
-export { ThemeSheet }
 import { StageTile } from "components/ff_stage_view.slint";
 export { StageTile }
 
@@ -17,10 +15,9 @@ import { ShellGeometry } from "geometry.slint";
 import { FFTabStrip, ProjectTabView } from "shell/tab_strip.slint";
 export { ProjectTabView }
 import { FFToolbar } from "shell/toolbar.slint";
+import { FFMenuList } from "components/ff_menu_list.slint";
 import { FFEditorToolbar } from "shell/editor_toolbar.slint";
 import { FFCanvas } from "shell/canvas.slint";
-import { ComparisonWindow } from "comparison_window.slint";
-export { ComparisonWindow }
 import { FFDock, SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView } from "shell/dock.slint";
 export { SettingsRow, SectionHeadView, ImageRowView, CheckpointEntryView }
 import { FFBottomBar } from "shell/bottom_bar.slint";
@@ -33,6 +30,7 @@ import { FFToast } from "components/ff_toast.slint";
 import { FFProjectsOverlay, ProjectCardView, RecentRowView } from "shell/projects_overlay.slint";
 import { FFCalculatorOverlay, CalculatorFieldView, SummaryCell } from "shell/calculator_overlay.slint";
 import { FFAnalyticsOverlay, AnalyticsRowView } from "shell/analytics_overlay.slint";
+import { OverlapSegmentView } from "components/ff_overlap_bar.slint";
 import { FFLoadingIndicator } from "shell/loading.slint";
 export { ProjectCardView, RecentRowView, ExportRowView, NotificationRowView, CalculatorFieldView, SummaryCell }
 
@@ -54,6 +52,10 @@ export component AppWindow inherits Window {
     // The editor toolbar, forwarded one-for-one from `FFEditorToolbar` below.
     callback brush-size-fraction-changed(float);
     callback brush-softness-fraction-changed(float);
+    callback brush-opacity-fraction-changed(float);
+    callback brush-mode-menu-toggled();
+    callback brush-mode-menu-dismissed();
+    callback brush-mode-selected(string);
     callback pipette-toggled();
     callback undo-requested();
     callback redo-requested();
@@ -78,6 +80,11 @@ export component AppWindow inherits Window {
     in property <int> brush-size-ceiling: 1;
     in property <string> brush-soft-text: "";
     in property <float> brush-soft-fraction: 0.0;
+    in property <string> brush-mode-label: "";
+    in property <string> brush-mode-id: "";
+    in property <bool> brush-mode-menu-open: false;
+    in property <string> brush-opacity-text: "";
+    in property <float> brush-opacity-fraction: 0.0;
     in property <bool> brush-picking: false;
     in property <bool> can-undo: false;
     in property <bool> can-redo: false;
@@ -90,6 +97,10 @@ export component AppWindow inherits Window {
     in property <string> cursor-core-commands;
     in property <bool> cursor-picking: false;
     in property <color> cursor-pick-color;
+    in property <string> cursor-mode-tag: "";
+    in property <length> cursor-tag-origin;
+    in property <bool> cursor-checkpoint-source: false;
+    in property <color> cursor-glyph-color;
     in property <bool> cursor-visible: false;
     in property <length> cursor-frame-x;
     in property <length> cursor-frame-y;
@@ -209,6 +220,10 @@ export component AppWindow inherits Window {
         size-ceiling: root.brush-size-ceiling;
         soft-text: root.brush-soft-text;
         soft-fraction: root.brush-soft-fraction;
+        mode-label: root.brush-mode-label;
+        mode-menu-open: root.brush-mode-menu-open;
+        opacity-text: root.brush-opacity-text;
+        opacity-fraction: root.brush-opacity-fraction;
         picking: root.brush-picking;
         can-undo: root.can-undo;
         can-redo: root.can-redo;
@@ -216,6 +231,8 @@ export component AppWindow inherits Window {
 
         brush-size-fraction-changed(f) => { root.brush-size-fraction-changed(f); }
         brush-softness-fraction-changed(f) => { root.brush-softness-fraction-changed(f); }
+        brush-opacity-fraction-changed(f) => { root.brush-opacity-fraction-changed(f); }
+        brush-mode-menu-toggled => { root.brush-mode-menu-toggled(); }
         pipette-toggled => { root.pipette-toggled(); }
         undo-requested => { root.undo-requested(); }
         redo-requested => { root.redo-requested(); }
@@ -231,6 +248,9 @@ export component AppWindow inherits Window {
     // composite above.
     in property <image> frame-source;
     in property <string> frame-label: "";
+    in property <bool> frame-label-icon: false;
+    in property <bool> frame-label-swatch: false;
+    in property <color> frame-label-icon-color;
     // Each pane's refusal, one entry per line: the selected frame's on the
     // left, the current checkpoint's on the right.
     in property <[string]> frame-message-lines: [];
@@ -363,6 +383,9 @@ export component AppWindow inherits Window {
             composite-source: root.composite-source;
             frame-source: root.frame-source;
             frame-label: root.frame-label;
+            frame-label-icon: root.frame-label-icon;
+            frame-label-swatch: root.frame-label-swatch;
+            frame-label-icon-color: root.frame-label-icon-color;
             frame-message-lines: root.frame-message-lines;
             composite-message-lines: root.composite-message-lines;
             undock-enabled: root.canvas-undock-enabled;
@@ -420,6 +443,10 @@ export component AppWindow inherits Window {
             cursor-core-commands: root.cursor-core-commands;
             cursor-picking: root.cursor-picking;
             cursor-pick-color: root.cursor-pick-color;
+            cursor-mode-tag: root.cursor-mode-tag;
+            cursor-tag-origin: root.cursor-tag-origin;
+            cursor-checkpoint-source: root.cursor-checkpoint-source;
+            cursor-glyph-color: root.cursor-glyph-color;
         cursor-visible: root.cursor-visible;
         cursor-frame-x: root.cursor-frame-x;
         cursor-frame-y: root.cursor-frame-y;
@@ -495,7 +522,7 @@ export component AppWindow inherits Window {
     callback images-frame-remove-requested(int);
     callback images-frame-drag-pointer(int, int, length);
     callback images-viewport-scrolled(length);
-    callback images-frame-wheel(length);
+    callback images-frame-wheel(int, length) -> bool;
     callback images-scrollbar-pointer(int, length);
     callback images-scrollbar-dragged(length);
     callback images-viewport-height-changed(length);
@@ -563,7 +590,7 @@ export component AppWindow inherits Window {
         images-frame-remove-requested(i) => { root.images-frame-remove-requested(i); }
         images-frame-drag-pointer(i, kind, y) => { root.images-frame-drag-pointer(i, kind, y); }
         images-viewport-scrolled(offset) => { root.images-viewport-scrolled(offset); }
-        images-frame-wheel(delta) => { root.images-frame-wheel(delta); }
+        images-frame-wheel(row, delta) => { return root.images-frame-wheel(row, delta); }
         images-scrollbar-pointer(kind, y) => { root.images-scrollbar-pointer(kind, y); }
         images-scrollbar-dragged(y) => { root.images-scrollbar-dragged(y); }
         images-viewport-height-changed(h) => { root.images-viewport-height-changed(h); }
@@ -752,6 +779,32 @@ export component AppWindow inherits Window {
     callback projects-recent-clicked(int);
     out property <length> gallery-width: projects-overlay.gallery-width;
 
+    // The mode list paints over the canvas and dock; a press anywhere
+    // else closes it and goes no further.
+    if root.mode == "editor" && root.brush-mode-menu-open: Rectangle {
+        width: root.width;
+        height: root.height;
+
+        TouchArea {
+            clicked => { root.brush-mode-menu-dismissed(); }
+        }
+        FFMenuList {
+            x: ShellGeometry.icon-bar-width + ShellGeometry.editor-toolbar-mode-menu-x
+                - ShellGeometry.editor-toolbar-shift(
+                    root.width - ShellGeometry.dock-width - ShellGeometry.icon-bar-width, 2);
+            y: ShellGeometry.strip-height
+                + (ShellGeometry.toolbar-height - ShellGeometry.toolbar-button-height) / 2
+                + ShellGeometry.toolbar-button-height;
+            width: ShellGeometry.editor-toolbar-mode-menu-width;
+            choices: ["Normal", "Lighten", "Darken", "Detail"];
+            choice-ids: ["normal", "lighten", "darken", "detail"];
+            show-choice-ids: false;
+            chosen-accent: true;
+            selected: root.brush-mode-id;
+            option-selected(picked) => { root.brush-mode-selected(picked); }
+        }
+    }
+
     projects-overlay := FFProjectsOverlay {
         x: ShellGeometry.icon-bar-width;
         y: ShellGeometry.strip-height;
@@ -827,6 +880,7 @@ export component AppWindow inherits Window {
     in property <bool> analytics-open: false;
     in property <string> analytics-state: "waiting";
     in property <[AnalyticsRowView]> analytics-rows: [];
+    in property <[OverlapSegmentView]> analytics-segments: [];
     in property <string> analytics-error: "";
     callback analytics-toggled();
 
@@ -839,6 +893,7 @@ export component AppWindow inherits Window {
         open: root.analytics-open;
         state: root.analytics-state;
         rows: root.analytics-rows;
+        segments: root.analytics-segments;
         error: root.analytics-error;
 
         close-requested => { root.analytics-toggled(); }

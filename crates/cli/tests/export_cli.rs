@@ -458,12 +458,7 @@ fn build_branched(name: &str) -> Branched {
     let branch_a = project::append_ops_onto(
         &project_path,
         &root,
-        vec![Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 2, y: 2 }],
-            radius: 1.5,
-            softness: 0.0,
-        }],
+        vec![Op::frame_stroke(1, vec![Point { x: 2, y: 2 }], 1.5, 0.0)],
         Some("branch-a".to_string()),
         1,
     )
@@ -473,12 +468,7 @@ fn build_branched(name: &str) -> Branched {
     let branch_b = project::append_ops_onto(
         &project_path,
         &refuse,
-        vec![Op::BrushStroke {
-            source_id: 2,
-            path: vec![Point { x: 3, y: 3 }],
-            radius: 1.5,
-            softness: 0.0,
-        }],
+        vec![Op::frame_stroke(2, vec![Point { x: 3, y: 3 }], 1.5, 0.0)],
         Some("branch-b".to_string()),
         2,
     )
@@ -1050,12 +1040,7 @@ fn build_unrecorded_alignment(name: &str) -> (common::TmpDir, PathBuf, String, S
     let child = project::append_ops_onto(
         &project_path,
         &sealed.checkpoint,
-        vec![Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 1, y: 1 }],
-            radius: 1.0,
-            softness: 0.0,
-        }],
+        vec![Op::frame_stroke(1, vec![Point { x: 1, y: 1 }], 1.0, 0.0)],
         None,
         1,
     )

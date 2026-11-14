@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// The overlap bar's key: one chip per colour stop.
+
+import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
+
+component LegendChip inherits Rectangle {
+    in property <color> swatch;
+    in property <string> label;
+
+    width: row.preferred-width;
+    height: ShellGeometry.overlap-legend-chip-height;
+    border-width: 1px;
+    border-color: Theme.border-default;
+    border-radius: Theme.radius-sm;
+
+    row := HorizontalLayout {
+        padding-left: ShellGeometry.overlap-legend-chip-inset;
+        padding-right: ShellGeometry.overlap-legend-chip-inset;
+        spacing: Theme.space-1;
+        Rectangle {
+            y: (parent.height - self.height) / 2;
+            width: ShellGeometry.overlap-legend-swatch;
+            height: ShellGeometry.overlap-legend-swatch;
+            border-radius: Theme.radius-xs;
+            background: root.swatch;
+        }
+        Text {
+            text: root.label;
+            color: Theme.text-primary;
+            font-size: Theme.text-section.size;
+            font-weight: Theme.text-body.weight;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component FFOverlapLegend inherits Rectangle {
+    width: chips.preferred-width;
+    height: ShellGeometry.overlap-legend-chip-height;
+
+    chips := HorizontalLayout {
+        spacing: ShellGeometry.overlap-legend-chip-gap;
+        alignment: start;
+
+        LegendChip { swatch: Theme.status-failure; label: "0 %"; }
+        LegendChip { swatch: Theme.status-warning; label: "5 %"; }
+        LegendChip { swatch: Theme.status-success; label: "20 %+"; }
+    }
+}

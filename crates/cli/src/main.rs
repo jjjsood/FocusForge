@@ -93,6 +93,7 @@ mod retouch;
 mod review;
 mod set;
 mod sharp_areas;
+mod sharpness_map;
 mod signals;
 mod stack;
 mod status;
@@ -115,6 +116,21 @@ fn resolve_backend(
     {
         let _ = (algorithm_id, no_gpu, max_vram, quiet);
         stack::BackendChoice::cpu()
+    }
+}
+
+/// The accelerator for the sharpness maps and the sharp-area count: the lazy
+/// GPU backend when the `gpu` feature is on, which logs its choice and prints
+/// nothing; otherwise `None`.
+fn sharpness_backend() -> Option<&'static dyn focusforge_core::gpu::SharpnessBackend> {
+    #[cfg(feature = "gpu")]
+    {
+        focusforge_gpu::harness::sharpness_backend_for(false, None)
+            .map(|backend| backend as &'static dyn focusforge_core::gpu::SharpnessBackend)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        None
     }
 }
 
@@ -213,7 +229,9 @@ enum Command {
     /// The image is divided into square cells. A cell is counted in the frame where
     /// its mean focus score peaks, when that peak exceeds the contrast times the cell's
     /// lowest score over the stack; a cell without that contrast is counted in no frame.
-    /// Frames are counted as read, without alignment.
+    /// Each pair of neighbouring frames also gets an overlap: twice the counted cells
+    /// sharp in both, divided by the sum of the counted cells sharp in each, or `no data`
+    /// when neither is sharp in any. Frames are counted as read, without alignment.
     #[command(after_help = set::parameter_help(&focusforge_core::sharp_areas::SHARP_AREA_PARAMS))]
     SharpAreas {
         /// Directory of frames to count (non-recursive, descending into a `frames` subdirectory).
@@ -224,6 +242,28 @@ enum Command {
         #[arg(long)]
         json: bool,
         /// How many frames are read at once; the counts are the same at either value.
+        #[arg(long, value_enum, default_value_t = sharp_areas::Priority::Normal)]
+        priority: sharp_areas::Priority,
+    },
+    /// Write the focus score of every frame of a stack, and of a composite, as maps on one scale.
+    ///
+    /// The scale is the 99th percentile of each pixel's peak focus score over the frames, so
+    /// a value means the same sharpness in every map; a map holds the focus score divided by
+    /// it, and a value above 1 is sharper than the scale. Frames are read without alignment;
+    /// `--composite` adds the composite's own focus score on the frames' scale.
+    SharpnessMap {
+        /// Directory of frames to map (non-recursive, descending into a `frames` subdirectory).
+        dir: PathBuf,
+        /// Directory the maps are written to; created if missing.
+        #[arg(long)]
+        out: PathBuf,
+        /// A composite image of the frames' size to map on the frames' scale.
+        #[arg(long)]
+        composite: Option<PathBuf>,
+        /// Print the scale and the written maps as one JSON object.
+        #[arg(long)]
+        json: bool,
+        /// How many frames are read at once; the maps are the same at either value.
         #[arg(long, value_enum, default_value_t = sharp_areas::Priority::Normal)]
         priority: sharp_areas::Priority,
     },
@@ -387,11 +427,24 @@ enum Command {
         /// The project to append to.
         project: PathBuf,
         /// The op list: a JSON array of ops in the persisted `Op` shape.
-        /// A brush stroke blends frame `source_id` over the image along
+        /// The source of a brush stroke is `"source": {"frame": n}`, a source
+        /// frame, or `"source": {"checkpoint": "<id prefix>"}`, a checkpoint's
+        /// own render; `"source_id": n` reads as frame n. A checkpoint is named
+        /// by any unique prefix of a visible checkpoint's id, is stored as its
+        /// full id, and must share the edited state's pixel grid and sample
+        /// type. A brush stroke blends its source over the image along
         /// its path: fully within `radius * (1 - softness)`, fading
-        /// linearly to nothing at `radius`. Every op is checked before
-        /// anything is written; positions in error messages count from 0 in
-        /// list order.
+        /// linearly to nothing at `radius`. A stroke may also carry `mode`
+        /// (`normal`, `lighten`, `darken` or `detail`; default `normal`) and
+        /// `opacity` (0 < x ≤ 1; default 1.0). An opacity too small to
+        /// register still records a state but changes no sample. `lighten`
+        /// changes a pixel only where the source's sum over all its samples
+        /// is greater than the image's there, `darken` only where it is
+        /// smaller; either then blends every sample by the same amount.
+        /// `detail` keeps the image's own brightness and takes only the
+        /// source's fine detail, over a reach about the brush radius.
+        /// Every op is checked before anything is written; positions in error
+        /// messages count from 0 in list order.
         #[arg(long, value_name = "FILE")]
         ops: PathBuf,
         /// The state to append under -- any unique prefix of its id.
@@ -550,6 +603,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Algorithms { .. } => "algorithms",
         Command::StepPlan { .. } => "step-plan",
         Command::SharpAreas { .. } => "sharp-areas",
+        Command::SharpnessMap { .. } => "sharpness-map",
         Command::Stack { .. } => "stack",
         Command::Export { .. } => "export",
         Command::Retouch { .. } => "retouch",
@@ -566,7 +620,14 @@ const ROOT_CATEGORIES: [(&str, &[&str]); 3] = [
     ("Processing", &["stack", "align", "retouch", "export"]),
     (
         "Inspection",
-        &["info", "review", "algorithms", "step-plan", "sharp-areas"],
+        &[
+            "info",
+            "review",
+            "algorithms",
+            "step-plan",
+            "sharp-areas",
+            "sharpness-map",
+        ],
     ),
     (
         "Maintenance",
@@ -658,6 +719,13 @@ fn main() -> ExitCode {
             json,
             priority,
         } => sharp_areas::run(&dir, &set, json, priority),
+        Command::SharpnessMap {
+            dir,
+            out,
+            composite,
+            json,
+            priority,
+        } => sharpness_map::run(&dir, &out, composite.as_deref(), json, priority),
         Command::Stack {
             dir,
             output,
@@ -2472,7 +2540,7 @@ mod tests {
         assert_eq!(first, generated_cli_assets());
         assert_eq!(
             first.keys().filter(|path| path.starts_with("man")).count(),
-            18
+            19
         );
         let manuals = first
             .keys()
@@ -2487,6 +2555,7 @@ mod tests {
                 std::path::Path::new("man/focusforge-cli-algorithms.1"),
                 std::path::Path::new("man/focusforge-cli-step-plan.1"),
                 std::path::Path::new("man/focusforge-cli-sharp-areas.1"),
+                std::path::Path::new("man/focusforge-cli-sharpness-map.1"),
                 std::path::Path::new("man/focusforge-cli-stack.1"),
                 std::path::Path::new("man/focusforge-cli-export.1"),
                 std::path::Path::new("man/focusforge-cli-retouch.1"),
@@ -2586,7 +2655,7 @@ mod tests {
             .keys()
             .filter(|path| path.starts_with("man"))
             .collect::<Vec<_>>();
-        assert_eq!(manuals.len(), 19);
+        assert_eq!(manuals.len(), 20);
         assert!(assets.contains_key(std::path::Path::new("man/focusforge-cli-visible-test.1")));
         assert!(!assets.contains_key(std::path::Path::new("man/focusforge-cli-hidden-test.1")));
         assert!(manuals.iter().all(|path| {
@@ -2633,7 +2702,7 @@ mod tests {
         assert_eq!(first, generated_cli_assets());
         assert_eq!(
             first.keys().filter(|path| path.starts_with("man")).count(),
-            18
+            19
         );
         assert!(first.contains_key(std::path::Path::new("completions/_focusforge-cli.ps1")));
         #[cfg(not(feature = "gpu"))]

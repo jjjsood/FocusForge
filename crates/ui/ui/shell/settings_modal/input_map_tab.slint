@@ -4,6 +4,7 @@
 
 import { Theme } from "../../theme.slint";
 import { ShellGeometry } from "../../geometry.slint";
+import { FFScrollbar } from "../../components/ff_scrollbar.slint";
 import { FFSettingsSection } from "../../components/ff_settings_section.slint";
 import { FFStatusText } from "../../components/ff_status_text.slint";
 import { FFInputTableRow } from "../../components/ff_input_table_row.slint";
@@ -19,44 +20,57 @@ export component FFInputMapTab inherits Rectangle {
     in property <string> input-source: "";
     in property <[string]> input-problems: [];
 
-    VerticalLayout {
-        padding-left: ShellGeometry.settings-content-inset-left;
-        padding-right: ShellGeometry.settings-content-inset-right;
-        padding-top: ShellGeometry.settings-content-inset-top;
-        padding-bottom: ShellGeometry.settings-content-inset-bottom;
-        alignment: start;
+    scroller := Flickable {
+        width: 100%;
+        height: 100%;
 
-        FFSettingsSection {
-            heading: "BINDINGS";
+        VerticalLayout {
+            padding-left: ShellGeometry.settings-content-inset-left;
+            padding-right: ShellGeometry.settings-content-inset-right;
+            padding-top: ShellGeometry.settings-content-inset-top;
+            padding-bottom: ShellGeometry.settings-content-inset-bottom;
+            alignment: start;
 
-            VerticalLayout {
-                spacing: ShellGeometry.settings-paragraph-gap;
-                padding-bottom: Theme.space-3;
+            FFSettingsSection {
+                heading: "BINDINGS";
 
-                FFStatusText {
-                    text: root.input-source;
-                    wrap: word-wrap;
+                VerticalLayout {
+                    spacing: ShellGeometry.settings-paragraph-gap;
+                    padding-bottom: Theme.space-3;
+
+                    FFStatusText {
+                        text: root.input-source;
+                        wrap: word-wrap;
+                    }
+
+                    for problem in root.input-problems: FFStatusText {
+                        text: problem;
+                        tone: "failure";
+                        wrap: word-wrap;
+                    }
                 }
 
-                for problem in root.input-problems: FFStatusText {
-                    text: problem;
-                    tone: "failure";
-                    wrap: word-wrap;
+                FFInputTableRow {
+                    header: true;
+                    input-label: "INPUT";
+                    stacking-label: "STACKING";
+                    editor-label: "EDITOR";
                 }
-            }
 
-            FFInputTableRow {
-                header: true;
-                input-label: "INPUT";
-                stacking-label: "STACKING";
-                editor-label: "EDITOR";
-            }
-
-            for row in root.input-rows: FFInputTableRow {
-                input-label: row.input;
-                stacking-label: row.stacking;
-                editor-label: row.editor;
+                for row in root.input-rows: FFInputTableRow {
+                    input-label: row.input;
+                    stacking-label: row.stacking;
+                    editor-label: row.editor;
+                }
             }
         }
+    }
+
+    FFScrollbar {
+        x: parent.width - self.width - Theme.space-2;
+        height: parent.height;
+        content-height: scroller.viewport-height;
+        viewport-height: scroller.height;
+        offset: -scroller.viewport-y;
     }
 }

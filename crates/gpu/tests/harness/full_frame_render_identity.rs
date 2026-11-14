@@ -42,13 +42,14 @@ const RENDER_BAND_BYTES: usize = 4 << 20;
 /// one reaches past the right edge.
 fn strokes(width: u32, height: u32) -> Vec<Op> {
     let (w, h) = (width as i32, height as i32);
-    let stroke =
-        |source_id: u16, radius: f32, softness: f32, path: &[(i32, i32)]| Op::BrushStroke {
+    let stroke = |source_id: u16, radius: f32, softness: f32, path: &[(i32, i32)]| {
+        Op::frame_stroke(
             source_id,
-            path: path.iter().map(|&(x, y)| Point { x, y }).collect(),
+            path.iter().map(|&(x, y)| Point { x, y }).collect(),
             radius,
             softness,
-        };
+        )
+    };
     vec![
         stroke(
             0,
@@ -115,13 +116,11 @@ fn render_live(held: &HeldCheckpoint, ops: &[Op], blender: &Blender, out: &Path)
 
     let mut placed = Vec::new();
     for op in ops {
-        let Op::BrushStroke { source_id, .. } = op else {
-            panic!("the live leg blends brush strokes only");
-        };
+        let frame = blend::source_frame(op).expect("the live leg blends frame strokes only");
         if let Some(footprint) = blend::footprint(op, info).expect("the stroke must be valid") {
             placed.push(blend::PlacedStroke {
                 op,
-                frame: usize::from(*source_id),
+                source: blend::PlacedSource::Frame(usize::from(frame)),
                 footprint,
             });
         }
@@ -172,6 +171,7 @@ fn render_live(held: &HeldCheckpoint, ops: &[Op], blender: &Blender, out: &Path)
                 &warped,
                 origin,
                 spp,
+                &[],
                 |op, info, out_rect, out, region, src, spp| {
                     blender
                         .apply(op, info, out_rect, out, region, src, spp)
@@ -310,6 +310,7 @@ fn every_render_path_agrees_on_the_reference_stack() {
             } else {
                 let reference = held.align.as_ref().map_or(0, |a| a.reference);
                 let pending = PendingState {
+                    held: Vec::new(),
                     composite: held.composite.clone(),
                     ops: ops.to_vec(),
                     sources: held.sources.clone(),
@@ -317,7 +318,7 @@ fn every_render_path_agrees_on_the_reference_stack() {
                     reference,
                     description: held.composite_description.clone(),
                 };
-                project::export_pending(&pending, &display, &options.0, &options.1)
+                project::export_pending(&pending, None, &display, &options.0, &options.1)
             }
             .expect("the unsaved state must export");
 

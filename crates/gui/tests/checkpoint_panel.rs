@@ -16,8 +16,9 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::{
-    HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, Point, Project, ProjectError,
-    SealRequest, append_ops_at, append_ops_onto, render_checkpoint, seal_at,
+    BrushMode, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op, Point, Project,
+    ProjectError, SealRequest, StrokeSource, append_ops_at, append_ops_onto, render_checkpoint,
+    seal_at,
 };
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use focusforge_gui::bridge::Canvas;
@@ -144,12 +145,7 @@ fn write_chain(project_path: &Path, times: &[i64]) {
     .expect("root checkpoint must seal");
 
     for (i, &at) in times.iter().enumerate().skip(1) {
-        let op = Op::BrushStroke {
-            source_id: 0,
-            path: vec![Point { x: 1, y: 1 }],
-            radius: 0.5,
-            softness: 0.0,
-        };
+        let op = Op::frame_stroke(0, vec![Point { x: 1, y: 1 }], 0.5, 0.0);
         append_ops_at(project_path, vec![op], None, at)
             .unwrap_or_else(|err| panic!("checkpoint {i} must append: {err}"));
     }
@@ -173,12 +169,7 @@ fn rows_match_the_core_listing() {
     let project_path = edited.project.clone();
     let t0 = 1_756_468_800;
     for (parent, x) in [(&edited.edited, 4), (&edited.root, 0)] {
-        let op = Op::BrushStroke {
-            source_id: 2,
-            path: vec![Point { x, y: 0 }],
-            radius: 0.5,
-            softness: 0.0,
-        };
+        let op = Op::frame_stroke(2, vec![Point { x, y: 0 }], 0.5, 0.0);
         append_ops_onto(&project_path, parent, vec![op], None, t0 + 60).unwrap();
     }
 
@@ -343,12 +334,7 @@ fn build_edited(name: &str) -> Edited {
     let edited = append_ops_onto(
         &project,
         &root,
-        vec![Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 2, y: 1 }],
-            radius: 1.5,
-            softness: 0.0,
-        }],
+        vec![Op::frame_stroke(1, vec![Point { x: 2, y: 1 }], 1.5, 0.0)],
         None,
         t0 + 60,
     )
@@ -365,7 +351,7 @@ fn build_edited(name: &str) -> Edited {
 /// `render_checkpoint`'s own output for `id`, as samples.
 fn rendered(project: &Path, id: &str, out: &Path) -> Vec<u16> {
     let mut project = Project::open(project).unwrap();
-    render_checkpoint(&mut project, id, out).unwrap();
+    render_checkpoint(&mut project, id, out, None).unwrap();
     samples(out)
 }
 
@@ -503,12 +489,7 @@ fn selecting_a_row_materializes_and_marks_it() {
 /// A stroke painting `source_id` at `(x, y)`; the map is 5 x 3 with source
 /// `(y * 5 + x) % 3` at each pixel.
 fn stroke(x: i32, y: i32, source_id: u16) -> Op {
-    Op::BrushStroke {
-        source_id,
-        path: vec![Point { x, y }],
-        radius: 0.5,
-        softness: 0.0,
-    }
+    Op::frame_stroke(source_id, vec![Point { x, y }], 0.5, 0.0)
 }
 
 /// Every op the live image shows over its base, oldest first.
@@ -1648,6 +1629,248 @@ fn deleting_asks_one_quiet_question() {
             .iter()
             .all(|word| !dialog.to_lowercase().contains(word))
     );
+}
+
+/// A stroke painting from checkpoint `source` at `(x, y)`.
+fn stroke_from(source: &str, x: i32, y: i32) -> Op {
+    Op::BrushStroke {
+        source: StrokeSource::Checkpoint(source.to_string()),
+        path: vec![Point { x, y }],
+        radius: 0.5,
+        softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
+    }
+}
+
+/// A new saved checkpoint under `parent` holding `ops`, `at` seconds after
+/// `T0`.
+fn append_under(project: &Path, parent: &str, ops: Vec<Op>, at: i64) -> String {
+    append_ops_onto(project, parent, ops, None, T0 + at)
+        .unwrap()
+        .checkpoint
+}
+
+/// The question's body for row `id`, closed again without an answer.
+fn body_of(controller: &mut AppController, id: &str) -> String {
+    request(controller, id);
+    let (_, body) = controller
+        .pending_checkpoint_delete_copy()
+        .expect("the question is open");
+    controller.cancel_checkpoint_delete();
+    body
+}
+
+/// The question's body for a checkpoint `strokes` strokes use, `places` saying
+/// where they sit, with `others` other checkpoints in the panel.
+fn used_body(places: &str, strokes: usize, others: usize) -> String {
+    let those = if strokes == 1 {
+        "that stroke keeps its"
+    } else {
+        "those strokes keep their"
+    };
+    format!(
+        "This checkpoint is the source of {places}.\n\nIt is hidden and kept in the project, \
+         so {those} pixels. The other {others} checkpoints are untouched, and the stack is not \
+         fused again."
+    )
+}
+
+/// The question for a checkpoint that strokes paint from: how many strokes
+/// and in how many other checkpoints, counted over the stored checkpoints,
+/// the unsaved ones a save would write and the open edit.
+#[test]
+fn delete_dialog_counts_the_strokes_that_use_it() {
+    let name = "checkpoint_panel_delete_count";
+    let (project, child) = three_saved(name);
+    let (root, edited) = (project.root.clone(), project.edited.clone());
+    // Under the root: one stroke from `edited`, two from it, two from `child`.
+    let one = append_under(
+        &project.project,
+        &root,
+        vec![stroke_from(&edited, 1, 1)],
+        180,
+    );
+    let two = append_under(
+        &project.project,
+        &root,
+        vec![stroke_from(&edited, 2, 1), stroke_from(&edited, 3, 1)],
+        240,
+    );
+    append_under(
+        &project.project,
+        &root,
+        vec![stroke_from(&child, 1, 0), stroke_from(&child, 2, 0)],
+        300,
+    );
+    let mut controller = scratch_controller(name);
+    common::open_and_settle(&mut controller, std::slice::from_ref(&project.project));
+
+    // Stored users: the used-case body, singular and plural.
+    assert_eq!(
+        body_of(&mut controller, &edited),
+        "This checkpoint is the source of 3 brush strokes in 2 other checkpoints.\n\nIt is \
+         hidden and kept in the project, so those strokes keep their pixels. The other 5 \
+         checkpoints are untouched, and the stack is not fused again."
+    );
+    assert_eq!(
+        body_of(&mut controller, &child),
+        used_body("2 brush strokes in another checkpoint", 2, 5)
+    );
+    // A checkpoint no stroke uses keeps the plain body.
+    assert_eq!(
+        body_of(&mut controller, &root),
+        "The other 5 checkpoints are untouched, and the stack is not fused again."
+    );
+
+    // A stored checkpoint already queued for deletion is not a user.
+    confirm(&mut controller, &two);
+    assert_eq!(
+        body_of(&mut controller, &edited),
+        "This checkpoint is the source of 1 brush stroke in another checkpoint.\n\nIt is hidden \
+         and kept in the project, so that stroke keeps its pixels. The other 4 checkpoints are \
+         untouched, and the stack is not fused again."
+    );
+    confirm(&mut controller, &one);
+    assert_eq!(
+        body_of(&mut controller, &edited),
+        "The other 3 checkpoints are untouched, and the stack is not fused again."
+    );
+
+    // The open edit's strokes sit in no checkpoint and are worded apart.
+    enter_editor(&mut controller);
+    paint(&mut controller, stroke_from(&root, 1, 1));
+    assert_eq!(
+        body_of(&mut controller, &root),
+        "This checkpoint is the source of 1 brush stroke in the current edit.\n\nIt is hidden \
+         and kept in the project, so that stroke keeps its pixels. The other 3 checkpoints are \
+         untouched, and the stack is not fused again."
+    );
+    paint(&mut controller, stroke_from(&root, 2, 1));
+    assert_eq!(
+        body_of(&mut controller, &root),
+        used_body("2 brush strokes in the current edit", 2, 3)
+    );
+    // Stored and live users together.
+    paint(&mut controller, stroke_from(&child, 3, 0));
+    assert_eq!(
+        body_of(&mut controller, &child),
+        used_body(
+            "2 brush strokes in another checkpoint and 1 in the current edit",
+            3,
+            3
+        )
+    );
+
+    // The live strokes become a held entry that paints from the root; the
+    // next ones paint from that entry.
+    assert!(controller.save_checkpoint());
+    assert_eq!(
+        body_of(&mut controller, &root),
+        used_body("2 brush strokes in another checkpoint", 2, 4)
+    );
+    paint(&mut controller, stroke_from("held:0", 1, 2));
+    assert_eq!(
+        body_of(&mut controller, "held:0"),
+        used_body("1 brush stroke in the current edit", 1, 4)
+    );
+    assert!(controller.save_checkpoint());
+    assert_eq!(
+        body_of(&mut controller, "held:0"),
+        used_body("1 brush stroke in another checkpoint", 1, 5)
+    );
+
+    // A held entry the save will not write counts no stroke: `held:1`, the
+    // current row, is deleted and nothing builds on it.
+    confirm(&mut controller, "held:1");
+    assert_eq!(
+        body_of(&mut controller, "held:0"),
+        "The other 4 checkpoints are untouched, and the stack is not fused again."
+    );
+}
+
+/// Deleting a saved checkpoint that a stroke paints from takes its row off
+/// the panel; after the save it is stored hidden, the stroke renders the same
+/// and compacting the file keeps it.
+#[test]
+fn a_used_saved_checkpoint_survives_its_delete() {
+    let name = "checkpoint_panel_used_saved";
+    let (project, _child) = three_saved(name);
+    let user = append_under(
+        &project.project,
+        &project.root,
+        vec![stroke_from(&project.edited, 2, 1)],
+        180,
+    );
+    let out = common::tree(&format!("{name}_out"));
+    let before = rendered(&project.project, &user, &out.join("before.tif"));
+
+    let mut controller = scratch_controller(name);
+    common::open_and_settle(&mut controller, std::slice::from_ref(&project.project));
+    confirm(&mut controller, &project.edited);
+    assert!(!row_ids(&controller.checkpoints_panel()).contains(&project.edited));
+    assert!(controller.save_active_project(|_| None));
+
+    let assert_kept = |after: &str| {
+        let reopened = Project::open(&project.project).unwrap();
+        let history = reopened.history();
+        assert!(
+            history.get(&project.edited).unwrap().hidden,
+            "{after}: still stored, hidden"
+        );
+        assert!(
+            history
+                .visible()
+                .iter()
+                .all(|checkpoint| checkpoint.id != project.edited),
+            "{after}: not in the visible listing"
+        );
+        let again = rendered(&project.project, &user, &out.join(format!("{after}.tif")));
+        assert!(again == before, "{after}: the stroke renders the same");
+    };
+    assert_kept("saved");
+    focusforge_core::project::container::compact(&project.project).unwrap();
+    assert_kept("compacted");
+}
+
+/// An unsaved fused checkpoint that nothing built on but a stroke of the open
+/// edit paints from keeps its files at the delete and is written hidden by the
+/// save; the same checkpoint with no stroke on it is freed and not written.
+#[test]
+fn a_used_held_checkpoint_is_written_hidden() {
+    let name = "checkpoint_panel_used_held";
+    let mut controller = fused_tab(name, 3);
+    click(&mut controller, "held:0");
+    enter_editor(&mut controller);
+    paint(&mut controller, stroke_from("held:2", 1, 1));
+    confirm(&mut controller, "held:2");
+    assert_eq!(cache_dirs(name, "held"), ["fused-0", "fused-1", "fused-2"]);
+    assert!(!row_ids(&controller.checkpoints_panel()).contains(&"held:2".to_string()));
+    let saved = common::save_to_proposed(&mut controller);
+    let mut project = Project::open(&saved).unwrap();
+    let rows: Vec<focusforge_core::project::Checkpoint> =
+        project.history().all().into_iter().cloned().collect();
+    assert_eq!(rows.len(), 4, "three fusions and the edit's strokes");
+    let edit = rows.iter().find(|c| c.ops.len() == 1).unwrap();
+    let source = edit
+        .ops
+        .first()
+        .and_then(Op::checkpoint_source)
+        .expect("the stroke names a stored checkpoint");
+    assert!(
+        project.history().get(source).unwrap().hidden,
+        "the source is stored hidden"
+    );
+    let out = common::tree(&format!("{name}_out"));
+    render_checkpoint(&mut project, &edit.id, &out.join("edit.tif"), None).unwrap();
+
+    let name = "checkpoint_panel_unused_held";
+    let mut controller = fused_tab(name, 3);
+    click(&mut controller, "held:0");
+    confirm(&mut controller, "held:2");
+    assert_eq!(cache_dirs(name, "held"), ["fused-0", "fused-1"]);
+    let saved = common::save_to_proposed(&mut controller);
+    assert_eq!(Project::open(&saved).unwrap().history().all().len(), 2);
 }
 
 #[test]

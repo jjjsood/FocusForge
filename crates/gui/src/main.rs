@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
+#[cfg(feature = "theme-sheet")]
+use focusforge_gui::ThemeSheet;
 use focusforge_gui::bridge::Canvas;
-use focusforge_gui::{
-    AppController, AppWindow, Theme, ThemeSheet, bridge, job, picker, screenshot,
-};
+use focusforge_gui::{AppController, AppWindow, Theme, bridge, job, picker, screenshot};
 use slint::ComponentHandle;
 use slint::wgpu_29::wgpu;
 #[cfg(target_os = "linux")]
@@ -1291,6 +1291,12 @@ fn apply_appearance_preview(app: &AppWindow, preview: Option<AppearancePreview>)
 
 fn preview_row(chip: [u8; 3], name: &str, time: &str) -> focusforge_gui::ImageRowView {
     focusforge_gui::ImageRowView {
+        kind: "frame".into(),
+        method: "".into(),
+        strokes: "".into(),
+        badges: Default::default(),
+        collapsed: false,
+        height: 0.0,
         chip: slint::Color::from_rgb_u8(chip[0], chip[1], chip[2]),
         name: name.into(),
         time_text: time.into(),
@@ -1307,16 +1313,38 @@ fn preview_row(chip: [u8; 3], name: &str, time: &str) -> focusforge_gui::ImageRo
     }
 }
 
+#[cfg(feature = "theme-sheet")]
+fn run_sheet(args: &Args, inspection: &Inspection) -> i32 {
+    let sheet = ThemeSheet::new().expect("failed to instantiate ThemeSheet");
+    fill_stage_sheet(&sheet);
+    run_window(sheet, args, None, None, None, inspection)
+}
+
+#[cfg(not(feature = "theme-sheet"))]
+fn run_sheet(_args: &Args, _inspection: &Inspection) -> i32 {
+    unreachable!("`--theme-sheet` is refused before a window is created")
+}
+
 /// Samples for the sheet's stage view: a 5 x 4 tile grid over a synthetic
 /// picture, the first eight tiles fused, the next two the front.
+#[cfg(feature = "theme-sheet")]
 fn fill_stage_sheet(sheet: &ThemeSheet) {
-    use focusforge_gui::{StageTile, Theme};
+    use focusforge_gui::theme_sheet::{StageTile, Theme};
     const COLS: usize = 5;
     const ROWS: usize = 4;
     const TILE: (usize, usize) = (40, 35);
     const FUSED: usize = 5;
     const FRONT: usize = 7;
-    let ramp = bridge::heat_ramp(&sheet.global::<Theme>());
+    let ramp = {
+        let theme = sheet.global::<Theme>();
+        bridge::heat_ramp([
+            theme.get_surface_canvas(),
+            theme.get_accent_subtle(),
+            theme.get_accent_pressed(),
+            theme.get_accent_default(),
+            theme.get_text_primary(),
+        ])
+    };
     let (w, h) = (COLS * TILE.0, ROWS * TILE.1);
     let heat_at = |x: usize, y: usize| {
         let ripple = (x as f32 * 0.17).sin() * (y as f32 * 0.23).cos();
@@ -1365,6 +1393,14 @@ fn fill_stage_sheet(sheet: &ThemeSheet) {
     sheet.set_stage_complete(build(&|_| true, &|_| false, false));
     sheet.set_stage_heat(build(&|t| t < FRONT, &|_| false, true));
     sheet.set_stage_tiles(slint::ModelRc::new(slint::VecModel::from(tiles)));
+    let chip = |c| {
+        let [r, g, b] = job::checkpoint_color(c, 61);
+        slint::Color::from_rgb_u8(r, g, b)
+    };
+    sheet.set_checkpoint_c0(chip(0));
+    sheet.set_checkpoint_c1(chip(1));
+    sheet.set_checkpoint_c2(chip(2));
+    sheet.set_checkpoint_c3(chip(3));
 }
 
 fn preview_image() -> slint::Image {
@@ -2129,6 +2165,14 @@ fn main() -> ExitCode {
 /// normally, 1 for a failure while opening one, 2 for a refused argument, 3
 /// for a session ended because the graphics device was lost.
 fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
+    #[cfg(not(feature = "theme-sheet"))]
+    if args.theme_sheet {
+        tracing::error!(
+            "--theme-sheet needs a build with the theme-sheet feature \
+             (cargo build -p focusforge-gui --features theme-sheet)"
+        );
+        return ExitCode::from(2);
+    }
     if let Some(section) = &args.settings_section
         && focusforge_gui::SettingsSection::from_slug(section).is_none()
     {
@@ -2186,9 +2230,7 @@ fn run(args: &Args, launch_tokens: LaunchTokens) -> ExitCode {
 
     let inspection = Inspection::default();
     let code = if args.theme_sheet {
-        let sheet = ThemeSheet::new().expect("failed to instantiate ThemeSheet");
-        fill_stage_sheet(&sheet);
-        run_window(sheet, args, None, None, None, &inspection)
+        run_sheet(args, &inspection)
     } else {
         let app = AppWindow::new().expect("failed to instantiate AppWindow");
         *app_handle.borrow_mut() = Some(app.as_weak());

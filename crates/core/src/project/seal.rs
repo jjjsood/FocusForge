@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::blob::{self, Plane, StagedBlob, ZSTD_LEVEL};
-use super::checkpoint::{Checkpoint, FuseRecord, Op};
+use super::checkpoint::{Checkpoint, FuseRecord, Op, StrokeSource};
 use super::container::{ContainerWriter, PartialFile};
 use super::error::ProjectError;
 use super::manifest::{
@@ -180,6 +180,7 @@ fn seal_staged(
         blobs,
         metrics: request.metrics,
         checkpoint: checkpoint_id.clone(),
+        format_version: None,
     };
 
     let checkpoint = Checkpoint {
@@ -200,6 +201,7 @@ fn seal_staged(
             metrics: manifest.metrics,
         }),
         hidden: false,
+        colour_index: Some(0),
     };
 
     let mut writer = ContainerWriter::create(request.project_path)?;
@@ -293,9 +295,61 @@ impl InMemoryCheckpoint {
     }
 }
 
+/// The name a stroke paints from entry `index` of an in-memory list by:
+/// `StrokeSource::Checkpoint(held_key(index))`. No stored checkpoint id can
+/// take this form, and [`seal_in_memory`] rewrites it to the id the entry is
+/// written under, so it never reaches a file.
+pub fn held_key(index: usize) -> String {
+    format!("held:{index}")
+}
+
+/// The name a stroke keeps once the entry it painted from is gone without
+/// being written. It is neither a [`held_key`] nor a stored checkpoint id, so
+/// a render or a save refuses the stroke as naming no checkpoint.
+pub const GONE_KEY: &str = "unsaved:gone";
+
+/// [`held_key`]'s index back; `None` for a saved checkpoint's id.
+pub fn held_index(key: &str) -> Option<usize> {
+    key.strip_prefix("held:")?.parse().ok()
+}
+
+/// The ops of in-memory entry `index` and of the op-bearing entries it
+/// descends from, oldest first, up to the first fused entry or saved
+/// checkpoint. `None` when `index` is not an op-bearing entry.
+pub fn stroke_chain(held: &[InMemoryCheckpoint], index: usize) -> Option<Vec<Op>> {
+    let mut levels = Vec::new();
+    let mut entry = held.get(index)?;
+    while let InMemoryKind::Ops { ops, .. } = &entry.kind {
+        levels.push(ops);
+        match &entry.parent {
+            Some(ParentRef::Entry(parent)) => entry = held.get(*parent)?,
+            _ => break,
+        }
+    }
+    if levels.is_empty() {
+        return None;
+    }
+    Some(levels.into_iter().rev().flatten().cloned().collect())
+}
+
+/// The colour number entry `entry` of a list written onto a target whose next
+/// free number is `next` keeps: `next + entry`, whether or not the entries
+/// before it are written.
+pub fn entry_colour_index(next: u32, entry: usize) -> u32 {
+    next + u32::try_from(entry).expect("an entry list is far shorter than u32::MAX")
+}
+
+/// Whether a stroke of `entry` paints from the entry named `key`.
+fn paints_from(entry: &InMemoryCheckpoint, key: &str) -> bool {
+    match &entry.kind {
+        InMemoryKind::Ops { ops, .. } => ops.iter().any(|op| op.checkpoint_source() == Some(key)),
+        InMemoryKind::Fused(_) => false,
+    }
+}
+
 /// Which of `entries` [`seal_in_memory`] writes: every one except an entry
-/// `deletes` names that is not `keep` and that no written entry is recorded
-/// under.
+/// `deletes` names that is not `keep`, that no written entry is recorded under
+/// and that no written entry's stroke paints from.
 pub fn kept_entries(
     entries: &[InMemoryCheckpoint],
     deletes: &[ParentRef],
@@ -304,23 +358,29 @@ pub fn kept_entries(
     let mut written = vec![true; entries.len()];
     for i in (0..entries.len()).rev() {
         let this = ParentRef::Entry(i);
+        let key = held_key(i);
         written[i] = !deletes.contains(&this)
             || keep == Some(&this)
             || entries[i + 1..]
                 .iter()
                 .zip(&written[i + 1..])
-                .any(|(entry, written)| *written && entry.parent.as_ref() == Some(&this));
+                .any(|(entry, written)| {
+                    *written && (entry.parent.as_ref() == Some(&this) || paints_from(entry, &key))
+                });
     }
     written
 }
 
-/// Writes the [`kept_entries`], each under its own parent, hides `deletes`
+/// Writes the [`kept_entries`], each under its own parent and with the colour
+/// number [`entry_colour_index`] gives it, a stroke's `held_key` source
+/// rewritten to the id of the entry it names; hides `deletes`
 /// (see [`super::delete_checkpoint`]) and stops listing hidden checkpoints
-/// nothing visible is built on, sparing `keep` and its ancestors. Everything
-/// is appended to `target` (the project there when `onto_existing`) and
-/// committed at once. Returns the id written per written entry. On error
-/// `target` is left as it was; bad references and unknown deletes are refused
-/// before any write.
+/// nothing visible is built on and no kept checkpoint's stroke paints from,
+/// sparing `keep` and its ancestors. Everything is appended to `target` (the
+/// project there when `onto_existing`) and committed at once. Returns the id
+/// written per written entry. On error `target` is left as it was; bad
+/// references, strokes painting from an entry that is not before theirs and
+/// unknown deletes are refused before any write.
 pub fn seal_in_memory(
     target: &Path,
     entries: &[InMemoryCheckpoint],
@@ -333,7 +393,8 @@ pub fn seal_in_memory(
     if onto_existing {
         let mut project = Project::open(target)?;
         plan_in_memory(target, entries, deletes, keep, Some(&project))?;
-        write_entries(&mut project, entries, &kept, &mut ids)?;
+        let base = project.history().next_colour_index();
+        write_entries(&mut project, entries, &kept, base, &mut ids)?;
         apply_deletes(&mut project, deletes, keep, &ids)?;
         project.commit()?;
     } else {
@@ -345,7 +406,7 @@ pub fn seal_in_memory(
         ids[0] = Some(seal_root(guard.path(), root)?);
         if kept[1..].iter().any(|&written| written) || !deletes.is_empty() {
             let mut project = Project::open(guard.path())?;
-            write_entries(&mut project, entries, &kept, &mut ids)?;
+            write_entries(&mut project, entries, &kept, 0, &mut ids)?;
             apply_deletes(&mut project, deletes, keep, &ids)?;
             project.commit()?;
         }
@@ -370,6 +431,17 @@ fn plan_in_memory(
     }
 
     for (i, entry) in entries.iter().enumerate() {
+        if let InMemoryKind::Ops { ops, .. } = &entry.kind {
+            for source in ops.iter().filter_map(Op::checkpoint_source) {
+                if let Some(j) = held_index(source)
+                    && j >= i
+                {
+                    return Err(refuse(format!(
+                        "checkpoint {i} paints from checkpoint {j}, which is not before it"
+                    )));
+                }
+            }
+        }
         let root = !onto_existing && i == 0;
         if root && (entry.parent.is_some() || !matches!(entry.kind, InMemoryKind::Fused(_))) {
             return Err(refuse(
@@ -423,11 +495,13 @@ fn plan_in_memory(
 }
 
 /// Appends every `kept` entry not yet in `ids` to `project`, each under its
-/// own parent, recording the id written.
+/// own parent and numbered from `base` by [`entry_colour_index`], recording
+/// the id written.
 fn write_entries(
     project: &mut Project,
     entries: &[InMemoryCheckpoint],
     kept: &[bool],
+    base: u32,
     ids: &mut [Option<String>],
 ) -> Result<(), ProjectError> {
     for (i, entry) in entries.iter().enumerate() {
@@ -446,10 +520,26 @@ fn write_entries(
         let parent = parent
             .as_deref()
             .expect("an entry after the root has a parent");
+        let colour = Some(entry_colour_index(base, i));
         let id = match &entry.kind {
-            InMemoryKind::Fused(held) => append_held(project, held, parent)?,
+            InMemoryKind::Fused(held) => append_held(project, held, parent, colour)?,
             InMemoryKind::Ops { ops, created_at } => {
-                super::append::append_ops_on(project, parent, ops.clone(), None, *created_at)?
+                let ops = ops
+                    .iter()
+                    .cloned()
+                    .map(|mut op| {
+                        let Op::BrushStroke { source, .. } = &mut op;
+                        if let StrokeSource::Checkpoint(key) = source
+                            && let Some(j) = held_index(key)
+                        {
+                            *key = ids[j]
+                                .clone()
+                                .expect("an entry a kept stroke paints from is written before it");
+                        }
+                        op
+                    })
+                    .collect();
+                super::append::append_ops_on(project, parent, ops, None, *created_at, colour)?
                     .checkpoint
             }
         };
@@ -459,7 +549,8 @@ fn write_entries(
 }
 
 /// Hides `deletes` on `project`, then stops listing hidden checkpoints
-/// nothing visible is built on, sparing `keep` and its ancestors.
+/// nothing visible is built on and no kept checkpoint's stroke paints from,
+/// sparing `keep` and its ancestors.
 fn apply_deletes(
     project: &mut Project,
     deletes: &[ParentRef],
@@ -510,6 +601,7 @@ fn append_held(
     project: &mut Project,
     held: &HeldCheckpoint,
     parent: &str,
+    colour_index: Option<u32>,
 ) -> Result<String, ProjectError> {
     let path = project.path().to_path_buf();
     let written = super::append::append_onto(
@@ -530,6 +622,7 @@ fn append_held(
         Some(parent),
         held.created_at,
         held.compressed_composite.as_deref(),
+        colour_index,
     )?;
     Ok(written.checkpoint)
 }

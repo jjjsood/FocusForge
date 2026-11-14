@@ -195,18 +195,18 @@ fn run_scenarios(frames: &[PathBuf], method: &'static str, out: &Path) -> Vec<Fi
     );
 
     let (w, h) = (held.width as i32, held.height as i32);
-    let stroke = Op::BrushStroke {
-        source_id: 1,
-        path: vec![
+    let stroke = Op::frame_stroke(
+        1,
+        vec![
             Point { x: w / 4, y: h / 2 },
             Point {
                 x: 3 * w / 4,
                 y: h / 2,
             },
         ],
-        radius: w as f32 / 100.0,
-        softness: 0.5,
-    };
+        w as f32 / 100.0,
+        0.5,
+    );
     let mut head_id = String::new();
     let save_after_retouch = measure(
         method,

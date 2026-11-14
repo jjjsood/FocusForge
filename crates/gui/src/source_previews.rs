@@ -4,12 +4,15 @@
 
 use std::borrow::Cow;
 use std::num::NonZeroU32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use focusforge_core::display::{self, Downsampler};
 use focusforge_core::io::open_frame_set;
+use focusforge_core::project::{
+    CheckpointImage, InMemoryCheckpoint, Project, ProjectError, held_index,
+};
 use focusforge_core::tile::{HostBudget, Rect};
 
 /// No source preview exceeds this edge.  The UI aspect-fits the resulting
@@ -27,13 +30,58 @@ pub struct PreviewPixels {
     pub rgba: Vec<u8>,
 }
 
+/// The unsaved checkpoints of a tab, copied when a request is built so the
+/// worker never reads the tab. Two snapshots compare equal: a request's
+/// identity is its `key` and `stamp`.
+#[derive(Debug, Clone, Default)]
+pub struct HeldSnapshot(pub Arc<[InMemoryCheckpoint]>);
+
+impl PartialEq for HeldSnapshot {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for HeldSnapshot {}
+
+impl std::hash::Hash for HeldSnapshot {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
+}
+
+/// What a preview shows.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PreviewSource {
+    /// An original source frame.
+    Frame(PathBuf),
+    /// The rendered result of one checkpoint of a project.
+    Checkpoint {
+        /// The saved project, `None` for a tab that was never saved.
+        project: Option<PathBuf>,
+        /// A saved checkpoint's id, or `"held:<index>"` into `held`.
+        key: String,
+        /// Changes whenever the checkpoint's content does, so a cached
+        /// picture of an earlier state is not reused.
+        stamp: u64,
+        held: HeldSnapshot,
+    },
+}
+
+impl std::fmt::Display for PreviewSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Frame(path) => write!(f, "{}", path.display()),
+            Self::Checkpoint { key, .. } => write!(f, "checkpoint {key}"),
+        }
+    }
+}
+
 /// A source identity never uses its transient virtual-row index. A tab id
 /// plus content generation rejects late work after a replace or tab switch.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PreviewRequest {
     pub tab_id: u64,
     pub generation: u64,
-    pub path: std::path::PathBuf,
+    pub source: PreviewSource,
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +101,11 @@ enum WorkerCommand {
     Shutdown,
 }
 
-type PreviewRenderer = dyn Fn(&Path, HostBudget, &AtomicBool) -> Result<(PreviewPixels, PreviewReservation), PreviewError>
+type PreviewRenderer = dyn Fn(
+        &PreviewSource,
+        HostBudget,
+        &AtomicBool,
+    ) -> Result<(PreviewPixels, PreviewReservation), PreviewError>
     + Send
     + Sync;
 type WorkerExit = dyn Fn() + Send + Sync;
@@ -93,7 +145,7 @@ impl PreviewQuiescence {
 
 impl PreviewWorker {
     pub fn new() -> Self {
-        Self::with_renderer(Arc::new(render_cancellable), None)
+        Self::with_renderer(Arc::new(render_source), None)
     }
 
     fn with_renderer(renderer: Arc<PreviewRenderer>, on_exit: Option<Arc<WorkerExit>>) -> Self {
@@ -266,10 +318,10 @@ fn worker_loop(
                     }
                     // Parked outcomes still count against the allowance.
                     let admitted = budget.reduced_by(outcome_bytes.load(Ordering::Acquire));
-                    let rendered = renderer(&request.path, admitted, &cancel);
+                    let rendered = renderer(&request.source, admitted, &cancel);
                     if let Ok((_, reservation)) = &rendered {
                         tracing::debug!(
-                            path = %request.path.display(),
+                            source = %request.source,
                             configured_cap = budget.bytes(),
                             decoder_cache = reservation.decoder_cache,
                             read_scratch = reservation.read_scratch,
@@ -382,6 +434,130 @@ fn sample_step(width: u32, height: u32, target_width: u32, target_height: u32) -
         .max(1)
 }
 
+/// Bytes of the reduction to `target_width x target_height`: the accumulator,
+/// the reduced samples, the raw result and the resident image plus UI
+/// conversion that coexist with it. One worker owns the raw result while
+/// those two exist, so all are reserved before any read.
+fn reduction_bytes(target_width: u32, target_height: u32, spp: u32) -> (u64, u64, u64, u64) {
+    let target_cells = u64::from(target_width) * u64::from(target_height);
+    let accumulator = target_cells
+        .saturating_mul(u64::from(spp))
+        .saturating_mul(8)
+        .saturating_add(target_cells.saturating_mul(4));
+    let reduced_samples = target_cells
+        .saturating_mul(u64::from(spp))
+        .saturating_mul(2);
+    let result = target_cells.saturating_mul(4);
+    (
+        accumulator,
+        reduced_samples,
+        result,
+        result.saturating_mul(2),
+    )
+}
+
+/// Renders what `source` names on the caller's worker thread.
+pub fn render_source(
+    source: &PreviewSource,
+    host_budget: HostBudget,
+    cancelled: &AtomicBool,
+) -> Result<(PreviewPixels, PreviewReservation), PreviewError> {
+    match source {
+        PreviewSource::Frame(path) => render_cancellable(path, host_budget, cancelled),
+        PreviewSource::Checkpoint {
+            project, key, held, ..
+        } => {
+            render_checkpoint_cancellable(project.as_deref(), key, &held.0, host_budget, cancelled)
+        }
+    }
+}
+
+/// A checkpoint's rendered result reduced to at most [`MAX_EDGE`] on the long
+/// edge, keeping its aspect. The project is opened here; a held row renders
+/// from `held` over its saved or held base. The render streams bands into the
+/// reduction, so the full image is never held, and its source frames open
+/// under what remains of `host_budget`. Cancellation is checked between
+/// bands.
+fn render_checkpoint_cancellable(
+    project_path: Option<&Path>,
+    key: &str,
+    held: &[InMemoryCheckpoint],
+    host_budget: HostBudget,
+    cancelled: &AtomicBool,
+) -> Result<(PreviewPixels, PreviewReservation), PreviewError> {
+    let read = |error: ProjectError| PreviewError::Read(error.to_string());
+    if cancelled.load(Ordering::Acquire) {
+        return Err(PreviewError::Cancelled);
+    }
+    let mut project = project_path.map(Project::open).transpose().map_err(read)?;
+    let image = match held_index(key) {
+        Some(index) => CheckpointImage::prepare_unsaved(held, index, project.as_ref()),
+        None => match project.as_ref() {
+            Some(project) => CheckpointImage::prepare(project, key),
+            None => {
+                return Err(PreviewError::Read(format!(
+                    "checkpoint {key} is not in an open project"
+                )));
+            }
+        },
+    }
+    .map_err(read)?;
+    let spp = image.samples_per_pixel;
+    let (target_width, target_height) = target_dimensions(image.width, image.height);
+    let (accumulator, reduced_samples, result, resident_and_conversion) =
+        reduction_bytes(target_width, target_height, spp);
+    if result.saturating_add(resident_and_conversion) > MAX_CACHE_BYTES {
+        return Err(PreviewError::CacheLimit);
+    }
+    let total = accumulator
+        .saturating_add(reduced_samples)
+        .saturating_add(result)
+        .saturating_add(resident_and_conversion);
+    if total > host_budget.bytes() {
+        return Err(PreviewError::OverBudget);
+    }
+    let image = image.with_memory_cap(Some(host_budget.reduced_by(total).bytes()));
+    let mut reducer =
+        Downsampler::new_full_source(image.width, image.height, spp, target_width, target_height);
+    let rendered = image.render(project.as_mut(), image.full(), &mut |band, rect| {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ProjectError::Io {
+                path: PathBuf::new(),
+                source: std::io::ErrorKind::Interrupted.into(),
+            });
+        }
+        reducer.add_band(band, rect);
+        Ok(())
+    });
+    match rendered {
+        Err(_) if cancelled.load(Ordering::Acquire) => return Err(PreviewError::Cancelled),
+        Err(error) => return Err(read(error)),
+        Ok(()) => {}
+    }
+    let samples = reducer.finish();
+    let mut rgba = vec![0; result as usize];
+    tonemap_source(&samples, target_width, target_height, spp, &mut rgba);
+    Ok((
+        PreviewPixels {
+            width: target_width,
+            height: target_height,
+            rgba,
+        },
+        PreviewReservation {
+            decoder_cache: 0,
+            read_scratch: 0,
+            band: 0,
+            accumulator,
+            reduced_samples,
+            result,
+            resident_and_conversion,
+            total,
+            band_rows: 0,
+            step: 1,
+        },
+    ))
+}
+
 /// Renders one original source on the caller's worker thread.  This function
 /// opens and reads only here; callers on the UI thread only enqueue identities.
 pub fn render(
@@ -415,18 +591,8 @@ fn render_with_max_step(
     let frame = reader.frame(0);
     let spp = frame.samples_per_pixel;
     let (target_width, target_height) = target_dimensions(frame.width, frame.height);
-    let target_cells = u64::from(target_width) * u64::from(target_height);
-    let accumulator = target_cells
-        .saturating_mul(u64::from(spp))
-        .saturating_mul(8)
-        .saturating_add(target_cells.saturating_mul(4));
-    let reduced_samples = target_cells
-        .saturating_mul(u64::from(spp))
-        .saturating_mul(2);
-    let result = target_cells.saturating_mul(4);
-    // One worker owns the raw result while the UI conversion and resident
-    // image coexist, so reserve all three before decoding.
-    let resident_and_conversion = result.saturating_mul(2);
+    let (accumulator, reduced_samples, result, resident_and_conversion) =
+        reduction_bytes(target_width, target_height, spp);
     if result.saturating_add(resident_and_conversion) > MAX_CACHE_BYTES {
         return Err(PreviewError::CacheLimit);
     }
@@ -548,14 +714,18 @@ mod tests {
 
     use super::{
         PreviewError, PreviewOutcome, PreviewPixels, PreviewRequest, PreviewReservation,
-        PreviewWorker, target_dimensions, tonemap_source,
+        PreviewSource, PreviewWorker, target_dimensions, tonemap_source,
     };
+
+    fn frame(name: &str) -> PreviewSource {
+        PreviewSource::Frame(PathBuf::from(name))
+    }
 
     fn request(name: &str) -> PreviewRequest {
         PreviewRequest {
             tab_id: 1,
             generation: 1,
-            path: PathBuf::from(name),
+            source: frame(name),
         }
     }
 
@@ -972,7 +1142,7 @@ mod tests {
         let worker = PreviewWorker::new_with_renderer(Arc::new({
             let rendered = Arc::clone(&rendered);
             move |path, _, _| {
-                rendered.lock().unwrap().push(path.to_path_buf());
+                rendered.lock().unwrap().push(path.clone());
                 Ok((one_pixel(), reservation()))
             }
         }));
@@ -999,7 +1169,7 @@ mod tests {
         );
         assert_eq!(
             *rendered.lock().unwrap(),
-            names.iter().map(PathBuf::from).collect::<Vec<_>>()
+            names.iter().map(|name| frame(name)).collect::<Vec<_>>()
         );
         assert_eq!(worker.metrics().peak_workers, 1);
         assert!(worker.metrics().peak_outcome_bytes >= 12);
@@ -1011,10 +1181,10 @@ mod tests {
         let (slow_release_tx, slow_release_rx) = mpsc::channel();
         let slow_release_rx = Arc::new(std::sync::Mutex::new(slow_release_rx));
         let worker = PreviewWorker::new_with_renderer(Arc::new(move |path, _, _| {
-            if path == Path::new("bad") {
+            if *path == frame("bad") {
                 return Err(PreviewError::Read("unreadable".to_string()));
             }
-            if path == Path::new("slow") {
+            if *path == frame("slow") {
                 slow_started_tx
                     .send(())
                     .expect("test waits for the slow row");
@@ -1131,7 +1301,7 @@ mod tests {
         let (second_release_tx, second_release_rx) = mpsc::channel();
         let second_release_rx = Arc::new(std::sync::Mutex::new(second_release_rx));
         let worker = PreviewWorker::new_with_renderer(Arc::new(move |path, _, _| {
-            if path == Path::new("first") {
+            if *path == frame("first") {
                 first_published_tx.send(()).expect("first renderer entered");
             } else {
                 second_started_tx.send(()).expect("second renderer entered");

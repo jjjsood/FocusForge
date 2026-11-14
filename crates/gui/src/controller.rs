@@ -23,11 +23,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::analytics::{self, AnalyticsView, CountError, CountPriority, RowValue};
+use crate::analytics::{self, AnalyticsView, CountError, CountPriority, RowValue, SharpAreas};
 use crate::appearance_settings::{self, AppearanceSettings, SourcePresentation};
 use crate::brush;
 use crate::calculator::{Calculator, CalculatorView};
-use crate::canvas::{FrameView, OverlayDraw, PaneSource};
+use crate::canvas::{FrameView, OverlayDraw, PaneSource, SharedCheckpointSources, SharedOrigin};
 use crate::checkpoints;
 use crate::diagnostics::{
     DiagnosticsEntryView, DiagnosticsScan, DiagnosticsScanEntry, DiagnosticsStatus,
@@ -48,7 +48,8 @@ use crate::settings_panel::{
     self, PanelModel, ParamValue, ParamValues, ParamViolation, StackContext, slider_value,
 };
 use crate::source_previews::{
-    MAX_CACHE_BYTES, PreviewError, PreviewPixels, PreviewRequest, PreviewWorker,
+    HeldSnapshot, MAX_CACHE_BYTES, PreviewError, PreviewPixels, PreviewRequest, PreviewSource,
+    PreviewWorker,
 };
 use crate::update_settings::{self, PreviewRelease, UpdateSettings};
 use crate::viewport::{ImageSize, PaneDraw, PaneRect, Viewport};
@@ -424,6 +425,10 @@ struct InputState {
 struct BrushState {
     size: f32,
     soft: f32,
+    mode: job::BrushMode,
+    /// A whole percentage, `1.0..=100.0`.
+    opacity: f32,
+    mode_menu_open: bool,
     picking: bool,
 }
 
@@ -432,6 +437,9 @@ impl Default for BrushState {
         Self {
             size: 64.0,
             soft: 30.0,
+            mode: job::BrushMode::Normal,
+            opacity: 100.0,
+            mode_menu_open: false,
             picking: false,
         }
     }
@@ -490,6 +498,12 @@ pub struct BrushToolbarView {
     pub soft: f32,
     /// The linear slider's own thumb position, `0.0..=1.0`.
     pub soft_fraction: f32,
+    pub mode: job::BrushMode,
+    /// A whole percentage, `1.0..=100.0`.
+    pub opacity: f32,
+    /// The opacity slider's thumb position, `0.01..=1.0`.
+    pub opacity_fraction: f32,
+    pub mode_menu_open: bool,
     pub picking: bool,
     /// Whether the active tab's edit session has an op to undo/redo.
     pub can_undo: bool,
@@ -505,6 +519,29 @@ pub struct BrushToolbarView {
 pub struct OverlayView {
     pub on: bool,
     pub opacity: f32,
+}
+
+/// What the left pane shows -- [`AppController::frame_pane`]'s return value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FramePane {
+    /// The selected frame, with its view onto the newest fuse.
+    Frame(PathBuf, Option<FrameView>),
+    /// The scratch render of the chosen checkpoint, read as it is.
+    Checkpoint(PathBuf),
+    /// The chosen checkpoint is still rendering; the pane shows nothing.
+    Rendering,
+    /// The chosen checkpoint cannot be rendered; the pane shows these lines.
+    Refused(Vec<String>),
+}
+
+/// The mark ahead of the left pane label -- [`AppController::frame_pane_label_mark`]'s
+/// return value, in the colour carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelMark {
+    /// The checkpoint glyph, in the checkpoint's colour.
+    Icon([u8; 3]),
+    /// A filled square in the selected frame's source colour.
+    Swatch([u8; 3]),
 }
 
 /// The brush cursor overlay's own view -- [`AppController::brush_cursor_view`]'s
@@ -523,6 +560,13 @@ pub struct BrushCursorView {
     /// The shared source point projected into each pane's local coordinates.
     pub frame_position: (f32, f32),
     pub composite_position: (f32, f32),
+    /// The active brush mode's one-letter tag, empty while `picking`.
+    pub mode_tag: &'static str,
+    /// The tag chip's top-left on both axes of the cursor square.
+    pub tag_origin: f32,
+    /// The chosen checkpoint's colour while the brush source is a checkpoint,
+    /// `None` for a frame source.
+    pub checkpoint_colour: Option<[u8; 3]>,
 }
 
 /// The diagnostics panel's own state: the data directory a bundle is
@@ -641,6 +685,13 @@ struct ProjectTab {
     /// tab is created, and kept in step by every edit that moves or shortens
     /// `frames`.
     selected: usize,
+    /// The checkpoint the brush paints from, by list id (`held:<n>` for an
+    /// unsaved one), while one is chosen in place of the frame at `selected`.
+    /// Counts only while the editor's Results group lists it.
+    source_checkpoint: Option<String>,
+    /// Whether the editor list's Results and Frames groups hide their rows.
+    results_collapsed: bool,
+    frames_collapsed: bool,
     /// The sort menu's own selection -- `None` is the dragged state, where
     /// neither `Name` nor `Capture time` is checked. Cleared by a manual
     /// drag.
@@ -670,9 +721,22 @@ struct ProjectTab {
     /// whenever the selected row or planes are replaced (a restore, a new
     /// checkpoint).
     edit: Option<job::EditState>,
+    /// The readers that tell where this tab's Lighten and Darken strokes act,
+    /// once opened for the current row and frames.
+    origin: Option<Arc<job::OriginReaders>>,
+    /// The checkpoint renders the strokes of a row opened without a session
+    /// are decided against; the session's own map takes over once it is
+    /// installed.
+    origin_sources: HashMap<String, Arc<job::CheckpointSource>>,
+    /// Whether opening or reading [`Self::origin`] failed for the current
+    /// row and frames; they are not opened again until those change.
+    origin_failed: bool,
     /// Bumped whenever the session this tab holds, or is opening, is dropped:
     /// an opening session lands only while its generation is still this one.
     session_generation: u64,
+    /// The memory limit the frame set behind [`Self::edit`] and
+    /// [`Self::origin`] was last opened, or re-opened, under.
+    frames_cap: Option<u64>,
     /// This tab's own failed, cancelled or sources-missing run, if its most
     /// recent attempt did not succeed -- `None` once a later success clears
     /// it. Keyed by tab rather than by path so it survives an Unsaved ->
@@ -768,14 +832,91 @@ struct EditSlot {
     /// Set when a worker starts, until [`AppController::take_session_started`].
     started: bool,
     parked: Arc<Mutex<Vec<ParkedSession>>>,
+    /// Frame sets being re-opened under a changed memory limit: tab id,
+    /// session generation and the limit each was started for.
+    reopening: Vec<(u64, u64, Option<u64>)>,
+    parked_reopens: Arc<Mutex<Vec<ParkedReopen>>>,
 }
 
 type ParkedSession = (u64, u64, Result<job::EditState, String>);
+
+type ParkedReopen = (u64, u64, Option<u64>, Result<job::SharedFrames, String>);
 
 impl EditSlot {
     fn opening(&self, tab_id: u64, generation: u64) -> bool {
         self.in_flight.contains(&(tab_id, generation))
     }
+
+    /// Whether the tab's frame set is being re-opened for `generation`.
+    fn reopening(&self, tab_id: u64, generation: u64) -> bool {
+        self.reopening
+            .iter()
+            .any(|&(tab, started, _)| (tab, started) == (tab_id, generation))
+    }
+}
+
+/// The checkpoint renders workers make for edit sessions: the tab id,
+/// session generation and checkpoint key of each running one and of each that
+/// failed, and where workers park the render or why it failed.
+#[derive(Default)]
+struct SourceSlot {
+    in_flight: Vec<(u64, u64, String)>,
+    failed: Vec<(u64, u64, String)>,
+    parked: Arc<Mutex<Vec<ParkedSource>>>,
+    /// Renders started so far; names the next scratch file.
+    renders: u64,
+}
+
+type ParkedSource = (u64, u64, String, Result<job::CheckpointSource, String>);
+
+impl SourceSlot {
+    /// Whether the render of `key` runs or failed for the tab's session.
+    fn knows(&self, tab_id: u64, generation: u64, key: &str) -> bool {
+        self.in_flight
+            .iter()
+            .chain(&self.failed)
+            .any(|(tab, started, k)| (*tab, *started, k.as_str()) == (tab_id, generation, key))
+    }
+}
+
+/// The origin readers being opened and where their workers park the results:
+/// tab id, the session generation each was started for, the checkpoint the
+/// worker renders into the plane cache (if any), and the readers or why they
+/// failed.
+#[derive(Default)]
+struct OriginSlot {
+    in_flight: Vec<(u64, u64, Option<String>)>,
+    /// Set when a worker starts, until [`AppController::take_origin_started`].
+    started: bool,
+    parked: Arc<Mutex<Vec<ParkedOrigin>>>,
+}
+
+type ParkedOrigin = (u64, u64, Result<Arc<job::OriginReaders>, String>);
+
+impl OriginSlot {
+    fn opening(&self, tab_id: u64, generation: u64) -> bool {
+        self.in_flight
+            .iter()
+            .any(|(tab, started, _)| (*tab, *started) == (tab_id, generation))
+    }
+
+    /// The checkpoints the running workers render into the plane cache.
+    fn rendering(&self) -> Vec<String> {
+        self.in_flight
+            .iter()
+            .filter_map(|(.., id)| id.clone())
+            .collect()
+    }
+}
+
+/// Where an origin worker finds the composite the strokes were drawn over.
+enum OriginComposite {
+    Cached(PathBuf),
+    Render {
+        project_path: PathBuf,
+        scratch_root: PathBuf,
+        id: String,
+    },
 }
 
 /// Whether the active tab has an editor session, is opening one, or cannot.
@@ -885,6 +1026,98 @@ fn fused_of(entry: &job::InMemoryCheckpoint) -> Option<&job::HeldCheckpoint> {
     }
 }
 
+/// A number that changes when unsaved entry `index` or any entry it builds
+/// on changes: each link's creation time and its fuse files or op count
+/// (ops are only appended), so a new stroke gives a new preview identity.
+fn held_stamp(held: &[job::InMemoryCheckpoint], index: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut next = Some(index);
+    while let Some(at) = next.take() {
+        let Some(entry) = held.get(at) else { break };
+        at.hash(&mut hasher);
+        match &entry.kind {
+            job::InMemoryKind::Fused(fused) => {
+                (fused.created_at, &fused.composite).hash(&mut hasher);
+            }
+            job::InMemoryKind::Ops { ops, created_at } => {
+                (created_at, ops.len()).hash(&mut hasher);
+            }
+        }
+        match &entry.parent {
+            Some(job::ParentRef::Entry(parent)) if *parent < at => next = Some(*parent),
+            Some(job::ParentRef::Saved(id)) => id.hash(&mut hasher),
+            _ => {}
+        }
+    }
+    hasher.finish()
+}
+
+/// The left pane's label for the checkpoint of `row`, the fields its Results
+/// row shows.
+fn checkpoint_pane_label(row: &images::ResultRow) -> String {
+    let mut label = String::from("Checkpoint \u{b7} ");
+    if let Some(name) = &row.label {
+        label.push_str(name);
+        label.push_str(" \u{b7} ");
+    }
+    label.push_str(&format!("{} {}", row.method, row.time));
+    let strokes = images::stroke_text(row.strokes);
+    if !strokes.is_empty() {
+        label.push(' ');
+        label.push_str(&strokes);
+    }
+    label
+}
+
+/// How many brush strokes `ops` hold.
+fn stroke_count(ops: &[job::Op]) -> usize {
+    ops.iter()
+        .filter(|op| matches!(op, job::Op::BrushStroke { .. }))
+        .count()
+}
+
+/// The delete question's body for a checkpoint that strokes paint from:
+/// `stored` is `(strokes, checkpoints)` in other checkpoints, `live` the
+/// strokes of the open edit, `untouched` the sentence on the other rows.
+/// `None` when no stroke uses it.
+fn used_checkpoint_body(
+    (stored, containers): (usize, usize),
+    live: usize,
+    untouched: &str,
+) -> Option<String> {
+    let strokes = |n: usize| match n {
+        1 => "1 brush stroke".to_string(),
+        n => format!("{n} brush strokes"),
+    };
+    let places = match (stored, live) {
+        (0, 0) => return None,
+        (0, _) => format!("{} in the current edit", strokes(live)),
+        (_, 0) => format!("{} in {}", strokes(stored), other_checkpoints(containers)),
+        _ => format!(
+            "{} in {} and {live} in the current edit",
+            strokes(stored),
+            other_checkpoints(containers)
+        ),
+    };
+    let those = if stored + live == 1 {
+        "that stroke keeps its"
+    } else {
+        "those strokes keep their"
+    };
+    Some(format!(
+        "This checkpoint is the source of {places}.\n\nIt is hidden and kept in the project, so {those} pixels. {untouched}"
+    ))
+}
+
+/// "another checkpoint" or "N other checkpoints".
+fn other_checkpoints(n: usize) -> String {
+    match n {
+        1 => "another checkpoint".to_string(),
+        n => format!("{n} other checkpoints"),
+    }
+}
+
 /// A held checkpoint whose run diverged on `diverged`, by frame file name.
 struct ParkedRun {
     held: job::HeldCheckpoint,
@@ -942,6 +1175,9 @@ impl ProjectTab {
             frames,
             excluded,
             selected,
+            source_checkpoint: None,
+            results_collapsed: false,
+            frames_collapsed: false,
             frame_sort: None,
             meta,
             thumbnail,
@@ -949,7 +1185,11 @@ impl ProjectTab {
             run: job::RunState::Idle,
             request: None,
             edit: None,
+            origin: None,
+            origin_sources: HashMap::new(),
+            origin_failed: false,
             session_generation: 0,
+            frames_cap: None,
             failure: None,
         }
     }
@@ -1120,8 +1360,238 @@ impl ProjectTab {
         };
         // `ids` holds one id per written entry.
         let kept = job::kept_entries(&self.held, &self.pending_deletes, keep);
+        if !kept.get(entry).copied().unwrap_or(false) {
+            return None;
+        }
         ids.get(kept[..entry].iter().filter(|written| **written).count())
             .cloned()
+    }
+
+    /// Runs `f` over the pixel grid of the fuse `base` names. `None` when
+    /// the fuse cannot be read.
+    fn with_grid<R>(&self, base: &RowBase, f: impl FnOnce(&job::PixelGrid<'_>) -> R) -> Option<R> {
+        match base {
+            RowBase::Held(index) => {
+                let held = fused_of(self.held.get(*index)?)?;
+                Some(f(&job::PixelGrid::held(held)))
+            }
+            RowBase::Saved(id) => {
+                let GuiProject::Opened(project) = &self.project else {
+                    return None;
+                };
+                let record = project.fuse_state(id).ok()?;
+                Some(f(&project.pixel_grid(&record)))
+            }
+        }
+    }
+
+    /// Why `candidate` shares no pixel grid with `base`; `None` when it does
+    /// or when either fuse cannot be read.
+    fn grid_mismatch(&self, base: &RowBase, candidate: &RowBase) -> Option<job::GridMismatch> {
+        self.with_grid(base, |base| {
+            self.with_grid(candidate, |candidate| base.mismatch(candidate))
+        })
+        .flatten()
+        .flatten()
+    }
+
+    /// The nearest checkpoint without ops at or above list row `key`: the
+    /// fuse a retouch chain starts from.
+    fn fused_origin(&self, key: &str) -> Option<String> {
+        let saved_origin = |id: &str| {
+            let GuiProject::Opened(project) = &self.project else {
+                return None;
+            };
+            let chain = project.history().ancestors(id).ok()?;
+            chain
+                .into_iter()
+                .find(|c| c.ops.is_empty())
+                .map(|c| c.id.clone())
+        };
+        let Some(mut index) = checkpoints::held_index(key) else {
+            return saved_origin(key);
+        };
+        loop {
+            let entry = self.held.get(index)?;
+            if fused_of(entry).is_some() {
+                return Some(checkpoints::held_key(index));
+            }
+            match entry.parent.as_ref()? {
+                job::ParentRef::Entry(parent) if *parent < index => index = *parent,
+                job::ParentRef::Entry(_) => return None,
+                job::ParentRef::Saved(id) => return saved_origin(id),
+            }
+        }
+    }
+
+    /// Whether the editor list shows checkpoint `key` as a Results row.
+    fn lists_checkpoint(&self, key: &str) -> bool {
+        self.image_groups().rows.iter().any(|row| row.key == key)
+    }
+
+    /// The colour of checkpoint `key`, a saved id or an unsaved entry's key:
+    /// hidden checkpoints keep theirs. `None` for a key the tab does not hold.
+    fn checkpoint_colour(&self, key: &str) -> Option<[u8; 3]> {
+        let history = match &self.project {
+            GuiProject::Opened(project) => Some(project.history()),
+            GuiProject::Unsaved(_) => None,
+        };
+        let colour = match checkpoints::held_index(key) {
+            Some(index) if index < self.held.len() => job::entry_colour_index(
+                history.map_or(0, |history| history.next_colour_index()),
+                index,
+            ),
+            Some(_) => return None,
+            None => history?.colour_index(key).ok()?,
+        };
+        let sources = u32::try_from(self.frames.len().max(1)).unwrap_or(u32::MAX);
+        Some(job::checkpoint_color(colour, sources))
+    }
+
+    /// The editor list's Results rows: every checkpoint the checkpoint list
+    /// shows, in its order, whose pixel grid matches the edited row's; the
+    /// rest are counted per reason.
+    fn image_groups(&self) -> images::Groups {
+        let (saved, history) = match &self.project {
+            GuiProject::Opened(project) => (project.history().all(), Some(project.history())),
+            GuiProject::Unsaved(_) => (Vec::new(), None),
+        };
+        let listed = checkpoints::build_model(
+            &saved,
+            &self.held,
+            &self.pending_deletes,
+            checkpoints::today(),
+            None,
+            0.0,
+        );
+        let base = self.selected_checkpoint.as_deref();
+        let base_row = base.and_then(|key| self.resolve_row(key));
+        let origin = base
+            .and_then(|key| self.fused_origin(key))
+            .filter(|origin| Some(origin.as_str()) != base);
+        let mut hidden = [0usize; images::MISMATCH_ORDER.len()];
+        let mut rows = Vec::new();
+        for key in listed.entries.into_iter().filter_map(|entry| entry.id) {
+            if base != Some(key.as_str())
+                && let Some(base_row) = &base_row
+                && let Some(candidate) = self.resolve_row(&key)
+                && let Some(reason) = self.grid_mismatch(base_row, &candidate)
+            {
+                let slot = images::MISMATCH_ORDER
+                    .iter()
+                    .position(|r| *r == reason)
+                    .expect("MISMATCH_ORDER names every reason");
+                hidden[slot] += 1;
+                continue;
+            }
+            let held_at = checkpoints::held_index(&key);
+            let (algorithm, created_at, label, strokes) = match held_at {
+                Some(index) => {
+                    let Some(entry) = self.held.get(index) else {
+                        continue;
+                    };
+                    let strokes = match &entry.kind {
+                        job::InMemoryKind::Ops { ops, .. } => stroke_count(ops),
+                        job::InMemoryKind::Fused(_) => 0,
+                    };
+                    (
+                        checkpoints::held_algorithm(index, &self.held, &saved),
+                        entry.created_at(),
+                        None,
+                        strokes,
+                    )
+                }
+                None => {
+                    let Some(history) = history else { continue };
+                    let Ok(checkpoint) = history.get(&key) else {
+                        continue;
+                    };
+                    (
+                        checkpoint.algorithm.clone(),
+                        checkpoint.created_at,
+                        checkpoint.label.clone(),
+                        stroke_count(&checkpoint.ops),
+                    )
+                }
+            };
+            let mut badges = Vec::new();
+            if base == Some(key.as_str()) {
+                badges.push("BASE");
+            } else if origin.as_deref() == Some(key.as_str()) {
+                badges.push("FUSION");
+            }
+            if held_at.is_some() {
+                badges.push("UNSAVED");
+            }
+            rows.push(images::ResultRow {
+                colour: self
+                    .checkpoint_colour(&key)
+                    .expect("a listed checkpoint has a colour"),
+                label,
+                method: checkpoints::algorithm_label(&algorithm),
+                time: checkpoints::local_hhmmss(created_at),
+                strokes,
+                badges,
+                key,
+            });
+        }
+        let selected = self
+            .source_checkpoint
+            .clone()
+            .filter(|key| rows.iter().any(|row| &row.key == key));
+        images::Groups {
+            rows,
+            hidden: images::MISMATCH_ORDER.into_iter().zip(hidden).collect(),
+            selected,
+            results_collapsed: self.results_collapsed,
+            frames_collapsed: self.frames_collapsed,
+        }
+    }
+
+    /// What the thumbnail of `row` shows: the frame, or the checkpoint with a
+    /// copy of the unsaved entries (`held` builds it, only when an unsaved row
+    /// needs it). `None` for rows without a thumbnail and for a frame whose
+    /// file is unresolved.
+    fn preview_source(
+        &self,
+        row: &images::ImageRow,
+        held: impl FnOnce() -> HeldSnapshot,
+    ) -> Option<PreviewSource> {
+        match row.kind {
+            images::RowKind::Frame => {
+                let unresolved = self.meta.get(&row.path).is_none_or(|meta| meta.unresolved);
+                (row.frame.is_some() && !unresolved).then(|| PreviewSource::Frame(row.path.clone()))
+            }
+            images::RowKind::Checkpoint => {
+                let key = row.key.clone()?;
+                let (stamp, held) = match checkpoints::held_index(&key) {
+                    Some(index) => (held_stamp(&self.held, index), held()),
+                    None => (0, HeldSnapshot::default()),
+                };
+                Some(PreviewSource::Checkpoint {
+                    project: match &self.project {
+                        GuiProject::Opened(project) => Some(project.path().to_path_buf()),
+                        GuiProject::Unsaved(_) => None,
+                    },
+                    key,
+                    stamp,
+                    held,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The chosen brush-source checkpoint, while the Results group lists it.
+    fn listed_source(&self) -> Option<String> {
+        self.source_checkpoint.as_ref()?;
+        self.image_groups().selected
+    }
+
+    /// Falls back to the frame at `selected` once the chosen checkpoint is
+    /// no longer listed.
+    fn prune_source_checkpoint(&mut self) {
+        self.source_checkpoint = self.listed_source();
     }
 
     /// Where a checkpoint taken from the current row is recorded: under the
@@ -1184,10 +1654,12 @@ impl ProjectTab {
         let mut ops = edit.drawn_ops();
         if let Some(stroke) = &edit.stroke {
             ops.push(job::Op::BrushStroke {
-                source_id: stroke.source(),
+                source: stroke.source().clone(),
                 path: stroke.path_so_far(),
                 radius: stroke.radius(),
                 softness: stroke.softness(),
+                mode: stroke.mode(),
+                opacity: stroke.opacity(),
             });
         }
         ops
@@ -1198,7 +1670,44 @@ impl ProjectTab {
     /// lands. Returns whether an installed session was dropped.
     fn drop_session(&mut self) -> bool {
         self.session_generation += 1;
+        self.origin = None;
+        self.origin_sources.clear();
+        self.origin_failed = false;
         self.edit.take().is_some()
+    }
+
+    /// The checkpoints rendered as brush sources: with a session, the chosen
+    /// one and every one a stroke of the session paints from, base ops
+    /// included; with none, every one a stroke of the row's ops paints from,
+    /// once the origin readers are open.
+    fn wanted_sources(&self) -> BTreeSet<String> {
+        let Some(edit) = &self.edit else {
+            if self.origin.is_none() {
+                return BTreeSet::new();
+            }
+            return self
+                .overlay_ops()
+                .iter()
+                .filter_map(|op| match op {
+                    job::Op::BrushStroke {
+                        source: job::StrokeSource::Checkpoint(id),
+                        ..
+                    } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect();
+        };
+        let mut wanted = edit.stroke_checkpoints();
+        wanted.extend(self.listed_source());
+        wanted
+    }
+
+    /// The checkpoint renders strokes are decided against: the session's, or
+    /// the row's own with no session.
+    fn checkpoint_sources(&self) -> &HashMap<String, Arc<job::CheckpointSource>> {
+        self.edit
+            .as_ref()
+            .map_or(&self.origin_sources, job::EditState::checkpoint_sources)
     }
 
     /// Whether the selected row is an in-memory entry holding ops.
@@ -1215,14 +1724,65 @@ impl ProjectTab {
         self.edit.as_ref().is_some_and(|edit| edit.op_count() > 0)
     }
 
+    /// The in-memory entries plus, when the session holds strokes, one more
+    /// entry for them under the current row: what a save would write.
+    fn held_and_live(&self) -> Vec<job::InMemoryCheckpoint> {
+        let mut entries = self.held.clone();
+        if let Some(edit) = self.edit.as_ref().filter(|edit| edit.op_count() > 0) {
+            entries.push(job::InMemoryCheckpoint {
+                kind: job::InMemoryKind::Ops {
+                    ops: edit.ops().cloned().collect(),
+                    created_at: 0,
+                },
+                parent: self.row_parent(),
+            });
+        }
+        entries
+    }
+
+    /// The strokes that paint from checkpoint `key` (a saved id or an unsaved
+    /// entry's key): `(strokes, containers)` over the stored checkpoints and
+    /// the op entries a save would write, and the strokes of the session.
+    fn strokes_using(&self, key: &str) -> ((usize, usize), usize) {
+        let entries = self.held_and_live();
+        let kept = job::kept_entries(&entries, &self.pending_deletes, self.row_parent().as_ref());
+        fn ops_of(entry: &job::InMemoryCheckpoint) -> Option<&[job::Op]> {
+            match &entry.kind {
+                job::InMemoryKind::Ops { ops, .. } => Some(ops.as_slice()),
+                job::InMemoryKind::Fused(_) => None,
+            }
+        }
+        let history = match &self.project {
+            GuiProject::Opened(project) => Some(project.history()),
+            GuiProject::Unsaved(_) => None,
+        };
+        let held = self
+            .held
+            .iter()
+            .zip(&kept)
+            .filter_map(|(entry, kept)| ops_of(entry).filter(|_| *kept));
+        let queued = |id: &str| {
+            self.pending_deletes
+                .contains(&job::ParentRef::Saved(id.to_string()))
+        };
+        let stored = history
+            .into_iter()
+            .flat_map(|h| h.op_groups())
+            .filter(|(id, _)| !queued(id))
+            .map(|(_, ops)| ops);
+        let groups = stored.chain(held);
+        let live = entries
+            .get(self.held.len())
+            .and_then(ops_of)
+            .map_or(0, |ops| job::strokes_using_in(key, [ops]).0);
+        (job::strokes_using_in(key, groups), live)
+    }
+
     /// Removes the files of every fused in-memory entry a project save would
     /// not write: deleted, not the current row and no written entry's parent.
     fn free_unneeded_held(&self) {
-        let kept = job::kept_entries(
-            &self.held,
-            &self.pending_deletes,
-            self.row_parent().as_ref(),
-        );
+        let entries = self.held_and_live();
+        let kept = job::kept_entries(&entries, &self.pending_deletes, self.row_parent().as_ref());
         for (entry, kept) in self.held.iter().zip(kept) {
             if let (false, job::InMemoryKind::Fused(held)) = (kept, &entry.kind) {
                 remove_hold_dir_of(&held.composite);
@@ -1363,7 +1923,7 @@ enum AnalyticsSnapshot {
     /// The counts after a finished tile.
     Partial(Vec<u32>),
     /// The finished count, or its error text.
-    Done(Result<Vec<u32>, String>),
+    Done(Result<SharpAreas, String>),
 }
 
 /// The latest snapshot and the generation it belongs to, parked for settle;
@@ -1385,7 +1945,7 @@ struct AnalyticsState {
     outcome: AnalyticsOutcome,
     worker: Option<std::thread::JoinHandle<()>>,
     /// Finished counts by tab id, with the frames they were counted over.
-    cache: HashMap<u64, (Vec<PathBuf>, Vec<u32>)>,
+    cache: HashMap<u64, (Vec<PathBuf>, SharpAreas)>,
 }
 
 /// The shell's state, carried `Send + Sync` so a worker thread inherits the
@@ -1555,6 +2115,8 @@ struct ShellState {
     render: RenderSlot,
     thumbnails: ThumbnailSlot,
     edits: EditSlot,
+    sources: SourceSlot,
+    origin: OriginSlot,
     /// The open export modal, if any -- [`AppController::checkpoint_export_requested`].
     export_dialog: Option<ExportDialog>,
     /// The last confirmed export format and settings, which the next modal
@@ -2266,6 +2828,12 @@ impl AppController {
         true
     }
 
+    /// The memory budget a tab's frame sets are opened with: the host-derived
+    /// budget, lowered to the Performance memory limit when one is set.
+    fn frame_set_budget(&self) -> job::HostBudget {
+        job::host_budget().capped_to(self.performance.max_host_memory_bytes())
+    }
+
     /// Opens the active tab's edit session over its row's Z-Map and its own
     /// frames on a worker unless the tab already holds or is opening one,
     /// replaying an op-bearing row's stroke chain there. `Opening` also
@@ -2279,7 +2847,10 @@ impl AppController {
         if tab.edit.is_some() {
             return SessionOpen::Open;
         }
-        if self.state.edits.opening(tab.id, tab.session_generation) {
+        if self.state.edits.opening(tab.id, tab.session_generation)
+            || self.state.edits.reopening(tab.id, tab.session_generation)
+            || self.state.origin.opening(tab.id, tab.session_generation)
+        {
             return SessionOpen::Opening;
         }
         let (composite, zmap) = match self.active_tab_planes() {
@@ -2293,10 +2864,18 @@ impl AppController {
         // `can_edit` guarantees `tab.frames` equals the fused sources, in
         // the same order, by the time editor mode is entered -- so indexing
         // `registration`'s per-frame transforms by position here matches.
-        let Some((_, registration)) = tab.fused() else {
+        let Some((fused_frames, registration)) = tab.fused() else {
             return SessionOpen::Unavailable;
         };
-        let frames = tab.frames.clone();
+        let source = match &tab.origin {
+            Some(origin) if fused_frames == tab.frames => {
+                job::FrameSource::Reader(Arc::clone(origin.sources()))
+            }
+            _ => job::FrameSource::Open {
+                frames: tab.frames.clone(),
+                budget: self.frame_set_budget(),
+            },
+        };
         let base_ops = tab.base_ops();
         let chain = tab
             .selected_checkpoint
@@ -2305,26 +2884,75 @@ impl AppController {
             .and_then(|index| checkpoints::stroke_chain(&tab.held, index))
             .unwrap_or_default();
         let (tab_id, generation) = (tab.id, tab.session_generation);
+        // The checkpoints the chain's strokes paint from are rendered before
+        // the chain is replayed.
+        let chain_sources: BTreeSet<String> = chain
+            .iter()
+            .filter_map(|op| match op {
+                job::Op::BrushStroke {
+                    source: job::StrokeSource::Checkpoint(id),
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let held = if chain_sources.is_empty() {
+            Vec::new()
+        } else {
+            tab.held.clone()
+        };
+        let project_path = match &tab.project {
+            GuiProject::Opened(project) => Some(project.path().to_path_buf()),
+            _ => None,
+        };
+        let memory_cap = self.performance.max_host_memory_bytes();
+        let source_dir = self.scratch_root().join("sources");
         let tile_size = self
             .resident_tile_size_for_test
             .unwrap_or(job::RESIDENT_TILE_SIZE);
+        if matches!(source, job::FrameSource::Open { .. }) {
+            let cap = self.performance.max_host_memory_bytes();
+            self.state
+                .active_mut()
+                .expect("the active tab was just read")
+                .frames_cap = cap;
+        }
         let slot = &mut self.state.edits;
         slot.in_flight.push((tab_id, generation));
         slot.started = true;
         let parked = Arc::clone(&slot.parked);
+        let first_render = self.state.sources.renders;
+        self.state.sources.renders += chain_sources.len() as u64;
+        let wanted: Vec<(String, PathBuf)> = chain_sources
+            .into_iter()
+            .zip(first_render + 1..)
+            .map(|(id, n)| {
+                (
+                    id,
+                    source_dir.join(format!("{}-{n}.tif", std::process::id())),
+                )
+            })
+            .collect();
         std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(|| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let checkpoints = job::render_checkpoint_sources(
+                    &composite,
+                    project_path.as_deref(),
+                    &held,
+                    wanted,
+                    memory_cap,
+                );
                 job::open_edit_session(
                     zmap.as_deref(),
                     &composite,
-                    &frames,
+                    source,
                     registration,
                     tile_size,
-                    job::host_budget(),
                     base_ops,
                     chain,
+                    checkpoints,
                 )
-            })
+            }))
             .map_err(|_| "the session worker panicked".to_string())
             .and_then(|opened| opened.map_err(|err| err.to_string()));
             parked
@@ -2341,6 +2969,7 @@ impl AppController {
     /// active tab in editor mode, drops the window to stacking. Returns
     /// `true` once no session is being opened -- the poll's cue to stop.
     pub fn settle_edit_session(&mut self) -> bool {
+        self.settle_reopened_frame_sets();
         let parked = std::mem::take(
             &mut *self
                 .state
@@ -2349,6 +2978,7 @@ impl AppController {
                 .lock()
                 .expect("no thread panicked while holding the parked sessions"),
         );
+        let mut installed = Vec::new();
         for (tab_id, generation, result) in parked {
             let started = (tab_id, generation);
             self.state.edits.in_flight.retain(|open| *open != started);
@@ -2363,7 +2993,9 @@ impl AppController {
             match result {
                 Ok(mut edit) => {
                     edit.set_blender(self.blender.clone());
+                    edit.adopt_checkpoint_sources(std::mem::take(&mut tab.origin_sources));
                     tab.edit = Some(edit);
+                    installed.push(index);
                     self.emit(ShellEvent::EditorChanged);
                 }
                 Err(reason) => {
@@ -2374,13 +3006,450 @@ impl AppController {
                 }
             }
         }
+        for index in installed {
+            self.ensure_checkpoint_sources(index);
+        }
+        self.settle_checkpoint_sources();
+        self.reopen_frame_sets();
         self.state.edits.in_flight.is_empty()
+            && self.state.edits.reopening.is_empty()
+            && self.state.sources.in_flight.is_empty()
+    }
+
+    /// Keeps the checkpoint renders of tab `index` equal to the ones wanted
+    /// (see [`ProjectTab::wanted_sources`]), in the session or, with none, in
+    /// the row's own map. Drops the others, which removes their files, and
+    /// starts a worker for each wanted one that is neither rendered, running
+    /// nor failed.
+    fn ensure_checkpoint_sources(&mut self, index: usize) {
+        let dir = self.scratch_root().join("sources");
+        let memory_cap = self.performance.max_host_memory_bytes();
+        let Some(tab) = self.state.projects.get_mut(index) else {
+            return;
+        };
+        let wanted = tab.wanted_sources();
+        let (tab_id, generation) = (tab.id, tab.session_generation);
+        let project_path = match &tab.project {
+            GuiProject::Opened(project) => Some(project.path().to_path_buf()),
+            _ => None,
+        };
+        let base = match (&tab.edit, &tab.origin) {
+            (Some(edit), _) => Arc::clone(&edit.base),
+            (None, Some(origin)) => Arc::clone(origin.ancestor()),
+            (None, None) => return,
+        };
+        match tab.edit.as_mut() {
+            Some(edit) => edit.retain_checkpoint_sources(&wanted),
+            None => tab.origin_sources.retain(|id, _| wanted.contains(id)),
+        }
+        for key in wanted {
+            let slot = &mut self.state.sources;
+            if tab.checkpoint_sources().contains_key(&key) || slot.knows(tab_id, generation, &key) {
+                continue;
+            }
+            slot.renders += 1;
+            slot.in_flight.push((tab_id, generation, key.clone()));
+            self.state.edits.started = true;
+            let path = dir.join(format!("{}-{}.tif", std::process::id(), slot.renders));
+            let (held, base) = (tab.held.clone(), Arc::clone(&base));
+            let (project_path, parked) = (project_path.clone(), Arc::clone(&slot.parked));
+            std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    job::render_checkpoint_source(
+                        project_path.as_deref(),
+                        &held,
+                        &key,
+                        &path,
+                        memory_cap,
+                        &base,
+                    )
+                }))
+                .map_err(|_| "the checkpoint render worker panicked".to_string())
+                .and_then(|rendered| rendered.map_err(|err| err.to_string()));
+                parked
+                    .lock()
+                    .expect("no thread panicked while holding the parked checkpoint renders")
+                    .push((tab_id, generation, key, result));
+            });
+        }
+    }
+
+    /// Installs the parked checkpoint renders into the sessions that still
+    /// want them; one nobody wants any more is dropped, and a failed one is
+    /// logged and remembered so the press refuses it.
+    fn settle_checkpoint_sources(&mut self) {
+        let parked = std::mem::take(
+            &mut *self
+                .state
+                .sources
+                .parked
+                .lock()
+                .expect("no thread panicked while holding the parked checkpoint renders"),
+        );
+        for (tab_id, generation, key, result) in parked {
+            let slot = &mut self.state.sources;
+            slot.in_flight
+                .retain(|(tab, started, k)| (*tab, *started, k) != (tab_id, generation, &key));
+            let Some(index) = self.tab_index(tab_id) else {
+                continue;
+            };
+            let tab = &mut self.state.projects[index];
+            if tab.session_generation != generation {
+                continue;
+            }
+            let wanted = tab.wanted_sources();
+            match result {
+                Ok(source) if wanted.contains(&key) => match tab.edit.as_mut() {
+                    Some(edit) => edit.set_checkpoint_source(key, source),
+                    None => {
+                        tab.origin_sources.insert(key, Arc::new(source));
+                    }
+                },
+                Ok(_) => {}
+                Err(reason) => {
+                    tracing::error!(
+                        error = %reason, checkpoint = %key,
+                        "the checkpoint could not be rendered as a brush source"
+                    );
+                    self.state.sources.failed.push((tab_id, generation, key));
+                }
+            }
+        }
+    }
+
+    /// Re-opens the frame set of every tab holding a session or origin
+    /// readers that was opened under a memory limit other than the one in
+    /// force, on a worker each. A tab that is opening a session or readers,
+    /// or already re-opening, waits for the settle that follows.
+    fn reopen_frame_sets(&mut self) {
+        let cap = self.performance.max_host_memory_bytes();
+        let budget = self.frame_set_budget();
+        let slot = &mut self.state.edits;
+        for tab in &mut self.state.projects {
+            let (id, generation) = (tab.id, tab.session_generation);
+            if (tab.edit.is_none() && tab.origin.is_none())
+                || tab.frames_cap == cap
+                || slot.opening(id, generation)
+                || slot.reopening(id, generation)
+                || self.state.origin.opening(id, generation)
+            {
+                continue;
+            }
+            let frames = if tab.edit.is_some() {
+                tab.frames.clone()
+            } else if let Some((frames, _)) = tab.fused() {
+                frames
+            } else {
+                continue;
+            };
+            tab.frames_cap = cap;
+            slot.reopening.push((id, generation, cap));
+            slot.started = true;
+            let parked = Arc::clone(&slot.parked_reopens);
+            std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    job::FrameSource::Open { frames, budget }
+                        .into_reader()
+                        .map_err(|err| err.to_string())
+                }))
+                .map_err(|_| "the re-open worker panicked".to_string())
+                .and_then(|opened| opened);
+                parked
+                    .lock()
+                    .expect("no thread panicked while holding the parked re-opens")
+                    .push((id, generation, cap, result));
+            });
+        }
+    }
+
+    /// Installs the re-opened frame sets into the session and origin readers
+    /// of the tabs they were opened for. A result for a tab that is gone, at
+    /// another generation or opened under a limit no longer in force is
+    /// dropped; a refused one leaves the tab on its frames and warns.
+    fn settle_reopened_frame_sets(&mut self) {
+        let parked = std::mem::take(
+            &mut *self
+                .state
+                .edits
+                .parked_reopens
+                .lock()
+                .expect("no thread panicked while holding the parked re-opens"),
+        );
+        let landed = !parked.is_empty();
+        let cap = self.performance.max_host_memory_bytes();
+        for (tab_id, generation, opened_cap, result) in parked {
+            let reopening = &mut self.state.edits.reopening;
+            if let Some(at) = reopening
+                .iter()
+                .position(|&key| key == (tab_id, generation, opened_cap))
+            {
+                reopening.remove(at);
+            }
+            let Some(index) = self.tab_index(tab_id) else {
+                continue;
+            };
+            let tab = &mut self.state.projects[index];
+            if tab.session_generation != generation || opened_cap != cap {
+                continue;
+            }
+            match result {
+                Ok(reader) => {
+                    if let Some(origin) = &tab.origin {
+                        tab.origin = Some(Arc::new(origin.with_sources(Arc::clone(&reader))));
+                    }
+                    if let Some(edit) = &mut tab.edit {
+                        edit.sources = reader;
+                    }
+                }
+                Err(reason) => {
+                    tracing::warn!(error = %reason, "the frame set could not be re-opened");
+                    let (title, text) = match self.performance.max_host_memory.as_ref() {
+                        Some(cap) => (
+                            "Memory limit too small",
+                            format!(
+                                "The memory limit of {} is too small for this project's frames. \
+                                 This project keeps the frames it has open until the limit is raised.",
+                                cap.text
+                            ),
+                        ),
+                        None => (
+                            "Frames not re-opened",
+                            format!(
+                                "The frames could not be re-opened: {reason}. \
+                                 This project keeps the frames it has open."
+                            ),
+                        ),
+                    };
+                    let mut record = Notification::new(Kind::Warning, Source::Run, title, text);
+                    self.fill_project(&mut record, Some(index));
+                    self.publish_notification(record);
+                }
+            }
+        }
+        let wants_session = self.state.mode == ShellMode::Editor
+            || self.state.active().is_some_and(ProjectTab::on_ops_row);
+        if landed && wants_session && self.state.active().is_some_and(|tab| tab.edit.is_none()) {
+            self.ensure_edit_session();
+        }
     }
 
     /// Whether an editor session started opening since the last call -- the
     /// bridge's cue to start polling [`Self::settle_edit_session`].
     pub fn take_session_started(&mut self) -> bool {
         std::mem::take(&mut self.state.edits.started)
+    }
+
+    /// Opens the active tab's origin readers on a worker when the overlay is
+    /// on and a Lighten or Darken stroke is among its strokes, unless they are
+    /// open, opening or failed for the current row and frames. A saved
+    /// op-bearing row's fused ancestor is rendered into the plane cache first
+    /// when it is not there.
+    pub fn ensure_origin_readers(&mut self) {
+        self.start_origin_readers(false);
+    }
+
+    /// [`Self::ensure_origin_readers`]; `picking` asks for the readers for an
+    /// eyedropper read, which needs a session, with the overlay off too.
+    fn start_origin_readers(&mut self, picking: bool) {
+        let Some(tab) = self.state.active() else {
+            return;
+        };
+        let wanted = if picking {
+            tab.edit.is_some()
+        } else {
+            self.state.overlay.on
+        };
+        if !wanted
+            || tab.origin.is_some()
+            || tab.origin_failed
+            || self.state.origin.opening(tab.id, tab.session_generation)
+            || self.state.edits.opening(tab.id, tab.session_generation)
+            || self.state.edits.reopening(tab.id, tab.session_generation)
+            || !tab.overlay_ops().iter().any(|op| {
+                matches!(
+                    op,
+                    job::Op::BrushStroke {
+                        mode: job::BrushMode::Lighten | job::BrushMode::Darken,
+                        ..
+                    }
+                )
+            })
+        {
+            return;
+        }
+        let Some((frames, registration)) = tab.fused() else {
+            return;
+        };
+        let source = match &tab.edit {
+            Some(edit) if frames == tab.frames => {
+                job::FrameSource::Reader(Arc::clone(&edit.sources))
+            }
+            Some(_) => {
+                tracing::error!("the origin readers' frames differ from the edit session's");
+                self.state
+                    .active_mut()
+                    .expect("the active tab was just read")
+                    .origin_failed = true;
+                return;
+            }
+            None => job::FrameSource::Open {
+                frames,
+                budget: self.frame_set_budget(),
+            },
+        };
+        let (tab_id, generation) = (tab.id, tab.session_generation);
+        let Some(composite) = self.origin_composite() else {
+            return;
+        };
+        let memory_cap = self.performance.max_host_memory_bytes();
+        let rendering = match &composite {
+            OriginComposite::Render { id, .. } => Some(id.clone()),
+            OriginComposite::Cached(_) => None,
+        };
+        if matches!(source, job::FrameSource::Open { .. }) {
+            self.state
+                .active_mut()
+                .expect("the active tab was just read")
+                .frames_cap = memory_cap;
+        }
+        let slot = &mut self.state.origin;
+        slot.in_flight.push((tab_id, generation, rendering));
+        slot.started = true;
+        let parked = Arc::clone(&slot.parked);
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let composite = match composite {
+                    OriginComposite::Cached(path) => path,
+                    OriginComposite::Render {
+                        project_path,
+                        scratch_root,
+                        id,
+                    } => {
+                        job::render_checkpoint_planes(&project_path, &scratch_root, &id, memory_cap)
+                            .map_err(|err| err.to_string())?
+                            .0
+                    }
+                };
+                job::OriginReaders::open(&composite, source, registration)
+                    .map_err(|err| err.to_string())
+            }))
+            .map_err(|_| "the origin worker panicked".to_string())
+            .and_then(|opened| opened)
+            .map(Arc::new);
+            parked
+                .lock()
+                .expect("no thread panicked while holding the parked origin readers")
+                .push((tab_id, generation, result));
+        });
+    }
+
+    /// The composite the active tab's strokes were drawn over: its row's
+    /// planes when they carry no strokes, else the fused ancestor's, cached or
+    /// to be rendered. `None` while the planes are not ready, or while a
+    /// render of the ancestor already writes the cache.
+    fn origin_composite(&mut self) -> Option<OriginComposite> {
+        let scratch_root = self.scratch_root();
+        let tab = self.state.active()?;
+        if tab.base_ops().is_empty() {
+            return match self.active_tab_planes() {
+                TabPlanes::Ready(composite, _) => Some(OriginComposite::Cached(composite)),
+                TabPlanes::Pending | TabPlanes::None => None,
+            };
+        }
+        let GuiProject::Opened(project) = &tab.project else {
+            return None;
+        };
+        let ancestor = project
+            .history()
+            .ancestors(&tab.plane_key()?)
+            .ok()?
+            .into_iter()
+            .find(|checkpoint| checkpoint.ops.is_empty())?
+            .id
+            .clone();
+        match job::cached_checkpoint_planes(project, &scratch_root, &ancestor) {
+            Ok(job::CheckpointPlanes::Ready(composite, _)) => {
+                Some(OriginComposite::Cached(composite))
+            }
+            Ok(job::CheckpointPlanes::NeedsRender) => {
+                // Two writers of one checkpoint's planes share a partial file.
+                let rendered_elsewhere = self
+                    .state
+                    .render
+                    .in_flight
+                    .as_ref()
+                    .is_some_and(|(_, id)| *id == ancestor)
+                    || self.state.origin.rendering().contains(&ancestor);
+                (!rendered_elsewhere).then(|| OriginComposite::Render {
+                    project_path: project.path().to_path_buf(),
+                    scratch_root,
+                    id: ancestor,
+                })
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the origin readers' composite could not be located");
+                None
+            }
+        }
+    }
+
+    /// Installs the parked origin readers without waiting on a worker. They
+    /// land only on a tab that still exists at the generation they were
+    /// started for; a failed open is logged once and not retried until the
+    /// row or frames change. Returns `true` once none is being opened.
+    pub fn settle_origin_readers(&mut self) -> bool {
+        let parked = std::mem::take(
+            &mut *self
+                .state
+                .origin
+                .parked
+                .lock()
+                .expect("no thread panicked while holding the parked origin readers"),
+        );
+        let scratch_root = self.scratch_root();
+        for (tab_id, generation, result) in parked {
+            let mut rendered = None;
+            self.state.origin.in_flight.retain(|(tab, started, id)| {
+                let ours = (*tab, *started) == (tab_id, generation);
+                if ours {
+                    rendered.clone_from(id);
+                }
+                !ours
+            });
+            let Some(index) = self.tab_index(tab_id) else {
+                continue;
+            };
+            let tab = &mut self.state.projects[index];
+            if tab.session_generation != generation {
+                continue;
+            }
+            match result {
+                Ok(readers) => {
+                    if let Some(id) = &rendered {
+                        tab.note_viewed(&scratch_root, id);
+                    }
+                    tab.origin = Some(readers);
+                    self.ensure_checkpoint_sources(index);
+                }
+                Err(reason) => {
+                    tracing::warn!(error = %reason, "the origin readers could not be opened");
+                    tab.origin_failed = true;
+                }
+            }
+        }
+        let wants_session = self.state.mode == ShellMode::Editor
+            || self.state.active().is_some_and(ProjectTab::on_ops_row);
+        if wants_session && self.state.active().is_some_and(|tab| tab.edit.is_none()) {
+            self.ensure_edit_session();
+        }
+        self.reopen_frame_sets();
+        self.state.origin.in_flight.is_empty()
+    }
+
+    /// Whether origin readers started opening since the last call -- the
+    /// bridge's cue to start polling [`Self::settle_origin_readers`].
+    pub fn take_origin_started(&mut self) -> bool {
+        std::mem::take(&mut self.state.origin.started)
     }
 
     /// Discards the active tab's own in-progress stroke, if any: restores
@@ -2466,7 +3535,21 @@ impl AppController {
         let tab = self.state.active()?;
         let sources = tab.fused()?.0.len();
         let mut draw = OverlayDraw::for_opacity(sources as u32, self.state.overlay.opacity);
-        draw.ops = tab.overlay_ops().into();
+        let ops = tab.overlay_ops();
+        draw.checkpoint_colors = ops
+            .iter()
+            .filter_map(|op| match op {
+                job::Op::BrushStroke {
+                    source: job::StrokeSource::Checkpoint(id),
+                    ..
+                } => Some((id.clone(), tab.checkpoint_colour(id)?)),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>()
+            .into();
+        draw.ops = ops.into();
+        draw.origin = tab.origin.clone().map(SharedOrigin);
+        draw.checkpoint_sources = SharedCheckpointSources(tab.checkpoint_sources().clone());
         Some(draw)
     }
 
@@ -2498,6 +3581,22 @@ impl AppController {
     /// every call from `selected`; no field holds a copy.
     pub fn brush_source(&self) -> Option<u16> {
         u16::try_from(self.state.active()?.selected).ok()
+    }
+
+    /// What the next stroke paints from: the chosen checkpoint once the
+    /// session holds its render, else the selected frame. `None` while the
+    /// chosen checkpoint renders or could not be rendered.
+    pub fn stroke_source(&self) -> Option<job::StrokeSource> {
+        match self.source_checkpoint() {
+            Some(key) => self
+                .state
+                .active()?
+                .edit
+                .as_ref()?
+                .has_checkpoint_source(&key)
+                .then_some(job::StrokeSource::Checkpoint(key)),
+            None => self.brush_source().map(job::StrokeSource::Frame),
+        }
     }
 
     pub fn select_dock_tab(&mut self, tab: DockTab) {
@@ -2593,6 +3692,7 @@ impl AppController {
         let dropped_session = tab.drop_session();
         tab.selected_checkpoint = Some(key);
         tab.free_unneeded_held();
+        tab.prune_source_checkpoint();
         let on_ops_row = tab.on_ops_row();
         if !unchanged || matches!(tab.row_planes, Some(RowPlanes::Refused(_))) {
             tab.row_planes = None;
@@ -3280,7 +4380,7 @@ impl AppController {
             ActionEvent::Fired {
                 action: Action::StepSourceFrame,
                 steps,
-            } => self.step_source_frame(steps),
+            } => self.step_source_rows(steps),
             ActionEvent::Fired {
                 action: Action::BrushSize,
                 steps,
@@ -3301,6 +4401,22 @@ impl AppController {
                 action: Action::PickSourceUnderPointer,
                 ..
             } => self.pick_source_under_pointer(),
+            ActionEvent::Fired {
+                action: Action::BrushModeNormal,
+                ..
+            } => self.set_brush_mode(job::BrushMode::Normal),
+            ActionEvent::Fired {
+                action: Action::BrushModeLighten,
+                ..
+            } => self.set_brush_mode(job::BrushMode::Lighten),
+            ActionEvent::Fired {
+                action: Action::BrushModeDarken,
+                ..
+            } => self.set_brush_mode(job::BrushMode::Darken),
+            ActionEvent::Fired {
+                action: Action::BrushModeDetail,
+                ..
+            } => self.set_brush_mode(job::BrushMode::Detail),
             ActionEvent::Start {
                 action: Action::Paint,
                 x,
@@ -3373,36 +4489,82 @@ impl AppController {
         }
     }
 
-    /// `Ctrl + Wheel` over the canvas, or a plain wheel over the `Images`
-    /// list ([`Self::images_list_wheel`]): steps the left pane's selected
-    /// frame, clamped to the frame list. In editor mode this is also the
-    /// brush source, which reads `tab.selected` directly
-    /// ([`AppController::brush_source`]).
-    fn step_source_frame(&mut self, steps: f32) {
-        // Negated: scrolling toward the user (positive `steps`) steps to an
-        // earlier frame, matching how the `Images` list itself scrolls.
-        let detents = self.wheel_detents(Action::StepSourceFrame, -steps);
-        if detents == 0 {
-            return;
-        }
-        let Some(tab) = self.state.active() else {
+    /// `Ctrl + Wheel` over the canvas: steps the brush source through the
+    /// selectable rows of the `Images` list, as the arrow keys and the list
+    /// wheel do (see [`Self::select_adjacent_image_row`]), clamped at the
+    /// list's ends. A no-op with no row on screen.
+    fn step_source_rows(&mut self, steps: f32) {
+        let panel = self.images_panel();
+        let Some(from) = self.current_image_row(&panel) else {
             return;
         };
-        let len = tab.frames.len();
-        if len == 0 {
-            return;
+        // Negated: scrolling toward the user (positive `steps`) steps to an
+        // earlier row, matching how the `Images` list itself scrolls.
+        let detents = self.wheel_detents(Action::StepSourceFrame, -steps);
+        if detents != 0 {
+            self.step_image_rows(&panel, from, detents);
         }
-        let next = (tab.selected as i32 + detents).clamp(0, len as i32 - 1) as usize;
-        self.select_frame(next);
     }
 
-    /// A plain wheel over the `Images` list: the same effect `Ctrl + Wheel`
-    /// over the canvas has (`step_source_frame`) -- not gated on `Ctrl`,
-    /// `legend` or `mutable`, so it works identically in stacking and editor
-    /// mode.
-    pub fn images_list_wheel(&mut self, steps: f32) {
-        self.step_source_frame(steps);
-        self.keep_selected_image_visible();
+    /// A plain wheel over row `row` of the `Images` list: steps the source
+    /// through the selectable rows in list order (see
+    /// [`Self::select_adjacent_image_row`]) and returns `true`. Returns
+    /// `false` and leaves the wheel to the list's own scrolling when the row
+    /// is a heading or the hidden line, or no selectable row lies in the
+    /// wheel's direction.
+    pub fn images_list_wheel(&mut self, row: usize, steps: f32) -> bool {
+        if steps == 0.0 {
+            return false;
+        }
+        let panel = self.images_panel();
+        let over_source = panel.rows.get(row).is_some_and(|row| {
+            matches!(
+                row.kind,
+                images::RowKind::Frame | images::RowKind::Checkpoint
+            )
+        });
+        // Positive `steps` steps to an earlier row (see `step_source_rows`).
+        let step = if steps > 0.0 { -1 } else { 1 };
+        let Some(from) = self.current_image_row(&panel) else {
+            return false;
+        };
+        if !over_source || panel.next_selectable(from, step).is_none() {
+            return false;
+        }
+        let detents = self.wheel_detents(Action::StepSourceFrame, -steps);
+        self.step_image_rows(&panel, from, detents);
+        true
+    }
+
+    /// The row of `panel` holding the brush source: the selected checkpoint
+    /// or frame, else the selected frame's row; `None` while a collapsed
+    /// group hides it.
+    fn current_image_row(&self, panel: &images::ImagesModel) -> Option<usize> {
+        panel
+            .rows
+            .iter()
+            .position(|row| row.selected)
+            .or_else(|| panel.row_of_frame(self.state.active()?.selected))
+    }
+
+    /// Moves the brush source `detents` selectable rows from row `from`
+    /// (negative up), stopping at the list's end, and scrolls the landed row
+    /// into view. A landed checkpoint row is chosen as a click does.
+    fn step_image_rows(&mut self, panel: &images::ImagesModel, from: usize, detents: i32) {
+        let step = detents.signum() as isize;
+        let mut at = from;
+        for _ in 0..detents.unsigned_abs() {
+            match panel.next_selectable(at, step) {
+                Some(next) => at = next,
+                None => break,
+            }
+        }
+        let row = panel.rows[at].clone();
+        let (top, height) = (row.top, row.height);
+        if at != from {
+            self.select_row(row);
+        }
+        self.scroll_rows_into_view(top, height);
     }
 
     /// The active tab's fused image's shorter side -- `Size`'s ceiling.
@@ -3450,6 +4612,10 @@ impl AppController {
             size_fraction: fraction_from_size(size, ceiling),
             soft: self.state.brush.soft,
             soft_fraction: self.state.brush.soft / 100.0,
+            mode: self.state.brush.mode,
+            opacity: self.state.brush.opacity,
+            opacity_fraction: self.state.brush.opacity / 100.0,
+            mode_menu_open: self.state.brush.mode_menu_open,
             picking: self.state.brush.picking,
             can_undo: self.edit_session().is_some_and(job::EditState::can_undo),
             can_redo: self.edit_session().is_some_and(job::EditState::can_redo),
@@ -3478,11 +4644,25 @@ impl AppController {
         let hovered = picking
             .then(|| {
                 let (pane, local) = self.anchor_pane();
-                self.source_index_at(pane, local)
+                self.source_index_at(pane, local).ok().flatten()
             })
-            .flatten()
-            .filter(|&source| source != job::NO_SOURCE);
-        let source = hovered.unwrap_or_else(|| u16::try_from(tab.selected).unwrap_or(u16::MAX));
+            .flatten();
+        let chosen = || {
+            self.source_checkpoint()
+                .and_then(|key| tab.checkpoint_colour(&key))
+                .unwrap_or_else(|| {
+                    job::source_color(u16::try_from(tab.selected).unwrap_or(u16::MAX), sources)
+                })
+        };
+        let pick_color = match hovered {
+            Some(job::StrokeSource::Frame(n)) if n != job::NO_SOURCE => {
+                job::source_color(n, sources)
+            }
+            Some(job::StrokeSource::Checkpoint(key)) if tab.lists_checkpoint(&key) => {
+                tab.checkpoint_colour(&key).unwrap_or_else(chosen)
+            }
+            _ => chosen(),
+        };
         let (active_pane, local) = self.anchor_pane();
         let source_point = viewport.to_source_in(local, self.pane_rect(active_pane)?);
         Some(BrushCursorView {
@@ -3490,9 +4670,23 @@ impl AppController {
             ring_commands: paths.ring,
             core_commands: paths.core,
             picking,
-            pick_color: job::source_color(source, sources),
+            pick_color,
             frame_position: viewport.from_source_in(source_point, left),
             composite_position: viewport.from_source_in(source_point, right),
+            mode_tag: if picking {
+                ""
+            } else {
+                match self.state.brush.mode {
+                    job::BrushMode::Normal => "N",
+                    job::BrushMode::Lighten => "L",
+                    job::BrushMode::Darken => "D",
+                    job::BrushMode::Detail => "T",
+                }
+            },
+            tag_origin: paths.tag_origin,
+            checkpoint_colour: self
+                .source_checkpoint()
+                .and_then(|key| tab.checkpoint_colour(&key)),
         })
     }
 
@@ -3511,6 +4705,38 @@ impl AppController {
         self.emit(ShellEvent::EditorChanged);
     }
 
+    /// The opacity slider's own callback: `fraction` is `0.0..=1.0` along
+    /// the track and lands on a whole percentage of at least 1, so the
+    /// stroke it freezes is never fully transparent.
+    pub fn set_brush_opacity_fraction(&mut self, fraction: f32) {
+        self.state.brush.opacity = (fraction * 100.0).round().clamp(1.0, 100.0);
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// Picks the brush's blend mode and closes the mode list.
+    pub fn set_brush_mode(&mut self, mode: job::BrushMode) {
+        self.state.brush.mode = mode;
+        self.state.brush.mode_menu_open = false;
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// Opens or closes the mode list. A no-op outside the editor.
+    pub fn toggle_brush_mode_menu(&mut self) {
+        if self.mode() != ShellMode::Editor {
+            return;
+        }
+        self.state.brush.mode_menu_open = !self.state.brush.mode_menu_open;
+        self.emit(ShellEvent::EditorChanged);
+    }
+
+    /// Closes the mode list; nothing else changes.
+    pub fn close_brush_mode_menu(&mut self) {
+        if self.state.brush.mode_menu_open {
+            self.state.brush.mode_menu_open = false;
+            self.emit(ShellEvent::EditorChanged);
+        }
+    }
+
     /// Toggles the pipette's armed state.
     pub fn toggle_pipette(&mut self) {
         self.state.brush.picking = !self.state.brush.picking;
@@ -3524,6 +4750,12 @@ impl AppController {
         let ceiling = self.brush_size_ceiling();
         let size = self.state.brush.size.clamp(1.0, ceiling as f32);
         (size / 2.0, self.state.brush.soft / 100.0)
+    }
+
+    /// The brush's blend mode and opacity in the storage units core's
+    /// retouch ops take (`opacity` as a fraction of one).
+    fn brush_mode_opacity(&self) -> (job::BrushMode, f32) {
+        (self.state.brush.mode, self.state.brush.opacity / 100.0)
     }
 
     /// `Ctrl + Z`: steps the active tab's pending strokes back one op and
@@ -3588,38 +4820,99 @@ impl AppController {
         self.emit(ShellEvent::EditorChanged);
     }
 
-    /// The frame the overlay shows under `local` (pane-local coordinates):
-    /// the latest stroke covering the pixel by more than half, else the
-    /// stored Z-Map's index. `None` off the image or with nothing to read;
-    /// callers decide what `NO_SOURCE` means to them.
-    fn source_index_at(&self, pane: PaneSource, local: (f32, f32)) -> Option<u16> {
-        let tab = self.state.active()?;
-        let viewport = tab.viewport.as_ref()?;
-        let (sx, sy) = viewport.to_source_in(local, self.pane_rect(pane)?);
+    /// The source the overlay shows under `local` (pane-local coordinates):
+    /// the latest stroke covering the pixel by more than half (a frame or a
+    /// checkpoint, hidden-but-kept ones included), else the stored Z-Map's
+    /// frame. `None` off the image or with nothing to read; callers decide
+    /// what `NO_SOURCE` and an unlisted checkpoint mean to them.
+    fn source_index_at(
+        &self,
+        pane: PaneSource,
+        local: (f32, f32),
+    ) -> Result<Option<job::StrokeSource>, job::RetouchError> {
+        let Some(tab) = self.state.active() else {
+            return Ok(None);
+        };
+        let (Some(viewport), Some(rect), Some(edit)) = (
+            tab.viewport.as_ref(),
+            self.pane_rect(pane),
+            tab.edit.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        let (sx, sy) = viewport.to_source_in(local, rect);
+        let info = edit.info();
         if sx < 0.0 || sy < 0.0 {
-            return None;
+            return Ok(None);
         }
         let (x, y) = (sx.floor() as u32, sy.floor() as u32);
-        let edit = tab.edit.as_ref()?;
-        let info = edit.info();
         if x >= info.width() || y >= info.height() {
-            return None;
+            return Ok(None);
         }
-        job::top_source(&edit.drawn_ops(), info, x, y).or_else(|| edit.stored_source(x, y))
+        let ops = edit.drawn_ops();
+        let pixel = job::Rect {
+            x,
+            y,
+            width: 1,
+            height: 1,
+        };
+        let conditions = if job::needs_mode_conditions(&ops, info, pixel) {
+            let renders = tab.checkpoint_sources();
+            let unrendered = ops.iter().any(|op| {
+                matches!(op, job::Op::BrushStroke {
+                    source: job::StrokeSource::Checkpoint(id),
+                    ..
+                } if !renders.contains_key(id))
+                    && job::footprint(op, info)
+                        .is_ok_and(|fp| fp.is_some_and(|fp| fp.intersect(pixel).is_some()))
+            });
+            match (&tab.origin, tab.origin_failed) {
+                (Some(origin), false) if !unrendered => {
+                    origin.conditions(&ops, info, pixel, std::num::NonZeroU32::MIN, renders)?
+                }
+                _ => return Ok(None),
+            }
+        } else {
+            job::ModeConditions::default()
+        };
+        let top = job::top_source(&ops, info, x, y, &conditions, &|id| {
+            tab.checkpoint_colour(id)
+        })
+        .cloned();
+        Ok(top.or_else(|| edit.stored_source(x, y).map(job::StrokeSource::Frame)))
     }
 
-    /// `Alt + click`, or the armed pipette's `Start`: reads the frame the
+    /// `Alt + click`, or the armed pipette's `Start`: reads the source the
     /// overlay shows under `local` (pane-local coordinates) and makes it the
-    /// brush source.
-    /// `NO_SOURCE` and a point off the image leave the source unchanged.
+    /// brush source: a frame, or a listed checkpoint as a click on its row
+    /// does. `NO_SOURCE`, a hidden-but-kept checkpoint and a point off the
+    /// image leave the source unchanged.
     fn pick_source_at(&mut self, pane: PaneSource, local: (f32, f32)) {
-        let Some(source) = self.source_index_at(pane, local) else {
-            return;
+        self.start_origin_readers(true);
+        let source = match self.source_index_at(pane, local) {
+            Ok(Some(source)) => source,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, "the frame under the pointer could not be read");
+                if let Some(tab) = self.state.active_mut() {
+                    tab.origin_failed = true;
+                }
+                return;
+            }
         };
-        if source == job::NO_SOURCE {
-            return;
+        match source {
+            job::StrokeSource::Frame(job::NO_SOURCE) => {}
+            job::StrokeSource::Frame(frame) => self.select_frame(usize::from(frame)),
+            job::StrokeSource::Checkpoint(key) => {
+                if self
+                    .state
+                    .active()
+                    .is_some_and(|tab| tab.lists_checkpoint(&key))
+                {
+                    self.choose_checkpoint_source(key);
+                }
+            }
         }
-        self.select_frame(source as usize);
     }
 
     /// `Alt + click`: picks without arming the pipette.
@@ -3636,6 +4929,10 @@ impl AppController {
     /// softness for the stroke. Both panes share one viewport, so the stroke
     /// is the same whichever pane the press lands in.
     fn paint_start(&mut self, x: f32, y: f32) {
+        if self.state.brush.mode_menu_open {
+            self.close_brush_mode_menu();
+            return;
+        }
         if self.state.brush.picking {
             let (pane, local) = self.anchor_pane();
             self.pick_source_at(pane, local);
@@ -3656,10 +4953,11 @@ impl AppController {
         let Some(rect) = self.pane_rect(pane) else {
             return;
         };
-        let Some(source) = self.brush_source() else {
+        let Some(source) = self.stroke_source() else {
             return;
         };
         let (radius, softness) = self.brush_radius_softness();
+        let (mode, opacity) = self.brush_mode_opacity();
         let Some(tab) = self.state.active_mut() else {
             return;
         };
@@ -3674,6 +4972,8 @@ impl AppController {
             source,
             radius,
             softness,
+            mode,
+            opacity,
             sx as f32 - 0.5,
             sy as f32 - 0.5,
         ));
@@ -3716,18 +5016,24 @@ impl AppController {
         let Some(segment) = stroke.take_segment() else {
             return;
         };
-        let (source_id, radius, softness) = (stroke.source(), stroke.radius(), stroke.softness());
+        let (radius, softness) = (stroke.radius(), stroke.softness());
+        let source = stroke.source().clone();
+        let (mode, opacity) = (stroke.mode(), stroke.opacity());
         let op = job::Op::BrushStroke {
-            source_id,
+            source: source.clone(),
             path: segment,
             radius,
             softness,
+            mode,
+            opacity,
         };
         let so_far = job::Op::BrushStroke {
-            source_id,
+            source,
             path: stroke.path_so_far(),
             radius,
             softness,
+            mode,
+            opacity,
         };
         let region = job::footprint(&op, edit.info())
             .expect("a live stroke's own points are pre-clamped to what validate accepts");
@@ -3766,10 +5072,12 @@ impl AppController {
             return;
         };
         let op = job::Op::BrushStroke {
-            source_id: stroke.source(),
+            source: stroke.source().clone(),
             path: stroke.finish(),
             radius: stroke.radius(),
             softness: stroke.softness(),
+            mode: stroke.mode(),
+            opacity: stroke.opacity(),
         };
         let has_footprint = job::footprint(&op, edit.info()).ok().flatten().is_some();
         let mut touched = stroke.tick_rects;
@@ -5237,14 +6545,14 @@ impl AppController {
                 AnalyticsSnapshot::Partial(counts) => AnalyticsView::Counting(
                     analytics::build_rows(&analytics.frames, &counts, RowValue::Partial),
                 ),
-                AnalyticsSnapshot::Done(Ok(counts)) => {
-                    let rows = analytics::build_rows(&analytics.frames, &counts, RowValue::Final);
+                AnalyticsSnapshot::Done(Ok(areas)) => {
+                    let view = analytics::finished_view(&analytics.frames, &areas);
                     if let Some(tab) = analytics.tab {
                         analytics
                             .cache
-                            .insert(tab, (analytics.frames.clone(), counts));
+                            .insert(tab, (analytics.frames.clone(), areas));
                     }
-                    AnalyticsView::Rows(rows)
+                    view
                 }
                 AnalyticsSnapshot::Done(Err(message)) => AnalyticsView::Failed(message),
             };
@@ -5280,6 +6588,10 @@ impl AppController {
         let hold = self.analytics_hold;
         let tile_pause = self.analytics_tile_pause;
         let tile_size = self.analytics_tile_size;
+        let backend = focusforge_gpu::harness::sharpness_backend_for(
+            !self.performance.gpu,
+            self.performance.max_vram_bytes(),
+        );
         self.stop_analytics_count();
         let analytics = &mut self.state.analytics;
         analytics.tab = Some(id);
@@ -5313,15 +6625,20 @@ impl AppController {
             };
             // A stopped count parks nothing, so it cannot replace the
             // snapshot of the count that superseded it.
-            let result =
-                match analytics::count_frames(&frames, tile_size, &*control, &mut |counts| {
+            let result = match analytics::count_frames(
+                &frames,
+                tile_size,
+                &*control,
+                &mut |counts| {
                     park(AnalyticsSnapshot::Partial(counts.to_vec()));
                     std::thread::sleep(tile_pause);
-                }) {
-                    Ok(counts) => Ok(counts),
-                    Err(CountError::Failed(message)) => Err(message),
-                    Err(CountError::Stopped) => return,
-                };
+                },
+                backend,
+            ) {
+                Ok(areas) => Ok(areas),
+                Err(CountError::Failed(message)) => Err(message),
+                Err(CountError::Stopped) => return,
+            };
             park(AnalyticsSnapshot::Done(result));
         }));
         self.apply_analytics_priority();
@@ -5354,17 +6671,17 @@ impl AppController {
             )
         {
             // The count in flight (or its failure) stands.
-        } else if let Some((_, counts)) = analytics
+        } else if let Some((_, areas)) = analytics
             .cache
             .get(&id)
             .filter(|(counted, _)| *counted == frames)
         {
-            let rows = analytics::build_rows(&frames, counts, RowValue::Final);
+            let view = analytics::finished_view(&frames, areas);
             self.stop_analytics_count();
             let analytics = &mut self.state.analytics;
             analytics.tab = Some(id);
             analytics.frames = frames;
-            analytics.view = AnalyticsView::Rows(rows);
+            analytics.view = view;
             self.emit(ShellEvent::AnalyticsChanged);
         } else {
             analytics.cache.remove(&id);
@@ -5417,6 +6734,10 @@ impl AppController {
             }
             if self.state.analytics.open {
                 self.close_analytics();
+                return ChromeKey::Consumed;
+            }
+            if self.state.brush.mode_menu_open {
+                self.close_brush_mode_menu();
                 return ChromeKey::Consumed;
             }
             return ChromeKey::None;
@@ -6203,21 +7524,102 @@ impl AppController {
     /// tab active ("+" selected).
     pub fn images_panel(&self) -> images::ImagesModel {
         let legend = self.mode() == ShellMode::Editor;
+        let row_height = self.image_row_height();
         let Some(tab) = self.state.active() else {
-            return images::build_model(&[], &[], None, legend, &HashMap::new());
+            return images::build_model(&[], &[], None, legend, &HashMap::new(), row_height, None);
         };
+        let groups = legend.then(|| tab.image_groups());
+        let source_is_checkpoint = groups.as_ref().is_some_and(|g| g.selected.is_some());
         images::build_model(
             &tab.frames,
             &tab.excluded,
-            Some(tab.selected),
+            (!source_is_checkpoint).then_some(tab.selected),
             legend,
             &tab.meta,
+            row_height,
+            groups.as_ref(),
         )
+    }
+
+    /// The checkpoint chosen as the brush source, `None` while a frame is.
+    pub fn source_checkpoint(&self) -> Option<String> {
+        if self.mode() != ShellMode::Editor {
+            return None;
+        }
+        self.state.active()?.listed_source()
+    }
+
+    /// Acts on a click on row `index` of [`Self::images_panel`]: a frame row
+    /// selects that frame, a checkpoint row chooses it as the brush source
+    /// (the edited checkpoint stays), a group heading folds its group.
+    pub fn select_image_row(&mut self, index: usize) {
+        if let Some(row) = self.images_panel().rows.into_iter().nth(index) {
+            self.select_row(row);
+        }
+    }
+
+    fn select_row(&mut self, row: images::ImageRow) {
+        match row.kind {
+            images::RowKind::Frame => {
+                if let Some(frame) = row.frame {
+                    self.select_frame(frame);
+                }
+            }
+            images::RowKind::Checkpoint => {
+                if let Some(key) = row.key {
+                    self.choose_checkpoint_source(key);
+                }
+            }
+            images::RowKind::ResultsHeading => self.toggle_image_group(true),
+            images::RowKind::FramesHeading => self.toggle_image_group(false),
+            images::RowKind::Hidden => {}
+        }
+    }
+
+    /// Chooses listed checkpoint `key` as the brush source (the edited
+    /// checkpoint stays).
+    fn choose_checkpoint_source(&mut self, key: String) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        tab.source_checkpoint = Some(key.clone());
+        let tab_id = tab.id;
+        self.state
+            .sources
+            .failed
+            .retain(|(tab, _, failed)| (*tab, failed) != (tab_id, &key));
+        if let Some(index) = self.state.active {
+            self.ensure_checkpoint_sources(index);
+        }
+        self.emit(ShellEvent::ImagesChanged);
+    }
+
+    /// Folds or unfolds the Results (`results`) or Frames group of the
+    /// editor list; the brush source is untouched.
+    fn toggle_image_group(&mut self, results: bool) {
+        let Some(tab) = self.state.active_mut() else {
+            return;
+        };
+        let flag = if results {
+            &mut tab.results_collapsed
+        } else {
+            &mut tab.frames_collapsed
+        };
+        *flag = !*flag;
+        self.set_images_scroll(self.state.images_scroll_y);
+        self.refresh_source_previews();
+        self.emit(ShellEvent::ImagesChanged);
     }
 
     /// Queues only the active virtual window. The worker owns all source I/O
     /// and admission; this controller path only replaces immutable identities.
     pub fn refresh_source_previews(&mut self) {
+        self.refresh_source_previews_in(None);
+    }
+
+    /// [`Self::refresh_source_previews`] over `panel`, the model the caller
+    /// already built; `None` builds it when the window needs it.
+    fn refresh_source_previews_in(&mut self, panel: Option<&images::ImagesModel>) {
         if self.any_job_running() {
             self.preview_requests.clear();
             self.preview_budget_bytes = 0;
@@ -6229,31 +7631,51 @@ impl AppController {
         let requests = if self.source_presentation() == SourcePresentation::List {
             Vec::new()
         } else if let Some(tab) = self.state.active() {
-            let height = self.image_row_height();
-            if self.state.images_viewport_height <= 0.0 || height <= 0.0 {
+            if self.state.images_viewport_height <= 0.0 {
                 Vec::new()
             } else {
-                let scroll_y = self.images_scroll_y();
-                let first = (scroll_y / height).floor().max(0.0) as usize;
-                let visible_end = ((scroll_y + self.state.images_viewport_height) / height)
-                    .ceil()
-                    .max(1.0) as usize;
-                let count = tab.frames.len();
-                let first = first.min(count);
-                let visible_end = visible_end.min(count);
+                let built;
+                let panel = match panel {
+                    Some(panel) => panel,
+                    None => {
+                        built = self.images_panel();
+                        &built
+                    }
+                };
+                let scroll_y = self.images_scroll_y_in(panel.content_height());
+                let viewport_end = scroll_y + self.state.images_viewport_height;
+                let count = panel.rows.len();
+                // The model rows meeting the viewport.
+                let first = panel
+                    .rows
+                    .iter()
+                    .position(|row| row.top + row.height > scroll_y)
+                    .unwrap_or(count);
+                let visible_end = panel
+                    .rows
+                    .iter()
+                    .position(|row| row.top >= viewport_end)
+                    .unwrap_or(count)
+                    .max(first);
                 let start = first.saturating_sub(2);
                 let end = visible_end.saturating_add(2).min(count);
                 // Visible rows render first, top to bottom, then the prefetch
                 // rows above and below.
                 let order = [first..visible_end, start..first, visible_end..end];
+                let mut held = None;
                 order
                     .into_iter()
-                    .flat_map(|range| &tab.frames[range])
-                    .filter(|path| tab.meta.get(*path).is_some_and(|meta| !meta.unresolved))
-                    .map(|path| PreviewRequest {
+                    .flat_map(|range| &panel.rows[range])
+                    .filter_map(|row| {
+                        tab.preview_source(row, || {
+                            held.get_or_insert_with(|| HeldSnapshot(tab.held.clone().into()))
+                                .clone()
+                        })
+                    })
+                    .map(|source| PreviewRequest {
                         tab_id: tab.id,
                         generation: self.preview_generation,
-                        path: path.clone(),
+                        source,
                     })
                     .collect()
             }
@@ -6269,8 +7691,8 @@ impl AppController {
             .values()
             .map(|pixels| pixels.rgba.len() as u64 * 2)
             .sum();
-        let host_budget = job::host_budget().capped_to(self.performance.max_host_memory_bytes());
-        let budget = host_budget
+        let budget = self
+            .frame_set_budget()
             .reduced_by(self.preview_cache_bytes)
             .reduced_by(self.published_preview_bytes.load(Ordering::Acquire));
         let remaining = budget.bytes();
@@ -6372,41 +7794,46 @@ impl AppController {
         changed
     }
 
-    pub fn source_preview(&self, path: &Path) -> Option<&Arc<PreviewPixels>> {
+    /// The source `row`'s thumbnail shows, for [`Self::source_preview`] and
+    /// [`Self::source_preview_state`]; `None` for rows without a thumbnail.
+    pub fn row_preview_source(&self, row: &images::ImageRow) -> Option<PreviewSource> {
+        self.state
+            .active()?
+            .preview_source(row, HeldSnapshot::default)
+    }
+
+    pub fn source_preview(&self, source: &PreviewSource) -> Option<&Arc<PreviewPixels>> {
         let tab_id = self.state.active()?.id;
         self.preview_cache.get(&PreviewRequest {
             tab_id,
             generation: self.preview_generation,
-            path: path.to_path_buf(),
+            source: source.clone(),
         })
     }
 
     /// Whether this model row intersects the current source-list viewport.
     /// Prefetched pixels remain Rust-side only until their row becomes visible.
-    pub fn source_preview_row_visible(&self, index: usize) -> bool {
-        let height = self.image_row_height();
-        if self.state.images_viewport_height <= 0.0 || height <= 0.0 {
+    pub fn source_preview_row_visible(&self, row: &images::ImageRow) -> bool {
+        let viewport = self.state.images_viewport_height;
+        if viewport <= 0.0 || row.height <= 0.0 {
             return false;
         }
-        let first = (self.state.images_scroll_y / height).floor().max(0.0) as usize;
-        let end = ((self.state.images_scroll_y + self.state.images_viewport_height) / height)
-            .ceil()
-            .max(1.0) as usize;
-        index >= first && index < end
+        let scroll_y = self.state.images_scroll_y;
+        row.top < scroll_y + viewport && row.top + row.height > scroll_y
     }
 
-    pub fn source_preview_state(&self, path: &Path, unresolved: bool) -> &'static str {
+    pub fn source_preview_state(&self, source: &PreviewSource, unresolved: bool) -> &'static str {
         if unresolved {
             return "missing";
         }
-        if self.source_preview(path).is_some() {
+        if self.source_preview(source).is_some() {
             return "ready";
         }
         let active = self.state.active().map(|tab| tab.id);
         if self.preview_failures.keys().any(|request| {
             Some(request.tab_id) == active
                 && request.generation == self.preview_generation
-                && request.path == path
+                && request.source == *source
         }) {
             return "unavailable";
         }
@@ -6489,9 +7916,7 @@ impl AppController {
     }
 
     fn images_content_height(&self) -> f32 {
-        self.state
-            .active()
-            .map_or(0.0, |tab| tab.frames.len() as f32 * self.image_row_height())
+        self.images_panel().content_height()
     }
 
     fn keep_selected_image_visible(&mut self) {
@@ -6501,19 +7926,29 @@ impl AppController {
         self.keep_image_visible(selected);
     }
 
-    /// Scrolls a valid source row into the source-list viewport without
-    /// changing which source is selected.
+    /// Scrolls the row of frame `index` into the source-list viewport
+    /// without changing which source is selected; a frame hidden by a
+    /// collapsed group or past the list is left alone.
     fn keep_image_visible(&mut self, index: usize) {
-        let Some(frame_count) = self.state.active().map(|tab| tab.frames.len()) else {
-            return;
-        };
         let viewport = self.state.images_viewport_height;
-        if viewport <= 0.0 || index >= frame_count {
+        if viewport <= 0.0 {
             return;
         }
-        let row_height = self.image_row_height();
-        let top = index as f32 * row_height;
-        let bottom = top + row_height;
+        let panel = self.images_panel();
+        let Some(row) = panel.row_of_frame(index).map(|row| &panel.rows[row]) else {
+            return;
+        };
+        self.scroll_rows_into_view(row.top, row.height);
+    }
+
+    /// Scrolls the source-list viewport the least that shows the span
+    /// `top .. top + height`.
+    fn scroll_rows_into_view(&mut self, top: f32, height: f32) {
+        let viewport = self.state.images_viewport_height;
+        if viewport <= 0.0 {
+            return;
+        }
+        let bottom = top + height;
         let current = self.state.images_scroll_y;
         let target = if top < current {
             top
@@ -6569,41 +8004,26 @@ impl AppController {
             return;
         }
         tab.selected = index;
+        tab.source_checkpoint = None;
+        if let Some(index) = self.state.active {
+            self.ensure_checkpoint_sources(index);
+        }
         self.emit(ShellEvent::ImagesChanged);
     }
 
-    /// Selects the next resolved source in `direction`, retaining the current
-    /// source when the selection is already at that edge.
-    pub fn select_adjacent_resolved_frame(&mut self, direction: i32) {
-        let step = direction.signum() as isize;
-        let next = {
-            let Some(tab) = self.state.active() else {
-                return;
-            };
-            if step == 0 {
-                None
-            } else {
-                let mut index = tab.selected as isize;
-                loop {
-                    index += step;
-                    if index < 0 || index >= tab.frames.len() as isize {
-                        break None;
-                    }
-                    let index = index as usize;
-                    if tab
-                        .meta
-                        .get(&tab.frames[index])
-                        .is_some_and(|meta| !meta.unresolved)
-                    {
-                        break Some(index);
-                    }
-                }
-            }
-        };
-        if let Some(next) = next {
-            self.select_frame(next);
+    /// Selects the next resolved source in `direction` (negative up) in list
+    /// order: in the editor the Results group's checkpoint rows come before
+    /// the frames, so stepping up from the first frame lands on the last
+    /// checkpoint row. Headings, the hidden line and unresolved frames are
+    /// skipped; the source is retained at either end of the list.
+    pub fn select_adjacent_image_row(&mut self, direction: i32) {
+        if direction == 0 {
+            return;
         }
-        self.keep_selected_image_visible();
+        let panel = self.images_panel();
+        if let Some(from) = self.current_image_row(&panel) {
+            self.step_image_rows(&panel, from, direction.signum());
+        }
     }
 
     /// The selected frame's path -- `None` with no tab active or an empty
@@ -6634,12 +8054,75 @@ impl AppController {
         })
     }
 
-    /// The left pane's label: the selected frame's file name, or empty with
-    /// no tab active or nothing selected.
+    /// What the left pane shows: the chosen checkpoint's scratch render (or
+    /// its pending or refused state) while one is the brush source, else the
+    /// selected frame. `None` with no tab active or nothing selected.
+    pub fn frame_pane(&self) -> Option<FramePane> {
+        let Some(row) = self.source_row() else {
+            let path = self.selected_frame_path()?;
+            return Some(FramePane::Frame(path, self.selected_frame_view()));
+        };
+        let tab = self.state.active()?;
+        if let Some(path) = tab
+            .edit
+            .as_ref()
+            .and_then(|edit| edit.checkpoint_source_path(&row.key))
+        {
+            return Some(FramePane::Checkpoint(path.to_path_buf()));
+        }
+        let failed = self
+            .state
+            .sources
+            .failed
+            .iter()
+            .any(|(id, generation, key)| {
+                (*id, *generation, key.as_str())
+                    == (tab.id, tab.session_generation, row.key.as_str())
+            });
+        Some(if failed {
+            FramePane::Refused(job::checkpoint_refusal_lines(&checkpoint_pane_label(&row)))
+        } else {
+            FramePane::Rendering
+        })
+    }
+
+    /// The chosen brush-source checkpoint's Results row, while it is listed.
+    fn source_row(&self) -> Option<images::ResultRow> {
+        if self.mode() != ShellMode::Editor {
+            return None;
+        }
+        let groups = self.state.active()?.image_groups();
+        let key = groups.selected?;
+        groups.rows.into_iter().find(|row| row.key == key)
+    }
+
+    /// The left pane's label: `Checkpoint · [<name> · ]<method> <time>[ · N
+    /// strokes]` while a checkpoint is the brush source, else the selected
+    /// frame's file name; empty with no tab active or nothing selected.
     pub fn frame_pane_label(&self) -> String {
+        if let Some(row) = self.source_row() {
+            return checkpoint_pane_label(&row);
+        }
         self.selected_frame_path()
             .map(|path| images::file_name(&path))
             .unwrap_or_default()
+    }
+
+    /// The mark ahead of the left pane label: the checkpoint icon in the
+    /// checkpoint's colour, or for a chosen frame a square in the colour the
+    /// overlay and the pipette swatch use for it. `None` with no tab active
+    /// or nothing selected.
+    pub fn frame_pane_label_mark(&self) -> Option<LabelMark> {
+        if let Some(row) = self.source_row() {
+            return Some(LabelMark::Icon(row.colour));
+        }
+        self.selected_frame_path()?;
+        let tab = self.state.active()?;
+        let source = u16::try_from(tab.selected).unwrap_or(u16::MAX);
+        Some(LabelMark::Swatch(job::source_color(
+            source,
+            tab.frames.len().max(1) as u32,
+        )))
     }
 
     /// Adds `paths` to the active tab: hashes on a worker thread, then
@@ -7650,15 +9133,16 @@ impl AppController {
     /// Mirrors the `Images` list's own scroll offset, clamped, with no event
     /// -- the list already shows it. Returns whether the offset moved.
     pub fn images_viewport_scrolled(&mut self, offset_px: f32) -> bool {
+        let panel = self.images_panel();
         let offset = settings_panel::clamp_panel_scroll(
             offset_px,
-            self.images_content_height(),
+            panel.content_height(),
             self.state.images_viewport_height,
         );
         let moved = offset != self.state.images_scroll_y;
         self.state.images_scroll_y = offset;
         if moved {
-            self.refresh_source_previews();
+            self.refresh_source_previews_in(Some(&panel));
         }
         moved
     }
@@ -7720,9 +9204,15 @@ impl AppController {
 
     /// The `Images` list's scroll offset, clamped to the active tab's rows.
     pub fn images_scroll_y(&self) -> f32 {
+        self.images_scroll_y_in(self.images_content_height())
+    }
+
+    /// [`Self::images_scroll_y`] for a list `content_height` tall, so a caller
+    /// holding the model does not build it again.
+    pub fn images_scroll_y_in(&self, content_height: f32) -> f32 {
         settings_panel::clamp_panel_scroll(
             self.state.images_scroll_y,
-            self.images_content_height(),
+            content_height,
             self.state.images_viewport_height,
         )
     }
@@ -8042,6 +9532,7 @@ impl AppController {
                 self.host_notes.rejected = None;
                 self.save_performance();
                 self.refresh_source_previews();
+                self.reopen_frame_sets();
             }
             Err(_) => self.host_notes.rejected = Some(text.to_string()),
         }
@@ -9192,6 +10683,7 @@ impl AppController {
             parent,
         });
         tab.free_unneeded_held();
+        tab.prune_source_checkpoint();
         // The new checkpoint's own extent may differ from what the viewport
         // was fitted to (a first fuse's crop, a re-fuse over a changed frame
         // set) -- refit on the next `fit_if_unfitted` rather than keep
@@ -9334,6 +10826,7 @@ impl AppController {
     fn active_tab_planes(&mut self) -> TabPlanes {
         let scratch_root = self.scratch_root();
         let render_free = self.state.render.in_flight.is_none();
+        let origin_rendering = self.state.origin.rendering();
         let Some(tab) = self.state.active_mut() else {
             return TabPlanes::None;
         };
@@ -9388,7 +10881,7 @@ impl AppController {
                 TabPlanes::None
             }
             Ok(job::CheckpointPlanes::NeedsRender) => {
-                if render_free {
+                if render_free && !origin_rendering.contains(&key) {
                     let project_path = project.path().to_path_buf();
                     tab.row_planes = Some(RowPlanes::Pending);
                     let tab_id = tab.id;
@@ -9410,10 +10903,11 @@ impl AppController {
     ) {
         self.state.render.in_flight = Some((tab_id, key.clone()));
         self.state.render.started = true;
+        let memory_cap = self.performance.max_host_memory_bytes();
         let outcome = Arc::clone(&self.state.render.outcome);
         std::thread::spawn(move || {
             let result = job::render_outcome(std::panic::catch_unwind(|| {
-                job::render_checkpoint_planes(&project_path, &scratch_root, &key)
+                job::render_checkpoint_planes(&project_path, &scratch_root, &key, memory_cap)
             }));
             *outcome
                 .lock()
@@ -9525,6 +11019,7 @@ impl AppController {
             parent: Some(parent),
         });
         tab.selected_checkpoint = Some(checkpoints::held_key(tab.held.len() - 1));
+        tab.prune_source_checkpoint();
         tab.row_planes = shown;
         self.mark_fresh_checkpoint(index);
         self.emit(ShellEvent::CheckpointsChanged);
@@ -9552,6 +11047,7 @@ impl AppController {
             Some(index) => job::ParentRef::Entry(index),
             None => job::ParentRef::Saved(id.to_string()),
         });
+        tab.prune_source_checkpoint();
         self.emit(ShellEvent::CheckpointsChanged);
         true
     }
@@ -9588,13 +11084,15 @@ impl AppController {
             .iter()
             .find(|entry| entry.id.as_deref() == Some(key.as_str()))?;
         let others = panel.row_count - 1;
-        let body = if others == 1 {
+        let untouched = if others == 1 {
             "The other checkpoint is untouched, and the stack is not fused again.".to_string()
         } else {
             format!(
                 "The other {others} checkpoints are untouched, and the stack is not fused again."
             )
         };
+        let (stored, live) = self.state.active()?.strokes_using(key);
+        let body = used_checkpoint_body(stored, live, &untouched).unwrap_or(untouched);
         Some((format!("{} · {}", row.algorithm, row.time_text), body))
     }
 
@@ -9912,13 +11410,33 @@ impl AppController {
             {
                 tab.fresh_checkpoint = Some((saved, generation));
             }
+            tab.source_checkpoint = tab
+                .source_checkpoint
+                .as_deref()
+                .and_then(|row| tab.saved_row_key(row, &ids, keep.as_ref()));
             tab.selected_checkpoint =
                 next.or_else(|| project.history().visible().first().map(|c| c.id.clone()));
             tab.row_planes = None;
             tab.project = GuiProject::Opened(Box::new(project));
             tab.title = entry::tab_title(&tab.project);
+            let saved: Vec<Option<String>> = (0..tab.held.len())
+                .map(|entry| tab.saved_row_key(&checkpoints::held_key(entry), &ids, keep.as_ref()))
+                .collect();
+            if let Some(edit) = tab.edit.as_mut() {
+                edit.rewrite_checkpoint_sources(|source| {
+                    let written = saved.get(checkpoints::held_index(source)?);
+                    Some(
+                        written
+                            .cloned()
+                            .flatten()
+                            .unwrap_or_else(|| job::GONE_KEY.to_string()),
+                    )
+                });
+            }
             remove_in_memory(&tab.held);
             tab.held.clear();
+            self.ensure_checkpoint_sources(index);
+            let tab = &mut self.state.projects[index];
             tab.compressing.clear();
             tab.pending_deletes.clear();
             if tab.edit.is_none() {
@@ -10969,14 +12487,32 @@ fn export_source_for(tab: &ProjectTab) -> Option<job::ExportSource> {
         .filter(|edit| edit.op_count() > 0 || info.live)
     {
         let (sources, registration) = tab.fused()?;
-        return Some(job::ExportSource::Pending(job::PendingState {
-            composite: edit.composite.clone(),
-            ops: edit.stack_ops(),
-            sources,
-            registration,
-            reference: info.reference,
-            description: info.description,
-        }));
+        let ops = edit.stack_ops();
+        let names_checkpoint = ops.iter().any(|op| {
+            matches!(
+                op,
+                job::Op::BrushStroke {
+                    source: job::StrokeSource::Checkpoint(_),
+                    ..
+                }
+            )
+        });
+        let project_path = match &tab.project {
+            GuiProject::Opened(project) if names_checkpoint => Some(project.path().to_path_buf()),
+            _ => None,
+        };
+        return Some(job::ExportSource::Pending {
+            state: job::PendingState {
+                composite: edit.composite.clone(),
+                ops,
+                sources,
+                registration,
+                reference: info.reference,
+                description: info.description,
+                held: tab.held.clone(),
+            },
+            project_path,
+        });
     }
     if info.live {
         return None;
@@ -11136,7 +12672,21 @@ mod tests {
 
     use super::{AppController, OpenOutcome, plain_cause};
     use crate::appearance_settings::{AppearanceSettings, SourcePresentation};
-    use crate::source_previews::{PreviewError, PreviewPixels, PreviewReservation, PreviewWorker};
+    use crate::source_previews::{
+        PreviewError, PreviewPixels, PreviewRequest, PreviewReservation, PreviewSource,
+        PreviewWorker,
+    };
+
+    fn frame_source(path: &Path) -> PreviewSource {
+        PreviewSource::Frame(path.to_path_buf())
+    }
+
+    fn frame_path(request: &PreviewRequest) -> &Path {
+        match &request.source {
+            PreviewSource::Frame(path) => path,
+            PreviewSource::Checkpoint { key, .. } => panic!("checkpoint request {key}"),
+        }
+    }
 
     fn install_blocked_preview_worker(
         controller: &mut AppController,
@@ -11153,8 +12703,11 @@ mod tests {
         let release_rx = Arc::new(Mutex::new(release_rx));
         let (completed_tx, completed_rx) = mpsc::channel();
         controller.previews = Some(PreviewWorker::new_with_renderer(Arc::new(
-            move |path, _, _| {
-                if path != blocked_path {
+            move |source, _, _| {
+                let PreviewSource::Frame(path) = source else {
+                    return Err(PreviewError::Cancelled);
+                };
+                if *path != blocked_path {
                     return Err(PreviewError::Cancelled);
                 }
                 started_tx.send(path.to_path_buf()).unwrap();
@@ -11203,7 +12756,7 @@ mod tests {
         controller
             .preview_cache
             .keys()
-            .any(|request| request.path == source)
+            .any(|request| frame_path(request) == source)
     }
 
     fn seal_project_with_sources(dir: &Path, sources: &[PathBuf]) -> PathBuf {
@@ -11324,7 +12877,7 @@ mod tests {
         );
         wait_for_preview_quiescence(&mut controller);
         assert_eq!(controller.source_preview_snapshot().cache_entries, 0);
-        assert!(controller.source_preview(&source).is_none());
+        assert!(controller.source_preview(&frame_source(&source)).is_none());
         assert!(!cache_has_source(&controller, &source));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -11374,7 +12927,7 @@ mod tests {
             controller
                 .preview_requests
                 .iter()
-                .map(|request| request.path.clone())
+                .map(|request| frame_path(request).to_path_buf())
                 .collect::<Vec<_>>(),
             [3, 1, 2, 4, 5].map(|index| frames[index].clone()),
             "the visible row is first, then the rows above, then the rows below"
@@ -11388,7 +12941,7 @@ mod tests {
         let request = |index: usize| super::PreviewRequest {
             tab_id,
             generation: controller.preview_generation,
-            path: frames[index].clone(),
+            source: frame_source(&frames[index]),
         };
         let finished = request(3);
         controller.preview_cache.insert(
@@ -11421,7 +12974,7 @@ mod tests {
             worker
                 .drain()
                 .iter()
-                .any(|outcome| outcome.request.path == frames[1] && outcome.result.is_ok()),
+                .any(|outcome| frame_path(&outcome.request) == frames[1] && outcome.result.is_ok()),
             "the render that was in flight is published, not cancelled"
         );
 
@@ -11443,7 +12996,7 @@ mod tests {
             worker
                 .drain()
                 .iter()
-                .all(|outcome| outcome.request.path != frames[1]),
+                .all(|outcome| frame_path(&outcome.request) != frames[1]),
             "a scroll that leaves the row cancels its render"
         );
         let _ = std::fs::remove_dir_all(root);
@@ -11512,7 +13065,7 @@ mod tests {
         wait_for_preview_quiescence(&mut controller);
 
         assert!(!cache_has_source(&controller, &source));
-        assert!(controller.source_preview(&source).is_none());
+        assert!(controller.source_preview(&frame_source(&source)).is_none());
         let _ = std::fs::remove_dir_all(&first);
         let _ = std::fs::remove_dir_all(&second);
     }
@@ -11573,7 +13126,11 @@ mod tests {
         wait_for_preview_quiescence(&mut controller);
 
         assert!(!cache_has_source(&controller, &old_source));
-        assert!(controller.source_preview(&old_source).is_none());
+        assert!(
+            controller
+                .source_preview(&frame_source(&old_source))
+                .is_none()
+        );
         assert_eq!(controller.images_panel().rows[0].path, new_source);
         let _ = std::fs::remove_dir_all(&root);
     }

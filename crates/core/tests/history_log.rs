@@ -213,18 +213,13 @@ fn inject_unknown_field(path: &Path, entry_name: &str) {
 
 fn two_strokes() -> Vec<Op> {
     vec![
-        Op::BrushStroke {
-            source_id: 2,
-            path: vec![Point { x: 3, y: 4 }, Point { x: 10, y: 12 }],
-            radius: 3.5,
-            softness: 0.25,
-        },
-        Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 5, y: 2 }],
-            radius: 2.0,
-            softness: 0.0,
-        },
+        Op::frame_stroke(
+            2,
+            vec![Point { x: 3, y: 4 }, Point { x: 10, y: 12 }],
+            3.5,
+            0.25,
+        ),
+        Op::frame_stroke(1, vec![Point { x: 5, y: 2 }], 2.0, 0.0),
     ]
 }
 

@@ -11,17 +11,54 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use focusforge_core::io::{CaptureTime, capture_time};
+use focusforge_core::project::GridMismatch;
 use focusforge_core::timing::{TimingCounter, measurement_scope, record_timing};
 use focusforge_core::zmap::{overlay_table, source_color};
 
-/// A row's fixed height, top to top of the next row.
+/// A frame row's height in the List presentation.
 pub const ROW_HEIGHT: f32 = 26.0;
+/// A group heading's height.
+pub const HEADING_HEIGHT: f32 = 26.0;
+/// The space above the Frames heading, below the Results group.
+pub const GROUP_GAP: f32 = 12.0;
+/// The hidden-checkpoints line when it names one reason.
+pub const HIDDEN_LINE_HEIGHT: f32 = 26.0;
+/// The hidden-checkpoints line when several reasons wrap it onto a second line.
+pub const HIDDEN_WRAPPED_HEIGHT: f32 = 44.0;
 
-/// One row of the `Images` list. Carries no index of its own -- a frame is
-/// a position, not an identity, and the row's position in [`ImagesModel::rows`]
-/// *is* that position.
-#[derive(Debug, Clone, PartialEq)]
+/// What a row of the `Images` list is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RowKind {
+    #[default]
+    Frame,
+    ResultsHeading,
+    Checkpoint,
+    /// The counted line naming checkpoints left out of the list.
+    Hidden,
+    FramesHeading,
+}
+
+/// One row of the `Images` list. A frame row's position in
+/// [`ImagesModel::rows`] is not its frame position once the list carries
+/// group headings: [`Self::frame`] names the frame.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ImageRow {
+    pub kind: RowKind,
+    /// The frame position of a [`RowKind::Frame`] row.
+    pub frame: Option<usize>,
+    /// A checkpoint row's id, or `"held:<index>"` for one not saved yet.
+    pub key: Option<String>,
+    /// A checkpoint row's method name; `name` then carries its label, if set.
+    pub method: String,
+    /// A retouch checkpoint's "· N strokes", empty otherwise.
+    pub strokes: String,
+    /// Role pills of a checkpoint row, in drawing order.
+    pub badges: Vec<String>,
+    /// A group heading whose rows are hidden.
+    pub collapsed: bool,
+    /// The row's distance from the top of the list.
+    pub top: f32,
+    pub height: f32,
     /// Stable source identity for background preview lookup.
     pub path: PathBuf,
     pub chip: [u8; 3],
@@ -44,6 +81,93 @@ pub struct ImageRow {
 pub struct ImagesModel {
     pub rows: Vec<ImageRow>,
     pub header_text: String,
+}
+
+impl ImagesModel {
+    /// The height of all rows together.
+    pub fn content_height(&self) -> f32 {
+        self.rows.last().map_or(0.0, |row| row.top + row.height)
+    }
+
+    /// The index of the row showing frame `frame`, `None` while it is hidden
+    /// by a collapsed group.
+    pub fn row_of_frame(&self, frame: usize) -> Option<usize> {
+        self.rows.iter().position(|row| row.frame == Some(frame))
+    }
+
+    /// The nearest row from `from` in direction `step` (`-1` up, `1` down)
+    /// that can become the source: a resolved frame or a checkpoint.
+    /// Headings, the hidden line and unresolved frames are skipped.
+    pub fn next_selectable(&self, from: usize, step: isize) -> Option<usize> {
+        let mut index = from as isize;
+        loop {
+            index += step;
+            let row = self.rows.get(usize::try_from(index).ok()?)?;
+            let selectable = matches!(row.kind, RowKind::Frame | RowKind::Checkpoint);
+            if selectable && !row.unresolved {
+                return Some(index as usize);
+            }
+        }
+    }
+}
+
+/// One checkpoint of the editor's Results group.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResultRow {
+    pub key: String,
+    pub colour: [u8; 3],
+    pub label: Option<String>,
+    pub method: String,
+    /// Local `HH:MM:SS`.
+    pub time: String,
+    /// Brush strokes among the checkpoint's own ops.
+    pub strokes: usize,
+    pub badges: Vec<&'static str>,
+}
+
+/// The editor list's two groups: the compatible checkpoints above the frames.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Groups {
+    pub rows: Vec<ResultRow>,
+    /// Checkpoints left out, counted per reason.
+    pub hidden: Vec<(GridMismatch, usize)>,
+    /// The checkpoint chosen as the brush source.
+    pub selected: Option<String>,
+    pub results_collapsed: bool,
+    pub frames_collapsed: bool,
+}
+
+/// Every reason, in the order the hidden line names them.
+pub const MISMATCH_ORDER: [GridMismatch; 4] = [
+    GridMismatch::SourceFrames,
+    GridMismatch::Alignment,
+    GridMismatch::Crop,
+    GridMismatch::Dimensions,
+];
+
+/// "2 hidden: different alignment", or "3 hidden: 2 different alignment, 1
+/// different crop" for several reasons; `None` when nothing is hidden.
+fn hidden_text(hidden: &[(GridMismatch, usize)]) -> Option<String> {
+    let reasons: Vec<_> = hidden.iter().filter(|(_, count)| *count > 0).collect();
+    let total: usize = reasons.iter().map(|(_, count)| count).sum();
+    let detail = match reasons.as_slice() {
+        [] => return None,
+        [(reason, _)] => reason.to_string(),
+        many => many
+            .iter()
+            .map(|(reason, count)| format!("{count} {reason}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    Some(format!("{total} hidden: {detail}"))
+}
+
+pub(crate) fn stroke_text(strokes: usize) -> String {
+    match strokes {
+        0 => String::new(),
+        1 => "\u{b7} 1 stroke".to_string(),
+        n => format!("\u{b7} {n} strokes"),
+    }
 }
 
 /// What the `Images` list shows about one source file, read once from disk
@@ -91,6 +215,7 @@ fn build_rows(
         .map(|(i, path)| {
             let resolved = meta.get(path).filter(|m| !m.unresolved);
             ImageRow {
+                frame: Some(i),
                 path: path.clone(),
                 chip: source_color(i as u16, total),
                 name: file_name(path),
@@ -105,6 +230,7 @@ fn build_rows(
                 excluded: excluded.get(i).copied().unwrap_or(false),
                 unresolved: resolved.is_none(),
                 selected: selected == Some(i),
+                ..Default::default()
             }
         })
         .collect()
@@ -126,6 +252,7 @@ fn build_legend_rows(
         .iter()
         .enumerate()
         .map(|(i, path)| ImageRow {
+            frame: Some(i),
             path: path.clone(),
             chip: table[i],
             name: file_name(path),
@@ -134,6 +261,7 @@ fn build_legend_rows(
             excluded: false,
             unresolved: meta.get(path).is_none_or(|m| m.unresolved),
             selected: selected == Some(i),
+            ..Default::default()
         })
         .collect()
 }
@@ -162,18 +290,29 @@ pub(crate) fn file_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// Appends `row` below the rows already placed.
+fn place(rows: &mut Vec<ImageRow>, mut row: ImageRow, height: f32) {
+    row.top = rows.last().map_or(0.0, |last| last.top + last.height);
+    row.height = height;
+    rows.push(row);
+}
+
 /// Builds the whole panel model, the header count and the rows, without
 /// touching the disk. `legend` selects the editor's read-only legend (colour
 /// and position number from `build_legend_rows`) over stacking's own row
-/// builder (capture time, exclusion count).
+/// builder (capture time, exclusion count). `row_height` is the height of a
+/// frame or checkpoint row in the current presentation. `groups` adds the
+/// editor's headed Results and Frames groups; `None` lists the frames alone.
 pub fn build_model(
     frames: &[PathBuf],
     excluded: &[bool],
     selected: Option<usize>,
     legend: bool,
     meta: &HashMap<PathBuf, FrameMeta>,
+    row_height: f32,
+    groups: Option<&Groups>,
 ) -> ImagesModel {
-    let rows = if legend {
+    let frame_rows = if legend {
         build_legend_rows(frames, selected, meta)
     } else {
         build_rows(frames, excluded, selected, meta)
@@ -181,18 +320,82 @@ pub fn build_model(
     let header_text = if legend {
         format!(
             "{} frame{}",
-            rows.len(),
-            if rows.len() == 1 { "" } else { "s" }
+            frame_rows.len(),
+            if frame_rows.len() == 1 { "" } else { "s" }
         )
     } else {
-        let excluded_count = rows.iter().filter(|r| r.excluded).count();
+        let excluded_count = frame_rows.iter().filter(|r| r.excluded).count();
         format!(
             "{} frame{} \u{b7} {} excluded",
-            rows.len(),
-            if rows.len() == 1 { "" } else { "s" },
+            frame_rows.len(),
+            if frame_rows.len() == 1 { "" } else { "s" },
             excluded_count
         )
     };
+    let mut rows = Vec::with_capacity(frame_rows.len());
+    let Some(groups) = groups else {
+        for row in frame_rows {
+            place(&mut rows, row, row_height);
+        }
+        return ImagesModel { rows, header_text };
+    };
+    place(
+        &mut rows,
+        ImageRow {
+            kind: RowKind::ResultsHeading,
+            name: "Results".to_string(),
+            trailing_text: groups.rows.len().to_string(),
+            collapsed: groups.results_collapsed,
+            ..Default::default()
+        },
+        HEADING_HEIGHT,
+    );
+    if !groups.results_collapsed {
+        for result in &groups.rows {
+            let row = ImageRow {
+                kind: RowKind::Checkpoint,
+                key: Some(result.key.clone()),
+                chip: result.colour,
+                name: result.label.clone().unwrap_or_default(),
+                method: result.method.clone(),
+                trailing_text: result.time.clone(),
+                strokes: stroke_text(result.strokes),
+                badges: result.badges.iter().map(|b| b.to_string()).collect(),
+                selected: groups.selected.as_deref() == Some(result.key.as_str()),
+                ..Default::default()
+            };
+            place(&mut rows, row, row_height);
+        }
+        if let Some(text) = hidden_text(&groups.hidden) {
+            let reasons = groups.hidden.iter().filter(|(_, n)| *n > 0).count();
+            let row = ImageRow {
+                kind: RowKind::Hidden,
+                name: text,
+                ..Default::default()
+            };
+            let height = if reasons > 1 {
+                HIDDEN_WRAPPED_HEIGHT
+            } else {
+                HIDDEN_LINE_HEIGHT
+            };
+            place(&mut rows, row, height);
+        }
+    }
+    place(
+        &mut rows,
+        ImageRow {
+            kind: RowKind::FramesHeading,
+            name: header_text.clone(),
+            collapsed: groups.frames_collapsed,
+            ..Default::default()
+        },
+        GROUP_GAP + HEADING_HEIGHT,
+    );
+    if !groups.frames_collapsed {
+        for row in frame_rows {
+            place(&mut rows, row, row_height);
+        }
+    }
     ImagesModel { rows, header_text }
 }
 
@@ -420,6 +623,8 @@ mod tests {
             None,
             false,
             &read_metadata(&frames),
+            ROW_HEIGHT,
+            None,
         );
         assert_eq!(model.rows.len(), 3);
         assert_eq!(model.header_text, "3 frames \u{b7} 0 excluded");
@@ -437,7 +642,15 @@ mod tests {
         std::fs::remove_file(&frames[0]).unwrap();
         std::fs::remove_file(&frames[1]).unwrap();
         meta.remove(&frames[1]);
-        let model = build_model(&frames, &[false, false], None, false, &meta);
+        let model = build_model(
+            &frames,
+            &[false, false],
+            None,
+            false,
+            &meta,
+            ROW_HEIGHT,
+            None,
+        );
         assert!(!model.rows[0].unresolved);
         assert_eq!(model.rows[0].trailing_text, "10:00:00");
         assert!(model.rows[1].unresolved);
@@ -457,6 +670,8 @@ mod tests {
             None,
             false,
             &read_metadata(&frames),
+            ROW_HEIGHT,
+            None,
         );
         assert_eq!(model.rows[1].trailing_text, "");
         assert!(!model.rows[1].unresolved);
@@ -465,7 +680,15 @@ mod tests {
     #[test]
     fn an_unresolved_source_carries_no_fabricated_time() {
         let frames = [PathBuf::from("/does/not/exist.tif")];
-        let model = build_model(&frames, &[false], None, false, &read_metadata(&frames));
+        let model = build_model(
+            &frames,
+            &[false],
+            None,
+            false,
+            &read_metadata(&frames),
+            ROW_HEIGHT,
+            None,
+        );
         assert!(model.rows[0].unresolved);
         assert_eq!(model.rows[0].trailing_text, "");
     }
@@ -488,6 +711,8 @@ mod tests {
             None,
             false,
             &read_metadata(&frames),
+            ROW_HEIGHT,
+            None,
         );
         assert_eq!(model.header_text, "2 frames \u{b7} 1 excluded");
     }

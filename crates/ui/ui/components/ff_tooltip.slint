@@ -5,6 +5,8 @@ import { ShellGeometry } from "../geometry.slint";
 
 export component FFTooltip inherits Rectangle {
     in property <string> text: "";
+    // A second line under `text`, shown only when it is not empty.
+    in property <string> detail: "";
     in property <length> tooltip-max-width: ShellGeometry.tooltip-width;
 
     property <length> available-content-width: max(1px, root.tooltip-max-width - 2 * Theme.space-2);
@@ -21,7 +23,7 @@ export component FFTooltip inherits Rectangle {
         x: Theme.space-2;
         y: Theme.space-2;
         width: parent.width - 2 * Theme.space-2;
-        text: root.text;
+        text: root.detail == "" ? root.text : root.text + "\n" + root.detail;
         color: Theme.text-primary;
         font-size: Theme.text-body.size;
         font-weight: Theme.text-body.weight;

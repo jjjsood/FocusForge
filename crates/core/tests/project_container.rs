@@ -34,12 +34,7 @@ fn params() -> ParamValues {
 }
 
 fn stroke(x: i32, y: i32) -> Vec<Op> {
-    vec![Op::BrushStroke {
-        source_id: 1,
-        path: vec![Point { x, y }],
-        radius: 3.0,
-        softness: 0.0,
-    }]
+    vec![Op::frame_stroke(1, vec![Point { x, y }], 3.0, 0.0)]
 }
 
 /// A project over `fixtures/mantis-512`'s golden planes, in its own directory.

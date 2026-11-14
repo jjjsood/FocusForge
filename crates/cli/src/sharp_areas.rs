@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use focusforge_core::io::open_frame_set;
 use focusforge_core::job::JobControl;
-use focusforge_core::sharp_areas::{SHARP_AREA_PARAMS, count_sharp_areas};
+use focusforge_core::sharp_areas::{SHARP_AREA_PARAMS, count_sharp_areas_reporting_with_backend};
 use focusforge_core::tile::HostBudget;
 use focusforge_core::tile::plan::DEFAULT_TILE_SIZE;
 
@@ -44,7 +44,7 @@ pub(crate) fn run(dir: &Path, set: &SetArgs, json: bool, priority: Priority) -> 
     if priority == Priority::Low {
         control.set_admission_cap(Some(1));
     }
-    let result = match count_sharp_areas(
+    let result = match count_sharp_areas_reporting_with_backend(
         reader,
         reader.len(),
         reader.dimensions(),
@@ -52,6 +52,8 @@ pub(crate) fn run(dir: &Path, set: &SetArgs, json: bool, priority: Priority) -> 
         &values,
         DEFAULT_TILE_SIZE,
         &*control,
+        &mut |_| {},
+        crate::sharpness_backend(),
     ) {
         Ok(result) => result,
         Err(err) => return crate::fail(err),
@@ -67,11 +69,17 @@ pub(crate) fn run(dir: &Path, set: &SetArgs, json: bool, priority: Priority) -> 
             );
             (index, file, *count)
         });
+    let pairs = result
+        .overlaps
+        .iter()
+        .enumerate()
+        .map(|(index, overlap)| (format!("{}-{}", index + 1, index + 2), overlap.share()));
     if json {
         let document = serde_json::json!({
             "params": {
                 "cell-size": values["cell-size"],
                 "contrast": values["contrast"],
+                "overlap-threshold": values["overlap-threshold"],
             },
             "cells": result.cells,
             "frames": rows
@@ -81,6 +89,9 @@ pub(crate) fn run(dir: &Path, set: &SetArgs, json: bool, priority: Priority) -> 
                     "count": count,
                 }))
                 .collect::<Vec<_>>(),
+            "overlaps": pairs
+                .map(|(pair, share)| serde_json::json!({ "pair": pair, "share": share }))
+                .collect::<Vec<_>>(),
         });
         match serde_json::to_string_pretty(&document) {
             Ok(text) => println!("{text}"),
@@ -89,6 +100,12 @@ pub(crate) fn run(dir: &Path, set: &SetArgs, json: bool, priority: Priority) -> 
     } else {
         for (index, file, count) in rows {
             println!("{index}  {file}  {count}");
+        }
+        for (pair, share) in pairs {
+            match share {
+                Some(share) => println!("overlap  {pair}  {:.1}%", share * 100.0),
+                None => println!("overlap  {pair}  no data"),
+            }
         }
     }
     ExitCode::SUCCESS

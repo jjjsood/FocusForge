@@ -1,63 +1,82 @@
-# Editor source list in Image list, Large previews and List
-Start: --open fixtures/mantis-512/frames
+# Editor source list: Results and Frames in Image list, Large previews and List
+Start: --open fixtures/mantis-512/frames --fuse-tabs 0 --enter-editor
 
-Use a fresh settings directory, where the source presentation is Image list. The fixture fuse ends in the keep question; the journey answers **Keep** and the window then shows the editor. The Settings window opens on Performance when it is reopened from the icon bar (bottom-left): click **Appearance** each time. Source rows are counted in visible order: when the list scrolls, instance 0 is the first row on screen.
+Use a fresh settings directory, where the source presentation is Image list. The fuse that starts with the window ends in the keep question; the journey answers **Keep** and the window then shows the editor. The journey fuses a second time with alignment switched off; that fuse ends in the editor without a question, and the first result no longer shares the new result's pixel grid, so it is listed only as a hidden count. Then it saves one stroke as a third result. Nothing is saved to a project file, so every result is marked UNSAVED. The editor list holds the heading "Results" (with a count), the result rows, a line "N hidden: reason" when results were left out, the heading "8 frames" and the frame rows; headings are not rows, the hidden line is one. `FFImageRow::area` counts the rows on screen in visible order, starting at the first row under the heading "Results"; `FFSectionHeading::root` counts the headings in visible order only while the list has not been scrolled (0 is "Results", 1 is "8 frames"), so the heading steps come before any step that moves the selection to a row lower in the list. `FFMenu::root` counts over the whole window: match 0 is the blend mode "Normal" in the editor toolbar, match 1 is Presentation in the open Settings window. The Settings window opens on Performance when it is reopened from the icon bar (bottom-left): click **Appearance** each time. Result previews are drawn one after another; the steps that read them allow a minute. After a presentation change the list scrolls so that the selected frame 00.tif stays in view: the heading "Results" and the top of the first result row may then be cut off, and a heading scrolled out of the list has no `FFSectionHeading::root` match, so the heading "8 frames" is then match 0. The tooltip on a row is a native one that the driver does not raise: the hover step is a person's.
 
-## Image list before fusing
-1. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
-   Expect: the Settings window opens.
-2. Click **Appearance** (`FFNavRailEntry::area` 1).
-   Expect: the field Presentation reads "Image list" and the text "Editor source rows stay read-only." is shown.
-3. Click **Close settings** (`FFSettingsModal::close`).
-   Expect: (within 10 s) the Images dock lists 00.tif to 03.tif (the rows that fit), each with a preview picture at its left, a colour bar above its name, and no row reads "Loading…" or "Preview unavailable".
-4. Click the second source row (`FFImageRow::area` 1).
-   Expect: the left pane label (`FFCanvas::pane-left`) reads "01.tif"; the row shows an eye and a red trash icon at its lower right (`buttons FFDock::images-panel` lists **Exclude** `FFImageRow::image-list-exclude-button` and **Remove** `FFImageRow::image-list-remove-button`).
-## Fuse and keep
+## One result in the list
+1. Click **Keep** (`AppWindow::divergence-warning`).
+   Expect: (within 120 s) the dialog is gone; the CHECKPOINTS list shows 1 row; the Images dock list starts with the heading "Results" and the count "1", then one row reading "Details" and a time, with the pills "BASE" and "UNSAVED" and a preview picture, then the heading "8 frames"; no line reads "hidden" and no text in the list reads "group".
+## A second result with a different alignment
+2. Click **STACKING** (`FFModeSwitch::stacking-half`).
+   Expect: the toolbar shows **Fuse stack**; the dock shows the tabs **Images** and **Settings**.
+3. Click **Settings** (`FFDockTabs::settings-tab`).
+   Expect: the dock lists the headings "PREPARE", "FUSE" and "ALIGN" (the heading "FINISH" lies below the visible part of the dock).
+4. Click the **Enabled** switch under ALIGN (`FFToggle::area` 0).
+   Expect: the switch is off; the ALIGN heading has no "DEFAULT" badge.
 5. Click **Fuse stack** (`FFToolbar::fuse-button`).
-   Expect: (within 120 s) the "Keep this fused result?" dialog is shown.
-6. Click **Keep** (`AppWindow::divergence-warning`).
-   Expect: the dialog is gone; the CHECKPOINTS list shows 1 row; the bottom bar reads "fused" followed by a time (within 60 s).
-## Editor rows follow Image list and stay read-only
-7. Click **EDITOR** (`FFModeSwitch::editor-half`).
-   Expect: the dock header reads "8 frames" with no Images or Settings tab; each visible row shows a preview picture at its left, a colour bar above its name, and its source number ("1", "2", "3") at its lower right; no row reads "Loading…".
-8. Hover the second source row (`FFImageRow::area` 1).
-   Expect: Must not: an eye or trash icon appears; `buttons FFDock::images-panel` lists no **Exclude** and no **Remove**; the row still shows its number "2" at the lower right.
-9. Click the second source row (`FFImageRow::area` 1).
-   Expect: the left pane label (`FFCanvas::pane-left`) reads "01.tif"; the row has an orange outline all around, and still shows its number "2", with no eye or trash icon.
-10. Click the first source row (`FFImageRow::area` 0).
-   Expect: the left pane label reads "00.tif"; the row has an orange outline and shows its number "1".
-11. Drag the first source row (`FFImageRow::area` 0) to the centre of the third source row (`FFImageRow::area` 2), using the logical element geometry without scale conversion.
-   Expect: Must not: the rows reorder or the selection moves; the first three rows still read 00.tif, 01.tif, 02.tif from top to bottom and the left pane label still reads "00.tif".
-## Large previews in the editor
-12. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
+   Expect: (within 120 s) no question appears and the window shows the editor; the CHECKPOINTS list shows 2 rows; the Images dock list shows "Results" with the count "1", one row reading "Details" with the pills "BASE" and "UNSAVED", and under it the line "1 hidden: different alignment".
+## Save a stroke as a third result
+6. Drag across the Composite pane from its centre to window point 1000,400 (`FFCanvas::pane-right`).
+   Expect: (within 120 s) `buttons AppWindow::editor-toolbar` lists **Save checkpoint** with enabled true.
+7. Click **Save checkpoint** (`AppWindow::editor-toolbar`, top right): drive it with `click "Save checkpoint"` alone, without the container id, which finds no button.
+   Expect: the CHECKPOINTS list shows 3 rows; the list shows "Results" with the count "2"; the first result row reads "Details" and "· 1 stroke" with the pills "BASE" and "UNSAVED", the second reads "Details" with the pills "FUSION" and "UNSAVED", and the line "1 hidden: different alignment" is still under them.
+## Collapse and expand "Results"
+8. Click the heading "Results" (`FFSectionHeading::root` 0).
+   Expect: the result rows and the hidden line are gone; the heading still reads "Results" with "2" and shows a right-pointing arrow; the heading "8 frames" and the frame rows stay.
+9. Press Up.
+   Expect: Must not: any row other than frame 00.tif is selected; frame 00.tif stays selected and the left pane label (`FFCanvas::pane-left`) reads "00.tif".
+10. Click the heading "Results" (`FFSectionHeading::root` 0).
+   Expect: both result rows and the line "1 hidden: different alignment" are back; the heading shows a down-pointing arrow.
+## Large previews
+11. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
    Expect: the Settings window opens.
-13. Click **Appearance** (`FFNavRailEntry::area` 1).
-   Expect: the field Presentation reads "Image list" and the text "Editor source rows stay read-only." is shown.
-14. Click **Presentation** (`FFMenu::root`).
+12. Click **Appearance** (`FFNavRailEntry::area` 1).
+   Expect: the field Presentation reads "Image list".
+13. Click **Presentation** (`FFMenu::root` 1; match 0 is the blend mode "Normal").
    Expect: the three lines "List", "Image list" and "Large previews" appear.
-15. Click the entry **Large previews**, the last of the three (`FFMenuList::option-area` 2).
+14. Click the entry **Large previews**, the last of the three (`FFMenuList::option-area` 2).
    Expect: the list is gone and the Presentation field reads "Large previews".
-16. Click **Close settings** (`FFSettingsModal::close`).
-   Expect: the first dock row is a wide preview picture (`FFImageRow::large-identity`) with a colour square, "00.tif" and its number "1" on the line below it; the second row's preview picture starts under it; neither reads "Loading preview…".
-17. Hover the number of the first source row (`FFImageRow::large-timestamp-slot` 0).
-   Expect: Must not: an eye or trash icon replaces the number; `buttons FFDock::images-panel` lists no **Exclude** and no **Remove**, and the number "1" is still shown.
-18. Click the preview picture of the second source row (`FFImageRow::large-identity` 1).
-   Expect: the left pane label (`FFCanvas::pane-left`) reads "01.tif"; the second row has an orange outline.
-## List in the editor
-19. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
+15. Click **Close settings** (`FFSettingsModal::close`).
+   Expect: (within 60 s) every result row in view is a wide preview picture (`FFImageRow::large-identity`) with one line under it holding a layers icon, the text ("Details", a time, "· 1 stroke" on the first row) and its pills, and no picture reads "Loading…"; the second result row (FUSION, UNSAVED) is always in view, the first may be scrolled out of the list; the line "1 hidden: different alignment" follows them, then the heading "8 frames".
+## List
+16. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
    Expect: the Settings window opens.
-20. Click **Appearance** (`FFNavRailEntry::area` 1).
+17. Click **Appearance** (`FFNavRailEntry::area` 1).
    Expect: the field Presentation reads "Large previews".
-21. Click **Presentation** (`FFMenu::root`).
+18. Click **Presentation** (`FFMenu::root` 1; match 0 is the blend mode "Normal").
    Expect: the three lines "List", "Image list" and "Large previews" appear.
-22. Click the entry **List**, the first of the three (`FFMenuList::option-area` 0).
+19. Click the entry **List**, the first of the three (`FFMenuList::option-area` 0).
    Expect: the list is gone and the Presentation field reads "List".
-23. Click **Close settings** (`FFSettingsModal::close`).
-   Expect: the dock lists 00.tif to 07.tif, one compact line each with a colour square, the name and the numbers "1" to "8" at the right end; no preview pictures.
-24. Click the fifth source row (`FFImageRow::area` 4).
-   Expect: the left pane label (`FFCanvas::pane-left`) reads "04.tif"; the row shows number "5" and no eye or trash icon.
-## Stacking mode keeps its controls
-25. Click **STACKING** (`FFModeSwitch::stacking-half`).
-   Expect: the toolbar shows **Fuse stack**; the dock shows the Images and Settings tabs and the header "8 frames · 0 excluded" with the add and sort icons at its right end.
-26. Click the first source row (`FFImageRow::area` 0).
-   Expect: the left pane label (`FFCanvas::pane-left`) reads "00.tif"; an eye and a red trash icon replace the capture time on that row (`buttons FFDock::images-panel` lists **Exclude** `FFImageRow::list-exclude-button` and **Remove** `FFImageRow::list-remove-button`).
+20. Click **Close settings** (`FFSettingsModal::close`).
+   Expect: the list shows "Results" with "2", then two one-line rows with a layers icon, "Details", the start of a time and the pills; a row whose text does not fit ends in an ellipsis, so "· 1 stroke" may be cut off here (it is read in the Image list and Large previews steps); then the line "1 hidden: different alignment", then "8 frames" and the frames 00.tif and below as compact lines; no preview pictures are drawn.
+## Image list
+21. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
+   Expect: the Settings window opens.
+22. Click **Appearance** (`FFNavRailEntry::area` 1).
+   Expect: the field Presentation reads "List".
+23. Click **Presentation** (`FFMenu::root` 1; match 0 is the blend mode "Normal").
+   Expect: the three lines "List", "Image list" and "Large previews" appear.
+24. Click the entry **Image list**, the middle one of the three (`FFMenuList::option-area` 1).
+   Expect: the list is gone and the Presentation field reads "Image list".
+25. Click **Close settings** (`FFSettingsModal::close`).
+   Expect: (within 60 s) two result rows each with a preview picture (no "Loading…"), a layers icon and pills at the top right of the row text (the first row's top edge, with its layers icon and BASE pill, may be cut off by the scroll); "Details" with "· 1 stroke" and a time on the first row, "Details" and a time on the second; the line "1 hidden: different alignment"; then the heading "8 frames" and the frame 00.tif with its preview picture.
+## Choose a brush source
+26. (human only) Hover the first result row (`FFImageRow::area` 0).
+   Expect: a tooltip reads "Use as brush source"; the row shows no eye or trash icon.
+27. Click the second result row (`FFImageRow::area` 1).
+   Expect: Must not: a frame row stays selected, or the CHECKPOINTS list selection moves off its top row; only the second result row is selected, drawn with a light wash and a bar at its left edge, and the left pane label (`FFCanvas::pane-left`) starts "Checkpoint · Details".
+28. Click the first frame row (`FFImageRow::area` 3).
+   Expect: the left pane label (`FFCanvas::pane-left`) reads "00.tif"; the frame row is selected and no result row has a wash; the frame row shows no eye or trash icon.
+## Step through one list
+29. Press Up.
+   Expect: the second result row is selected (light wash and bar) and frame 00.tif is not; the heading "8 frames" and the hidden line were passed over.
+30. Press Down.
+   Expect: frame 00.tif is selected again, the left pane label (`FFCanvas::pane-left`) reads "00.tif" and no result row has a wash.
+31. (human only) Roll the mouse wheel up one notch while the pointer is over frame 00.tif (`FFImageRow::area` 3).
+   Expect: the second result row is selected, as after Press Up; with the pointer over the hidden line the wheel scrolls the list instead.
+32. (human only) Hold Ctrl and roll the mouse wheel down one notch over the Composite pane (`FFCanvas::pane-right`).
+   Expect: frame 00.tif is selected again, as after Press Down.
+33. (human only) Hold Shift and roll the mouse wheel up one notch over the Composite pane (`FFCanvas::pane-right`).
+   Expect: the brush Size value in the toolbar changes; the selected row does not.
+34. Click the heading "8 frames" (`FFSectionHeading::root` 0 when "Results" is scrolled out of the list, else 1).
+   Expect: the frame rows are gone and the list is back at its top: "Results" with "2", two result rows each with a preview picture and pills, the line "1 hidden: different alignment", then the heading "8 frames" with a right-pointing arrow.

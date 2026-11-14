@@ -17,7 +17,9 @@ use focusforge_core::align::Registration;
 use focusforge_core::io::{TiffSpec, TiffWriter};
 use focusforge_core::params::{ParamValue, ParamValues};
 use focusforge_core::project::container::{ContainerWriter, Index};
-use focusforge_core::project::{self, Checkpoint, Metrics, Op, Point, Project, SealRequest};
+use focusforge_core::project::{
+    self, BrushMode, Checkpoint, Metrics, Op, Point, Project, SealRequest, StrokeSource,
+};
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use serde_json::Value;
@@ -107,12 +109,12 @@ fn write_op_file(dir: &Path, name: &str, body: &Value) -> PathBuf {
 /// A brush stroke well inside a 512x512, 8-frame map -- [`shared_stack`]'s
 /// own geometry.
 fn one_stroke() -> Vec<Op> {
-    vec![Op::BrushStroke {
-        source_id: 1,
-        path: vec![Point { x: 20, y: 20 }, Point { x: 24, y: 24 }],
-        radius: 3.0,
-        softness: 0.0,
-    }]
+    vec![Op::frame_stroke(
+        1,
+        vec![Point { x: 20, y: 20 }, Point { x: 24, y: 24 }],
+        3.0,
+        0.0,
+    )]
 }
 
 #[test]
@@ -196,12 +198,12 @@ fn exported_zmap_matches_core_replay() {
     let ops_b = write_op_file(
         &dir,
         "ops-b.json",
-        &serde_json::to_value(vec![Op::BrushStroke {
-            source_id: 3,
-            path: vec![Point { x: 200, y: 200 }],
-            radius: 2.0,
-            softness: 0.0,
-        }])
+        &serde_json::to_value(vec![Op::frame_stroke(
+            3,
+            vec![Point { x: 200, y: 200 }],
+            2.0,
+            0.0,
+        )])
         .unwrap(),
     );
     let output = run(
@@ -278,12 +280,12 @@ fn sealing_from_an_older_checkpoint_branches() {
     let ops_b = write_op_file(
         &dir,
         "ops-b.json",
-        &serde_json::to_value(vec![Op::BrushStroke {
-            source_id: 4,
-            path: vec![Point { x: 300, y: 300 }],
-            radius: 2.0,
-            softness: 0.0,
-        }])
+        &serde_json::to_value(vec![Op::frame_stroke(
+            4,
+            vec![Point { x: 300, y: 300 }],
+            2.0,
+            0.0,
+        )])
         .unwrap(),
     );
 
@@ -527,20 +529,41 @@ fn delete_reports_what_it_removed_in_text() {
     let (dir, project) = fresh_project("delete_reports_what_it_removed_in_text");
     let root = root_id(&project);
     let leaf = retouch(&dir, &project, &one_stroke(), None).remove(0);
-    let output = run(
+    let user = retouch(
         &dir,
-        &[
-            "history",
-            "delete",
-            project.to_str().unwrap(),
-            "--checkpoint",
-            &leaf,
-        ],
-    );
-    assert!(output.success, "stderr: {}", output.stderr);
-    assert!(output.stdout.contains(&format!("hidden: {leaf}")));
-    assert!(output.stdout.contains(&format!("removed: {leaf}")));
-    assert!(output.stdout.contains(&format!("head: {root}")));
+        &project,
+        &[Op::BrushStroke {
+            source: StrokeSource::Checkpoint(leaf.clone()),
+            path: vec![Point { x: 22, y: 22 }],
+            radius: 3.0,
+            softness: 0.0,
+            mode: BrushMode::Normal,
+            opacity: 1.0,
+        }],
+        Some(&root),
+    )
+    .remove(0);
+    let delete = |id: &str, json: bool| {
+        let mut args = vec!["history", "delete", project.to_str().unwrap()];
+        args.extend(["--checkpoint", id]);
+        if json {
+            args.push("--json");
+        }
+        let output = run(&dir, &args);
+        assert!(output.success, "stderr: {}", output.stderr);
+        output.stdout
+    };
+
+    let report: Value = serde_json::from_str(&delete(&leaf, true)).unwrap();
+    assert_eq!(report["strokes_using"], 1);
+    assert_eq!(report["removed"], serde_json::json!([]));
+
+    let text = delete(&user, false);
+    assert!(text.contains(&format!("hidden: {user}")), "{text}");
+    assert!(text.contains("strokes using it: 0"), "{text}");
+    let removed = text.lines().find(|l| l.starts_with("removed:")).unwrap();
+    assert!(removed.contains(&user) && removed.contains(&leaf), "{text}");
+    assert!(text.contains(&format!("head: {root}")), "{text}");
 }
 
 #[test]
@@ -739,12 +762,12 @@ fn output_does_not_reveal_storage_kind() {
     let ops = write_op_file(
         &dir,
         "ops.json",
-        &serde_json::to_value(vec![Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 5, y: 5 }],
-            radius: 1.0,
-            softness: 0.0,
-        }])
+        &serde_json::to_value(vec![Op::frame_stroke(
+            1,
+            vec![Point { x: 5, y: 5 }],
+            1.0,
+            0.0,
+        )])
         .unwrap(),
     );
     let output = run(
@@ -963,6 +986,18 @@ fn help_lists_every_command() {
             output.stdout
         );
     }
+
+    let output = run(&dir, &["history", "delete", "--help"]);
+    assert!(
+        output
+            .stdout
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("no stroke paints from it"),
+        "history delete --help does not state the stroke rule: {}",
+        output.stdout
+    );
 
     let subcommand_flags: [(&str, &[&str]); 3] = [
         ("list", &["--json"]),
@@ -1282,6 +1317,36 @@ fn validation_states_are_reported() {
     assert_eq!(output.exit_code, Some(8));
     assert!(output.stdout.is_empty());
 
+    // Exit 8: a stroke painted from a checkpoint the project lacks.
+    let mut painter = read_checkpoint_json(&project_path, &root_id);
+    painter["id"] = serde_json::json!("painter");
+    painter["parent"] = serde_json::json!(root_id);
+    painter["fuse"] = serde_json::Value::Null;
+    painter["ops"] = serde_json::json!([{"brush-stroke": {
+        "source": {"checkpoint": "ghost"},
+        "path": [{"x": 1, "y": 1}],
+        "radius": 2.0,
+        "softness": 0.0
+    }}]);
+    let dangling_source = dir.join("dangling-source.ffp");
+    mutate_container(
+        &project_path,
+        &dangling_source,
+        &[],
+        &[],
+        &[(
+            "checkpoints/painter.json".to_string(),
+            serde_json::to_vec_pretty(&painter).unwrap(),
+        )],
+    );
+    let output = run(
+        &dir,
+        &["history", "list", dangling_source.to_str().unwrap()],
+    );
+    assert_eq!(output.exit_code, Some(8));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.contains("ghost"), "{}", output.stderr);
+
     // Exit 8: also an op-bearing checkpoint with no parent at all -- its
     // own project, so the head sealed here never disturbs `project_path`.
     let ops_dir = common::tmp_dir("validation_states_are_reported_ops");
@@ -1289,12 +1354,12 @@ fn validation_states_are_reported() {
     let ops = write_op_file(
         &ops_dir,
         "orphan-ops.json",
-        &serde_json::to_value(vec![Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 2, y: 2 }],
-            radius: 1.0,
-            softness: 0.0,
-        }])
+        &serde_json::to_value(vec![Op::frame_stroke(
+            1,
+            vec![Point { x: 2, y: 2 }],
+            1.0,
+            0.0,
+        )])
         .unwrap(),
     );
     let output = run(
@@ -1372,12 +1437,12 @@ fn accept_changed_sources_list_and_delete_changed_project() {
     let child = retouch(
         &dir,
         &project,
-        &[Op::BrushStroke {
-            source_id: 1,
-            path: vec![Point { x: 5, y: 5 }, Point { x: 7, y: 7 }],
-            radius: 1.0,
-            softness: 0.0,
-        }],
+        &[Op::frame_stroke(
+            1,
+            vec![Point { x: 5, y: 5 }, Point { x: 7, y: 7 }],
+            1.0,
+            0.0,
+        )],
         None,
     )
     .remove(0);

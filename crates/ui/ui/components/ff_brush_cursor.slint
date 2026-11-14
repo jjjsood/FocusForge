@@ -2,8 +2,11 @@
 //
 // The brush cursor: a dashed ring at the radius around a solid core, or,
 // while picking, the pipette icon beside a swatch of the colour it would pick.
+// A checkpoint source draws the ring in `text-primary` with a layers glyph at
+// the centre.
 
 import { Theme } from "../theme.slint";
+import { ShellGeometry } from "../geometry.slint";
 
 export component FFBrushCursor inherits Rectangle {
     // Side of the square the path commands are drawn in, in logical px; the
@@ -14,8 +17,17 @@ export component FFBrushCursor inherits Rectangle {
     in property <string> core-commands;
     in property <bool> picking: false;
     in property <color> pick-color;
+    // The mode chip's letter (empty draws no chip) and its top-left on both
+    // axes of the square.
+    in property <string> mode-tag: "";
+    in property <length> tag-origin;
+    // The brush source is a checkpoint: a `text-primary` ring around the
+    // layers glyph in `glyph-color`. Picking takes precedence.
+    in property <bool> checkpoint-source: false;
+    in property <color> glyph-color;
 
-    property <color> ink: Theme.cursor-ink;
+    property <bool> checkpoint-look: root.checkpoint-source && !root.picking;
+    property <color> ink: root.checkpoint-look ? Theme.text-primary : Theme.cursor-ink;
 
     width: root.extent;
     height: root.extent;
@@ -28,7 +40,7 @@ export component FFBrushCursor inherits Rectangle {
         viewbox-width: root.extent / 1px;
         viewbox-height: root.extent / 1px;
         commands: root.ring-commands;
-        stroke: root.ink.with-alpha(0.7);
+        stroke: root.ink.with-alpha(root.checkpoint-look ? 0.9 : 0.7);
         stroke-width: 1px;
     }
     if !root.picking: Path {
@@ -41,6 +53,39 @@ export component FFBrushCursor inherits Rectangle {
         commands: root.core-commands;
         stroke: root.ink;
         stroke-width: 1px;
+    }
+
+    if root.checkpoint-look: Image {
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        width: ShellGeometry.cursor-glyph-side;
+        height: ShellGeometry.cursor-glyph-side;
+        source: @image-url("../../../../assets/icons/layers.svg");
+        colorize: root.glyph-color;
+    }
+
+    // The active brush mode's one-letter chip, outside the ring at its
+    // lower-right; hidden while picking.
+    if !root.picking && root.mode-tag != "": Rectangle {
+        x: root.tag-origin;
+        y: root.tag-origin;
+        width: ShellGeometry.brush-tag-side;
+        height: ShellGeometry.brush-tag-side;
+        background: Theme.surface-raised;
+        border-width: 1px;
+        border-color: Theme.border-default;
+        border-radius: Theme.radius-sm;
+
+        Text {
+            width: parent.width;
+            height: parent.height;
+            text: root.mode-tag;
+            color: Theme.text-primary;
+            font-size: Theme.text-value.size;
+            font-weight: Theme.text-value.weight;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
     }
 
     if root.picking: Image {

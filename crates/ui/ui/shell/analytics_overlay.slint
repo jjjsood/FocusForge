@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// The Analytics overlay: the sharp-area count of every frame of the open
-// stack, as one row each, or the count's waiting and failure states.
+// The Analytics overlay: the overlap bar and one sharp-area row per frame, or
+// the count's waiting and failure states.
 
 import { Theme } from "../theme.slint";
 import { ShellGeometry } from "../geometry.slint";
@@ -9,6 +9,8 @@ import { FFOverlayFrame } from "../components/ff_overlay_frame.slint";
 import { FFSectionHeading } from "../components/ff_section_heading.slint";
 import { FFStatusText } from "../components/ff_status_text.slint";
 import { FFAnalyticsRow } from "../components/ff_analytics_row.slint";
+import { FFOverlapBar, OverlapSegmentView } from "../components/ff_overlap_bar.slint";
+import { FFOverlapLegend } from "../components/ff_overlap_legend.slint";
 import { FFLoadingPanel } from "../components/ff_loading_panel.slint";
 import { FFScrollbar } from "../components/ff_scrollbar.slint";
 
@@ -28,10 +30,43 @@ export component FFAnalyticsOverlay inherits Rectangle {
     // waiting and failed states.
     in property <string> state: "waiting";
     in property <[AnalyticsRowView]> rows: [];
+    in property <[OverlapSegmentView]> segments: [];
     in property <string> error: "";
     callback close-requested();
 
+    // The bar block sits above the list while there is a neighbour pair to
+    // show; the list and its headings move down by its height.
+    property <bool> bar-shown: (root.state == "rows" || root.state == "counting") && root.segments.length > 0;
+    // One frame has no neighbour to compare with: an info panel replaces the
+    // headings and the list.
+    property <bool> too-few: (root.state == "rows" || root.state == "counting") && root.rows.length == 1;
+    property <length> list-top: root.bar-shown ? ShellGeometry.overlap-block-height : 0px;
+
+    // The entry motion runs once the overlay is open on finished rows, after
+    // `entry-wait`, during which a finished count's loading bands fade out;
+    // closing the overlay or leaving `rows` resets it. While counting, the
+    // pending segments and the row tracks with their bands are drawn as they
+    // are.
+    property <bool> entered: false;
+    property <bool> drawn: root.entered || root.state == "counting";
+
     visible: root.open;
+
+    changed open => {
+        if (!root.open) {
+            root.entered = false;
+        }
+    }
+    changed state => {
+        if (root.state != "rows") {
+            root.entered = false;
+        }
+    }
+    Timer {
+        interval: Theme.entry-wait;
+        running: root.open && root.state == "rows" && !root.entered;
+        triggered => { root.entered = true; }
+    }
 
     // Swallows the click and the wheel, so neither reaches the canvas below.
     TouchArea {
@@ -42,22 +77,50 @@ export component FFAnalyticsOverlay inherits Rectangle {
         footer-height: 0px;
         close-requested => { root.close-requested(); }
 
-        FFSectionHeading {
+        if root.bar-shown: FFSectionHeading {
             x: Theme.space-4;
             y: 18px;
+            label: "SHARPNESS OVERLAP";
+            flat: true;
+            strong: true;
+        }
+        if root.bar-shown: FFStatusText {
+            x: Theme.space-4;
+            y: 34px;
+            height: 16px;
+            text: "Share of sharp areas that neighbouring images have in common";
+        }
+        if root.bar-shown: FFOverlapLegend {
+            x: parent.width - self.width - Theme.space-4;
+            y: ShellGeometry.overlap-legend-y;
+        }
+        if root.bar-shown: FFOverlapBar {
+            x: Theme.space-4;
+            y: ShellGeometry.overlap-bar-y;
+            width: parent.width - 2 * Theme.space-4;
+            segments: root.segments;
+            pending: root.state == "counting";
+            entered: root.drawn;
+            sweep-offset: self.x;
+            sweep-span: parent.width;
+        }
+        if (root.state == "rows" || root.state == "counting") && !root.too-few: FFSectionHeading {
+            x: Theme.space-4;
+            y: 18px + root.list-top;
             label: "SHARP AREAS PER IMAGE";
             flat: true;
             strong: true;
         }
-        FFStatusText {
+        if (root.state == "rows" || root.state == "counting") && !root.too-few: FFStatusText {
             x: Theme.space-4;
-            y: 34px;
+            y: 34px + root.list-top;
             height: 16px;
             text: "Image areas that are sharpest in this image";
         }
 
         scroller := Flickable {
-            y: 63px;
+            visible: !root.too-few;
+            y: 63px + root.list-top;
             width: parent.width;
             height: parent.height - self.y;
 
@@ -65,13 +128,19 @@ export component FFAnalyticsOverlay inherits Rectangle {
                 alignment: start;
                 padding-bottom: ShellGeometry.settings-content-inset-bottom;
 
-                for row in root.rows: FFAnalyticsRow {
+                for row[i] in root.rows: FFAnalyticsRow {
                     chip: row.chip;
                     name: row.name;
                     mm-text: row.mm-text;
                     fraction: row.fraction;
                     count: row.count;
                     value-state: row.value-state;
+                    entered: root.drawn;
+                    sweep-lag: Theme.sweep-stagger * i;
+                    fill-delay: root.entered
+                        ? min(Theme.entry-fill-stagger, Theme.entry-fill-span / max(1, root.rows.length - 1)) * i
+                        : 0ms;
+                    fill-duration: root.entered ? Theme.entry-fill : Theme.motion-fast;
                 }
             }
         }
@@ -90,7 +159,16 @@ export component FFAnalyticsOverlay inherits Rectangle {
             framed: false;
             show-spinner: false;
             title: "No stack loaded";
-            caption: "Load a stack to count its sharp areas.";
+            caption: "Load a stack to analyse it.";
+        }
+        if root.too-few: FFLoadingPanel {
+            x: (parent.width - self.width) / 2;
+            y: scroller.y + (scroller.height - self.height) / 2;
+            width: parent.width - 2 * Theme.space-4;
+            framed: false;
+            show-spinner: false;
+            title: "Not enough images";
+            caption: "Analytics compares neighbouring images. Load at least two.";
         }
         if root.state == "failed": FFLoadingPanel {
             x: (parent.width - self.width) / 2;
@@ -99,7 +177,7 @@ export component FFAnalyticsOverlay inherits Rectangle {
             framed: false;
             show-spinner: false;
             tone: "failed";
-            title: "Counting failed";
+            title: "Analysis failed";
             caption: root.error;
         }
     }

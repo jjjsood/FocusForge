@@ -52,6 +52,7 @@ pub mod container;
 pub mod error;
 pub mod export;
 pub mod manifest;
+pub mod pixel_grid;
 mod render;
 pub mod review;
 pub mod seal;
@@ -70,21 +71,25 @@ pub use blob::{
     FileStamp, Plane, StagedBlob, short_hash, source_hash, source_hash_change_checked,
     stack_fingerprint,
 };
-pub use checkpoint::{Checkpoint, FuseRecord, History, Op, Point};
+pub use checkpoint::{
+    BrushMode, Checkpoint, FuseRecord, History, Op, Point, StrokeSource, strokes_using_in,
+};
 pub use container::partial_path;
 use container::{ContainerWriter, Index};
 pub use error::ProjectError;
 pub use export::{export_checkpoint, export_held, export_pending};
 pub use manifest::{
     AlignRecord, BlobKind, BlobRecord, ByteOrderTag, Manifest, Metrics, PlaneRef, SourceRef,
-    SourceResolution,
+    SourceResolution, required_format_version,
 };
 use manifest::{FORMAT_VERSION, FormatProbe};
-pub use render::{CheckpointImage, PendingState, render_checkpoint};
+pub use pixel_grid::{GridMismatch, PixelGrid};
+pub use render::{CheckpointImage, PendingState, render_checkpoint, render_unsaved_checkpoint};
 pub use review::ReviewMetrics;
 pub use seal::{
-    HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, SealRequest, SealedProject,
-    kept_entries, now_unix, seal, seal_at, seal_in_memory,
+    GONE_KEY, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, ParentRef, SealRequest,
+    SealedProject, entry_colour_index, held_index, held_key, kept_entries, now_unix, seal, seal_at,
+    seal_in_memory, stroke_chain,
 };
 pub use validate::{
     FingerprintMismatch, Opened, PendingProject, SourceCheck, Validation, check_sources,
@@ -663,6 +668,35 @@ impl Project {
             .expect("open refuses an op-less checkpoint without a fuse record"))
     }
 
+    /// The pixel grid `fuse` renders on, with its sources resolved through
+    /// [`Self::source_path`] so a held fuse made from the same files
+    /// compares equal.
+    pub fn pixel_grid<'a>(&self, fuse: &'a FuseRecord) -> PixelGrid<'a> {
+        PixelGrid {
+            hashes: Some(fuse.sources.iter().map(|s| s.hash.as_str()).collect()),
+            paths: fuse.sources.iter().map(|s| self.source_path(s)).collect(),
+            registration: &fuse.registration,
+            width: fuse.composite.width,
+            height: fuse.composite.height,
+        }
+    }
+
+    /// Why `candidate` cannot be painted from while `edited` is being
+    /// edited, `None` when their pixels line up one-to-one. Each id is
+    /// judged through the fuse it renders against, so retouch checkpoints on
+    /// one fuse are always compatible. A held retouch entry is judged by the
+    /// caller through its fused parent.
+    pub fn grid_mismatch(
+        &self,
+        edited: &str,
+        candidate: &str,
+    ) -> Result<Option<GridMismatch>, ProjectError> {
+        let (edited, candidate) = (self.fuse_state(edited)?, self.fuse_state(candidate)?);
+        Ok(self
+            .pixel_grid(&edited)
+            .mismatch(&self.pixel_grid(&candidate)))
+    }
+
     /// The nearest ancestor of `id` (self included) whose `ops` is empty --
     /// the checkpoint whose fuse `id`'s Z-Map renders against.
     pub(super) fn fused_ancestor(&self, id: &str) -> Result<&Checkpoint, ProjectError> {
@@ -780,9 +814,15 @@ impl Project {
     }
 
     /// Writes the manifest if it changed, then the footer: every record put
-    /// since the project was opened becomes the committed state at once. After
-    /// an error the project is stale; reopen it.
+    /// since the project was opened becomes the committed state at once. The
+    /// manifest's `format_version` is raised to what the history needs and
+    /// never lowered. After an error the project is stale; reopen it.
     pub(super) fn commit(&mut self) -> Result<(), ProjectError> {
+        let required = required_format_version(&self.history);
+        if required > self.manifest.format_version.unwrap_or(1).max(1) {
+            self.manifest.format_version = Some(required);
+            self.manifest_changed = true;
+        }
         if self.manifest_changed {
             let bytes = serde_json::to_vec(&self.manifest)
                 .map_err(|err| ProjectError::container(&self.path, err))?;

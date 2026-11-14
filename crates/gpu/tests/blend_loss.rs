@@ -26,12 +26,7 @@ fn blend_on_a_lost_device_returns_an_error() {
         height: 32,
     };
     let info = ZMapInfo::new(32, 32, 2).unwrap();
-    let op = Op::BrushStroke {
-        source_id: 1,
-        path: vec![Point { x: 16, y: 16 }],
-        radius: 10.0,
-        softness: 0.5,
-    };
+    let op = Op::frame_stroke(1, vec![Point { x: 16, y: 16 }], 10.0, 0.5);
     let base: Vec<u16> = (0..32 * 32).map(|i| i * 3).collect();
     let src = vec![40_000u16; 32 * 32];
 
