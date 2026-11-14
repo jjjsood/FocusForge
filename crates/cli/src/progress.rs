@@ -55,11 +55,11 @@ pub fn eta_display_enabled(value: Option<&OsStr>) -> bool {
 }
 
 /// `develop`/`align <done>/<total> frames` or `prepare <done>/<total> strips`
-/// while that stage counts; otherwise `fuse <done>/<total> tiles <pct>%`. With `show_eta`, each
-/// line ends in ` eta <eta>`: the time left in the whole run, not just the
-/// current stage. `<eta>` reads `--` only while no prediction exists, and a
-/// sub-second estimate renders as `<1s` rather than a `0s` that would read as
-/// "finished" mid-run.
+/// while that stage counts; otherwise `fuse <done>/<total> tiles <pct>%`.
+/// With `show_eta`, each line ends in ` eta <eta>`: the time left in the whole
+/// run, not just the current stage. `<eta>` reads `--` only while no
+/// prediction exists, and a sub-second estimate renders as `<1s` rather than
+/// a `0s` that would read as "finished" mid-run.
 pub fn format_line(progress: &JobProgress, show_eta: bool) -> String {
     let eta = if show_eta {
         format!(" eta {}", eta_text(progress.total_eta))
