@@ -77,8 +77,11 @@ focusforge-cli stack frames/ --algorithm laplacian --resume
 
 <a id="the-stage-cache"></a>
 
-A `stack` run keeps its alignment result so that a re-run which changes only a
-fusion setting does not align again. `--no-cache` skips this for one run, and
+A `stack` run keeps its alignment result, and the brightness measurement when
+`equalize` is on, so that a re-run which changes only a fusion setting does not
+align or measure again. The run prints `prepare N frames (reused from the stage
+cache)` when it takes the measurement from there, and `stack --json` reports
+`equalization_cached` as `true`. `--no-cache` skips this for one run, and
 `focusforge-cli cache clear` empties it without touching a project or a
 cancelled run.
 
