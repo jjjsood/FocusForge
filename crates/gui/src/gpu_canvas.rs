@@ -408,6 +408,10 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/mantis-512/frames/00.tif")
     }
 
+    fn other_512_frame() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/mantis-512/frames/01.tif")
+    }
+
     /// A step-1 draw of the `side`x`side` square at the source origin.
     fn square_draw(side: u32) -> PaneDraw {
         square_draw_at(0, 0, side)
@@ -1001,8 +1005,7 @@ mod tests {
         let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
             return;
         };
-        let other_frame = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/mantis-512/frames/01.tif");
+        let other_frame = other_512_frame();
         let mut renderer = renderer_with(shared, &fixture_512_frame());
         let draw = draw_of((200, 200, 64, 64), 1);
         let spec = brush(232, 232, 10.0, BrushMode::Lighten);
@@ -1062,8 +1065,7 @@ mod tests {
         spec: &BrushPreviewSpec,
         draw: &PaneDraw,
     ) -> CanvasRenderer {
-        let other_frame = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/mantis-512/frames/01.tif");
+        let other_frame = other_512_frame();
         let mut renderer = renderer_with(shared, &fixture_512_frame());
         publish_all(&mut renderer);
         assert!(
@@ -1087,8 +1089,7 @@ mod tests {
         };
         let spec = brush(24, 24, 10.0, BrushMode::Lighten);
         let draw = draw_of((0, 0, SIDE, SIDE), 8);
-        let other_frame = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/mantis-512/frames/01.tif");
+        let other_frame = other_512_frame();
         let mut renderer = renderer_with(shared, &fixture_512_frame());
         publish_all(&mut renderer);
         assert_eq!(
@@ -1289,8 +1290,7 @@ mod tests {
             return;
         };
         let spec = brush(232, 232, 10.0, BrushMode::Lighten);
-        let other_frame = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/mantis-512/frames/01.tif");
+        let other_frame = other_512_frame();
         let scratch = tempfile::tempdir().expect("a scratch directory");
         let other_planes = scratch.path().join("composite.tif");
         std::fs::copy(composite_file(), &other_planes).expect("the composite copies");
