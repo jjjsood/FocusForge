@@ -16,15 +16,18 @@ use rawler::rawsource::RawSource;
 
 use super::frame_cache::{CacheFault, CachedFrame, FrameCache, TileFault, check_tile};
 use super::grouping::parse_exif_datetime;
-use super::{DevelopStore, FrameDesc, FrameError, FrameReader, RawIdentity, cache_refusal_message};
+use super::{
+    DevelopStore, FrameDesc, FrameError, FrameReader, RAW_EXTENSIONS, RawIdentity,
+    cache_refusal_message, has_extension,
+};
 use crate::algorithm::{AlgorithmError, TileReader};
 use crate::equalize::UNIT_GAIN;
 use crate::tile::budget::DECODED_CACHE_SHARE_DIVISOR;
 use crate::tile::{HostBudget, MemoryBound, Rect, Sample, SampleFormat, ScratchDir, TileError};
 
 mod look;
-pub use look::LookTransform;
 use look::encode_f32;
+pub use look::{HighlightClip, LookTransform};
 
 /// Default bound for one developed RAW frame and its decode reservation.
 pub const DEFAULT_RAW_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -1166,6 +1169,66 @@ fn reference_image(path: &Path) -> Result<RawImage, RawError> {
 /// metadata alone.
 fn reference_look(path: &Path) -> Result<LookTransform, RawError> {
     Ok(LookTransform::from_image(&reference_image(path)?))
+}
+
+/// The highlight clip for the document of a RAW stack whose first frame is
+/// `first_frame`, fused from frames read with the equalization `gains` (empty
+/// without equalization). The sensor saturation point is the lowest gain, in
+/// camera-linear units, since a fused pixel cannot say which frame it came
+/// from. `None` for a TIFF or JPEG source, classified by extension without
+/// opening the file, and for a monochrome RAW source.
+pub fn highlight_clip(
+    first_frame: &Path,
+    gains: &[u32],
+) -> Result<Option<HighlightClip>, RawError> {
+    if !has_extension(first_frame, RAW_EXTENSIONS) {
+        return Ok(None);
+    }
+    panic_boundary(first_frame, || {
+        let image = reference_image(first_frame)?;
+        if image.is_monochrome() {
+            return Ok(None);
+        }
+        let saturation = gains
+            .iter()
+            .min()
+            .map_or(1.0, |&gain| f64::from(gain) / f64::from(UNIT_GAIN));
+        Ok(Some(HighlightClip::new(
+            LookTransform::from_image(&image),
+            saturation,
+        )))
+    })
+}
+
+/// The clip a document narrows with: [`highlight_clip`] for a three-channel
+/// `F32` document, `None` for anything else, for a source whose clip cannot be
+/// built (missing, moved or unreadable) and when there is no source. A
+/// 16-bit document opens no file.
+pub fn document_clip(
+    first_frame: Option<&Path>,
+    gains: &[u32],
+    format: SampleFormat,
+    samples_per_pixel: u32,
+) -> Option<HighlightClip> {
+    if format != SampleFormat::F32 || samples_per_pixel != 3 {
+        return None;
+    }
+    highlight_clip(first_frame?, gains).ok().flatten()
+}
+
+/// Narrows an `f32` document band to `out`, resized to `band`'s length: with
+/// `clip` the highlights clip in camera space, without it each sample clamps
+/// onto the 16-bit scale. `clip` implies an interleaved RGB band.
+pub(crate) fn narrow_document_band(clip: Option<&HighlightClip>, band: &[f32], out: &mut Vec<u16>) {
+    out.resize(band.len(), 0);
+    match clip {
+        Some(clip) => clip.narrow_band(band, out),
+        None => {
+            for (narrowed, &sample) in out.iter_mut().zip(band) {
+                *narrowed = <u16 as Sample>::narrow(sample);
+            }
+        }
+    }
 }
 
 /// One of a camera's XYZ-to-camera matrices with the DNG light-source code of

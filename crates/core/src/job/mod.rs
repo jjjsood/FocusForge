@@ -68,7 +68,7 @@ pub use ledger::{
 pub use progress::JobProgress;
 pub use record::{ALIGN_SOLVER_VERSION, AlignIdentity, DRIVER_POLICY_FIELDS, JobRecord};
 pub use stage_cache::{
-    CachedAlignment, CachedStage, FrameKey, StageCache, StageCacheError, StageKey,
+    CachedAlignment, CachedStage, EqualizeKey, FrameKey, StageCache, StageCacheError, StageKey,
 };
 
 use std::collections::HashSet;

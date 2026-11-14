@@ -20,6 +20,7 @@ use focusforge_core::algorithm::{AlgorithmError, read_tile_step_into};
 use focusforge_core::align::{Transform, WarpingReader};
 use focusforge_core::display::alpha_from_opacity;
 use focusforge_core::equalize::GainReader;
+use focusforge_core::io::raw::HighlightClip;
 use focusforge_core::io::{FrameError, FrameReader, TiffStack, open_frame_set};
 use focusforge_core::project::Op;
 use focusforge_core::retouch::{needs_mode_conditions, overlay_colors};
@@ -39,11 +40,14 @@ pub enum CanvasFeed {
     /// No tab is active, or the active tab has nothing sealed to show yet.
     Clear,
     /// Open `composite`, and `zmap` when the row has a readable one, as
-    /// `tab`'s own planes.
+    /// `tab`'s own planes. `clip_source` is the row's first source frame and
+    /// its equalization gains, which a RAW document's highlight clip is
+    /// built from; `None` for a row that is not fused.
     Load {
         tab: usize,
         composite: PathBuf,
         zmap: Option<PathBuf>,
+        clip_source: Option<(PathBuf, Vec<u32>)>,
     },
 }
 
@@ -381,6 +385,40 @@ impl PaneReader for TiffStack {
         out: &mut [u16],
     ) -> Result<(), PaneReadError> {
         Ok(self.read_tile_step_into(0, rect, step, out)?)
+    }
+}
+
+/// The float composite of a RAW document as the pane reads it: the stored
+/// samples narrowed with the document's highlight clip, so a saturated
+/// highlight shows neutral as in the 16-bit export.
+pub struct ClippedComposite {
+    stack: Arc<TiffStack>,
+    clip: HighlightClip,
+}
+
+impl ClippedComposite {
+    /// `stack` read through `clip`; `stack` is a three-sample float TIFF.
+    pub fn new(stack: Arc<TiffStack>, clip: HighlightClip) -> Self {
+        Self { stack, clip }
+    }
+}
+
+impl PaneReader for ClippedComposite {
+    fn samples_per_pixel(&self) -> u32 {
+        self.stack.header(0).samples_per_pixel
+    }
+
+    fn read_step_into(
+        &self,
+        rect: Rect,
+        step: NonZeroU32,
+        out: &mut [u16],
+    ) -> Result<(), PaneReadError> {
+        let mut band = vec![0f32; out.len()];
+        self.stack
+            .read_tile_step_f32_into(0, rect, step, &mut band)?;
+        self.clip.narrow_band(&band, out);
+        Ok(())
     }
 }
 
@@ -1137,14 +1175,17 @@ fn read_job(job: PaneJob, mut samples: Vec<u16>, mut indices: Vec<u16>) -> Optio
 
 /// Overlays `samples` (already the sealed composite, decimated over `rect`
 /// at `step`) with `tiles`' edited pixel at every texel it holds one for --
-/// left as the sealed pixel everywhere else. An edited sample is clipped to
-/// 16 bits with [`u16::narrow`], as the sealed composite's own read is.
+/// left as the sealed pixel everywhere else. An edited texel narrows to 16
+/// bits as the sealed composite's own read does: through `clip` when the
+/// document has one and the texel is RGB, else sample by sample with
+/// [`u16::narrow`].
 pub fn overlay_edited(
     samples: &mut [u16],
     rect: Rect,
     step: NonZeroU32,
     samples_per_pixel: u32,
     tiles: &ResidentTiles,
+    clip: Option<&HighlightClip>,
 ) {
     let step = step.get();
     let spp = samples_per_pixel as usize;
@@ -1157,8 +1198,14 @@ pub fn overlay_edited(
         while sx < rect.x + rect.width {
             let t = (oy * out_w + ox) as usize;
             if let Some(pixel) = tiles.pixel_at(sx, sy) {
-                for (dst, &src) in samples[t * spp..t * spp + spp].iter_mut().zip(pixel) {
-                    *dst = u16::narrow(src);
+                let texel = &mut samples[t * spp..t * spp + spp];
+                match (clip, pixel) {
+                    (Some(clip), &[r, g, b]) => texel.copy_from_slice(&clip.narrow([r, g, b])),
+                    _ => {
+                        for (dst, &src) in texel.iter_mut().zip(pixel) {
+                            *dst = u16::narrow(src);
+                        }
+                    }
                 }
             }
             ox += 1;

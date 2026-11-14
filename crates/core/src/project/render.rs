@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use crate::align::{Registration, WarpingReader};
 use crate::equalize::GainReader;
+use crate::io::raw::{HighlightClip, document_clip, narrow_document_band};
 use crate::io::{FrameSet, TiffSpec, TiffStack, TiffWriter, open_frame_set};
 use crate::retouch::blend::{self, Blend};
 use crate::tile::{HostBudget, Rect, Sample, SampleFormat};
@@ -52,6 +53,9 @@ pub struct CheckpointImage {
     /// Most bytes of checkpoint-sourced stroke samples a render holds at
     /// once; see [`Self::with_source_bytes`].
     source_bytes: u64,
+    /// How a RAW document's `f32` samples narrow to 16 bits; `None` clamps
+    /// each sample.
+    clip: Option<HighlightClip>,
 }
 
 enum Body {
@@ -140,7 +144,12 @@ impl<S: Blend + LeSample> DocumentSample for S {}
 pub(super) type Renderer<'a> = dyn FnMut(&mut RenderSink<'_>) -> Result<(), ProjectError> + 'a;
 
 impl CheckpointImage {
-    fn shaped(composite: &PlaneRef, sample_format: SampleFormat, body: Body) -> Self {
+    fn shaped(
+        composite: &PlaneRef,
+        sample_format: SampleFormat,
+        clip: Option<HighlightClip>,
+        body: Body,
+    ) -> Self {
         CheckpointImage {
             width: composite.width,
             height: composite.height,
@@ -150,6 +159,7 @@ impl CheckpointImage {
             body,
             memory_cap: None,
             source_bytes: CHECKPOINT_SOURCE_BYTES,
+            clip,
         }
     }
 
@@ -180,12 +190,20 @@ impl CheckpointImage {
 
         let composite = record.composite.clone();
         let format = project.plane_format(&composite)?;
+        let first_source = record.sources.first().map(|s| project.source_path(s));
+        let clip = document_clip(
+            first_source.as_deref(),
+            record.registration.gains(),
+            format,
+            composite.samples_per_pixel,
+        );
         let mut ops = project.history().op_chain(id)?;
         ops.extend(&extra);
         if ops.is_empty() {
             return Ok(Self::shaped(
                 &composite,
                 format,
+                clip,
                 Body::Fused(record.composite),
             ));
         }
@@ -220,6 +238,7 @@ impl CheckpointImage {
         Ok(Self::shaped(
             &composite,
             format,
+            clip,
             Body::Ops {
                 checkpoint: Box::new(checkpoint),
                 ancestor: Box::new(record),
@@ -375,15 +394,23 @@ impl CheckpointImage {
                 ),
             ));
         }
+        let samples_per_pixel = stack.header(0).samples_per_pixel;
+        let clip = document_clip(
+            held.sources.first().map(PathBuf::as_path),
+            held.registration.gains(),
+            stack.sample_format(),
+            samples_per_pixel,
+        );
         Ok(CheckpointImage {
             width: held.width,
             height: held.height,
-            samples_per_pixel: stack.header(0).samples_per_pixel,
+            samples_per_pixel,
             description: held.composite_description.clone(),
             sample_format: stack.sample_format(),
             body: Body::Held(held.composite.clone()),
             memory_cap: None,
             source_bytes: CHECKPOINT_SOURCE_BYTES,
+            clip,
         })
     }
 
@@ -425,6 +452,12 @@ impl CheckpointImage {
         let info = ZMapInfo::new(width, height, state.sources.len() as u32)
             .map_err(|err| ProjectError::container(composite, err))?;
         let format = stack.sample_format();
+        let clip = document_clip(
+            state.sources.first().map(PathBuf::as_path),
+            state.registration.gains(),
+            format,
+            samples_per_pixel,
+        );
         let grid = PixelGrid {
             hashes: None,
             paths: state.sources.clone(),
@@ -469,6 +502,7 @@ impl CheckpointImage {
             },
             memory_cap: None,
             source_bytes: CHECKPOINT_SOURCE_BYTES,
+            clip,
         })
     }
 
@@ -488,7 +522,9 @@ impl CheckpointImage {
     /// plane even for a small tile, so its stored hash is still verified;
     /// a held or pending image reads only the rows `tile` covers. `project`
     /// is needed for a saved image and unused for the others. An `f32` image
-    /// is rendered in `f32` and each band narrowed with `u16::narrow`.
+    /// is rendered in `f32` and each band narrowed to 16 bits: a RAW
+    /// document's highlights clip in camera space, so a pixel whose sensor
+    /// saturated comes out neutral; any other samples clamp onto the scale.
     pub fn render(
         &self,
         project: Option<&mut Project>,
@@ -500,8 +536,7 @@ impl CheckpointImage {
             SampleFormat::F32 => {
                 let mut narrowed: Vec<u16> = Vec::new();
                 self.render_as::<f32>(project, tile, self.limits(), &mut |band, rect| {
-                    narrowed.clear();
-                    narrowed.extend(band.iter().map(|&v| u16::narrow(v)));
+                    narrow_document_band(self.clip.as_ref(), band, &mut narrowed);
                     sink(&narrowed, rect)
                 })
             }

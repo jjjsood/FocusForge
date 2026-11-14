@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 
 use focusforge_core::algorithm::TileReader;
 use focusforge_core::align::Registration;
+use focusforge_core::equalize::UNIT_GAIN;
 use focusforge_core::io::RawStack;
 use focusforge_core::io::TiffHeader;
-use focusforge_core::io::raw::{LookTransform, dng_colour};
+use focusforge_core::io::raw::{HighlightClip, LookTransform, dng_colour, highlight_clip};
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
 use focusforge_core::params::ParamValues;
 use focusforge_core::project::export::{
@@ -184,7 +185,7 @@ fn blob_kind(project: &Project, hash: &str) -> BlobKind {
 /// held result, a pending state with the stroke, and a saved root with the
 /// stroke appended.
 struct StrokedRaw {
-    _frames: Vec<tempfile::NamedTempFile>,
+    frames: Vec<tempfile::NamedTempFile>,
     width: u32,
     height: u32,
     held: HeldCheckpoint,
@@ -232,7 +233,7 @@ fn stroked_raw(name: &str) -> StrokedRaw {
         "the stroke's samples stay unclamped"
     );
     StrokedRaw {
-        _frames: frames,
+        frames,
         width,
         height,
         held,
@@ -279,15 +280,17 @@ fn read_png(path: &Path) -> (png::BitDepth, Vec<u8>) {
 }
 
 /// Exports through `export` in every format and checks each file against
-/// `wide` clipped once to 16 bits (and once more to 8).
+/// `wide` clipped once to 16 bits by `clip` (and once more to 8).
 fn check_exports(
     dir: &Path,
     label: &str,
+    clip: &HighlightClip,
     wide: &[f32],
     (width, height): (u32, u32),
     export: &mut dyn FnMut(&Path, &ExportOptions),
 ) {
-    let expect16 = narrowed(wide);
+    let mut expect16 = vec![0u16; wide.len()];
+    clip.narrow_band(wide, &mut expect16);
     let expect8: Vec<u8> = expect16.iter().map(|&v| to_8bit(v)).collect();
     assert!(
         expect16.contains(&65_535),
@@ -362,9 +365,12 @@ fn raw_exports_clip_once() {
         iptc: false,
     };
 
+    let clip = highlight_clip(&paths(&raw.frames)[0], &[])
+        .unwrap()
+        .expect("a colour RAW source has a clip");
     let staged = read_f32(&raw.held.composite);
     let held = raw.held.clone();
-    check_exports(&dir, "held", &staged, size, &mut |path, options| {
+    check_exports(&dir, "held", &clip, &staged, size, &mut |path, options| {
         project::export_held(&held, path, options, &meta).unwrap();
     });
 
@@ -375,13 +381,13 @@ fn raw_exports_clip_once() {
         full(size.0, size.1),
     );
     assert_eq!(bits(&wide), bits(&raw.edited_f32), "pending equals saved");
-    check_exports(&dir, "pending", &wide, size, &mut |path, options| {
+    check_exports(&dir, "pending", &clip, &wide, size, &mut |path, options| {
         project::export_pending(&pending, None, path, options, &meta).unwrap();
     });
 
     let wide = raw.edited_f32.clone();
     let edited = raw.edited.clone();
-    check_exports(&dir, "saved", &wide, size, &mut |path, options| {
+    check_exports(&dir, "saved", &clip, &wide, size, &mut |path, options| {
         project::export_checkpoint(&mut raw.project, &edited, path, options, &meta).unwrap();
     });
 }
@@ -451,10 +457,15 @@ fn raw_document_keeps_headroom() {
         let tile = full(width, height);
         let wide = render_f32(&image, Some(&mut project), tile);
         assert_eq!(bits(&wide), bits(&staged), "{label}: saved f32 render");
+        let clip = highlight_clip(&paths(&frames)[0], &[])
+            .unwrap()
+            .expect("a colour RAW source has a clip");
+        let mut clipped = vec![0u16; staged.len()];
+        clip.narrow_band(&staged, &mut clipped);
         assert_eq!(
             render_u16(&image, Some(&mut project), tile),
-            narrowed(&staged),
-            "{label}: the 16-bit render narrows the f32 one"
+            clipped,
+            "{label}: the 16-bit render clips the f32 one"
         );
     }
 }
@@ -1025,7 +1036,7 @@ fn dng_same_document_as_render() {
     let mut raw = stroked_raw("raw_document_dng_same");
     let dir = tmp_dir("raw_document_dng_same_out");
     let size = full(raw.width, raw.height);
-    let look = dng_colour(raw._frames[0].path()).unwrap().look;
+    let look = dng_colour(raw.frames[0].path()).unwrap().look;
     let meta = dng_meta(true);
 
     let held_path = dir.join("held.dng");
@@ -1078,7 +1089,7 @@ fn dng_same_document_as_render() {
 fn dng_keeps_highlights() {
     let raw = stroked_raw("raw_document_dng_highlights");
     let dir = tmp_dir("raw_document_dng_highlights_out");
-    let look = dng_colour(raw._frames[0].path()).unwrap().look;
+    let look = dng_colour(raw.frames[0].path()).unwrap().look;
     let path = dir.join("held.dng");
     project::export_held(&raw.held, &path, &ExportOptions::Dng, &dng_meta(true)).unwrap();
     let dng = read_dng(&path).samples();
@@ -1220,4 +1231,405 @@ fn dng_refused() {
         error.to_string().contains(unwritable.to_str().unwrap()),
         "{error}"
     );
+}
+
+/// Columns and rows of the 8x8 patch at sensor white in [`patch_frames`].
+const PATCH_X: std::ops::Range<u32> = 5..13;
+const PATCH_Y: std::ops::Range<u32> = 4..12;
+
+/// Writes `[red, green, blue]` sensor values into the RGGB mosaic over
+/// `xs` by `ys`.
+fn fill_patch(
+    spec: &mut DngSpec,
+    xs: std::ops::Range<u32>,
+    ys: std::ops::Range<u32>,
+    [red, green, blue]: [u16; 3],
+) {
+    for y in ys {
+        for x in xs.clone() {
+            spec.samples[(y * spec.width + x) as usize] =
+                [red, green, blue][(x % 2 + y % 2) as usize];
+        }
+    }
+}
+
+fn white_patch(spec: &mut DngSpec) {
+    fill_patch(spec, PATCH_X, PATCH_Y, [4095; 3]);
+}
+
+/// `count` textured 37x23 frames with the white patch at sensor saturation.
+fn patch_frames(count: usize) -> Vec<tempfile::NamedTempFile> {
+    dng_frames_with(count, 37, 23, white_patch)
+}
+
+/// Pixels two or more pixels inside the patch.
+fn deep_in_patch(x: u32, y: u32) -> bool {
+    deep_in(PATCH_X, PATCH_Y, x, y)
+}
+
+/// Pixels two or more pixels inside the patch spanning `xs` by `ys`.
+fn deep_in(xs: std::ops::Range<u32>, ys: std::ops::Range<u32>, x: u32, y: u32) -> bool {
+    (xs.start + 2..xs.end - 2).contains(&x) && (ys.start + 2..ys.end - 2).contains(&y)
+}
+
+/// Pixels two or more pixels outside the patch and clear of the last two rows
+/// and columns, where the demosaic of an odd-sized frame extrapolates samples
+/// thousands of times above white.
+fn far_from_patch(x: u32, y: u32, (width, height): (u32, u32)) -> bool {
+    !((PATCH_X.start - 1..PATCH_X.end + 1).contains(&x)
+        && (PATCH_Y.start - 1..PATCH_Y.end + 1).contains(&y))
+        && x < width - 2
+        && y < height - 2
+}
+
+fn is_neutral(rgb: &[u16]) -> bool {
+    rgb[0].abs_diff(rgb[1]) <= 1 && rgb[1].abs_diff(rgb[2]) <= 1
+}
+
+#[test]
+fn raw_highlight_clip_document() {
+    let (width, height) = (37u32, 23u32);
+    let frames = patch_frames(3);
+    let dir = tmp_dir("raw_highlight_clip_document");
+    let held = common::fuse_held(&paths(&frames), "weighted-average", false, &dir);
+    let samples = read_f32(&held.composite);
+    let clip = highlight_clip(&paths(&frames)[0], &[])
+        .unwrap()
+        .expect("a colour RAW source has a clip");
+    let mut clipped = vec![0u16; samples.len()];
+    clip.narrow_band(&samples, &mut clipped);
+    let plain = narrowed(&samples);
+
+    let (mut inside, mut outside, mut above_white) = (0, 0, 0);
+    for y in 0..height {
+        for x in 0..width {
+            let at = ((y * width + x) * 3) as usize..((y * width + x) * 3 + 3) as usize;
+            if deep_in_patch(x, y) {
+                inside += 1;
+                assert!(
+                    is_neutral(&clipped[at.clone()]),
+                    "({x}, {y}): {:?}",
+                    &clipped[at]
+                );
+            } else if far_from_patch(x, y, (width, height)) {
+                outside += 1;
+                above_white += samples[at.clone()]
+                    .iter()
+                    .filter(|&&s| s > 65_535.0)
+                    .count();
+                assert_eq!(&clipped[at.clone()], &plain[at], "({x}, {y})");
+            }
+        }
+    }
+    assert!(inside > 0 && outside > 0);
+    assert!(
+        above_white > 0,
+        "the texture must carry samples above white"
+    );
+}
+
+/// A patch whose green stops at 99 % of the white level (4055 = 64 + 0.99 *
+/// 4031) is clipped; a patch with green at 97 % (3974) and red well below it,
+/// and the texture, stay as `u16::narrow` leaves them. A mixed-value mosaic
+/// demosaics to camera values that differ with pixel parity, so neutrality of
+/// the first patch is shown at the look level.
+#[test]
+fn raw_highlight_clip_below_white_level() {
+    let (width, height) = (37u32, 23u32);
+    let second_x = 20..28;
+    let frames = dng_frames_with(3, width, height, |spec| {
+        fill_patch(spec, PATCH_X, PATCH_Y, [4055, 4055, 4000]);
+        fill_patch(spec, second_x.clone(), PATCH_Y, [2700, 3974, 3974]);
+    });
+    let dir = tmp_dir("raw_highlight_clip_below_white_level");
+    let held = common::fuse_held(&paths(&frames), "weighted-average", false, &dir);
+    let samples = read_f32(&held.composite);
+    let clip = highlight_clip(&paths(&frames)[0], &[])
+        .unwrap()
+        .expect("a colour RAW source has a clip");
+    let mut clipped = vec![0u16; samples.len()];
+    clip.narrow_band(&samples, &mut clipped);
+    let plain = narrowed(&samples);
+
+    let near_second = |x: u32, y: u32| {
+        (second_x.start - 1..second_x.end + 1).contains(&x)
+            && (PATCH_Y.start - 1..PATCH_Y.end + 1).contains(&y)
+    };
+    let (mut at_99, mut at_97, mut texture) = (0, 0, 0);
+    for y in 0..height {
+        for x in 0..width {
+            let at = ((y * width + x) * 3) as usize..((y * width + x) * 3 + 3) as usize;
+            if deep_in_patch(x, y) {
+                at_99 += 1;
+                assert_ne!(&clipped[at.clone()], &plain[at], "({x}, {y})");
+            } else if deep_in(second_x.clone(), PATCH_Y, x, y) {
+                at_97 += 1;
+                assert_eq!(&clipped[at.clone()], &plain[at], "({x}, {y})");
+            } else if far_from_patch(x, y, (width, height)) && !near_second(x, y) {
+                texture += 1;
+                assert_eq!(&clipped[at.clone()], &plain[at], "({x}, {y})");
+            }
+        }
+    }
+    assert!(at_99 > 0 && at_97 > 0 && texture > 0);
+}
+
+#[test]
+fn raw_highlight_clip_equalized() {
+    let (width, height) = (37u32, 23u32);
+    let frames = patch_frames(3);
+    let sources = paths(&frames);
+    let stack = RawStack::open_files(&sources).unwrap();
+    let gains = [
+        (0.82 * f64::from(UNIT_GAIN)) as u32,
+        UNIT_GAIN,
+        (1.2 * f64::from(UNIT_GAIN)) as u32,
+    ];
+    let frame_samples: Vec<Vec<f32>> = gains
+        .iter()
+        .enumerate()
+        .map(|(frame, &gain)| {
+            let mut out = vec![0f32; (width * height * 3) as usize];
+            stack
+                .read_tile_gained_f32_into(frame, full(width, height), gain, &mut out)
+                .unwrap();
+            out
+        })
+        .collect();
+
+    let patch_of = |clip: &focusforge_core::io::raw::HighlightClip, frame: usize| {
+        let samples = &frame_samples[frame];
+        let mut clipped = vec![0u16; samples.len()];
+        clip.narrow_band(samples, &mut clipped);
+        let plain = narrowed(samples);
+        let mut pixels = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                if deep_in_patch(x, y) {
+                    let at = ((y * width + x) * 3) as usize;
+                    pixels.push((clipped[at..at + 3].to_vec(), plain[at..at + 3].to_vec()));
+                }
+            }
+        }
+        assert!(!pixels.is_empty());
+        pixels
+    };
+
+    let recorded = highlight_clip(&sources[0], &gains).unwrap().unwrap();
+    for frame in 0..3 {
+        for (clipped, _) in patch_of(&recorded, frame) {
+            assert!(is_neutral(&clipped), "frame {frame}: {clipped:?}");
+        }
+    }
+
+    let unity = highlight_clip(&sources[0], &[]).unwrap().unwrap();
+    for frame in [1, 2] {
+        for (clipped, _) in patch_of(&unity, frame) {
+            assert!(is_neutral(&clipped), "frame {frame}: {clipped:?}");
+        }
+    }
+    for (clipped, plain) in patch_of(&unity, 0) {
+        assert_eq!(
+            clipped, plain,
+            "the 0.82 frame stays below a saturation point of 1"
+        );
+        assert!(
+            !is_neutral(&plain),
+            "the unclipped patch is tinted: {plain:?}"
+        );
+    }
+}
+
+#[test]
+fn raw_highlight_clip_context() {
+    let dir = tmp_dir("raw_highlight_clip_context");
+    let tiff = dir.join("frame.tif");
+    let mut writer = TiffWriter::create(
+        &tiff,
+        TiffSpec {
+            width: 4,
+            height: 4,
+            samples_per_pixel: 3,
+            description: None,
+        },
+    )
+    .unwrap();
+    writer.write_tile(full(4, 4), &[1_000u16; 48]).unwrap();
+    writer.finish().unwrap();
+    assert!(highlight_clip(&tiff, &[]).unwrap().is_none(), "TIFF");
+    assert!(
+        highlight_clip(&dir.join("absent.jpg"), &[])
+            .unwrap()
+            .is_none(),
+        "a JPEG path is classified without reading it"
+    );
+
+    let monochrome = dng_frames_with(1, 8, 8, |spec| spec.monochrome = true);
+    assert!(
+        highlight_clip(monochrome[0].path(), &[]).unwrap().is_none(),
+        "monochrome"
+    );
+
+    let tagless = dng_frames_with(1, 8, 8, |spec| {
+        spec.as_shot_neutral = None;
+        spec.omit_color_matrix = true;
+    });
+    let clip = highlight_clip(tagless[0].path(), &[])
+        .unwrap()
+        .expect("a colour DNG with no colour tags still clips");
+    let saturated = [90_000.0, 80_000.0, 70_000.0];
+    let clipped = clip.narrow(saturated);
+    assert!(is_neutral(&clipped), "{clipped:?}");
+
+    let missing = dir.join("absent.dng");
+    assert!(highlight_clip(&missing, &[]).is_err(), "a missing RAW file");
+}
+
+fn tiff16() -> ExportOptions {
+    ExportOptions::Tiff {
+        bits: TiffBits::Sixteen,
+        compression: TiffCompression::None,
+    }
+}
+
+const NO_METADATA: MetadataOptions = MetadataOptions {
+    exif: false,
+    icc: false,
+    xmp: false,
+    iptc: false,
+};
+
+#[test]
+fn raw_exports_clip_highlight() {
+    let (width, height) = (37u32, 23u32);
+    let frames = patch_frames(3);
+    let dir = tmp_dir("raw_exports_clip_highlight");
+    let held = common::fuse_held(&paths(&frames), "weighted-average", false, &dir);
+    let staged = read_f32(&held.composite);
+    let plain = narrowed(&staged);
+    let out = dir.join("held.tif");
+    project::export_held(&held, &out, &tiff16(), &NO_METADATA).unwrap();
+    let exported = read_u16(&out);
+
+    let (mut inside, mut outside, mut tinted_by_clamp) = (0, 0, 0);
+    for y in 0..height {
+        for x in 0..width {
+            let at = ((y * width + x) * 3) as usize..((y * width + x) * 3 + 3) as usize;
+            if deep_in_patch(x, y) {
+                inside += 1;
+                assert!(is_neutral(&exported[at.clone()]), "({x}, {y})");
+                tinted_by_clamp += usize::from(!is_neutral(&plain[at]));
+            } else if far_from_patch(x, y, (width, height)) {
+                outside += 1;
+                assert_eq!(&exported[at.clone()], &plain[at], "({x}, {y})");
+            }
+        }
+    }
+    assert!(inside > 0 && outside > 0);
+    assert!(
+        tinted_by_clamp > 0,
+        "the per-channel clamp must leave a cast the clip removes"
+    );
+}
+
+/// What the observer keeps of a run: the last composite preview delivered.
+struct CompositePreviews(std::sync::Mutex<Option<focusforge_core::display::StagePreview>>);
+
+impl focusforge_core::pipeline::StageObserver for CompositePreviews {
+    fn preview_kinds(&self) -> focusforge_core::display::PreviewKinds {
+        focusforge_core::display::PreviewKinds {
+            composite: true,
+            ..Default::default()
+        }
+    }
+
+    fn preview(&self, preview: &focusforge_core::display::StagePreview) {
+        *self.0.lock().unwrap() = Some(preview.clone());
+    }
+}
+
+fn read_composite(project: &mut Project) -> Vec<u16> {
+    let mut samples = Vec::new();
+    project
+        .read_plane_into(project::Plane::Composite, &mut |band, _| {
+            samples.extend_from_slice(band);
+        })
+        .unwrap();
+    samples
+}
+
+#[test]
+fn raw_display_matches_export() {
+    let (width, height) = (37u32, 23u32);
+    let frames = patch_frames(3);
+    let dir = tmp_dir("raw_display_matches_export");
+    let observer = CompositePreviews(Default::default());
+    let held =
+        common::fuse_held_observed(&paths(&frames), "weighted-average", false, &dir, &observer);
+    let out = dir.join("held.tif");
+    project::export_held(&held, &out, &tiff16(), &NO_METADATA).unwrap();
+    let export16 = read_u16(&out);
+
+    let project_path = dir.join(format!("saved.{}", project::PROJECT_EXTENSION));
+    seal_held(&project_path, &held);
+    let mut project = Project::open(&project_path).unwrap();
+    assert_eq!(read_composite(&mut project), export16, "plane read");
+
+    let preview = observer
+        .0
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the run delivers a composite preview");
+    assert_eq!((preview.width, preview.height), (width, height), "1:1");
+    let mut neutral = 0;
+    for y in 0..height {
+        for x in 0..width {
+            let cell = (y * width + x) as usize;
+            let shown = &preview.rgba[cell * 4..cell * 4 + 3];
+            let expected: Vec<u8> = export16[cell * 3..cell * 3 + 3]
+                .iter()
+                .map(|&v| focusforge_core::display::reduce16to8(v, x, y))
+                .collect();
+            assert_eq!(shown, expected, "({x}, {y})");
+            if deep_in_patch(x, y) {
+                neutral += 1;
+                assert!(
+                    shown[0].abs_diff(shown[1]) <= 1 && shown[1].abs_diff(shown[2]) <= 1,
+                    "({x}, {y}): {shown:?}"
+                );
+            }
+        }
+    }
+    assert!(neutral > 0);
+}
+
+#[test]
+fn raw_reopened_project_clips_like_held() {
+    let frames = patch_frames(3);
+    let dir = tmp_dir("raw_reopened_project_clips_like_held");
+    let held = common::fuse_held(&paths(&frames), "weighted-average", false, &dir);
+    let plain = narrowed(&read_f32(&held.composite));
+    let out = dir.join("held.tif");
+    project::export_held(&held, &out, &tiff16(), &NO_METADATA).unwrap();
+    let clipped = read_u16(&out);
+    assert_ne!(clipped, plain, "the clip changes this document");
+
+    let project_path = dir.join(format!("saved.{}", project::PROJECT_EXTENSION));
+    let root = seal_held(&project_path, &held);
+    let check = |expected: &[u16], label: &str| {
+        let mut project = Project::open(&project_path).unwrap();
+        assert_eq!(
+            read_composite(&mut project),
+            expected,
+            "{label}: plane read"
+        );
+        let out = dir.join(format!("{label}.tif"));
+        project::export_checkpoint(&mut project, &root, &out, &tiff16(), &NO_METADATA).unwrap();
+        assert_eq!(read_u16(&out), expected, "{label}: export");
+    };
+    check(&clipped, "reopened");
+
+    drop(frames);
+    check(&plain, "sources gone");
 }

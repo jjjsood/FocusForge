@@ -206,7 +206,18 @@ impl TiffStack {
         rect: Rect,
         out: &mut [f32],
     ) -> Result<(), TiffError> {
-        let step = NonZeroU32::MIN;
+        self.read_tile_step_f32_into(frame, rect, NonZeroU32::MIN, out)
+    }
+
+    /// [`Self::read_tile_f32_into`] over every `step`-th row and column of
+    /// `rect`, sized and sampled as [`Self::read_tile_step_into`].
+    pub fn read_tile_step_f32_into(
+        &self,
+        frame: usize,
+        rect: Rect,
+        step: NonZeroU32,
+        out: &mut [f32],
+    ) -> Result<(), TiffError> {
         match self.format {
             SampleFormat::U16 => self.read_step_as(frame, rect, step, out, |order, c| {
                 f32::from(order.u16_from([c[0], c[1]]))

@@ -33,6 +33,28 @@ pub fn mantis_512_dir() -> PathBuf {
     fixtures_dir().join("mantis-512")
 }
 
+/// Every field of `report`, each `f64` as `f64::to_bits()`, flattened to
+/// words: two reports are bit-identical exactly when these are equal.
+#[allow(dead_code)]
+pub fn equalization_bits(report: &focusforge_core::equalize::EqualizationReport) -> Vec<u64> {
+    let mut words = vec![
+        report.max_gain.to_bits(),
+        report.target_stops.to_bits(),
+        report.neutral.to_bits(),
+        report.target.to_bits(),
+    ];
+    for f in &report.frames {
+        words.extend([f.mean, f.estimated, f.applied, f.output_mean, f.residual].map(f64::to_bits));
+        words.extend([
+            u64::from(f.gain),
+            u64::from(f.clamped),
+            u64::from(f.black),
+            f.clipped_samples,
+        ]);
+    }
+    words
+}
+
 /// A fresh temporary directory under `CARGO_TARGET_TMPDIR`, removed on drop.
 #[allow(dead_code)]
 pub fn target_tmp() -> tempfile::TempDir {
@@ -50,17 +72,30 @@ pub fn fuse_held(
     crop: bool,
     dir: &Path,
 ) -> focusforge_core::project::HeldCheckpoint {
+    struct NoopObserver;
+    impl focusforge_core::pipeline::StageObserver for NoopObserver {}
+
+    fuse_held_observed(frames, algorithm_id, crop, dir, &NoopObserver)
+}
+
+/// [`fuse_held`] reporting to `observer`, so a test can read the run's
+/// previews.
+#[allow(dead_code)]
+pub fn fuse_held_observed(
+    frames: &[PathBuf],
+    algorithm_id: &str,
+    crop: bool,
+    dir: &Path,
+    observer: &dyn focusforge_core::pipeline::StageObserver,
+) -> focusforge_core::project::HeldCheckpoint {
     use std::time::Duration;
 
     use focusforge_core::job::JobControl;
     use focusforge_core::params::ParamValues;
     use focusforge_core::pipeline::{
-        AlignRequest, FuseOutcome, FuseOutput, FuseProduct, FuseRequest, StageObserver,
+        AlignRequest, FuseOutcome, FuseOutput, FuseProduct, FuseRequest,
     };
     use focusforge_core::{project, registry};
-
-    struct NoopObserver;
-    impl StageObserver for NoopObserver {}
 
     let hold = dir.join("held");
     std::fs::create_dir_all(&hold).expect("the held directory must be creatable");
@@ -95,7 +130,7 @@ pub fn fuse_held(
         poll: Duration::from_millis(50),
         free_space: None,
     };
-    let outcome = focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+    let outcome = focusforge_core::pipeline::run(&request, observer, JobControl::new(), None)
         .expect("the fusion must complete");
     let FuseOutcome::Completed(report) = outcome else {
         panic!("the fusion was cancelled");

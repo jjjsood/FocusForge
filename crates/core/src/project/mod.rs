@@ -185,7 +185,7 @@ fn stream_bands<W: PlaneWriter>(
     mut writer: W,
 ) -> Result<W, ProjectError> {
     let mut failure: Option<String> = None;
-    project.read_plane_ref_into(plane_ref, &mut |band, rect| {
+    project.read_plane_ref_into(plane_ref, None, &mut |band, rect| {
         if failure.is_some() {
             return;
         }
@@ -256,6 +256,7 @@ pub(super) fn full_blob<'a>(
 
 use crate::algorithm::StackAlgorithm;
 use crate::equalize::EqualizeSettings;
+use crate::io::raw::{HighlightClip, document_clip, narrow_document_band};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues, validate};
 use crate::tile::{Rect, Sample, SampleFormat};
 
@@ -608,7 +609,7 @@ impl Project {
             accepted_mismatch: None,
             relocated: None,
         };
-        project.read_plane_ref_into(&head_ref, &mut |_, _| {})?;
+        project.read_plane_ref_into(&head_ref, None, &mut |_, _| {})?;
         Ok(project)
     }
 
@@ -882,23 +883,40 @@ impl Project {
     /// the sink hands it must therefore write to a `.partial` and rename
     /// only once this call returns `Ok` -- which is exactly what `export`
     /// does.
+    ///
+    /// A composite of `f32` samples narrows to 16 bits as an export of the
+    /// checkpoint does: a RAW document's highlights clip in camera space.
     pub fn read_plane_into(
         &mut self,
         which: Plane,
         sink: &mut impl FnMut(&[u16], Rect),
     ) -> Result<(), ProjectError> {
         let plane = self.plane(which).clone();
-        self.read_plane_ref_into(&plane, sink)
+        let clip = match which {
+            Plane::Composite => {
+                let record = self.fuse_state(&self.checkpoint.id)?;
+                let first_source = record.sources.first().map(|s| self.source_path(s));
+                document_clip(
+                    first_source.as_deref(),
+                    record.registration.gains(),
+                    self.plane_format(&plane)?,
+                    plane.samples_per_pixel,
+                )
+            }
+            Plane::ZMap => None,
+        };
+        self.read_plane_ref_into(&plane, clip.as_ref(), sink)
     }
 
     /// [`Self::read_plane_into`]'s body, over an arbitrary [`PlaneRef`]
     /// rather than one of `self.manifest`'s own two -- what
     /// [`materialize_zmap`] uses to read a non-head checkpoint's own Z-Map
     /// blob under the manifest's declared shape. A blob of `f32` samples is
-    /// narrowed with `u16::narrow`.
+    /// narrowed with `clip`, clamped per sample without one.
     fn read_plane_ref_into(
         &mut self,
         plane: &PlaneRef,
+        clip: Option<&HighlightClip>,
         sink: &mut impl FnMut(&[u16], Rect),
     ) -> Result<(), ProjectError> {
         match self.plane_format(plane)? {
@@ -906,8 +924,7 @@ impl Project {
             SampleFormat::F32 => {
                 let mut narrowed: Vec<u16> = Vec::new();
                 self.read_plane_ref_as::<f32>(plane, &mut |band, rect| {
-                    narrowed.clear();
-                    narrowed.extend(band.iter().map(|&v| u16::narrow(v)));
+                    narrow_document_band(clip, band, &mut narrowed);
                     sink(&narrowed, rect);
                 })
             }

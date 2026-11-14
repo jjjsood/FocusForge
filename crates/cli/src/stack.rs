@@ -130,6 +130,9 @@ pub struct StackReport {
     /// when the device ran, or no device was in use. On a fallback `backend`
     /// is `cpu` and the three device fields above are `null`.
     pub gpu_fallback: Option<String>,
+    /// `true` only when the brightness estimate came out of the stage cache;
+    /// `false` for a computed one, or when equalization was off.
+    pub equalization_cached: bool,
     /// `true` only when the alignment came out of the stage cache;
     /// `false` for a computed one, a `--resume` ledger-peeked one, or a
     /// `--no-align` run.
@@ -1404,7 +1407,7 @@ struct CliObserver<'a> {
 
 impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
     fn stage(&self, stage: focusforge_core::pipeline::RunStage) {
-        use focusforge_core::pipeline::{AlignSource, RunStage};
+        use focusforge_core::pipeline::{AlignSource, PrepareSource, RunStage};
         let mut renderer = self
             .renderer
             .lock()
@@ -1414,10 +1417,21 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
                 renderer.stage(&format!("develop {frames} frames (RAW)"));
                 renderer.start(&self.control.progress());
             }
-            RunStage::Prepare { frames } => {
+            RunStage::Prepare {
+                frames,
+                source: PrepareSource::Computed,
+                ..
+            } => {
                 renderer.stage(&format!("prepare {frames} frames (brightness)"));
                 renderer.start(&self.control.progress());
             }
+            RunStage::Prepare {
+                frames,
+                source: PrepareSource::Cached,
+                ..
+            } => renderer.stage(&format!(
+                "prepare {frames} frames (reused from the stage cache)"
+            )),
             // A peeked (resumed) alignment prints nothing -- it cost no
             // wall time and is not a stage a viewer is waiting through.
             RunStage::Align {
@@ -1610,6 +1624,7 @@ fn build_stack_report(
         device_budget_provenance: device_budget_report.as_ref().map(|r| r.provenance),
         device_peak_in_flight: device_peak.map(|p| p.peak_in_flight()),
         gpu_fallback: report.gpu_fallback,
+        equalization_cached: report.equalization_cached,
         align_cached: report.align_cached,
         stages: report.stages,
         develop_counts: report.develop_counts,
@@ -1711,7 +1726,7 @@ fn render(report: &StackReport) -> String {
     lines.push(match &report.equalization {
         None => "equalization=off".to_string(),
         Some(eq) => format!(
-            "equalization=on max_gain={} target_stops={} neutral={:.1} target={:.1} clamped={} black={} clipped={} (scales encoded code values, not a linear-light correction)",
+            "equalization=on max_gain={} target_stops={} neutral={:.1} target={:.1} clamped={} black={} clipped={} ({})",
             eq.max_gain,
             eq.target_stops,
             eq.neutral,
@@ -1719,6 +1734,11 @@ fn render(report: &StackReport) -> String {
             eq.frames.iter().filter(|f| f.clamped).count(),
             eq.frames.iter().filter(|f| f.black).count(),
             eq.frames.iter().filter(|f| f.clipped_samples > 0).count(),
+            if report.working_space == "encoded-srgb" {
+                "a linear-light correction, applied before encoding"
+            } else {
+                "scales encoded code values, not a linear-light correction"
+            },
         ),
     });
     lines.push(format!("backend: {}", report.backend));
@@ -1894,6 +1914,7 @@ mod tests {
             device_budget_provenance: None,
             device_peak_in_flight: None,
             gpu_fallback: None,
+            equalization_cached: false,
             align_cached: false,
             stages: focusforge_core::timing::StageTimings {
                 setup: Some(0.012),
@@ -1957,6 +1978,37 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
         }
+    }
+
+    #[test]
+    fn render_names_the_equalization_space() {
+        let equalization_line = |working_space: &'static str| {
+            let mut sample = sample_report();
+            sample.working_space = working_space;
+            sample.equalization = Some(EqualizationReport {
+                max_gain: 1.25,
+                target_stops: 0.0,
+                neutral: 100.0,
+                target: 100.0,
+                frames: Vec::new(),
+            });
+            render(&sample)
+                .lines()
+                .find(|line| line.starts_with("equalization=on"))
+                .expect("an equalized run names its equalization")
+                .to_string()
+        };
+        let raw = equalization_line("encoded-srgb");
+        assert!(
+            raw.ends_with("(a linear-light correction, applied before encoding)"),
+            "{raw}"
+        );
+        assert!(!raw.contains("encoded code values"), "{raw}");
+        let tiff = equalization_line("encoded-unknown-transfer");
+        assert!(
+            tiff.ends_with("(scales encoded code values, not a linear-light correction)"),
+            "{tiff}"
+        );
     }
 
     #[test]
