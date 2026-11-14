@@ -142,6 +142,6 @@ run_case bad-init 2 bash -c '
   source "$1/tools/lib/run-logged.sh"
   RUNLOG_DIR=/dev/null; runlog_init test
 ' _ "$REPO" "$TMP"
-run_case canonical-init 2 "$REPO/tools/check-all.sh" --static --log-dir /dev/null
+run_case canonical-init 2 env FF_GATE_NO_CACHE=1 "$REPO/tools/check-all.sh" --static --log-dir /dev/null
 
 echo "OK: logging selftest preserves failures and rejects empty or unwritable runs"
