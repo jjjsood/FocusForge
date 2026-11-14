@@ -13,6 +13,7 @@ use focusforge_core::project::{BrushMode, Op, Point, StrokeSource};
 use focusforge_core::retouch::blend;
 use focusforge_core::retouch::preview::{
     BRUSH_PREVIEW_STRENGTH_Q16, BrushPreview, BrushPreviewGrid, BrushPreviewSpec, brush_preview,
+    brush_preview_bounds,
 };
 use focusforge_core::tile::Rect;
 use focusforge_core::zmap::ZMapInfo;
@@ -678,4 +679,60 @@ fn edge_and_bad_inputs_are_empty() {
 
     assert_eq!(result.samples, kept_result);
     assert_eq!(source.samples, kept_source);
+}
+
+#[test]
+fn brush_preview_bounds_is_the_box_the_preview_needs() {
+    let image = (300, 300);
+    let nz = |step: u32| NonZeroU32::new(step).unwrap();
+    let answers = |bounds: Rect, step: u32, brush: &BrushPreviewSpec| {
+        let result = Owned::new(bounds, step, 3);
+        let source = Owned::new(bounds, step, 4);
+        make(image, &result, &source, brush, OPAQUE).is_some()
+    };
+    for mode in [BrushMode::Lighten, BrushMode::Detail] {
+        for step in [1, 2, 5] {
+            let brush = spec((101, 97), 9.5, 0.3, mode, 1.0);
+            let bounds = brush_preview_bounds(image, &brush, nz(step)).unwrap();
+            assert!(answers(bounds, step, &brush), "{mode:?} step {step}");
+            let short = rect(
+                bounds.x + step,
+                bounds.y,
+                bounds.width - step,
+                bounds.height,
+            );
+            assert!(
+                !answers(short, step, &brush),
+                "{mode:?} step {step}: losing the first {step} pixels on the left"
+            );
+        }
+    }
+
+    let width_of = |mode| {
+        brush_preview_bounds(image, &spec((101, 97), 9.5, 0.3, mode, 1.0), nz(5))
+            .unwrap()
+            .width
+    };
+    assert!(
+        width_of(BrushMode::Detail) > width_of(BrushMode::Lighten),
+        "Detail reads past the footprint"
+    );
+
+    // Clipped to the image, and still answered.
+    for mode in [BrushMode::Lighten, BrushMode::Detail] {
+        let brush = spec((3, 297), 12.0, 0.3, mode, 1.0);
+        let bounds = brush_preview_bounds(image, &brush, nz(2)).unwrap();
+        assert_eq!((bounds.x, bounds.y + bounds.height), (0, 300), "{mode:?}");
+        assert!(answers(bounds, 2, &brush), "{mode:?} at the image edge");
+    }
+
+    // A brush the preview cannot draw has no box.
+    for brush in [
+        spec((101, 97), -1.0, 0.3, BrushMode::Lighten, 1.0),
+        spec((900, 900), 5.0, 0.3, BrushMode::Lighten, 1.0),
+    ] {
+        assert_eq!(brush_preview_bounds(image, &brush, nz(1)), None);
+    }
+    let brush = spec((10, 10), 5.0, 0.3, BrushMode::Lighten, 1.0);
+    assert_eq!(brush_preview_bounds((0, 0), &brush, nz(1)), None);
 }

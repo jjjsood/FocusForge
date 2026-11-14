@@ -99,6 +99,59 @@ pub struct BrushPreviewSpec {
     pub opacity: f32,
 }
 
+/// The one-point stroke a press at the spec's centre records.
+fn one_point_stroke(spec: &BrushPreviewSpec) -> Op {
+    Op::BrushStroke {
+        source: StrokeSource::Frame(0),
+        path: vec![spec.centre],
+        radius: spec.radius,
+        softness: spec.softness,
+        mode: spec.mode,
+        opacity: spec.opacity,
+    }
+}
+
+/// Width of each of Detail's three box passes on a lattice of `step`:
+/// `max(1, (p + step / 2) / step)` samples for the stroke's pass radius `p`.
+fn pass_samples(pass: u32, step: NonZeroU32) -> u32 {
+    let step = step.get();
+    ((pass + step / 2) / step).max(1)
+}
+
+/// The pixel box [`brush_preview`] needs both grids to cover when the result
+/// grid has lattice `step`: the stroke's footprint, grown for Detail by its
+/// three [`pass_samples`] box passes, clipped to the image. Grids that start
+/// at or before the box's corner and reach its far edges answer; one that
+/// starts later does not. `None` when the image or the brush is out of range
+/// or the footprint holds no pixel. Allocates nothing.
+pub fn brush_preview_bounds(
+    image_size: (u32, u32),
+    spec: &BrushPreviewSpec,
+    step: NonZeroU32,
+) -> Option<Rect> {
+    let info = ZMapInfo::new(image_size.0, image_size.1, 1).ok()?;
+    let stroke = blend::validate_parts(
+        &StrokeSource::Frame(0),
+        blend::Stroke {
+            path: std::slice::from_ref(&spec.centre),
+            radius: spec.radius,
+            softness: spec.softness,
+            mode: spec.mode,
+            opacity: spec.opacity,
+        },
+        info,
+    )
+    .ok()?;
+    let footprint = blend::stroke_footprint(&stroke, info)?;
+    let reach = match spec.mode {
+        BrushMode::Detail => 3u32
+            .saturating_mul(pass_samples(blend::stroke_pass_radius(&stroke), step))
+            .saturating_mul(step.get()),
+        _ => 0,
+    };
+    Some(blend::grow(footprint, reach, info))
+}
+
 /// RGBA8 texels, row-major, over `width` x `height` lattice samples of the
 /// result grid starting at lattice sample (`column`, `row`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,14 +200,7 @@ pub fn brush_preview(
     if !info.contains(result.rect) {
         return None;
     }
-    let op = Op::BrushStroke {
-        source: StrokeSource::Frame(0),
-        path: vec![spec.centre],
-        radius: spec.radius,
-        softness: spec.softness,
-        mode: spec.mode,
-        opacity: spec.opacity,
-    };
+    let op = one_point_stroke(spec);
     let footprint = blend::footprint(&op, info).ok()??;
     if result.rect.intersect(footprint) != Some(footprint) {
         return None;
@@ -258,9 +304,8 @@ fn detail_target(
     at: Rect,
 ) -> Option<Vec<u16>> {
     let step = i64::from(result.step.get());
-    let pass = i64::from(blend::pass_radius(op, info).ok()?);
-    let pass_samples = ((pass + step / 2) / step).max(1);
-    let reach = 3 * pass_samples;
+    let pass_samples = pass_samples(blend::pass_radius(op, info).ok()?, result.step);
+    let reach = 3 * i64::from(pass_samples);
     // The lattice samples inside the map: pixel `origin + i * step` in `0..extent`.
     let inside = |origin: u32, extent: u32| {
         (
@@ -304,7 +349,7 @@ fn detail_target(
     }
     let mut target = vec![0u16; at.width as usize * at.height as usize * 3];
     blend::detail_output(
-        pass_samples as u32,
+        pass_samples,
         (window, &from_result),
         (window, &from_source),
         at,
