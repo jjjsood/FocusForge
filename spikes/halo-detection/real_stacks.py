@@ -13,6 +13,7 @@ Subcommands (run from the repository root):
                  through the product's own grouping file, and export composite and Z-Map
     crops        cut the context crops of the fixed rects from every method's composite and Z-Map,
                  or write a gridded quarter-scale preview of one stack to choose rects on
+    sheet        one PNG of every arm's maps on every cropped rect and method (needs torch)
     --self-check   grouping, run cutting, image test, preview layout and boundary cases on
                    constructed answers
 
@@ -31,21 +32,24 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import tomllib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, "tools", "lib"))
 import rawtiff  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import classical_maps as cm  # noqa: E402
 import halo_net as hn  # noqa: E402
 import layered_scene as ls  # noqa: E402
+import pretrained_dbd as pd  # noqa: E402
 
 METHODS = ls.gff.ALGOS
 
@@ -1076,6 +1080,240 @@ def cmd_crops(args):
     return 0
 
 
+MAX_SIDE = 32767  # px: the most a side of the sheet may have for common viewers
+B_LIMIT = 200.0  # counts: map B is drawn on a fixed scale of +/- this
+LABEL_W, SHEET_HEAD, STRIP, GAP = 300, 170, 26, 4  # px: row labels, legend band, column strip per stack, gap between cells
+NAN_GREY, MESSAGE_FILL, BACKGROUND = 128, 60, 24
+# column key, title, drawing: "rgb" composite, ("grey", range) unsigned map, "b" signed map on the +/- B_LIMIT scale
+SHEET_COLUMNS = (
+    ("composite", "composite", "rgb"),
+    ("risk-zones", "map A: risk-zones", ("grey", cm.PARAMS["risk-zones"]["band_hi"] + 1)),
+    ("glow-self", "map B: glow-self", "b"),
+    ("glow-focus-map", "map B: glow-focus-map", "b"),
+    ("pretrained-a", "pretrained 320 map A", ("grey", pd.PARAMS["320"]["band_hi"] + 1)),
+    ("pretrained-blur", "pretrained 320 blur (1 - mask)", ("grey", 1.0)),
+    ("network-a", "network map A", ("grey", 1.0)),
+    ("network-b", "network map B", "b"),
+)
+
+
+def sheet_rows(crops):
+    """(crop, method) of every sheet row: one per crop and method, crop-major."""
+    return [(c, m) for c in crops for m in METHODS]
+
+
+def sheet_layout(stacks, side=CROP_SIDE):
+    """(width, height, top of each row) for rows of the stacks named in order: a legend band, a column strip before
+    each stack's first row and `side` px per row."""
+    ys, y, prev = [], SHEET_HEAD, None
+    for st in stacks:
+        if st != prev:
+            y, prev = y + STRIP, st
+        ys.append(y)
+        y += side + GAP
+    return LABEL_W + len(SHEET_COLUMNS) * (side + GAP), y, ys
+
+
+def check_sheet_size(size):
+    if max(size) > MAX_SIDE:
+        sys.exit(f"the sheet would be {size[0]} x {size[1]} px; a side over {MAX_SIDE} px does not open in common viewers")
+
+
+def sheet_label(crop, method, frames):
+    return [crop["stack"], crop["name"], method, "rect " + ",".join(map(str, crop["rect"][:2])), f"{frames} frames"]
+
+
+def grey_cell(v, vmax):
+    """`v` from 0 to `vmax` as grey levels, clipped."""
+    g = np.rint(np.clip(np.nan_to_num(np.asarray(v, np.float64)), 0, vmax) / vmax * 255).astype(np.uint8)
+    return np.repeat(g[..., None], 3, axis=2)
+
+
+def diverging_cell(v, limit=B_LIMIT):
+    """Signed `v` on blue (-limit), white (0), red (+limit); NaN is grey."""
+    v = np.asarray(v, np.float64)
+    t = np.clip(np.nan_to_num(v), -limit, limit) / limit
+    pos, neg = np.clip(t, 0, 1), np.clip(-t, 0, 1)
+    out = np.rint(np.stack([255 * (1 - neg), 255 * (1 - pos - neg), 255 * (1 - pos)], axis=-1)).astype(np.uint8)
+    out[np.isnan(v)] = NAN_GREY
+    return out
+
+
+def message_cell(side, kind, text):
+    """A labelled cell for an arm that has no map: `kind` ("failed", "n/a", ...) and its reason."""
+    img = Image.new("RGB", (side, side), (MESSAGE_FILL,) * 3)
+    draw, font = ImageDraw.Draw(img), ImageFont.load_default(size=max(12, side // 24))
+    draw.text((8, 8), f"{kind}\n" + "\n".join(textwrap.wrap(str(text), max(8, side // 12))[:12]), fill=(255, 220, 120), font=font)
+    return np.asarray(img)
+
+
+def row_cells(comp, z, ref, off, side, frames, models, secs):
+    """(cells, stats) of one row for a context crop: the 8 columns of SHEET_COLUMNS as side x side RGB images of the
+    central rect at `off` (x, y) in the context crop, and per column (mean, p99 of |v|, NaN share) or None when the
+    arm has no map. A failed arm is a labelled cell and the row goes on; `secs` gains each arm's seconds."""
+    sl = np.s_[off[1] : off[1] + side, off[0] : off[0] + side]
+    cells, stats = [pd.to8(comp[sl])], [None]
+    drawers = {c[0]: c[2] for c in SHEET_COLUMNS}
+
+    def draw(key, v):
+        how = drawers[key]
+        return diverging_cell(v) if how == "b" else grey_cell(v, how[1])
+
+    def stat(v):
+        v = np.asarray(v, np.float64)
+        if np.isnan(v).all():
+            return float("nan"), float("nan"), 1.0
+        return float(np.nanmean(v)), float(np.nanpercentile(np.abs(v), 99)), float(np.isnan(v).mean())
+
+    def arm(group, keys, fn):
+        t0 = time.monotonic()
+        try:
+            maps = [np.asarray(m)[sl] if np.asarray(m).shape[:2] != (side, side) else np.asarray(m) for m in fn()]
+            cells.extend(draw(k, m) for k, m in zip(keys, maps))
+            stats.extend(stat(m) for m in maps)
+        except (Exception, SystemExit) as e:
+            cells.extend(message_cell(side, "failed", e) for _ in keys)
+            stats.extend(None for _ in keys)
+        secs[group] += time.monotonic() - t0
+
+    arm("risk-zones", ["risk-zones"], lambda: [cm.make_map("risk-zones", comp, z, cm.PARAMS["risk-zones"])])
+    arm("glow-self", ["glow-self"], lambda: [cm.make_map("glow-self", comp, z, cm.PARAMS["glow-self"])])
+    if ref is None:
+        cells.append(message_cell(side, "n/a", "depth-map is the reference of glow-focus-map"))
+        stats.append(None)
+    else:
+        arm("glow-focus-map", ["glow-focus-map"], lambda: [cm.make_map("glow-focus-map", comp, z, cm.PARAMS["glow-focus-map"], ref)])
+    secs.setdefault("glow-focus-map", 0.0)
+
+    def pretrained():
+        mask, depth = models["dbd"](comp[sl])
+        return pd.map_a(depth, pd.PARAMS["320"]), 1.0 - np.asarray(mask, np.float64)
+
+    def network():
+        risk, glow = hn.maps_from_heads(*models["net"](hn.net_input(comp, z, frames)))
+        return risk, glow
+
+    arm("pretrained", ["pretrained-a", "pretrained-blur"], pretrained)
+    arm("network", ["network-a", "network-b"], network)
+    return cells, stats
+
+
+def _font(size):
+    return ImageFont.load_default(size=size)
+
+
+def draw_legend(canvas, side):
+    """Fill the legend band: how to read a cell, the signed scale with its not-measured grey, and the unsigned ramps."""
+    img = Image.fromarray(canvas[:SHEET_HEAD])
+    d, f = ImageDraw.Draw(img), _font(16)
+    d.text((10, 8), f"Every cell shows the central {side} px rect of its crop, unscaled; the maps saw {CONTEXT} px more on each side where the image has it. "
+           "Rows: crop x method. Columns as titled in the strip above each stack.", fill=(235, 235, 235), font=f)
+    x0, y0, n = 10, 40, 400
+    ramp = np.repeat(diverging_cell(np.linspace(-B_LIMIT, B_LIMIT, n))[None], 24, axis=0)
+    img.paste(Image.fromarray(ramp), (x0, y0))
+    d.text((x0, y0 + 28), f"-{B_LIMIT:.0f}", fill=(235, 235, 235), font=f)
+    d.text((x0 + n // 2 - 4, y0 + 28), "0", fill=(235, 235, 235), font=f)
+    d.text((x0 + n - 40, y0 + 28), f"+{B_LIMIT:.0f}", fill=(235, 235, 235), font=f)
+    d.text((x0 + n + 14, y0 + 2), "map B, counts: blue darker than the far band, red glow; clipped at +/-200", fill=(235, 235, 235), font=f)
+    d.rectangle([x0, y0 + 56, x0 + 24, y0 + 80], fill=(NAN_GREY,) * 3)
+    d.text((x0 + 34, y0 + 58), "grey: map B not measured (outside the band, or no Z-Map value)", fill=(235, 235, 235), font=f)
+    for k, (key, title, how) in enumerate(c for c in SHEET_COLUMNS if isinstance(c[2], tuple)):
+        x = 10 + k * 560
+        g = grey_cell(np.linspace(0, 1, 160)[None].repeat(16, 0), 1.0)
+        img.paste(Image.fromarray(g), (x, y0 + 96))
+        d.text((x + 170, y0 + 96), f"{title}: 0 to {how[1]:g}", fill=(235, 235, 235), font=f)
+    canvas[:SHEET_HEAD] = np.asarray(img)
+
+
+def draw_strip(canvas, y, side):
+    img = Image.fromarray(canvas[y : y + STRIP])
+    d, f = ImageDraw.Draw(img), _font(15)
+    for c, (key, title, how) in enumerate(SHEET_COLUMNS):
+        rng = " +/-200" if how == "b" else f" 0-{how[1]:g}" if isinstance(how, tuple) else ""
+        d.text((LABEL_W + c * (side + GAP) + 4, 4), title + rng, fill=(255, 220, 120), font=f)
+    canvas[y : y + STRIP] = np.asarray(img)
+
+
+def draw_label(canvas, y, side, lines):
+    img = Image.fromarray(canvas[y : y + side, :LABEL_W])
+    d = ImageDraw.Draw(img)
+    for k, t in enumerate(lines):
+        d.text((10, 10 + k * 28), t, fill=(255, 255, 255) if k < 3 else (170, 170, 170), font=_font(22 if k < 3 else 18))
+    canvas[y : y + side, :LABEL_W] = np.asarray(img)
+
+
+def cmd_sheet(args):
+    """One PNG: a row per crop and method, a column per arm and map, every map's central rect unscaled."""
+    real, out = os.path.abspath(args.real), os.path.abspath(args.out)
+    with open(os.path.join(real, "crops", "crops.json")) as fh:
+        crops = json.load(fh)
+    spec = sheet_rows(crops)
+    side = crops[0]["rect"][2]
+    w, h, ys = sheet_layout([c["stack"] for c, _ in spec], side)
+    check_sheet_size((w, h))
+    print(f"{len(crops)} crops x {len(METHODS)} methods = {len(spec)} rows, {len(spec) * len(SHEET_COLUMNS)} cells, sheet {w} x {h} px", flush=True)
+    models = {}
+    try:
+        device = hn.device_for(args.device)
+        net_pd, net_hn = pd.load_model(pd.WORK, device), None
+        hn.require_pinned(hn.WEIGHTS_SHA256, hn.WEIGHTS)
+        net_hn = hn.load_net(hn.WEIGHTS, device)
+        models = dict(dbd=lambda img: pd.detect(net_pd, img, "320", device), net=lambda x: hn.predict(net_hn, x, device))
+    except (Exception, SystemExit) as e:
+        err = e
+
+        def fail(_):
+            raise err
+
+        models = dict(dbd=fail, net=fail)
+    canvas = np.full((h, w, 3), BACKGROUND, np.uint8)
+    draw_legend(canvas, side)
+    secs, stats_rows, failed, na, shown, refs = Counter(), [], [], [], None, {}
+    for (crop, method), y in zip(spec, ys):
+        sd, name = crop["stack"], crop["name"]
+        if sd != shown:
+            draw_strip(canvas, y - STRIP, side)
+            shown = sd
+        read = lambda m, kind: (ls.ss.read_tiff if kind == "composite" else ls.gff.read_zmap)(os.path.join(real, "crops", sd, name, m, f"{kind}.tif"))  # noqa: E731
+        comp, z = read(method, "composite"), read(method, "zmap")
+        if (sd, name) not in refs:
+            refs = {(sd, name): read("depth-map", "composite")}
+        ref = None if method == "depth-map" else refs[(sd, name)]
+        frames = json.load(open(os.path.join(real, sd, "times.json")))[method]["frames"]
+        rx, ry = crop["rect"][:2]
+        off = (rx - crop["context"][0], ry - crop["context"][1])
+        full = os.path.join(real, sd, method, "composite.tif")
+        raw = np.frombuffer(rawtiff.read_rect(full, rx, ry, side, side, rawtiff.read_info(full)), "<u2").reshape(side, side, -1)
+        if not np.array_equal(raw, comp[off[1] : off[1] + side, off[0] : off[0] + side]):
+            sys.exit(f"{sd} {name} {method}: the crop's central rect differs from the composite at {rx},{ry}")
+        t0 = time.monotonic()
+        cells, stats = row_cells(comp, z, ref, off, side, frames, models, secs)
+        for c, cell in enumerate(cells):
+            x = LABEL_W + c * (side + GAP)
+            canvas[y : y + side, x : x + side] = cell
+            key = SHEET_COLUMNS[c][0]
+            if stats[c] is None and key != "composite":
+                (na if key == "glow-focus-map" and ref is None else failed).append(f"{sd} {name} {method} {key}")
+            stats_rows.append(f"{sd}\t{name}\t{method}\t{key}\t" + ("none" if stats[c] is None else "\t".join(f"{v:.5g}" for v in stats[c])))
+        draw_label(canvas, y, side, sheet_label(crop, method, frames))
+        print(f"{sd} {name} {method}: {time.monotonic() - t0:.1f} s", flush=True)
+    stats_path = os.path.splitext(out)[0] + "-stats.tsv"
+    with open(stats_path, "w") as fh:
+        fh.write("stack\tcrop\tmethod\tcolumn\tmean\tp99_abs\tnan_share\n" + "\n".join(stats_rows) + "\n")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    Image.fromarray(canvas).save(out, compress_level=1)
+    if args.review:
+        os.makedirs(args.review, exist_ok=True)
+        for sd in dict.fromkeys(c["stack"] for c, _ in spec):
+            mine = [y for (c, _), y in zip(spec, ys) if c["stack"] == sd]
+            part = Image.fromarray(canvas[mine[0] - STRIP : mine[-1] + side])
+            part.resize((part.width // 4, part.height // 4), Image.Resampling.BOX).save(os.path.join(args.review, f"{sd}.png"))
+    print(f"cells {len(spec) * len(SHEET_COLUMNS)}, n/a {len(na)}, failed or dropped {len(failed)}: {'; '.join(failed) or 'none'}")
+    print("seconds per arm over all rows: " + ", ".join(f"{k} {v:.1f}" for k, v in secs.items()))
+    print(f"{out}: {w} x {h} px\nsha256 {rawtiff.sha256_file(out)}\nstats {stats_path}")
+    return 0
+
+
 def synthetic_stack(n, kind, h=420, w=640, seed=1):
     """Luma frames of a smooth scene with a texture that is sharp in column band k of frame k
     (`stack`), or: shifted between frames (`moving`), sharp in frame 0 only (`one-sharp`), noise (`noise`)."""
@@ -1410,6 +1648,61 @@ def _selftest() -> int:
     check("every non-Mantis stack has at most two rects", max(Counter(c["stack"] for c in CROPS if c["stack"] != "mantis").values(), default=0) <= 2)
     check("every rect has a distinct name within its stack", len({(c["stack"], c["name"]) for c in CROPS}) == len(CROPS))
 
+    print("sheet (cells, colours, layout, failed arms):")
+    rows57 = sheet_rows([{"stack": c["stack"], "name": c["name"]} for c in CROPS])
+    check("the sheet has a row per crop and method, crop-major, methods in registry order",
+          len(rows57) == 57 and [m for _, m in rows57[:3]] == list(METHODS) and rows57[3][0]["name"] == CROPS[1]["name"], len(rows57))
+    check("the 57 rows hold 456 cells of 8 columns", len(rows57) * len(SHEET_COLUMNS) == 456 and len(SHEET_COLUMNS) == 8)
+    w57, h57, ys57 = sheet_layout([c["stack"] for c, _ in rows57])
+    check("the full sheet stays under 32767 px per side", max(w57, h57) <= MAX_SIDE, (w57, h57))
+    check("the first row sits below the header and the column strip, the next one a row further down",
+          ys57[0] == SHEET_HEAD + STRIP and ys57[1] == ys57[0] + CROP_SIDE + GAP, ys57[:2])
+    stacks3 = ["a", "a", "b"]
+    _, _, ys3 = sheet_layout(stacks3, 100)
+    check("a new stack adds a column strip", ys3[2] - ys3[1] == 100 + GAP + STRIP, ys3)
+    try:
+        check_sheet_size((40000, 100))
+        check("a side over 32767 px is refused", False)
+    except SystemExit as e:
+        check("a side over 32767 px is refused naming the size", "40000" in str(e) and "32767" in str(e), str(e))
+    check("a side of exactly 32767 px is allowed", check_sheet_size((MAX_SIDE, MAX_SIDE)) is None)
+    check("the grey scale maps 0, half and the range end to black, mid grey and white and clips beyond it",
+          [int(grey_cell(np.array([[v]]), 10.0)[0, 0, 0]) for v in (0, 5, 10, 99)] == [0, 128, 255, 255])
+    div = diverging_cell(np.array([[np.nan, 200.0, -200.0, 0.0, 900.0]]))[0]
+    check("map B is red at +200, blue at -200, white at 0, clipped beyond, and NaN is grey",
+          div.tolist() == [[128, 128, 128], [255, 0, 0], [0, 0, 255], [255, 255, 255], [255, 0, 0]], div.tolist())
+    a, b = message_cell(64, "failed", "boom"), message_cell(64, "failed", "another reason")
+    check("a message cell is not blank and differs with its text", len(np.unique(a)) > 2 and not np.array_equal(a, b))
+    lab = sheet_label({"stack": "mantis", "name": "antenna", "rect": [1976, 353, 512, 512]}, "laplacian", 61)
+    check("the row label names stack, crop, method, rect and frame count", all(t in " ".join(lab) for t in ("mantis", "antenna", "laplacian", "1976,353", "61")), lab)
+    rng = np.random.default_rng(3)
+    ctx = rng.integers(0, 65535, (300, 300, 3), dtype=np.uint16)
+    zc = np.zeros((300, 300), np.int64)
+    zc[100:] = 5
+    fake = dict(dbd=lambda img: (np.full(img.shape[:2], 0.25), np.full(img.shape[:2], 0.5)),
+                net=lambda x: (np.zeros(x.shape[1:]), np.zeros(x.shape[1:])))
+    secs = Counter()
+    cells, stats = row_cells(ctx, zc, ctx, (22, 10), 128, 10, fake, secs)
+    check("a row has the 8 cells of the columns, each a side x side RGB image",
+          len(cells) == 8 and all(c.shape == (128, 128, 3) and c.dtype == np.uint8 for c in cells))
+    check("the composite cell is the central rect, columns first", np.array_equal(cells[0], pd.to8(ctx[10:138, 22:150])))
+    check("map A marks the step at the right row of the central rect", cells[1][80:100].mean() > cells[1][:20].mean() + 50, (cells[1][80:100].mean(), cells[1][:20].mean()))
+    check("the pretrained blur cell is the mask's complement on the grey scale", int(cells[5][0, 0, 0]) == 191 and abs(stats[5][0] - 0.75) < 1e-6, (cells[5][0, 0], stats[5]))
+    check("every arm of the row was timed", set(secs) >= {"risk-zones", "glow-self", "glow-focus-map", "pretrained", "network"}, dict(secs))
+    nf, _ = row_cells(ctx, zc, None, (22, 10), 128, 10, fake, Counter())
+    check("glow-focus-map without a reference is a labelled n/a cell", len(np.unique(nf[3])) > 2 and not np.array_equal(nf[3], cells[3]))
+
+    def boom(img):
+        raise RuntimeError("boom")
+
+    def quit_(x):
+        raise SystemExit("no usable GPU")
+
+    secs2 = Counter()
+    cells2, stats2 = row_cells(ctx, zc, ctx, (22, 10), 128, 10, dict(dbd=boom, net=quit_), secs2)
+    check("a failing detector and a failing network give labelled cells, never blank, and the other arms still draw",
+          all(len(np.unique(cells2[i])) > 2 for i in (4, 5, 6, 7)) and all(stats2[i] is None for i in (4, 5, 6, 7)) and stats2[1] is not None and stats2[2] is not None)
+
     print("self-check passed" if ok else "self-check FAILED")
     return 0 if ok else 1
 
@@ -1439,6 +1732,11 @@ def main(argv=None) -> int:
     p.add_argument("--preview", metavar="STACK", help="write <out>/<STACK>/preview.png instead")
     p.add_argument("--rect", action="append", metavar="STACK:NAME:X:Y", help="cut this composite-coordinate rect instead of the CROPS table; repeat")
     p.add_argument("--side", type=int, default=CROP_SIDE, help="rect side in px")
+    sh = sub.add_parser("sheet", help="one PNG of every arm's maps on every crop and method")
+    sh.add_argument("--out", required=True, help="the PNG to write")
+    sh.add_argument("--real", default=os.path.join(ROOT, ".scratch", "halo-detection", "real"), help="the folder `run` and `crops` wrote into")
+    sh.add_argument("--review", metavar="DIR", help="also write a quarter-scale strip per stack here")
+    sh.add_argument("--device", default="cuda", choices=("cuda", "cpu"), help="device of the two learned arms")
     args = ap.parse_args(argv)
     if args.self_check:
         return _selftest()
@@ -1450,6 +1748,8 @@ def main(argv=None) -> int:
         return cmd_run(args)
     if args.cmd == "crops":
         return cmd_crops(args)
+    if args.cmd == "sheet":
+        return cmd_sheet(args)
     ap.print_help()
     return 2
 

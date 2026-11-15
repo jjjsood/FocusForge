@@ -345,6 +345,31 @@ quarter-scale PNG of that stack's weighted-average composite (a grid line and la
 resolution) to choose rects on. `crops` then cuts, for each rect of the `CROPS` table and each method,
 the rect plus a 128 px context margin on every side (clipped at the border) from the composite and the
 Z-Map, and prints the table. The three Mantis rects are given in the coordinates of the reference
-result; each is moved into the composite by the phase-correlation shift of the 1024 px luma tile
-around it, and refused when the moved rect overlaps a moved training window. Images are read by rect
+result; each is moved into the composite by one similarity (scale, rotation, shift) fitted to the
+phase-correlation shifts of a grid of textured 512 px luma tiles, and refused when the moved rect
+overlaps a moved training window. Images are read by rect
 (`rawtiff.read_rect`), never whole.
+
+### The contact sheet
+
+`sheet` draws every arm on every cropped rect and method into one PNG, one row per crop and method
+(the order of `crops/crops.json`, methods in registry order) and 8 columns: the composite, map A of
+`risk-zones`, map B of `glow-self`, map B of `glow-focus-map` (a labelled `n/a` cell for `depth-map`,
+which is its reference), the pretrained detector at 320 px (map A through `pretrained_dbd.map_a`, and
+`1 - mask`), and the trained network's map A and map B. Each cell shows the central rect (512 px)
+unscaled. The classical arms and the network read the 768 px context crop; the pretrained detector reads
+only the central rect. Map A is grey on a fixed range (0 to 49 for the two band maps, 0 to 1 for the
+blur and the network), map B is blue to white to red on a fixed scale of +/-200 counts with
+pixels that are not measured in grey, and a legend band at the top says so. A column strip repeats the
+titles before each stack. An arm that fails or has no input is a labelled cell, never blank. Every row's
+central rect is compared with the composite file read at the rect before it is drawn.
+
+```
+.scratch/halo-detection/venv/bin/python spikes/halo-detection/real_stacks.py sheet --out .scratch/halo-detection/contact-sheet.png [--review DIR]
+```
+
+It runs under the GPU lock, prints the cell count, the pixel size, the SHA-256 and the seconds per arm,
+exits naming the size when a side would exceed 32767 px, and writes `contact-sheet-stats.tsv` beside
+the PNG (mean, 99th percentile of the absolute value and share of NaN of every map). `--review DIR`
+also writes one quarter-scale PNG per stack for a quick scan. The parameters of every arm are the
+frozen ones of its own module.
