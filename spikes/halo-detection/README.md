@@ -109,3 +109,103 @@ adds `risk-zones-dm-zmap` and `glow-self-dm-zmap`, the same maps read from the `
 Z-Map. `score` prints, per method, each measure with its limit and `pass` or `fail`, and
 `n/a` for a method the arm has no maps for; a map for only some scenes, or of a size other
 than the label's, exits non-zero.
+
+## Pretrained defocus detector
+
+`pretrained_dbd.py` runs the Depth Distillation defocus-blur detector (MIT, arXiv 2007.08113)
+unchanged on the rendered scenes' composites and writes its output as two `halo_gate.py` arm
+directories per input size: map A (`dbd-risk-<size>`, the distilled depth output banded beside
+its depth steps with `classical_maps.risk_map`) and map B (`dbd-blur-<size>`, the blur
+probability). Both are unsigned, so `score` takes `--unsigned` for them; map B's AUC without the
+flag is a diagnostic and its sign agreement does not apply. `<size>` is `320` (the detector's own
+320 x 320 preprocessing) or `native` (the composite's size, which must be a multiple of 32 on both
+sides).
+
+Nothing it needs is tracked: the environment, the upstream code at its pinned commit, the weights
+and the raw outputs live under `.scratch/halo-detection/` (`venv/`, `upstream/`, `weights/`,
+`dbd-raw/`).
+
+### The environment
+
+Python 3.14, PyTorch 2.11.0 and torchvision 0.26.0 from the CUDA 12.8 wheel index (the card is a
+Blackwell part, `sm_120`, which needs a CUDA 12.8 or newer build):
+
+```
+uv venv --python 3.14 .scratch/halo-detection/venv
+uv pip install --python .scratch/halo-detection/venv/bin/python \
+    --index-url https://download.pytorch.org/whl/cu128 torch==2.11.0 torchvision==0.26.0 numpy
+```
+
+`uv pip freeze` of the result is the pinned set (numpy, Pillow and the `nvidia-*` wheels come from
+the same index):
+
+```
+cuda-bindings==12.9.7
+cuda-pathfinder==1.6.0
+cuda-toolkit==12.8.1
+filelock==4.2.4
+fsspec==2026.9.0
+jinja2==3.1.6
+markupsafe==3.0.3
+mpmath==1.3.0
+networkx==3.7
+numpy==2.5.4
+nvidia-cublas-cu12==12.8.4.1
+nvidia-cuda-cupti-cu12==12.8.90
+nvidia-cuda-nvrtc-cu12==12.8.93
+nvidia-cuda-runtime-cu12==12.8.90
+nvidia-cudnn-cu12==9.19.0.56
+nvidia-cufft-cu12==11.3.3.83
+nvidia-cufile-cu12==1.13.1.3
+nvidia-curand-cu12==10.3.9.90
+nvidia-cusolver-cu12==11.7.3.90
+nvidia-cusparse-cu12==12.5.8.93
+nvidia-cusparselt-cu12==0.7.1
+nvidia-nccl-cu12==2.28.9
+nvidia-nvjitlink-cu12==12.8.93
+nvidia-nvshmem-cu12==3.4.5
+nvidia-nvtx-cu12==12.8.90
+pillow==13.0.0
+setuptools==78.1.0
+sympy==1.14.0
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+triton==3.6.0
+typing-extensions==4.16.0
+```
+
+Saved to a file, the list installs the identical set: `uv pip install --python
+.scratch/halo-detection/venv/bin/python --index-url https://download.pytorch.org/whl/cu128 -r <file>`.
+
+`check-env` proves the build runs on the card: it prints the torch and CUDA versions and the device
+name, and exits non-zero naming the cause when CUDA is unavailable, when the build has no kernels
+for the card's `sm_` architecture, or when an integer-valued matrix product differs between the
+CPU and the card. Every subcommand that needs the card (`check-env`, `polarity`, `infer`, `bench`)
+refuses to run without it; only `bench --device cpu` uses the CPU.
+
+### Running it
+
+From the repository root, with `PY=.scratch/halo-detection/venv/bin/python`:
+
+```
+python3 spikes/halo-detection/pretrained_dbd.py --self-check            # numpy only, no torch
+$PY spikes/halo-detection/pretrained_dbd.py check-env
+$PY spikes/halo-detection/pretrained_dbd.py fetch                       # upstream code, res_best.pth, resnext.zip
+$PY spikes/halo-detection/pretrained_dbd.py polarity --scenes .scratch/halo-scenes
+$PY spikes/halo-detection/pretrained_dbd.py infer --size 320 --scenes .scratch/halo-scenes
+$PY spikes/halo-detection/pretrained_dbd.py infer --size native --scenes .scratch/halo-scenes
+$PY spikes/halo-detection/pretrained_dbd.py tune --scenes .scratch/halo-scenes
+$PY spikes/halo-detection/pretrained_dbd.py write --scenes .scratch/halo-scenes --out .scratch/halo-detection
+$PY spikes/halo-detection/pretrained_dbd.py bench --scenes .scratch/halo-scenes [--device cpu]
+python3 spikes/halo-detection/halo_gate.py score --scenes .scratch/halo-scenes --maps .scratch/halo-detection/dbd-risk-320 --unsigned
+```
+
+The commands that use the card run under the shared GPU lock. `fetch` reads the upstream code
+(`vinthony/depth-distillation` at commit `6a59c51059d78af344cbd50192726cbe488a9daf`, refused
+unless its `LICENSE` is MIT) and both weights files from Google Drive with plain `urllib`; a body
+that is an HTML page, shorter than its `Content-Length`, or of another SHA-256 than the table
+`SHA256` in the script is refused and leaves no file. `--weights-url` replaces the Drive address.
+The distilled depth output is quantized to 8 bits as the upstream notebook stores it before map
+A, so map A's step threshold is in depth levels. `infer --split` limits the scenes to one split;
+`tune` reads the calibration split only, per size, and its pick is frozen as `PARAMS` before
+`write` runs (`write` refuses without it).
