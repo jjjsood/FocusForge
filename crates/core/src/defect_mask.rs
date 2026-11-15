@@ -87,11 +87,9 @@ impl DefectMask {
 
     /// Every position within Euclidean distance `radius` of a set one
     /// (`dx² + dy² ≤ radius²`), clipped at the frame edge. A radius of 0 keeps
-    /// the mask as it is.
-    ///
-    /// Each row is reduced to its horizontal distance to the nearest set
-    /// pixel, kept for the `2 * radius + 1` rows that can reach the output
-    /// row, so the cost is pixels × (2 × radius + 1) with no per-defect work.
+    /// the mask as it is. Each row is reduced to its horizontal distance to
+    /// the nearest set pixel, kept for the `2 * radius + 1` rows that can reach
+    /// the output row: cost is pixels × (2 × radius + 1), no per-defect work.
     pub fn grow(&self, radius: u32) -> DefectMask {
         if radius == 0 || self.count() == 0 {
             return self.clone();
