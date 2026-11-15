@@ -4663,6 +4663,82 @@ mod dialog_close {
         }
     }
 
+    /// The refused export stage's rows as `(top, bottom)`, top to bottom,
+    /// and the footer's top (the bottom of the 184 px content area).
+    fn refusal_rows(lines: Vec<String>) -> (Vec<(f32, f32)>, f32) {
+        let app = app_at(1440, 900);
+        app.set_export_refusal_lines(slint::ModelRc::new(slint::VecModel::from(
+            lines.into_iter().map(Into::into).collect::<Vec<_>>(),
+        )));
+        (INCLUDED[6].open)(&app);
+        let root = dialog_root(&app, "FFExportDialog");
+        let rows = by_position(root.query_descendants().match_type_name("FFErrorRow"))
+            .iter()
+            .map(|row| {
+                let top = row.absolute_position().y;
+                (top, top + row.size().height)
+            })
+            .collect();
+        let footer = dialog_root(&app, "FFDialogFooter").absolute_position().y;
+        (rows, footer)
+    }
+
+    #[test]
+    fn export_refusal_lines_wrap_and_stack_by_height() {
+        use focusforge_core::project::ProjectError;
+        use focusforge_gui::job::{ExportError, export_refusal_lines};
+
+        let dng = export_refusal_lines(&ExportError::Project(ProjectError::ExportDngNeedsRaw {
+            path: "mantis.ffp".into(),
+        }));
+        assert_eq!(dng.len(), 1, "the DNG refusal is one line");
+        let short = "mantis_014.tif — missing".to_string();
+
+        let (rows, footer) = refusal_rows(dng.clone());
+        assert_eq!(rows.len(), 1, "one row for the DNG line");
+        let (top, bottom) = rows[0];
+        assert!(
+            bottom - top > 16.0 + EPS,
+            "the long DNG line wraps: row is {} px tall, one row is 16",
+            bottom - top
+        );
+        assert!(
+            bottom <= footer,
+            "the wrapped row ends at {bottom}, inside the content area above the footer at {footer}"
+        );
+
+        let mut lines = dng;
+        lines.push(short.clone());
+        let (rows, footer) = refusal_rows(lines);
+        assert_eq!(rows.len(), 2, "one row per line");
+        assert!(
+            rows[1].0 >= rows[0].1 - EPS,
+            "the second row starts at {}, below the wrapped first row's bottom {}",
+            rows[1].0,
+            rows[0].1
+        );
+        assert!(
+            rows[1].1 <= footer,
+            "the second row ends at {}, above the footer at {footer}",
+            rows[1].1
+        );
+
+        let (rows, footer) = refusal_rows(vec![short]);
+        assert_eq!(rows.len(), 1, "one row for the short line");
+        let (top, bottom) = rows[0];
+        assert!(
+            (bottom - top - 16.0).abs() < EPS,
+            "a short line keeps its 16 px row, got {}",
+            bottom - top
+        );
+        // Heading (18 px) plus 8 px of space below the content area's top.
+        let expected_top = footer - 184.0 + 18.0 + 8.0;
+        assert!(
+            (top - expected_top).abs() < EPS,
+            "the short row sits at {top}, directly under the heading at {expected_top}"
+        );
+    }
+
     #[test]
     fn dialog_close_button_acts_as_cancel_leaves_excluded_dialogs_bare() {
         let app = app_at(1440, 900);

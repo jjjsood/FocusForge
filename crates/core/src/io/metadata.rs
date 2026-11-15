@@ -726,6 +726,8 @@ fn dng_rationals(tag: u16, values: &[f64]) -> TagEntry {
 /// calibrations, analog balance and as-shot neutral, and the frame's
 /// orientation.
 pub(crate) fn dng_entries(colour: &DngColour) -> Vec<TagEntry> {
+    // Adobe's raw reader takes the main image only from an IFD that carries this tag.
+    const TAG_NEW_SUBFILE_TYPE: u16 = 254;
     const TAG_PHOTOMETRIC: u16 = 262;
     const TAG_MAKE: u16 = 271;
     const TAG_MODEL: u16 = 272;
@@ -743,6 +745,12 @@ pub(crate) fn dng_entries(colour: &DngColour) -> Vec<TagEntry> {
     const LINEAR_RAW: u16 = 34892;
     const DNG_VERSION: [u8; 4] = [1, 4, 0, 0];
     let mut entries = vec![
+        dng_entry(
+            TAG_NEW_SUBFILE_TYPE,
+            FIELD_TYPE_LONG,
+            1,
+            0_u32.to_le_bytes().to_vec(),
+        ),
         dng_shorts(TAG_PHOTOMETRIC, &[LINEAR_RAW]),
         dng_ascii(TAG_MAKE, &colour.make),
         dng_ascii(TAG_MODEL, &colour.model),
