@@ -16,8 +16,12 @@ use focusforge_core::timing::measurement_scope;
 use focusforge_core::TiffError;
 use focusforge_core::io::raw::{HighlightClip, document_clip};
 use focusforge_core::io::{FrameError, TiffStack};
+use focusforge_core::retouch::preview::{
+    BRUSH_PREVIEW_STRENGTH_Q16, BrushPreviewGrid, BrushPreviewSpec, brush_preview_bounds,
+};
 use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::zmap::ZMapReader;
+use focusforge_gpu::display::preview::{BrushPreviewRenderer, plan as plan_brush_preview};
 use focusforge_gpu::display::{DisplayRenderer, DisplayTexture, render_overlay};
 use slint::wgpu_29::wgpu;
 
@@ -45,6 +49,25 @@ fn visible_draw_fits(source_size: (u32, u32), draw: &PaneDraw) -> bool {
     crate::canvas::draw_rect_fits(source_size, draw.src)
 }
 
+/// Which pair of textures answered [`CanvasRenderer::brush_preview_grids`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewTier {
+    /// The frame and composite panes at the current view.
+    Exact,
+    /// The two whole-image backdrops.
+    Backdrop,
+}
+
+/// The samples a brush preview is built from, borrowed from the renderer.
+#[derive(Debug, Clone, Copy)]
+pub struct PreviewGrids<'a> {
+    pub tier: PreviewTier,
+    /// The composite's size in pixels.
+    pub image_size: (u32, u32),
+    pub result: BrushPreviewGrid<'a>,
+    pub source: BrushPreviewGrid<'a>,
+}
+
 /// One pane's wgpu-owned state: the display texture, the `slint::Image`
 /// wrapping it -- re-created only when the texture is (re)allocated
 /// (`crate::canvas::needs_realloc`), never every frame: `try_from` takes
@@ -57,6 +80,11 @@ pub struct PaneTexture {
     spec: Option<TextureSpec>,
     image: Option<slint::Image>,
     coverage: Option<Coverage>,
+    /// The source-type samples `coverage` was drawn from (for the composite,
+    /// the merged result before any overlay colouring), `retained_spp` per
+    /// texel; empty until a publish and dropped with the pane.
+    retained: Vec<u16>,
+    retained_spp: u32,
     /// The content last requested for a backdrop texture, so one still in
     /// flight is not requested again; unused by exact textures.
     requested: Option<Coverage>,
@@ -164,6 +192,40 @@ impl PaneTexture {
             return;
         };
         render_overlay(device, queue, texture, composite, colors, alpha);
+    }
+
+    /// Keeps the samples this texture was just drawn from: `merged` when the
+    /// composite was merged with the edit session's tiles, else `samples`,
+    /// copied into the existing allocation.
+    fn retain(&mut self, merged: Option<Vec<u16>>, samples: &[u16], samples_per_pixel: u32) {
+        match merged {
+            Some(merged) => self.retained = merged,
+            None => {
+                self.retained.clear();
+                self.retained.extend_from_slice(samples);
+            }
+        }
+        self.retained_spp = samples_per_pixel;
+    }
+
+    /// The retained samples as a preview grid over the pane's covered source
+    /// rect; `None` before the first publish.
+    fn retained_grid(&self) -> Option<BrushPreviewGrid<'_>> {
+        let ((x, y, width, height), step, _) = self.coverage.as_ref()?;
+        if self.retained.is_empty() {
+            return None;
+        }
+        Some(BrushPreviewGrid {
+            rect: Rect {
+                x: *x,
+                y: *y,
+                width: *width,
+                height: *height,
+            },
+            step: *step,
+            samples_per_pixel: self.retained_spp,
+            samples: &self.retained,
+        })
     }
 
     /// Applies the outcome of importing a newly (re)allocated texture. On
@@ -347,6 +409,10 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/mantis-512/frames/00.tif")
     }
 
+    fn other_512_frame() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/mantis-512/frames/01.tif")
+    }
+
     /// A step-1 draw of the `side`x`side` square at the source origin.
     fn square_draw(side: u32) -> PaneDraw {
         square_draw_at(0, 0, side)
@@ -473,8 +539,8 @@ mod tests {
             assert!(renderer.display_renderer.is_some());
             assert_eq!(
                 after.pipeline_creations - before.pipeline_creations,
-                1,
-                "attach {attach} builds exactly one display pipeline"
+                4,
+                "attach {attach} builds the display pipeline and the three brush-preview ones"
             );
             assert_eq!(
                 after.allocation_operations - before.allocation_operations,
@@ -519,6 +585,10 @@ mod tests {
             .set_frame(&fixture_frame(), None, crate::job::host_budget())
             .expect("fixture frame opens");
 
+        let draw = draw_of((200, 200, 64, 64), 1);
+        let mut preview = renderer_with(shared, &fixture_512_frame());
+        publish_exact(&mut preview, &draw);
+
         focusforge_gpu::errors::install_handlers(shared.device());
         shared.device().destroy();
         // wgpu delivers the device-lost callback from a later poll, and a
@@ -532,6 +602,14 @@ mod tests {
             focusforge_gpu::errors::device_lost(),
             "a destroyed device reports itself lost"
         );
+
+        assert!(
+            preview
+                .brush_preview_layer(&brush(232, 232, 10.0, BrushMode::Lighten), &draw)
+                .is_none(),
+            "no preview layer on a lost device"
+        );
+        assert!(preview.brush_preview_pane.display_texture.is_none());
 
         let before = accounting_snapshot();
         let _ = renderer.redraw_frame(&square_draw(8));
@@ -553,6 +631,869 @@ mod tests {
             0,
             "nothing is uploaded to a lost device"
         );
+    }
+
+    use focusforge_core::io::{TiffSpec, TiffWriter};
+    use focusforge_core::project::{BrushMode, Point};
+    use focusforge_core::retouch::preview::{
+        BRUSH_PREVIEW_STRENGTH_Q16, brush_preview, brush_preview_layout,
+    };
+
+    const SIDE: u32 = 512;
+
+    fn tuple(rect: Rect) -> (u32, u32, u32, u32) {
+        (rect.x, rect.y, rect.width, rect.height)
+    }
+
+    fn draw_of(src: (u32, u32, u32, u32), step: u32) -> PaneDraw {
+        PaneDraw {
+            src,
+            dst: (0.0, 0.0, src.2 as f32, src.3 as f32),
+            crop: (0.0, 0.0, src.2 as f32, src.3 as f32),
+            pixelated: false,
+            step: NonZeroU32::new(step).expect("a step is nonzero"),
+        }
+    }
+
+    fn brush(x: i32, y: i32, radius: f32, mode: BrushMode) -> BrushPreviewSpec {
+        BrushPreviewSpec {
+            centre: Point { x, y },
+            radius,
+            softness: 0.3,
+            mode,
+            opacity: 1.0,
+        }
+    }
+
+    /// Distinct, deterministic samples for `len` values.
+    fn pattern(len: usize, seed: u32) -> Vec<u16> {
+        (0..len as u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761).wrapping_add(seed * 7919) >> 16) as u16)
+            .collect()
+    }
+
+    fn composite_file() -> PathBuf {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        golden_plane_files(&fixtures).0
+    }
+
+    /// A renderer on `shared` with `frame` and the 512 px golden composite open.
+    fn renderer_with(shared: Shared, frame: &Path) -> CanvasRenderer {
+        let mut renderer = CanvasRenderer::new();
+        renderer.attach_device(shared.device().clone(), shared.queue().clone());
+        renderer
+            .set_frame(frame, None, crate::job::host_budget())
+            .expect("frame opens");
+        renderer
+            .set_planes(&composite_file(), None)
+            .expect("composite opens");
+        renderer
+    }
+
+    /// Publishes `pattern` samples sized to `job` and returns them.
+    fn publish_pattern(renderer: &mut CanvasRenderer, job: &PaneJob, seed: u32) -> Vec<u16> {
+        let (width, height) = job.draw.extent();
+        let samples = pattern(
+            width as usize * height as usize * job.reader.samples_per_pixel() as usize,
+            seed,
+        );
+        assert!(
+            renderer.publish(job, &samples).is_some(),
+            "the job publishes"
+        );
+        samples
+    }
+
+    /// What `publish_all` published, per texture.
+    struct Published {
+        frame: Vec<u16>,
+        composite: Vec<u16>,
+        frame_backdrop: Vec<u16>,
+        composite_backdrop: Vec<u16>,
+    }
+
+    /// Both exact panes around (232, 232) and both backdrops (steps 4 and 8)
+    /// of a 512 px image, the exact panes' guarded `src` being
+    /// (136, 136, 192, 192).
+    fn publish_all(renderer: &mut CanvasRenderer) -> Published {
+        let visible = draw_of((200, 200, 64, 64), 1);
+        let job = renderer.request_frame(&visible).expect("frame job");
+        let frame = publish_pattern(renderer, &job, 1);
+        let job = renderer.request_planes(&visible, None, None).expect("job");
+        let composite = publish_pattern(renderer, &job, 2);
+        let job = renderer
+            .request_frame_backdrop(&draw_of((0, 0, SIDE, SIDE), 4))
+            .expect("frame backdrop job");
+        let frame_backdrop = publish_pattern(renderer, &job, 3);
+        let job = renderer
+            .request_plane_backdrop(&draw_of((0, 0, SIDE, SIDE), 8), None, None)
+            .expect("composite backdrop job");
+        let composite_backdrop = publish_pattern(renderer, &job, 4);
+        Published {
+            frame,
+            composite,
+            frame_backdrop,
+            composite_backdrop,
+        }
+    }
+
+    fn retained_lengths(renderer: &CanvasRenderer) -> [usize; 4] {
+        [
+            renderer.frame_pane.retained.len(),
+            renderer.composite_pane.retained.len(),
+            renderer.frame_backdrop.retained.len(),
+            renderer.composite_backdrop.retained.len(),
+        ]
+    }
+
+    fn one_spp_frame(dir: &Path) -> PathBuf {
+        let path = dir.join("frame.tif");
+        let mut writer = TiffWriter::create(
+            &path,
+            TiffSpec {
+                width: SIDE,
+                height: SIDE,
+                samples_per_pixel: 1,
+                description: None,
+            },
+        )
+        .expect("the frame file is created");
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: SIDE,
+            height: SIDE,
+        };
+        writer
+            .write_tile(rect, &pattern((SIDE * SIDE) as usize, 9))
+            .expect("the frame tile is written");
+        writer.finish().expect("the frame file is finished");
+        path
+    }
+
+    #[test]
+    fn retained_exact_samples_match_the_published_ones() {
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let one_spp = one_spp_frame(scratch.path());
+        let steps = [(1, 1), (1, 2)];
+        let cases = [
+            (fixture_512_frame(), steps[0]),
+            (fixture_512_frame(), steps[1]),
+            (one_spp, steps[0]),
+        ];
+        let spec = brush(232, 232, 10.0, BrushMode::Lighten);
+        for (frame, (frame_step, composite_step)) in cases {
+            let mut renderer = renderer_with(shared, &frame);
+            let frame_spp = renderer.frame.samples_per_pixel().expect("a frame is open");
+            let frame_job = renderer
+                .request_frame(&draw_of(
+                    (200, 200, 64 * frame_step, 64 * frame_step),
+                    frame_step,
+                ))
+                .expect("frame job");
+            let frame_samples = publish_pattern(&mut renderer, &frame_job, 1);
+            let composite_job = renderer
+                .request_planes(
+                    &draw_of(
+                        (200, 200, 64 * composite_step, 64 * composite_step),
+                        composite_step,
+                    ),
+                    None,
+                    None,
+                )
+                .expect("composite job");
+            let composite_samples = publish_pattern(&mut renderer, &composite_job, 2);
+            let label = format!("frame {frame_spp} spp, steps {frame_step}/{composite_step}");
+
+            let bounds = brush_preview_bounds(
+                (SIDE, SIDE),
+                &spec,
+                NonZeroU32::new(composite_step).expect("a step is nonzero"),
+            )
+            .expect("the brush has a box");
+            assert!(
+                rect_contains(composite_job.draw.src, tuple(bounds)),
+                "{label}"
+            );
+            assert!(rect_contains(frame_job.draw.src, tuple(bounds)), "{label}");
+
+            let grids = renderer
+                .brush_preview_grids(&spec)
+                .unwrap_or_else(|| panic!("{label}: the exact panes answer"));
+            assert_eq!(grids.tier, PreviewTier::Exact, "{label}");
+            assert_eq!(grids.image_size, (SIDE, SIDE), "{label}");
+            assert_eq!(grids.result.samples, composite_samples, "{label}: result");
+            assert_eq!(grids.source.samples, frame_samples, "{label}: source");
+            assert_eq!(tuple(grids.result.rect), composite_job.draw.src, "{label}");
+            assert_eq!(tuple(grids.source.rect), frame_job.draw.src, "{label}");
+            assert_eq!(grids.result.step, composite_job.draw.step, "{label}");
+            assert_eq!(grids.source.step, frame_job.draw.step, "{label}");
+            assert_eq!(grids.result.samples_per_pixel, 3, "{label}");
+            assert_eq!(grids.source.samples_per_pixel, frame_spp, "{label}");
+            let preview = brush_preview(
+                grids.image_size,
+                &grids.result,
+                &grids.source,
+                &spec,
+                BRUSH_PREVIEW_STRENGTH_Q16,
+            );
+            assert_eq!(preview.is_some(), frame_spp == 3, "{label}: the preview");
+        }
+
+        // Under an edit generation the result is the merged composite.
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        let mut tiles = crate::canvas::ResidentTiles::new(16, SIDE, SIDE, 3);
+        let region = Rect {
+            x: 224,
+            y: 224,
+            width: 8,
+            height: 8,
+        };
+        tiles.install(region, &vec![65_000u16; 8 * 8 * 3]);
+        let view = EditedView { tiles: &tiles };
+        let visible = draw_of((200, 200, 64, 64), 1);
+        let frame_job = renderer.request_frame(&visible).expect("frame job");
+        publish_pattern(&mut renderer, &frame_job, 1);
+        let job = renderer
+            .request_planes(&visible, Some(tiles.generation()), None)
+            .expect("composite job");
+        let (width, height) = job.draw.extent();
+        let sealed = pattern(width as usize * height as usize * 3, 2);
+        assert!(
+            renderer
+                .publish_edited(&job, &sealed, &[], Some(&view))
+                .is_some()
+        );
+        let mut merged = sealed.clone();
+        let (x, y, w, h) = job.draw.src;
+        crate::canvas::overlay_edited(
+            &mut merged,
+            Rect {
+                x,
+                y,
+                width: w,
+                height: h,
+            },
+            job.draw.step,
+            3,
+            &tiles,
+            None,
+        );
+        assert_ne!(merged, sealed, "the edit changes samples");
+        let grids = renderer.brush_preview_grids(&spec).expect("answers");
+        assert_eq!(grids.result.samples, merged, "the merged samples");
+    }
+
+    /// Publishes pattern samples for `draw` to both exact panes.
+    fn publish_exact(renderer: &mut CanvasRenderer, draw: &PaneDraw) {
+        let frame_job = renderer.request_frame(draw).expect("frame job");
+        publish_pattern(renderer, &frame_job, 1);
+        let job = renderer
+            .request_planes(draw, None, None)
+            .expect("composite job");
+        publish_pattern(renderer, &job, 2);
+    }
+
+    #[test]
+    fn brush_preview_kernel_draws_on_the_calling_thread() {
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        let draw = draw_of((200, 200, 64, 64), 1);
+        publish_exact(&mut renderer, &draw);
+        let spec = brush(232, 232, 10.0, BrushMode::Lighten);
+
+        let (image, place) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("the layer draws");
+        let grids = renderer
+            .brush_preview_grids(&spec)
+            .expect("the panes answer");
+        let layout = brush_preview_layout(grids.image_size, &grids.result, &spec)
+            .expect("the brush has a layout");
+        assert_eq!((layout.column % 4, layout.row % 4), (0, 0));
+        assert_eq!(
+            (image.size().width, image.size().height),
+            (layout.width, layout.height),
+            "the image is the layout's texel size"
+        );
+        let step = grids.result.step.get();
+        let (x, y) = (
+            grids.result.rect.x + layout.column * step,
+            grids.result.rect.y + layout.row * step,
+        );
+        assert_eq!(
+            place,
+            (
+                (x - 200) as f32,
+                (y - 200) as f32,
+                (layout.width * step) as f32,
+                (layout.height * step) as f32
+            ),
+            "the layer lands on its pixels under the draw"
+        );
+
+        let texture = |renderer: &CanvasRenderer| {
+            renderer
+                .brush_preview_pane
+                .display_texture
+                .as_ref()
+                .expect("the layer has a texture")
+                .texture()
+                .clone()
+        };
+        let first = texture(&renderer);
+        renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("the layer draws again");
+        assert!(
+            texture(&renderer) == first,
+            "the same texel size reuses the texture"
+        );
+    }
+
+    #[test]
+    fn brush_preview_kernel_returns_none_on_refusal_or_lost_device() {
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let draw = draw_of((200, 200, 64, 64), 1);
+        let spec = brush(232, 232, 10.0, BrushMode::Lighten);
+
+        // A one-sample frame has no layer, and allocates no texture.
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let mut grey = renderer_with(shared, &one_spp_frame(scratch.path()));
+        publish_exact(&mut grey, &draw);
+        assert!(
+            grey.brush_preview_grids(&spec).is_some(),
+            "the panes answer"
+        );
+        assert!(grey.brush_preview_layer(&spec, &draw).is_none());
+        assert!(grey.brush_preview_pane.display_texture.is_none());
+
+        // A brush outside the retained grids keeps the previous image.
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        publish_exact(&mut renderer, &draw);
+        let (image, _) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("the layer draws");
+        let before = renderer
+            .brush_preview_pane
+            .display_texture
+            .as_ref()
+            .expect("the layer has a texture")
+            .texture()
+            .clone();
+        let outside = brush(400, 400, 10.0, BrushMode::Lighten);
+        assert!(renderer.brush_preview_grids(&outside).is_none());
+        assert!(renderer.brush_preview_layer(&outside, &draw).is_none());
+        let after = renderer
+            .brush_preview_pane
+            .display_texture
+            .as_ref()
+            .expect("the texture stays")
+            .texture()
+            .clone();
+        assert!(after == before, "the texture is the previous one");
+        assert_eq!(renderer.brush_preview_pane.image().size(), image.size());
+    }
+
+    #[test]
+    fn brush_preview_follows_a_source_step_on_the_next_frame_publish() {
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let other_frame = other_512_frame();
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        let draw = draw_of((200, 200, 64, 64), 1);
+        let spec = brush(232, 232, 10.0, BrushMode::Lighten);
+        publish_exact(&mut renderer, &draw);
+        let (image, rect) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("both panes published");
+
+        // The same inputs answer from the memo: with the kernel gone a rebuild
+        // would find none.
+        let kernel = renderer.brush_preview.take();
+        let (again, again_rect) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("the memo answers");
+        assert_eq!(again_rect, rect, "the same rect");
+        assert_eq!(again.size(), image.size(), "the same image");
+        renderer.brush_preview = kernel;
+
+        // A source step empties the frame pane and its backdrop.
+        renderer
+            .set_frame(&other_frame, None, crate::job::host_budget())
+            .expect("the other frame opens");
+        assert!(renderer.brush_preview_grids(&spec).is_none(), "no source");
+        let (kept, kept_rect) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("the previous layer stays while the new frame has not published");
+        assert_eq!(kept_rect, rect, "the previous rect");
+        assert_eq!(kept.size(), image.size(), "the previous image");
+
+        // Another brush or draw would put the old layer in the wrong place.
+        let moved = brush(233, 232, 10.0, BrushMode::Lighten);
+        assert!(
+            renderer.brush_preview_layer(&moved, &draw).is_none(),
+            "a moved brush in the gap"
+        );
+        let panned = draw_of((201, 200, 64, 64), 1);
+        assert!(
+            renderer.brush_preview_layer(&spec, &panned).is_none(),
+            "a panned draw in the gap"
+        );
+
+        // The new frame's first publish builds from its own samples.
+        let frame_job = renderer.request_frame(&draw).expect("frame job");
+        let samples = publish_pattern(&mut renderer, &frame_job, 5);
+        let (_, rebuilt_rect) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("rebuilt after the publish");
+        assert_eq!(rebuilt_rect, rect, "the same brush lands in the same place");
+        let grids = renderer.brush_preview_grids(&spec).expect("answers");
+        assert_eq!(grids.source.samples, samples, "the new frame is the source");
+    }
+
+    /// A renderer whose backdrop tier answers `spec` at `draw`, stepped to
+    /// another frame whose exact pane has published and whose backdrop has not.
+    fn stepped_to_exact_published_gap(
+        shared: Shared,
+        spec: &BrushPreviewSpec,
+        draw: &PaneDraw,
+    ) -> CanvasRenderer {
+        let other_frame = other_512_frame();
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        publish_all(&mut renderer);
+        assert!(
+            renderer.brush_preview_layer(spec, draw).is_some(),
+            "both backdrops published"
+        );
+        renderer
+            .set_frame(&other_frame, None, crate::job::host_budget())
+            .expect("the other frame opens");
+        let job = renderer
+            .request_frame(&draw_of((200, 200, 64, 64), 1))
+            .expect("frame job");
+        publish_pattern(&mut renderer, &job, 5);
+        renderer
+    }
+
+    #[test]
+    fn brush_preview_keeps_the_layer_until_the_new_source_can_be_drawn() {
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let spec = brush(24, 24, 10.0, BrushMode::Lighten);
+        let draw = draw_of((0, 0, SIDE, SIDE), 8);
+        let other_frame = other_512_frame();
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        publish_all(&mut renderer);
+        assert_eq!(
+            renderer.brush_preview_grids(&spec).expect("answers").tier,
+            PreviewTier::Backdrop,
+            "the disc is outside the exact panes"
+        );
+        let (image, rect) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("both backdrops published");
+
+        renderer
+            .set_frame(&other_frame, None, crate::job::host_budget())
+            .expect("the other frame opens");
+        let (kept, kept_rect) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("the previous layer stays after the source step");
+        assert_eq!((kept.size(), kept_rect), (image.size(), rect));
+
+        let job = renderer
+            .request_frame(&draw_of((200, 200, 64, 64), 1))
+            .expect("frame job");
+        publish_pattern(&mut renderer, &job, 5);
+        let (kept, kept_rect) = renderer
+            .brush_preview_layer(&spec, &draw)
+            .expect("the previous layer stays after the exact frame publish");
+        assert_eq!((kept.size(), kept_rect), (image.size(), rect));
+
+        let job = renderer
+            .request_frame_backdrop(&draw_of((0, 0, SIDE, SIDE), 4))
+            .expect("frame backdrop job");
+        let samples = publish_pattern(&mut renderer, &job, 6);
+        assert!(
+            renderer.brush_preview_layer(&spec, &draw).is_some(),
+            "a layer from the new source"
+        );
+        let grids = renderer.brush_preview_grids(&spec).expect("answers");
+        assert_eq!(grids.tier, PreviewTier::Backdrop);
+        assert_eq!(
+            grids.source.samples, samples,
+            "the new backdrop is the source"
+        );
+
+        // The kept layer never outlives a changed brush or draw. Each check
+        // starts from its own gap, since an answer replaces the memo.
+        let mut gap = stepped_to_exact_published_gap(shared, &spec, &draw);
+        let moved = brush(25, 24, 10.0, BrushMode::Lighten);
+        assert!(
+            gap.brush_preview_layer(&moved, &draw).is_none(),
+            "a moved brush in the gap"
+        );
+        let mut gap = stepped_to_exact_published_gap(shared, &spec, &draw);
+        let panned = draw_of((8, 0, SIDE - 8, SIDE), 8);
+        assert!(
+            gap.brush_preview_layer(&spec, &panned).is_none(),
+            "a panned draw in the gap"
+        );
+    }
+
+    #[test]
+    fn brush_preview_draws_the_ring_alone_without_retained_samples() {
+        let draw = draw_of((200, 200, 64, 64), 1);
+        let spec = brush(232, 232, 10.0, BrushMode::Lighten);
+        let mut bare = CanvasRenderer::new();
+        assert!(
+            bare.brush_preview_layer(&spec, &draw).is_none(),
+            "no device"
+        );
+
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        assert!(
+            renderer.brush_preview_layer(&spec, &draw).is_none(),
+            "before any publish"
+        );
+
+        publish_exact(&mut renderer, &draw);
+        renderer.clear_frame();
+        assert!(
+            renderer.brush_preview_layer(&spec, &draw).is_none(),
+            "after clear_frame, nothing built yet"
+        );
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        publish_exact(&mut renderer, &draw);
+        assert!(renderer.brush_preview_layer(&spec, &draw).is_some());
+        renderer.clear_planes();
+        assert!(
+            renderer.brush_preview_layer(&spec, &draw).is_none(),
+            "after clear_planes the layer goes, the frame still holds samples"
+        );
+        renderer.clear_frame();
+        assert!(
+            renderer.brush_preview_layer(&spec, &draw).is_none(),
+            "nothing left to keep"
+        );
+        let mut detached = renderer_with(shared, &fixture_512_frame());
+        publish_exact(&mut detached, &draw);
+        assert!(detached.brush_preview_layer(&spec, &draw).is_some());
+        detached.detach_device();
+        assert!(
+            detached.brush_preview_layer(&spec, &draw).is_none(),
+            "after the device detaches"
+        );
+
+        // A disc near the image's lower-right corner ends at the image edge.
+        let corner = draw_of((448, 448, 64, 64), 1);
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        publish_exact(&mut renderer, &corner);
+        let near = brush(505, 505, 10.0, BrushMode::Lighten);
+        let (_, rect) = renderer
+            .brush_preview_layer(&near, &corner)
+            .expect("the corner brush draws");
+        let edge = corner.place((0, 0, SIDE, SIDE));
+        assert_eq!(
+            (rect.0 + rect.2, rect.1 + rect.3),
+            (edge.0 + edge.2, edge.1 + edge.3),
+            "the layer ends at the image's placed edge"
+        );
+
+        // A disc outside the exact panes but inside both backdrops.
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        publish_all(&mut renderer);
+        let outside = brush(24, 24, 10.0, BrushMode::Lighten);
+        let backdrop_draw = draw_of((0, 0, SIDE, SIDE), 8);
+        assert!(
+            renderer
+                .brush_preview_layer(&outside, &backdrop_draw)
+                .is_some(),
+            "built from the backdrops"
+        );
+    }
+
+    #[test]
+    fn retained_query_falls_back_to_the_backdrops_then_to_nothing() {
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        let published = publish_all(&mut renderer);
+        let tier = |renderer: &CanvasRenderer, spec: &BrushPreviewSpec| {
+            renderer.brush_preview_grids(spec).map(|grids| grids.tier)
+        };
+
+        let inside = brush(232, 232, 10.0, BrushMode::Lighten);
+        let grids = renderer.brush_preview_grids(&inside).expect("answers");
+        assert_eq!(grids.tier, PreviewTier::Exact);
+        assert_eq!(grids.result.samples, published.composite);
+        assert_eq!(grids.source.samples, published.frame);
+
+        // 14 px from the exact `src` edge: Lighten fits, Detail's reach does not.
+        let near_edge = |mode| brush(150, 232, 10.0, mode);
+        assert_eq!(
+            tier(&renderer, &near_edge(BrushMode::Lighten)),
+            Some(PreviewTier::Exact)
+        );
+        let detail = near_edge(BrushMode::Detail);
+        let grids = renderer.brush_preview_grids(&detail).expect("a backdrop");
+        assert_eq!(grids.tier, PreviewTier::Backdrop);
+
+        let outside = brush(20, 20, 5.0, BrushMode::Lighten);
+        let grids = renderer.brush_preview_grids(&outside).expect("a backdrop");
+        assert_eq!(grids.tier, PreviewTier::Backdrop);
+        assert_eq!(grids.result.samples, published.composite_backdrop);
+        assert_eq!(grids.source.samples, published.frame_backdrop);
+        assert_eq!(
+            (grids.result.step.get(), grids.source.step.get()),
+            (8, 4),
+            "each half keeps its own step"
+        );
+        assert_eq!(tuple(grids.result.rect), (0, 0, SIDE, SIDE));
+        assert_eq!(tuple(grids.source.rect), (0, 0, SIDE, SIDE));
+        assert_ne!(published.frame, published.frame_backdrop);
+
+        // No backdrops: a brush outside the exact panes finds nothing, and so
+        // does one whose backdrop pair is incomplete.
+        let mut exact_only = renderer_with(shared, &fixture_512_frame());
+        let visible = draw_of((200, 200, 64, 64), 1);
+        let job = exact_only.request_frame(&visible).expect("frame job");
+        publish_pattern(&mut exact_only, &job, 1);
+        let job = exact_only
+            .request_planes(&visible, None, None)
+            .expect("job");
+        publish_pattern(&mut exact_only, &job, 2);
+        assert_eq!(tier(&exact_only, &inside), Some(PreviewTier::Exact));
+        assert_eq!(tier(&exact_only, &outside), None);
+        let job = exact_only
+            .request_plane_backdrop(&draw_of((0, 0, SIDE, SIDE), 8), None, None)
+            .expect("composite backdrop job");
+        publish_pattern(&mut exact_only, &job, 4);
+        assert_eq!(tier(&exact_only, &outside), None, "no frame backdrop");
+    }
+
+    #[test]
+    fn a_reset_or_stale_job_leaves_no_retained_samples() {
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let spec = brush(232, 232, 10.0, BrushMode::Lighten);
+        let other_frame = other_512_frame();
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let other_planes = scratch.path().join("composite.tif");
+        std::fs::copy(composite_file(), &other_planes).expect("the composite copies");
+
+        type Reset<'a> = Box<dyn Fn(&mut CanvasRenderer) + 'a>;
+        let resets: [(&str, Reset, [bool; 4]); 5] = [
+            (
+                "set_frame",
+                Box::new(|r| {
+                    r.set_frame(&other_frame, None, crate::job::host_budget())
+                        .expect("frame opens");
+                }),
+                [false, true, false, true],
+            ),
+            (
+                "clear_frame",
+                Box::new(|r| r.clear_frame()),
+                [false, true, false, true],
+            ),
+            (
+                "set_planes",
+                Box::new(|r| r.set_planes(&other_planes, None).expect("composite opens")),
+                [true, false, true, false],
+            ),
+            (
+                "clear_planes",
+                Box::new(|r| r.clear_planes()),
+                [true, false, true, false],
+            ),
+            ("detach_device", Box::new(|r| r.detach_device()), [false; 4]),
+        ];
+        for (name, reset, kept) in resets {
+            let mut renderer = renderer_with(shared, &fixture_512_frame());
+            publish_all(&mut renderer);
+            assert!(retained_lengths(&renderer).iter().all(|&len| len > 0));
+            assert!(renderer.brush_preview_grids(&spec).is_some(), "{name}");
+            reset(&mut renderer);
+            let lengths = retained_lengths(&renderer);
+            for (i, (len, keep)) in lengths.iter().zip(kept).enumerate() {
+                assert_eq!(
+                    *len > 0,
+                    keep,
+                    "{name}: texture {i} (frame, composite, backdrops)"
+                );
+            }
+            assert!(renderer.brush_preview_grids(&spec).is_none(), "{name}");
+        }
+
+        // A job issued before the reset and published after it keeps nothing.
+        let visible = draw_of((200, 200, 64, 64), 1);
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        let frame_job = renderer.request_frame(&visible).expect("frame job");
+        let frame_backdrop_job = renderer
+            .request_frame_backdrop(&draw_of((0, 0, SIDE, SIDE), 4))
+            .expect("frame backdrop job");
+        let composite_job = renderer.request_planes(&visible, None, None).expect("job");
+        renderer
+            .set_frame(&other_frame, None, crate::job::host_budget())
+            .expect("frame opens");
+        renderer.clear_planes();
+        for job in [&frame_job, &frame_backdrop_job, &composite_job] {
+            let (width, height) = job.draw.extent();
+            let samples = pattern(width as usize * height as usize * 3, 5);
+            assert!(renderer.publish(job, &samples).is_none(), "{:?}", job.pane);
+        }
+        assert_eq!(retained_lengths(&renderer), [0; 4]);
+
+        // A job a newer one superseded is refused too.
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        let old = renderer.request_frame(&visible).expect("frame job");
+        let newer = renderer
+            .request_frame(&draw_of((300, 300, 64, 64), 1))
+            .expect("frame job");
+        let kept = publish_pattern(&mut renderer, &newer, 6);
+        let stale = pattern(
+            old.draw.extent().0 as usize * old.draw.extent().1 as usize * 3,
+            7,
+        );
+        assert!(renderer.publish(&old, &stale).is_none());
+        assert_eq!(renderer.frame_pane.retained, kept);
+    }
+
+    #[test]
+    fn retained_query_clips_at_the_image_edge_and_needs_a_publish() {
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        // Exact panes at the top-left and the bottom-right corner.
+        for (corner, spec_at) in [(0, 3), (448, 508)] {
+            let mut renderer = renderer_with(shared, &fixture_512_frame());
+            let visible = draw_of((corner, corner, 64, 64), 1);
+            let job = renderer.request_frame(&visible).expect("frame job");
+            publish_pattern(&mut renderer, &job, 1);
+            let job = renderer.request_planes(&visible, None, None).expect("job");
+            publish_pattern(&mut renderer, &job, 2);
+            for mode in [BrushMode::Lighten, BrushMode::Detail] {
+                let spec = brush(spec_at, spec_at, 12.0, mode);
+                let grids = renderer.brush_preview_grids(&spec).unwrap_or_else(|| {
+                    panic!("{mode:?} at {spec_at}: clipped to the image, still answered")
+                });
+                assert_eq!(grids.tier, PreviewTier::Exact);
+            }
+        }
+
+        // No device: nothing to publish, nothing to answer.
+        let mut no_device = CanvasRenderer::new();
+        no_device
+            .set_frame(&fixture_512_frame(), None, crate::job::host_budget())
+            .expect("frame opens");
+        no_device
+            .set_planes(&composite_file(), None)
+            .expect("composite opens");
+        let spec = brush(232, 232, 10.0, BrushMode::Lighten);
+        assert!(no_device.brush_preview_grids(&spec).is_none());
+        assert!(
+            no_device
+                .request_frame(&draw_of((200, 200, 64, 64), 1))
+                .is_none()
+        );
+
+        // A publish that returns `None` retains nothing.
+        let mut with_device = renderer_with(shared, &fixture_512_frame());
+        let job = with_device
+            .request_frame(&draw_of((200, 200, 64, 64), 1))
+            .expect("frame job");
+        let samples = pattern(192 * 192 * 3, 8);
+        assert!(no_device.publish(&job, &samples).is_none());
+        assert_eq!(retained_lengths(&no_device), [0; 4]);
+        assert!(
+            with_device.brush_preview_grids(&spec).is_none(),
+            "no publish yet"
+        );
+    }
+
+    #[test]
+    fn retained_composite_ignores_the_overlay_and_follows_the_generation() {
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        let overlay = crate::canvas::OverlayDraw::for_opacity(8, 0.5);
+        let mut tiles = crate::canvas::ResidentTiles::new(16, SIDE, SIDE, 3);
+        let visible = draw_of((200, 200, 64, 64), 1);
+        let mut publish = |tiles: &crate::canvas::ResidentTiles, seed: u32| {
+            let job = renderer
+                .request_planes(&visible, Some(tiles.generation()), Some(&overlay))
+                .expect("composite job");
+            assert!(job.state.overlay.is_some());
+            let (width, height) = job.draw.extent();
+            let texels = width as usize * height as usize;
+            let sealed = pattern(texels * 3, seed);
+            let colors = vec![[255u8, 0, 0]; texels];
+            let view = EditedView { tiles };
+            assert!(
+                renderer
+                    .publish_edited(&job, &sealed, &colors, Some(&view))
+                    .is_some()
+            );
+            let (x, y, w, h) = job.draw.src;
+            let mut merged = sealed.clone();
+            crate::canvas::overlay_edited(
+                &mut merged,
+                Rect {
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                },
+                job.draw.step,
+                3,
+                tiles,
+                None,
+            );
+            (sealed, merged, renderer.composite_pane.retained.clone())
+        };
+
+        tiles.install(
+            Rect {
+                x: 224,
+                y: 224,
+                width: 8,
+                height: 8,
+            },
+            &vec![65_000u16; 8 * 8 * 3],
+        );
+        let (sealed, merged, retained) = publish(&tiles, 1);
+        assert_ne!(merged, sealed);
+        assert_eq!(retained, merged, "the merged samples, not overlay colours");
+
+        tiles.install(
+            Rect {
+                x: 240,
+                y: 240,
+                width: 8,
+                height: 8,
+            },
+            &vec![1_000u16; 8 * 8 * 3],
+        );
+        let (_, newer, retained) = publish(&tiles, 1);
+        assert_ne!(newer, merged);
+        assert_eq!(retained, newer, "a newer generation replaces the copy");
     }
 
     /// Runs `body`, re-raising a failure with `name` in front of its message.
@@ -632,6 +1573,14 @@ impl PlaneFile {
     }
 }
 
+/// What a [`CanvasRenderer::brush_preview_layer`] answer was built from.
+struct PreviewMemo {
+    spec: BrushPreviewSpec,
+    draw: PaneDraw,
+    inputs: u64,
+    layer: Option<(slint::Image, (f32, f32, f32, f32))>,
+}
+
 /// The composite pane's GPU-owned state, the frame pane's own, the one
 /// [`DisplayRenderer`] every pane renders through, and the CPU scratch the
 /// synchronous redraws read into. A pane's read is a [`PaneJob`] (none when
@@ -644,6 +1593,13 @@ pub struct CanvasRenderer {
     device: Option<wgpu::Device>,
     queue: Option<wgpu::Queue>,
     display_renderer: Option<DisplayRenderer>,
+    brush_preview: Option<BrushPreviewRenderer>,
+    /// The texture [`Self::brush_preview_layer`] draws into.
+    brush_preview_pane: PaneTexture,
+    /// Counts every change to the retained samples the preview reads.
+    preview_inputs: u64,
+    /// The last [`Self::brush_preview_layer`] answer and what it was built from.
+    brush_preview_last: Option<PreviewMemo>,
     sample_scratch: Vec<u16>,
     composite: Option<Arc<TiffStack>>,
     zmap: Option<Arc<ZMapReader>>,
@@ -678,6 +1634,10 @@ impl CanvasRenderer {
             device: None,
             queue: None,
             display_renderer: None,
+            brush_preview: None,
+            brush_preview_pane: PaneTexture::default(),
+            preview_inputs: 0,
+            brush_preview_last: None,
             sample_scratch: Vec::new(),
             composite: None,
             zmap: None,
@@ -701,6 +1661,7 @@ impl CanvasRenderer {
     /// Empties the composite pane and its backdrop and refuses every job
     /// issued so far for them.
     fn reset_planes(&mut self) {
+        self.preview_inputs += 1;
         let stamp = self.next_stamp();
         self.composite_pane = PaneTexture::fresh(stamp);
         self.composite_backdrop = PaneTexture::fresh(stamp);
@@ -708,6 +1669,7 @@ impl CanvasRenderer {
 
     /// Empties the frame pane and refuses every job issued so far for it.
     fn reset_frame(&mut self) {
+        self.preview_inputs += 1;
         let stamp = self.next_stamp();
         self.frame_pane = PaneTexture::fresh(stamp);
         self.frame_backdrop = PaneTexture::fresh(stamp);
@@ -751,6 +1713,7 @@ impl CanvasRenderer {
     pub fn attach_device(&mut self, device: wgpu::Device, queue: wgpu::Queue) {
         self.detach_device();
         self.display_renderer = Some(DisplayRenderer::new(&device));
+        self.brush_preview = Some(BrushPreviewRenderer::new(&device));
         self.device = Some(device);
         self.queue = Some(queue);
     }
@@ -760,6 +1723,9 @@ impl CanvasRenderer {
         self.reset_planes();
         self.reset_frame();
         self.display_renderer = None;
+        self.brush_preview = None;
+        self.brush_preview_pane = PaneTexture::default();
+        self.brush_preview_last = None;
         self.device = None;
         self.queue = None;
     }
@@ -800,8 +1766,7 @@ impl CanvasRenderer {
         });
         self.composite = Some(Arc::new(composite));
         self.planes = files;
-        self.clip_source = None;
-        self.clip = None;
+        self.forget_clip();
         self.reset_planes();
         Ok(())
     }
@@ -831,17 +1796,27 @@ impl CanvasRenderer {
         if clip != self.clip {
             self.clip = clip;
             self.reset_planes();
+            self.reset_frame();
         }
     }
 
-    /// Drops the open planes, leaving the frame half untouched.
+    /// Drops the open planes, leaving the frame half untouched unless it was
+    /// read through their clip.
     pub fn clear_planes(&mut self) {
         self.composite = None;
         self.zmap = None;
         self.planes = None;
-        self.clip_source = None;
-        self.clip = None;
+        self.forget_clip();
         self.reset_planes();
+    }
+
+    /// Drops the clip and its source; a frame pane read through the clip is
+    /// emptied.
+    fn forget_clip(&mut self) {
+        self.clip_source = None;
+        if self.clip.take().is_some() {
+            self.reset_frame();
+        }
     }
 
     /// The frame pane's currently open path, if any.
@@ -949,7 +1924,7 @@ impl CanvasRenderer {
     fn frame_job(&mut self, draw: &PaneDraw, backdrop: bool) -> Option<PaneJob> {
         self.device.as_ref()?;
         let frame_size = self.frame.dimensions()?;
-        let reader = self.frame.reader()?;
+        let reader = self.frame.reader(self.clip.as_ref())?;
         self.request(
             Pane::Frame,
             backdrop,
@@ -1064,7 +2039,7 @@ impl CanvasRenderer {
         };
         let step = job.draw.step;
         let edited = edited.filter(|_| job.state.generation.is_some());
-        match job.pane {
+        let merged = match job.pane {
             Pane::Composite => {
                 let merged = edited.map(|view| {
                     let mut merged = samples.to_vec();
@@ -1101,19 +2076,177 @@ impl CanvasRenderer {
                         samples_per_pixel,
                     ),
                 }
+                merged
             }
-            _ => texture.ensure_and_render(
-                renderer,
-                &device,
-                &queue,
-                width,
-                height,
-                samples,
-                samples_per_pixel,
-            ),
-        }
+            _ => {
+                texture.ensure_and_render(
+                    renderer,
+                    &device,
+                    &queue,
+                    width,
+                    height,
+                    samples,
+                    samples_per_pixel,
+                );
+                None
+            }
+        };
+        texture.retain(merged, samples, samples_per_pixel);
+        self.preview_inputs += 1;
         texture.mark_covered(job.draw.src, job.draw.step, job.state.clone());
         Some(texture.image())
+    }
+
+    /// The result and source samples behind a brush preview at `spec`: the
+    /// pixels the panes last published, read on the calling thread with no new
+    /// file read and no allocation. The exact panes answer when both retained
+    /// grids cover [`brush_preview_bounds`] at the composite's step, else the
+    /// two backdrops do, else `None`. Each half keeps its own source rect,
+    /// step and samples per pixel; the image is the composite's.
+    pub fn brush_preview_grids(&self, spec: &BrushPreviewSpec) -> Option<PreviewGrids<'_>> {
+        Self::preview_grids(
+            self.source_size(Pane::Composite)?,
+            [
+                &self.composite_pane,
+                &self.frame_pane,
+                &self.composite_backdrop,
+                &self.frame_backdrop,
+            ],
+            spec,
+        )
+    }
+
+    /// [`Self::brush_preview_grids`] over the four panes: the composite and
+    /// frame panes, then their backdrops.
+    fn preview_grids<'a>(
+        image_size: (u32, u32),
+        [composite, frame, composite_backdrop, frame_backdrop]: [&'a PaneTexture; 4],
+        spec: &BrushPreviewSpec,
+    ) -> Option<PreviewGrids<'a>> {
+        [
+            (PreviewTier::Exact, composite, frame),
+            (PreviewTier::Backdrop, composite_backdrop, frame_backdrop),
+        ]
+        .into_iter()
+        .find_map(|(tier, result, source)| {
+            let (result, source) = (result.retained_grid()?, source.retained_grid()?);
+            let bounds = brush_preview_bounds(image_size, spec, result.step)?;
+            let bounds = (bounds.x, bounds.y, bounds.width, bounds.height);
+            let covers = |grid: &BrushPreviewGrid| {
+                let rect = grid.rect;
+                rect_contains((rect.x, rect.y, rect.width, rect.height), bounds)
+            };
+            (covers(&result) && covers(&source)).then_some(PreviewGrids {
+                tier,
+                image_size,
+                result,
+                source,
+            })
+        })
+    }
+
+    /// The brush-preview layer of `spec` over the panes' last published
+    /// pixels, drawn on the calling thread into a texture reused while the
+    /// texel size holds, with its place under `draw`. It submits and returns:
+    /// no readback, no wait. `None`, the previous image untouched, when the
+    /// panes lack the brush's pixels, the kernel has no layer or refuses the
+    /// brush, or the device is missing or lost.
+    ///
+    /// The same `spec`, `draw` and retained samples return the last answer
+    /// without a dispatch. While the frame backdrop has not published since
+    /// the source changed, the composite still holds samples and `spec` and
+    /// `draw` are unchanged, the last layer stays.
+    pub fn brush_preview_layer(
+        &mut self,
+        spec: &BrushPreviewSpec,
+        draw: &PaneDraw,
+    ) -> Option<(slint::Image, (f32, f32, f32, f32))> {
+        let last = self.brush_preview_last.as_ref();
+        let same_brush = last.is_some_and(|m| m.spec == *spec && m.draw == *draw);
+        let kept = last.and_then(|m| m.layer.clone());
+        if same_brush && last.is_some_and(|m| m.inputs == self.preview_inputs) {
+            return kept;
+        }
+        let backdrop_pending = self.frame_backdrop.retained_grid().is_none();
+        let result_held = self.composite_pane.retained_grid().is_some()
+            || self.composite_backdrop.retained_grid().is_some();
+        let layer = match self.build_brush_preview_layer(spec, draw) {
+            None if same_brush && backdrop_pending && result_held => kept,
+            built => built,
+        };
+        self.brush_preview_last = Some(PreviewMemo {
+            spec: *spec,
+            draw: *draw,
+            inputs: self.preview_inputs,
+            layer: layer.clone(),
+        });
+        layer
+    }
+
+    fn build_brush_preview_layer(
+        &mut self,
+        spec: &BrushPreviewSpec,
+        draw: &PaneDraw,
+    ) -> Option<(slint::Image, (f32, f32, f32, f32))> {
+        let _scope = measurement_scope("gui_brush_preview_layer");
+        let (device, queue) = self.device_queue()?;
+        let image_size = self.source_size(Pane::Composite)?;
+        let Self {
+            composite_pane,
+            frame_pane,
+            composite_backdrop,
+            frame_backdrop,
+            brush_preview,
+            brush_preview_pane,
+            ..
+        } = self;
+        let renderer = brush_preview.as_mut()?;
+        let grids = Self::preview_grids(
+            image_size,
+            [
+                composite_pane,
+                frame_pane,
+                composite_backdrop,
+                frame_backdrop,
+            ],
+            spec,
+        )?;
+        let max_binding = device.limits().max_storage_buffer_binding_size;
+        let planned = match plan_brush_preview(
+            grids.image_size,
+            &grids.result,
+            &grids.source,
+            spec,
+            BRUSH_PREVIEW_STRENGTH_Q16,
+            max_binding,
+        ) {
+            Ok(planned) => planned?,
+            Err(refusal) => {
+                tracing::debug!(%refusal, "no brush preview layer");
+                return None;
+            }
+        };
+        let layout = planned.layout;
+        let texture = brush_preview_pane.ensure_texture(&device, layout.width, layout.height)?;
+        renderer.render(
+            &device,
+            &queue,
+            texture,
+            &planned,
+            &grids.result,
+            &grids.source,
+        );
+
+        let (rect, step) = (grids.result.rect, grids.result.step.get());
+        let (x, y) = (rect.x + layout.column * step, rect.y + layout.row * step);
+        let clipped = |from: u32, cells: u32, end: u32| (cells * step).min(end - from);
+        let pixels = (
+            x,
+            y,
+            clipped(x, layout.width, rect.x + rect.width),
+            clipped(y, layout.height, rect.y + rect.height),
+        );
+        Some((brush_preview_pane.image(), draw.place(pixels)))
     }
 
     /// The image `pane` currently holds and where it lands under `draw`:

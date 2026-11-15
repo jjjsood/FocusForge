@@ -34,6 +34,28 @@ pub fn open_stack() -> TiffStack {
     TiffStack::open(mantis_512_dir()).expect("open mantis-512 fixture")
 }
 
+/// `rect`'s samples of `frame`, at `spp` samples a pixel: the fixture's own,
+/// or its first channel alone.
+pub fn frame_samples(
+    stack: &impl TileReader,
+    frame: usize,
+    rect: Rect,
+    spp: usize,
+    native: usize,
+) -> Vec<u16> {
+    let mut all = vec![0u16; rect.width as usize * rect.height as usize * native];
+    stack
+        .read_tile_into(frame, rect, &mut all)
+        .expect("read fixture tile");
+    if spp == native {
+        all
+    } else {
+        all.chunks_exact(native)
+            .flat_map(|px| px[..spp].to_vec())
+            .collect()
+    }
+}
+
 /// Worst absolute delta between two equal-length sample buffers, plus the
 /// sample index it occurred at.
 pub fn worst_delta<T: Copy + Into<i32>>(gpu: &[T], cpu: &[T]) -> (i32, usize) {

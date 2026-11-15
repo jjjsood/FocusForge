@@ -825,6 +825,38 @@ fn edit_session_is_per_tab_and_survives_mode_switches() {
 }
 
 #[test]
+fn brush_preview_state_is_window_wide() {
+    let mut controller = scratch_controller("brush_preview_window_wide");
+    open_fused_tab(&mut controller, "brush_preview_a", 2);
+    assert!(controller.set_mode(ShellMode::Editor));
+    assert!(!controller.brush_preview(), "off until switched on");
+
+    // The switch's callback path.
+    controller.toggle_brush_preview();
+    assert!(controller.brush_preview());
+    assert!(controller.brush_toolbar_view().preview);
+
+    controller.set_mode(ShellMode::Stacking);
+    open_fused_tab(&mut controller, "brush_preview_b", 3);
+    controller.set_mode(ShellMode::Stacking);
+    assert!(controller.set_mode(ShellMode::Editor));
+    assert!(controller.brush_preview(), "a newly opened tab shares it");
+
+    controller.select_project(0);
+    assert!(controller.brush_preview(), "switching tabs keeps it");
+
+    // The key's path flips the same state.
+    controller.key(true, "p", focusforge_gui::input_map::Modifiers::NONE);
+    assert!(!controller.brush_preview());
+    controller.select_project(1);
+    assert!(!controller.brush_preview(), "the other tab sees the flip");
+    controller.toggle_brush_preview();
+    controller.select_project(0);
+    assert!(controller.brush_preview());
+    assert!(controller.brush_toolbar_view().preview);
+}
+
+#[test]
 fn edit_session_follows_the_newest_planes() {
     let mut controller = scratch_controller("edit_session_newest");
     open_fused_tab(&mut controller, "edit_session_newest", 3);
@@ -12601,4 +12633,211 @@ fn checkpoint_origin_covers_a_row_without_a_session() {
         stored_colour(case.idle),
         "where it does not"
     );
+}
+
+/// The point a press at `screen` over `pane` would store, worked out from the
+/// plane draw alone: the integer centre of the one-point stroke.
+fn press_centre(c: &AppController, pane: PaneRect, screen: (f32, f32)) -> Point {
+    let draw = c.plane_draw().expect("the panes draw");
+    let scale = draw.dst.2 / draw.src.2 as f32;
+    let sx = draw.src.0 as f32 + (screen.0 - pane.x - draw.dst.0) / scale;
+    let sy = draw.src.1 as f32 + (screen.1 - pane.y - draw.dst.1) / scale;
+    Point {
+        x: (sx - 0.5).round() as i32,
+        y: (sy - 0.5).round() as i32,
+    }
+}
+
+fn hover(c: &mut AppController, pane: PaneRect, local: (f32, f32), mods: Modifiers) {
+    c.pointer(
+        PointerKind::Move,
+        Button::Left,
+        pane.x + local.0,
+        local.1,
+        mods,
+    );
+}
+
+#[test]
+fn brush_preview_shows_only_with_the_switch_on() {
+    let (mut c, _) = open_editor("brush_preview_spec");
+    // Off the 4-px lattice, so a rounding slip shows.
+    let spots = [(83.3, BAND + 121.1), (40.1, BAND + 57.7)];
+    for (size, mode, percent) in [
+        (12.0, BrushMode::Normal, 100),
+        (30.0, BrushMode::Lighten, 60),
+        (12.0, BrushMode::Detail, 35),
+    ] {
+        set_size(&mut c, size);
+        c.set_brush_softness_fraction(0.5);
+        set_look(&mut c, mode, percent);
+        let toolbar = c.brush_toolbar_view();
+        for pane in [RIGHT, LEFT] {
+            for spot in spots {
+                if c.brush_preview() {
+                    c.toggle_brush_preview();
+                }
+                hover(&mut c, pane, spot, NO_MODS);
+                assert_eq!(c.brush_preview_spec(), None, "{mode:?}: the switch is off");
+                let off = c.brush_cursor_view();
+                c.toggle_brush_preview();
+                assert_eq!(
+                    c.brush_cursor_view(),
+                    off,
+                    "{mode:?}: the cursor view ignores the switch"
+                );
+                let spec = c.brush_preview_spec().expect("the switch is on");
+                assert_eq!(
+                    spec.centre,
+                    press_centre(&c, pane, (pane.x + spot.0, spot.1)),
+                    "{mode:?} at {spot:?}: the point a press stores"
+                );
+                assert_eq!(spec.radius, toolbar.size / 2.0, "radius");
+                assert_eq!(spec.softness, toolbar.soft / 100.0, "softness");
+                assert_eq!(spec.mode, mode, "mode");
+                assert_eq!(spec.opacity, toolbar.opacity / 100.0, "opacity");
+            }
+        }
+    }
+
+    hover(&mut c, RIGHT, spots[0], NO_MODS);
+    let right = c.brush_preview_spec().expect("on");
+    hover(&mut c, LEFT, spots[0], NO_MODS);
+    assert_eq!(
+        c.brush_preview_spec(),
+        Some(right),
+        "the frame pane's point is the mirrored composite point"
+    );
+
+    c.set_mode(ShellMode::Stacking);
+    assert_eq!(c.brush_preview_spec(), None, "stacking mode");
+}
+
+#[test]
+fn brush_preview_spec_follows_a_checkpoint_source() {
+    let mut c = editor_over_several_checkpoints("brush_preview_checkpoint");
+    c.toggle_brush_preview();
+    set_size(&mut c, 10.0);
+    let key = checkpoint_keys(&c)[0].clone();
+    select_checkpoint_source(&mut c, &key);
+    hover(&mut c, RIGHT, (83.3, BAND + 121.1), NO_MODS);
+    let spec = c
+        .brush_preview_spec()
+        .expect("a checkpoint source previews");
+    assert_eq!(
+        spec.centre,
+        press_centre(&c, RIGHT, (RIGHT.x + 83.3, BAND + 121.1)),
+        "the point a press stores"
+    );
+    assert_eq!(spec.radius, c.brush_toolbar_view().size / 2.0);
+}
+
+#[test]
+fn brush_preview_hides_during_stroke_pipette_alt_outside_and_blocked() {
+    let (mut c, _) = open_editor("brush_preview_hides");
+    c.toggle_brush_preview();
+    set_size(&mut c, 8.0);
+    let inside = (83.3, BAND + 121.1);
+    hover(&mut c, RIGHT, inside, NO_MODS);
+    assert!(c.brush_preview_spec().is_some(), "visible before");
+
+    // A live stroke.
+    press(&mut c, (RIGHT.x + inside.0, inside.1));
+    assert_eq!(c.brush_preview_spec(), None, "during a stroke");
+    assert!(c.brush_cursor_view().is_some(), "the ring stays");
+    release(&mut c, (RIGHT.x + inside.0, inside.1));
+    common::settle_region_renders(&mut c);
+    assert!(c.brush_preview_spec().is_some(), "after release");
+
+    // The pipette.
+    c.toggle_pipette();
+    assert_eq!(c.brush_preview_spec(), None, "pipette armed");
+    assert!(c.brush_cursor_view().is_some(), "pipette: ring stays");
+    c.toggle_pipette();
+
+    // Alt on the last hover move.
+    hover(&mut c, RIGHT, inside, ALT);
+    assert_eq!(c.brush_preview_spec(), None, "Alt held");
+    assert!(c.brush_cursor_view().is_some(), "Alt: ring stays");
+    hover(&mut c, RIGHT, inside, NO_MODS);
+    assert!(c.brush_preview_spec().is_some(), "Alt released");
+
+    // The pane is exactly the image wide: the last column is in, `x == width`
+    // is out.
+    hover(&mut c, RIGHT, (PANE_WIDTH - 0.01, inside.1), NO_MODS);
+    assert!(c.brush_preview_spec().is_some(), "the last column");
+    hover(&mut c, RIGHT, (PANE_WIDTH, inside.1), NO_MODS);
+    assert_eq!(c.brush_preview_spec(), None, "x == width");
+    assert!(c.brush_cursor_view().is_some(), "x == width: ring stays");
+
+    // Margins on all four sides.
+    c.zoom_out();
+    c.zoom_out();
+    let draw = c.plane_draw().expect("still drawn");
+    let (x, y, w, h) = draw.dst;
+    assert!(x > 3.0 && y > 3.0 && x + w + 3.0 < PANE_WIDTH && y + h + 3.0 < 320.0);
+    hover(&mut c, RIGHT, (x + w / 2.0, y + h / 2.0), NO_MODS);
+    assert!(
+        c.brush_preview_spec().is_some(),
+        "zoomed out, over the image"
+    );
+    for (side, spot) in [
+        ("left", (x - 2.0, y + h / 2.0)),
+        ("above", (x + w / 2.0, y - 2.0)),
+        ("right", (x + w + 2.0, y + h / 2.0)),
+        ("below", (x + w / 2.0, y + h + 2.0)),
+    ] {
+        hover(&mut c, RIGHT, spot, NO_MODS);
+        assert_eq!(
+            c.brush_preview_spec(),
+            None,
+            "a pane margin {side} of the image"
+        );
+        assert!(c.brush_cursor_view().is_some(), "{side}: ring stays");
+    }
+
+    // A modal.
+    hover(&mut c, RIGHT, (x + w / 2.0, y + h / 2.0), NO_MODS);
+    c.open_settings();
+    assert_eq!(c.brush_preview_spec(), None, "settings open");
+    assert!(c.brush_cursor_view().is_none(), "settings: no cursor");
+    c.close_settings();
+    assert!(c.brush_preview_spec().is_some(), "settings closed");
+}
+
+#[test]
+fn brush_preview_changes_no_op_undo_or_export() {
+    let (mut c, _) = open_editor("brush_preview_display_only");
+    drag(&mut c, &[(10.0, 20.0), (12.0, 22.0)]);
+    c.toggle_brush_preview();
+    let state = |c: &AppController| {
+        (
+            c.edit_session().unwrap().op_count(),
+            c.edit_session().unwrap().can_undo(),
+            c.edit_session().unwrap().can_redo(),
+            c.project_tabs()[0].unsaved,
+        )
+    };
+    let before = state(&c);
+    assert_eq!(before.0, 1, "one committed stroke");
+    assert!(before.1 && !before.2, "undo is available, redo is not");
+    let mut shown = 0;
+    for i in 0..50 {
+        let pane = if i % 2 == 0 { RIGHT } else { LEFT };
+        hover(
+            &mut c,
+            pane,
+            (2.0 + i as f32 * 4.3, BAND + 5.0 + i as f32 * 4.1),
+            NO_MODS,
+        );
+        shown += usize::from(c.brush_preview_spec().is_some());
+        if i == 20 || i == 40 {
+            c.select_frame(if i == 20 { 1 } else { 2 });
+        }
+    }
+    assert!(
+        shown > 20,
+        "the preview was asked for over the image ({shown})"
+    );
+    assert_eq!(state(&c), before, "a preview leaves the session as it was");
 }

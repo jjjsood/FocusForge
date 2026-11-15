@@ -14,3 +14,4 @@ Gotchas:
 - The run is held at its first fuse tile for `--slow-run-seconds` of running time (journey 20 sets 600: slower runners reach Cancel only after several minutes, and the default 150 s let the run finish into the Keep question first), pauses excluded; cancelling ends it at once.
 Guides: 20-fuse-stage-view.md
 Book: guide/gui.md#the-two-panes
+Sources: crates/ui/ui/shell/canvas.slint, crates/ui/ui/comparison_window.slint, crates/ui/ui/shell/toolbar.slint, crates/ui/ui/shell/bottom_bar.slint, crates/ui/ui/shell/settings_modal/appearance_tab.slint, crates/gui/src/job.rs, crates/gui/src/canvas.rs, crates/gui/src/gpu_canvas.rs, crates/gui/src/appearance_settings.rs

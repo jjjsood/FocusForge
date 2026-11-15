@@ -485,11 +485,42 @@ pub fn read_tile_step_into<R: TileReader + ?Sized>(
     samples_per_pixel: u32,
     out: &mut [u16],
 ) -> Result<(), AlgorithmError> {
-    let step = step.get();
-    if step == 1 {
+    if step.get() == 1 {
         return reader.read_tile_into(frame, rect, out);
     }
+    read_step_rows(rect, step, samples_per_pixel, out, |row, buf| {
+        reader.read_tile_into(frame, row, buf)
+    })
+}
 
+/// [`read_tile_step_into`] in `f32` samples, through
+/// [`TileReader::read_tile_f32_into`].
+pub fn read_tile_step_f32_into<R: TileReader + ?Sized>(
+    reader: &R,
+    frame: usize,
+    rect: Rect,
+    step: NonZeroU32,
+    samples_per_pixel: u32,
+    out: &mut [f32],
+) -> Result<(), AlgorithmError> {
+    if step.get() == 1 {
+        return reader.read_tile_f32_into(frame, rect, out);
+    }
+    read_step_rows(rect, step, samples_per_pixel, out, |row, buf| {
+        reader.read_tile_f32_into(frame, row, buf)
+    })
+}
+
+/// Fills `out` with every `step`-th column of every `step`-th row of `rect`,
+/// each sampled row read whole by `read_row` into a one-row buffer.
+fn read_step_rows<T: Copy + Default>(
+    rect: Rect,
+    step: NonZeroU32,
+    samples_per_pixel: u32,
+    out: &mut [T],
+    mut read_row: impl FnMut(Rect, &mut [T]) -> Result<(), AlgorithmError>,
+) -> Result<(), AlgorithmError> {
+    let step = step.get();
     let spp = samples_per_pixel as usize;
     let out_width = rect.width.div_ceil(step);
     let out_height = rect.height.div_ceil(step);
@@ -498,13 +529,13 @@ pub fn read_tile_step_into<R: TileReader + ?Sized>(
         return Err(AlgorithmError::Failed {
             algorithm: "read_tile_step_into".to_string(),
             detail: format!(
-                "buffer size mismatch: expected {expected} u16 samples, got {}",
+                "buffer size mismatch: expected {expected} samples, got {}",
                 out.len()
             ),
         });
     }
 
-    let mut row_buf = vec![0u16; rect.width as usize * spp];
+    let mut row_buf = vec![T::default(); rect.width as usize * spp];
     for out_row in 0..out_height {
         let row_rect = Rect {
             x: rect.x,
@@ -512,7 +543,7 @@ pub fn read_tile_step_into<R: TileReader + ?Sized>(
             width: rect.width,
             height: 1,
         };
-        reader.read_tile_into(frame, row_rect, &mut row_buf)?;
+        read_row(row_rect, &mut row_buf)?;
         let dest_start = (out_row * out_width) as usize * spp;
         for out_col in 0..out_width {
             let src = out_col as usize * step as usize * spp;

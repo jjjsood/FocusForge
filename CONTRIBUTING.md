@@ -4,7 +4,8 @@
 
 ```
 crates/core/   TIFF and RAW I/O, tiles, stacking and alignment algorithms, the
-               Z-Map, the retouch op log and its brush-stroke blend, the
+               Z-Map, the retouch op log, its brush-stroke blend and the
+               brush-circle preview, the
                rainbow overlay palette, the job engine (pause/resume/cancel
                over tile-sized work units), the stage cache, grouping
                proposals, the `.ffp` project container and its
@@ -12,7 +13,7 @@ crates/core/   TIFF and RAW I/O, tiles, stacking and alignment algorithms, the
                composite, image export in TIFF, PNG and JPEG), the update check
                (`update`: version comparison and one HTTPS GET through `ureq`;
                tests and `FOCUSFORGE_RELEASE_URL` point it at a local server)
-crates/gpu/    the shared wgpu device, WGSL fusion/warp/blend and sharpness (scale, map tiles, sharp-area and
+crates/gpu/    the shared wgpu device, WGSL fusion/warp/blend, brush-preview and sharpness (scale, map tiles, sharp-area and
                overlap scoring) kernels, each with a CPU twin, and the
                tile-scheduler pipeline that runs them, behind the `gpu`
                feature (on by default). An allocate-and-back-off probe at
@@ -156,7 +157,7 @@ the `quick` profile leaves exactly those to the full gate. The
 `hit_cap_behaviour` tests are `measurement:` ignores, run by hand with
 `--ignored`.
 
-`tests/ui/` holds 22 journeys, each one whole path through the window as
+`tests/ui/` holds 25 journeys, each one whole path through the window as
 numbered clicks, keys and hovers with an `Expect:` line per step, plus
 `features/` files listing which journey covers which feature. They are run by
 hand or by a script against `focusforge-gui`; `tests/ui/README.md` gives the

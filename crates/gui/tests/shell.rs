@@ -176,6 +176,8 @@ fn checkpoint_panel_touches_no_storage() {
     // which builds the stored stroke's path in core's own point type.
     // `performance_settings.rs` parses its cap strings with core's size
     // syntax. `calculator.rs` plans through core's step calculator.
+    // `sheet_specimens.rs` reads fixture frames for the theme sheet and is not
+    // compiled without that feature.
     // Excluded by name: this test's own subject is the checkpoint
     // panel, not the whole crate. Source preview reductions also read frames.
     let canvas_files = [
@@ -196,6 +198,7 @@ fn checkpoint_panel_touches_no_storage() {
         "analytics.rs",
         "recent.rs",
         "settings.rs",
+        "sheet_specimens.rs",
     ];
     for path in common::find_rust_files(&common::src_dir()) {
         if path
@@ -1185,12 +1188,8 @@ fn input_map_cells(tab: &ElementHandle) -> Vec<[String; 3]> {
         .collect()
 }
 
-/// Like `input_map_cells`, for a table taller than the tab's viewport: the
-/// query does not return rows clipped below the viewport, so the top is read, the tab is
-/// scrolled to its end and read again, and the second read adds the rows
-/// whose input the first lacks (inputs are unique in a table).
-fn input_map_cells_scrolled(app: &AppWindow, tab: &ElementHandle) -> Vec<[String; 3]> {
-    let mut cells = input_map_cells(tab);
+/// Scrolls the Input map tab to the end of its table.
+fn scroll_input_map_to_end(app: &AppWindow, tab: &ElementHandle) {
     let (pos, size) = (tab.absolute_position(), tab.size());
     app.window()
         .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
@@ -1201,6 +1200,15 @@ fn input_map_cells_scrolled(app: &AppWindow, tab: &ElementHandle) -> Vec<[String
             delta_x: 0.0,
             delta_y: -10_000.0,
         });
+}
+
+/// Like `input_map_cells`, for a table taller than the tab's viewport: the
+/// query does not return rows clipped below the viewport, so the top is read, the tab is
+/// scrolled to its end and read again, and the second read adds the rows
+/// whose input the first lacks (inputs are unique in a table).
+fn input_map_cells_scrolled(app: &AppWindow, tab: &ElementHandle) -> Vec<[String; 3]> {
+    let mut cells = input_map_cells(tab);
+    scroll_input_map_to_end(app, tab);
     let rest: Vec<[String; 3]> = input_map_cells(tab)
         .into_iter()
         .filter(|row| cells.iter().all(|seen| seen[0] != row[0]))
@@ -1376,13 +1384,14 @@ fn input_map_tab_names_a_refused_table() {
     }
 }
 
-/// A 1 px rule sits directly under the header and under every row, the last
-/// one included.
+/// A 1 px rule sits directly under every row the table shows with the tab
+/// scrolled to its end, the last one included.
 #[test]
 fn input_map_table_draws_a_rule_under_every_row() {
     let controller = AppController::new();
     let app = input_map_window(1440, 900, &controller);
     let tab = input_map_tab(&app);
+    scroll_input_map_to_end(&app, &tab);
     let cells = by_position(
         tab.query_descendants()
             .match_id("FFInputTableRow::input-cell"),
@@ -1404,17 +1413,18 @@ fn input_map_table_draws_a_rule_under_every_row() {
     }
 }
 
-/// Every table row stays inside the settings content area, horizontally and
-/// above its bottom edge.
+/// Every table row stays inside the settings content area horizontally, and
+/// above its bottom edge with the tab scrolled to its end.
 #[test]
 fn input_map_rows_stay_inside_the_content_area() {
     let controller = AppController::new();
     for (width, height) in [(1440u32, 900u32), (1100, 700)] {
         let app = input_map_window(width, height, &controller);
         let (cx, cy, cw, ch) = rect(&app, "FFSettingsModal::content");
+        let tab = input_map_tab(&app);
+        scroll_input_map_to_end(&app, &tab);
         let rows = by_position(
-            input_map_tab(&app)
-                .query_descendants()
+            tab.query_descendants()
                 .match_id("FFInputTableRow::input-cell"),
         );
         assert_eq!(rows.len(), controller.input_rows().len() + 1);
@@ -3413,6 +3423,131 @@ fn switches_carry_their_row_name() {
         switch(&app, "GPU processing").accessible_checked(),
         Some(true)
     );
+}
+
+/// The editor bar's `Preview` switch follows the controller's pushed state
+/// and its click raises the toggle callback.
+#[test]
+fn editor_toolbar_preview_switch_follows_state() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let app = app_at(1440, 900);
+    app.set_show_empty_state(false);
+    app.set_mode("editor".into());
+    let toggles = Rc::new(Cell::new(0));
+    app.on_brush_preview_toggled({
+        let toggles = toggles.clone();
+        move || toggles.set(toggles.get() + 1)
+    });
+
+    let preview = switch(&app, "Preview");
+    assert_eq!(preview.accessible_label().as_deref(), Some("Preview"));
+    assert_eq!(preview.accessible_checked(), Some(false), "off by default");
+    for on in [true, false, true] {
+        app.set_brush_preview(on);
+        assert_eq!(switch(&app, "Preview").accessible_checked(), Some(on));
+    }
+
+    assert_eq!(toggles.get(), 0, "setting the state raises no callback");
+    switch(&app, "Preview").mock_single_click(slint::platform::PointerEventButton::Left);
+    assert_eq!(toggles.get(), 1, "a click raises one toggle");
+}
+
+/// Where the editor bar puts the `Preview` switch, its caption, Pipette,
+/// Undo, Redo and `Save checkpoint` at the window widths around both tier
+/// thresholds. Offsets are from the toolbar's left edge.
+#[test]
+fn editor_toolbar_preview_fits_every_width() {
+    // (caption x, switch x, pipette x, undo x, redo x, save width)
+    type Tier = (Option<f32>, f32, f32, f32, f32, f32);
+    const WIDE: Tier = (Some(650.0), 710.0, 754.0, 814.0, 846.0, 163.0);
+    const NARROW_TRACKS: Tier = (Some(566.0), 626.0, 670.0, 730.0, 762.0, 163.0);
+    const NO_CAPTION: Tier = (None, 566.0, 610.0, 670.0, 702.0, 132.0);
+    const CLEARANCE: f32 = 17.0;
+
+    // The toolbar is the window less the dock (260) and icon bar (48).
+    for (window, tier) in [
+        (1200, NO_CAPTION),
+        (1291, NO_CAPTION),
+        (1292, NARROW_TRACKS),
+        (1375, NARROW_TRACKS),
+        (1376, WIDE),
+        (1440, WIDE),
+    ] {
+        let (caption_x, switch_x, pipette_x, undo_x, redo_x, save_width) = tier;
+        let app = app_at(window, 900);
+        app.set_show_empty_state(false);
+        app.set_mode("editor".into());
+        let case = format!("window {window}");
+
+        let (bar_x, _, bar_width, _) = rect(&app, "AppWindow::editor-toolbar");
+        assert_eq!(bar_width, window as f32 - 308.0, "{case}: toolbar width");
+
+        let preview = switch(&app, "Preview");
+        let switch_box = (preview.absolute_position().x, preview.size().width);
+        assert!(
+            (switch_box.0 - (bar_x + switch_x)).abs() < EPS,
+            "{case}: switch at {}, expected {}",
+            switch_box.0 - bar_x,
+            switch_x
+        );
+        assert_eq!(switch_box.1, 36.0, "{case}: switch width");
+
+        let captions: Vec<_> = ElementHandle::find_by_accessible_label(&app, "Preview")
+            .filter(|e| e.accessible_role() != Some(AccessibleRole::Button))
+            .collect();
+        match caption_x {
+            Some(x) => {
+                assert_eq!(captions.len(), 1, "{case}: caption shown");
+                let got = captions[0].absolute_position().x - bar_x;
+                assert!(
+                    (got - x).abs() < EPS,
+                    "{case}: caption at {got}, expected {x}"
+                );
+            }
+            None => assert!(captions.is_empty(), "{case}: caption hidden"),
+        }
+
+        let left_of = |id: &str| rect(&app, &format!("FFEditorToolbar::{id}")).0 - bar_x;
+        for (id, x) in [("pipette", pipette_x), ("undo", undo_x), ("redo", redo_x)] {
+            assert!(
+                (left_of(id) - x).abs() < EPS,
+                "{case}: {id} at {}, expected {x}",
+                left_of(id)
+            );
+        }
+        assert!(
+            (left_of("pipette") - (switch_x + 36.0) - 8.0).abs() < EPS,
+            "{case}: 8 px between the switch and Pipette"
+        );
+
+        let saves: Vec<_> = ElementHandle::find_by_accessible_label(&app, "Save checkpoint")
+            .filter(|e| e.accessible_role() == Some(AccessibleRole::Button))
+            .collect();
+        assert_eq!(saves.len(), 1, "{case}: Save checkpoint keeps its label");
+        let save_left = saves[0].absolute_position().x - bar_x;
+        assert!(
+            (saves[0].size().width - save_width).abs() < EPS,
+            "{case}: Save width {}, expected {save_width}",
+            saves[0].size().width
+        );
+        let redo_right = left_of("redo") + rect(&app, "FFEditorToolbar::redo").2;
+        assert!(
+            save_left - redo_right >= CLEARANCE,
+            "{case}: {} px between Redo and Save checkpoint",
+            save_left - redo_right
+        );
+        assert!(
+            save_left + saves[0].size().width <= bar_width,
+            "{case}: Save checkpoint inside the toolbar"
+        );
+        assert_eq!(
+            switch(&app, "Preview").accessible_label().as_deref(),
+            Some("Preview"),
+            "{case}: the switch keeps its name"
+        );
+    }
 }
 
 #[test]

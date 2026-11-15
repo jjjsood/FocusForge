@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use focusforge_core::TiffError;
-use focusforge_core::algorithm::{AlgorithmError, read_tile_step_into};
+use focusforge_core::algorithm::{
+    AlgorithmError, TileReader, read_tile_step_f32_into, read_tile_step_into,
+};
 use focusforge_core::align::{Transform, WarpingReader};
 use focusforge_core::display::alpha_from_opacity;
 use focusforge_core::equalize::GainReader;
@@ -190,12 +192,16 @@ impl FrameSource {
     }
 
     /// The open frame as [`Self::read_into`] reads it -- warped by the
-    /// recorded view -- shared with a preparation worker's reads.
-    pub fn reader(&self) -> Option<Arc<dyn PaneReader>> {
+    /// recorded view -- shared with a preparation worker's reads. With a
+    /// `clip` and a three-sample frame the warped, gained samples are read as
+    /// `f32` and narrowed through it, as the 16-bit export narrows them.
+    pub fn reader(&self, clip: Option<&HighlightClip>) -> Option<Arc<dyn PaneReader>> {
         self.open.as_ref().map(|(_, reader, view)| {
+            let clip = clip.filter(|_| reader.frame(0).samples_per_pixel == 3);
             Arc::new(WarpedFrame {
                 reader: reader.clone(),
                 view: *view,
+                clip: clip.cloned(),
             }) as Arc<dyn PaneReader>
         })
     }
@@ -234,28 +240,59 @@ fn read_warped(
     let Some(view) = view else {
         return reader.read_tile_step_into(0, rect, step, samples_per_pixel, out);
     };
-    let (transform, origin) = (view.transform, view.origin);
+    through_view(reader, view, rect, |warped, shifted| {
+        read_tile_step_into(warped, 0, shifted, step, samples_per_pixel, out)
+    })
+}
+
+/// [`read_warped`] in `f32` samples.
+fn read_warped_f32(
+    reader: &dyn FrameReader,
+    view: Option<FrameView>,
+    rect: Rect,
+    step: NonZeroU32,
+    out: &mut [f32],
+) -> Result<(), AlgorithmError> {
+    let samples_per_pixel = reader.frame(0).samples_per_pixel;
+    let Some(view) = view else {
+        return read_tile_step_f32_into(reader, 0, rect, step, samples_per_pixel, out);
+    };
+    through_view(reader, view, rect, |warped, shifted| {
+        read_tile_step_f32_into(warped, 0, shifted, step, samples_per_pixel, out)
+    })
+}
+
+/// Runs `read` on `reader`'s frame 0 gained and warped by `view`, with `rect`
+/// moved to the view's crop origin.
+fn through_view(
+    reader: &dyn FrameReader,
+    view: FrameView,
+    rect: Rect,
+    read: impl FnOnce(&dyn TileReader, Rect) -> Result<(), AlgorithmError>,
+) -> Result<(), AlgorithmError> {
     let gains = [view.gain];
     let gained = GainReader::new(reader, &gains);
     let warped = WarpingReader::new(
         &gained,
         reader.dimensions(),
-        samples_per_pixel,
-        vec![transform],
+        reader.frame(0).samples_per_pixel,
+        vec![view.transform],
     );
     let shifted = Rect {
-        x: rect.x + origin.0,
-        y: rect.y + origin.1,
+        x: rect.x + view.origin.0,
+        y: rect.y + view.origin.1,
         ..rect
     };
-    read_tile_step_into(&warped, 0, shifted, step, samples_per_pixel, out)
+    read(&warped, shifted)
 }
 
 /// One open frame plus the view it is warped through, readable from a
-/// worker thread with exactly [`FrameSource::read_into`]'s semantics.
+/// worker thread with exactly [`FrameSource::read_into`]'s semantics, or
+/// narrowed through `clip` when one is set.
 struct WarpedFrame {
     reader: Arc<dyn FrameReader>,
     view: Option<FrameView>,
+    clip: Option<HighlightClip>,
 }
 
 impl PaneReader for WarpedFrame {
@@ -269,7 +306,13 @@ impl PaneReader for WarpedFrame {
         step: NonZeroU32,
         out: &mut [u16],
     ) -> Result<(), PaneReadError> {
-        Ok(read_warped(&*self.reader, self.view, rect, step, out)?)
+        let Some(clip) = &self.clip else {
+            return Ok(read_warped(&*self.reader, self.view, rect, step, out)?);
+        };
+        let mut band = vec![0f32; out.len()];
+        read_warped_f32(&*self.reader, self.view, rect, step, &mut band)?;
+        clip.narrow_band(&band, out);
+        Ok(())
     }
 }
 

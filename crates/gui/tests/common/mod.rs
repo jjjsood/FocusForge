@@ -983,6 +983,13 @@ pub struct RawFiles {
 
 #[allow(dead_code)]
 pub fn raw_files(name: &str) -> RawFiles {
+    raw_files_with_patch(name, None)
+}
+
+/// [`raw_files`] with the raw samples inside `patch` at the white level in
+/// every frame, a saturated highlight.
+#[allow(dead_code)]
+pub fn raw_files_with_patch(name: &str, patch: Option<focusforge_core::io::Rect>) -> RawFiles {
     use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
     let dir = tree(name);
@@ -992,6 +999,12 @@ pub fn raw_files(name: &str) -> RawFiles {
                 .map(|i| {
                     let (x, y) = (i % RAW_W, i / RAW_W);
                     let checker = if (x / 2 + y / 2) % 2 == 0 { 0 } else { 380 };
+                    let in_patch = patch.is_some_and(|p| {
+                        (p.x..p.x + p.width).contains(&x) && (p.y..p.y + p.height).contains(&y)
+                    });
+                    if in_patch {
+                        return 4_095;
+                    }
                     (2_700 + frame * 40 + checker) as u16
                 })
                 .collect();

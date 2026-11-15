@@ -1030,3 +1030,84 @@ fn mcp_feature_exposes_the_running_window() {
         "tools absent: {response}"
     );
 }
+
+/// How many brush-preview images sit below the element `id` of `root`, or in
+/// the whole of `root` when `id` is `None`.
+fn previews_below(root: &impl i_slint_backend_testing::ElementRoot, id: Option<&str>) -> usize {
+    use i_slint_backend_testing::ElementQuery;
+
+    match id {
+        Some(id) => ElementQuery::from_root(root)
+            .match_id(id)
+            .find_first()
+            .unwrap_or_else(|| panic!("no element {id}"))
+            .query_descendants()
+            .match_id("FFBrushCursor::preview")
+            .find_all()
+            .len(),
+        None => ElementQuery::from_root(root)
+            .match_id("FFBrushCursor::preview")
+            .find_all()
+            .len(),
+    }
+}
+
+#[test]
+fn brush_preview_lands_only_on_the_composite_cursor() {
+    use focusforge_gui::bridge::show_brush_preview;
+    use focusforge_gui::canvas::PaneSource;
+    use focusforge_gui::{AppWindow, ComparisonWindow};
+    use slint::ComponentHandle;
+
+    common::init_window_backend();
+    let app = AppWindow::new().unwrap();
+    app.set_project_loaded(true);
+    app.set_mode("editor".into());
+    app.set_cursor_visible(true);
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let side = ComparisonWindow::new().unwrap();
+    side.set_editor_mode(true);
+    side.set_cursor_visible(true);
+    let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(8, 8);
+    pixels.make_mut_slice().fill(slint::Rgba8Pixel {
+        r: 200,
+        g: 120,
+        b: 40,
+        a: 200,
+    });
+    let layer = || {
+        Some((
+            slint::Image::from_rgba8(pixels.clone()),
+            (1.0, 2.0, 30.0, 40.0),
+        ))
+    };
+    let seen = |label: &str, main_left: usize, main_right: usize, detached: usize| {
+        assert_eq!(
+            previews_below(&app, Some("FFCanvas::brush-cursor-left")),
+            main_left,
+            "{label}: the main frame cursor"
+        );
+        assert_eq!(
+            previews_below(&app, Some("FFCanvas::brush-cursor-right")),
+            main_right,
+            "{label}: the main composite cursor"
+        );
+        assert_eq!(
+            previews_below(&side, None),
+            detached,
+            "{label}: the detached window's cursor"
+        );
+    };
+
+    seen("nothing shown", 0, 0, 0);
+    show_brush_preview(&app, Some(&side), None, layer());
+    seen("nothing detached", 0, 1, 0);
+    show_brush_preview(&app, Some(&side), Some(PaneSource::Composite), layer());
+    seen("the composite detached", 0, 0, 1);
+    show_brush_preview(&app, Some(&side), Some(PaneSource::Frame), layer());
+    seen("the frame pane detached", 0, 1, 0);
+    show_brush_preview(&app, Some(&side), Some(PaneSource::Composite), None);
+    seen("cleared", 0, 0, 0);
+    show_brush_preview(&app, None, None, layer());
+    seen("no second window", 0, 1, 0);
+}
