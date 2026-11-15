@@ -4309,12 +4309,21 @@ fn raw_project_display_clips_once() {
 /// A 16-bit TIFF export of `files`' composite, the oracle every display site
 /// of a RAW document must match.
 fn export_oracle(files: &common::RawFiles) -> TiffStack {
+    export_oracle_of(files, vec![], "export.tif")
+}
+
+/// A 16-bit TIFF export named `file` of `files`' composite under `ops`.
+fn export_oracle_of(
+    files: &common::RawFiles,
+    ops: Vec<focusforge_core::project::Op>,
+    file: &str,
+) -> TiffStack {
     use focusforge_core::project::{
         self,
         export::{ExportOptions, MetadataOptions},
     };
 
-    let out = files.dir.join("export.tif");
+    let out = files.dir.join(file);
     let metadata = MetadataOptions {
         exif: false,
         icc: false,
@@ -4322,7 +4331,7 @@ fn export_oracle(files: &common::RawFiles) -> TiffStack {
         iptc: false,
     };
     project::export_pending(
-        &common::raw_pending(files, vec![]),
+        &common::raw_pending(files, ops),
         None,
         &out,
         &ExportOptions::default(),
@@ -4475,6 +4484,231 @@ fn raw_composite_pane_clips_like_export() {
     );
     renderer.set_clip_source(Some((&files.composite, &[])));
     assert_eq!(job_read(&mut renderer), plain, "(e) .tif first frame");
+}
+
+/// A RAW document whose frames hold a saturated patch, and the 16-bit export
+/// of a full-opacity Normal stroke from its first frame over the patch.
+struct PatchDocument {
+    files: common::RawFiles,
+    stroke: TiffStack,
+    spec: focusforge_core::retouch::preview::BrushPreviewSpec,
+}
+
+const STROKE_CENTRE: (u32, u32) = (18, 12);
+const STROKE_RADIUS: f32 = 9.0;
+
+fn patch_document(name: &str) -> PatchDocument {
+    use focusforge_core::project::{BrushMode, Op, Point};
+    use focusforge_core::retouch::preview::BrushPreviewSpec;
+
+    let patch = Rect {
+        x: 14,
+        y: 8,
+        width: 8,
+        height: 8,
+    };
+    let files = common::raw_files_with_patch(name, Some(patch));
+    let centre = Point {
+        x: STROKE_CENTRE.0 as i32,
+        y: STROKE_CENTRE.1 as i32,
+    };
+    let stroke = export_oracle_of(
+        &files,
+        vec![Op::frame_stroke(0, vec![centre], STROKE_RADIUS, 0.0)],
+        "stroke.tif",
+    );
+    let spec = BrushPreviewSpec {
+        centre,
+        radius: STROKE_RADIUS,
+        softness: 0.0,
+        mode: BrushMode::Normal,
+        opacity: 1.0,
+    };
+    PatchDocument {
+        files,
+        stroke,
+        spec,
+    }
+}
+
+/// Whether the stroke's mask is full at pixel `(x, y)`, a margin inside the
+/// disc's edge.
+fn in_stroke_core(x: u32, y: u32) -> bool {
+    let (dx, dy) = (
+        x as f32 - STROKE_CENTRE.0 as f32,
+        y as f32 - STROKE_CENTRE.1 as f32,
+    );
+    (dx * dx + dy * dy).sqrt() <= STROKE_RADIUS - 1.5
+}
+
+fn whole_draw(step: u32) -> focusforge_gui::viewport::PaneDraw {
+    focusforge_gui::viewport::PaneDraw {
+        src: (0, 0, RAW_W, RAW_H),
+        dst: (0.0, 0.0, RAW_W as f32, RAW_H as f32),
+        crop: (0.0, 0.0, RAW_W as f32, RAW_H as f32),
+        pixelated: true,
+        step: NonZeroU32::new(step).unwrap(),
+    }
+}
+
+/// A renderer holding the document's first frame and composite, read through
+/// the document's clip.
+fn patch_renderer(
+    shared: &focusforge_gpu::device::SharedDevice,
+    doc: &PatchDocument,
+) -> focusforge_gui::gpu_canvas::CanvasRenderer {
+    let mut renderer = focusforge_gui::gpu_canvas::CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    renderer
+        .set_frame(&doc.files.sources[0], None, job::host_budget())
+        .expect("the first frame opens");
+    renderer
+        .set_planes(&doc.files.composite, None)
+        .expect("the composite opens");
+    renderer.set_clip_source(Some((&doc.files.sources[0], &[])));
+    renderer
+}
+
+/// Asserts that every sample of the whole-image lattice of `step` in the
+/// stroke's full-mask core equals the stroke's export there.
+fn assert_core_matches_stroke(doc: &PatchDocument, samples: &[u16], step: u32, label: &str) {
+    let expected = oracle_read(&doc.stroke, raw_whole(), step);
+    let columns = RAW_W.div_ceil(step);
+    let mut checked = 0;
+    for (t, (shown, want)) in samples
+        .chunks_exact(3)
+        .zip(expected.chunks_exact(3))
+        .enumerate()
+    {
+        let (x, y) = ((t as u32 % columns) * step, (t as u32 / columns) * step);
+        if in_stroke_core(x, y) {
+            checked += 1;
+            assert_eq!(shown, want, "{label}: pixel ({x}, {y})");
+        }
+    }
+    assert!(checked > 0, "{label}: the core holds a sample");
+}
+
+#[test]
+fn raw_frame_pane_matches_the_stroke_on_a_clipped_highlight() {
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let doc = patch_document("raw_frame_pane_matches_the_stroke_on_a_clipped_highlight");
+    let mut renderer = patch_renderer(shared, &doc);
+    let job = renderer
+        .request_frame(&whole_draw(1))
+        .expect("the frame needs a read");
+    let shown = job_samples(&job);
+    let at_patch = ((STROKE_CENTRE.1 * RAW_W + STROKE_CENTRE.0) * 3) as usize;
+    assert_eq!(
+        oracle_read(&doc.stroke, raw_whole(), 1)[at_patch..at_patch + 3],
+        [u16::MAX; 3],
+        "the stroke paints the saturated patch white"
+    );
+    assert_core_matches_stroke(&doc, &shown, 1, "frame pane");
+}
+
+#[test]
+fn raw_brush_preview_frame_half_equals_the_stroke_render() {
+    use focusforge_gui::gpu_canvas::PreviewTier;
+
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let doc = patch_document("raw_brush_preview_frame_half_equals_the_stroke_render");
+
+    // The exact tier: both panes at step 1.
+    let mut renderer = patch_renderer(shared, &doc);
+    let draw = whole_draw(1);
+    let job = renderer.request_frame(&draw).expect("frame job");
+    assert!(renderer.publish(&job, &job_samples(&job)).is_some());
+    let job = renderer.request_planes(&draw, None, None).expect("job");
+    assert!(renderer.publish(&job, &job_samples(&job)).is_some());
+    let grids = renderer.brush_preview_grids(&doc.spec).expect("answers");
+    assert_eq!(grids.tier, PreviewTier::Exact);
+    assert_core_matches_stroke(&doc, grids.source.samples, 1, "exact tier");
+
+    // The backdrop tier: both backdrops at step 2.
+    let mut renderer = patch_renderer(shared, &doc);
+    let draw = whole_draw(2);
+    let job = renderer.request_frame_backdrop(&draw).expect("frame job");
+    assert!(renderer.publish(&job, &job_samples(&job)).is_some());
+    let job = renderer
+        .request_plane_backdrop(&draw, None, None)
+        .expect("job");
+    assert!(renderer.publish(&job, &job_samples(&job)).is_some());
+    let grids = renderer.brush_preview_grids(&doc.spec).expect("answers");
+    assert_eq!(grids.tier, PreviewTier::Backdrop);
+    assert_core_matches_stroke(&doc, grids.source.samples, 2, "backdrop tier");
+}
+
+#[test]
+fn raw_clip_change_resets_the_frame_pane() {
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let doc = patch_document("raw_clip_change_resets_the_frame_pane");
+    let mut renderer = patch_renderer(shared, &doc);
+    // The exact panes and the backdrops, the frame's only when `frame`.
+    let publish_all = |renderer: &mut CanvasRenderer, frame: bool| {
+        let exact = whole_draw(1);
+        let backdrop = whole_draw(2);
+        let jobs = [
+            frame.then(|| renderer.request_frame(&exact)).flatten(),
+            renderer.request_planes(&exact, None, None),
+            frame
+                .then(|| renderer.request_frame_backdrop(&backdrop))
+                .flatten(),
+            renderer.request_plane_backdrop(&backdrop, None, None),
+        ];
+        for job in jobs.into_iter().flatten() {
+            assert!(renderer.publish(&job, &job_samples(&job)).is_some());
+        }
+    };
+
+    publish_all(&mut renderer, true);
+    assert!(renderer.brush_preview_grids(&doc.spec).is_some());
+    renderer.set_clip_source(Some((&doc.files.sources[0], &[])));
+    assert!(
+        renderer.brush_preview_grids(&doc.spec).is_some(),
+        "an unchanged source keeps the panes"
+    );
+
+    // A draw the published pane does not already hold, so a job is issued.
+    let stale = renderer.request_frame(&whole_draw(2)).expect("frame job");
+    let under_clip = job_samples(&stale);
+    renderer.set_clip_source(None);
+    assert!(
+        renderer.publish(&stale, &under_clip).is_none(),
+        "a job issued under the old clip is refused"
+    );
+    publish_all(&mut renderer, false);
+    assert!(
+        renderer.brush_preview_grids(&doc.spec).is_none(),
+        "both frame textures are empty after the clip changed"
+    );
+
+    // Without a clip the frame job reads what the frame source reads.
+    let mut frame = FrameSource::default();
+    frame
+        .set(&doc.files.sources[0], None, job::host_budget())
+        .expect("the frame opens");
+    for step in [1u32, 2] {
+        let job = renderer
+            .request_frame(&whole_draw(step))
+            .expect("frame job");
+        let mut plain = vec![0u16; job_samples(&job).len()];
+        frame
+            .read_into(raw_whole(), job.draw.step, &mut plain)
+            .expect("the frame source reads");
+        assert_eq!(job_samples(&job), plain, "no clip, step {step}");
+        if step == 2 {
+            assert_ne!(under_clip, plain, "the clip changes the frame's read");
+        }
+    }
 }
 
 /// The `Image` elements below the element `id` of the main window.

@@ -1766,8 +1766,7 @@ impl CanvasRenderer {
         });
         self.composite = Some(Arc::new(composite));
         self.planes = files;
-        self.clip_source = None;
-        self.clip = None;
+        self.forget_clip();
         self.reset_planes();
         Ok(())
     }
@@ -1797,17 +1796,27 @@ impl CanvasRenderer {
         if clip != self.clip {
             self.clip = clip;
             self.reset_planes();
+            self.reset_frame();
         }
     }
 
-    /// Drops the open planes, leaving the frame half untouched.
+    /// Drops the open planes, leaving the frame half untouched unless it was
+    /// read through their clip.
     pub fn clear_planes(&mut self) {
         self.composite = None;
         self.zmap = None;
         self.planes = None;
-        self.clip_source = None;
-        self.clip = None;
+        self.forget_clip();
         self.reset_planes();
+    }
+
+    /// Drops the clip and its source; a frame pane read through the clip is
+    /// emptied.
+    fn forget_clip(&mut self) {
+        self.clip_source = None;
+        if self.clip.take().is_some() {
+            self.reset_frame();
+        }
     }
 
     /// The frame pane's currently open path, if any.
@@ -1915,7 +1924,7 @@ impl CanvasRenderer {
     fn frame_job(&mut self, draw: &PaneDraw, backdrop: bool) -> Option<PaneJob> {
         self.device.as_ref()?;
         let frame_size = self.frame.dimensions()?;
-        let reader = self.frame.reader()?;
+        let reader = self.frame.reader(self.clip.as_ref())?;
         self.request(
             Pane::Frame,
             backdrop,
