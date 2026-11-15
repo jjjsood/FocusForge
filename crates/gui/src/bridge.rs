@@ -20,6 +20,7 @@ use winit::window::WindowId;
 
 use crate::analytics::{AnalyticsView, RowValue};
 use crate::appearance_settings::SourcePresentation;
+use crate::brush::BrushPreviewSpec;
 use crate::canvas::{
     CanvasFeed, EditedView, OverlayDraw, Pane, PaneJob, PaneSource, Preparer, RepaintGate,
     truncate_pane_label, truncate_tail,
@@ -116,6 +117,16 @@ pub struct Canvas {
 }
 
 impl Canvas {
+    /// [`CanvasRenderer::brush_preview_layer`] on this canvas's renderer;
+    /// `None` without one.
+    fn brush_preview_layer(
+        &mut self,
+        spec: &BrushPreviewSpec,
+        draw: &PaneDraw,
+    ) -> Option<(slint::Image, (f32, f32, f32, f32))> {
+        self.renderer.as_mut()?.brush_preview_layer(spec, draw)
+    }
+
     /// Whether no exact pane read is queued, running or waiting to be taken;
     /// `true` without a preparer.
     pub fn exact_idle(&self) -> bool {
@@ -379,6 +390,7 @@ fn publish_completed(
     show_panes(app, &canvas.borrow(), frame_draw, plane_draw);
     push_stage_view_after_draw(app, controller, &canvas.borrow(), plane_draw);
     show_comparison_pane(app, controller, &canvas.borrow(), frame_draw, plane_draw);
+    push_brush_preview(app, controller, canvas);
     // The textures were rendered into in place; Slint sees no property change.
     app.window().request_redraw();
 }
@@ -521,7 +533,6 @@ fn show_comparison_pane(
             window.set_cursor_mode_tag(cursor.mode_tag.into());
             window.set_cursor_tag_origin(cursor.tag_origin);
             window.set_cursor_checkpoint_source(cursor.checkpoint_colour.is_some());
-            window.set_cursor_glyph_color(glyph_color(cursor.checkpoint_colour));
             window.set_cursor_pick_color(slint::Color::from_rgb_u8(
                 cursor.pick_color[0],
                 cursor.pick_color[1],
@@ -795,6 +806,69 @@ pub fn repaint(
     show_panes(app, &canvas.borrow(), frame_draw, plane_draw);
     push_stage_view_after_draw(app, controller, &canvas.borrow(), plane_draw);
     show_comparison_pane(app, controller, &canvas.borrow(), frame_draw, plane_draw);
+    push_brush_preview(app, controller, canvas);
+}
+
+/// Draws the brush preview layer under the controller's current spec and
+/// shows it on the composite cursor. The rectangle is converted from the
+/// composite pane's coordinates into the cursor square's own.
+fn push_brush_preview(
+    app: &AppWindow,
+    controller: &Arc<Mutex<AppController>>,
+    canvas: &Rc<RefCell<Canvas>>,
+) {
+    let (spec, draw, cursor, detached) = {
+        let controller = controller.lock().unwrap();
+        (
+            controller.brush_preview_spec(),
+            controller.plane_draw(),
+            controller.brush_cursor_view(),
+            controller.detached_pane(),
+        )
+    };
+    let layer = (|| {
+        let (image, (x, y, width, height)) =
+            canvas.borrow_mut().brush_preview_layer(&spec?, &draw?)?;
+        let cursor = cursor?;
+        let origin = (
+            cursor.composite_position.0 - cursor.extent / 2.0,
+            cursor.composite_position.1 - cursor.extent / 2.0,
+        );
+        Some((image, (x - origin.0, y - origin.1, width, height)))
+    })();
+    let window = COMPARISON_WINDOW.with(|slot| slot.borrow().clone());
+    show_brush_preview(app, window.as_deref(), detached, layer);
+}
+
+/// Puts `layer` -- the image and its rectangle in the cursor square's own
+/// coordinates -- on the composite pane's cursor, or clears it: in the main
+/// window, or in the comparison window while the composite is detached. A
+/// detached frame pane's cursor never carries it.
+pub fn show_brush_preview(
+    app: &AppWindow,
+    window: Option<&ComparisonWindow>,
+    detached: Option<PaneSource>,
+    layer: Option<(slint::Image, (f32, f32, f32, f32))>,
+) {
+    let composite_detached = detached == Some(PaneSource::Composite);
+    let (main, side) = match layer {
+        Some(layer) if composite_detached => (None, Some(layer)),
+        layer => (layer, None),
+    };
+    let (image, (x, y, width, height)) = main.unwrap_or_default();
+    app.set_cursor_preview(image);
+    app.set_cursor_preview_x(x);
+    app.set_cursor_preview_y(y);
+    app.set_cursor_preview_width(width);
+    app.set_cursor_preview_height(height);
+    if let Some(window) = window {
+        let (image, (x, y, width, height)) = side.unwrap_or_default();
+        window.set_cursor_preview(image);
+        window.set_cursor_preview_x(x);
+        window.set_cursor_preview_y(y);
+        window.set_cursor_preview_width(width);
+        window.set_cursor_preview_height(height);
+    }
 }
 
 /// Emits the final pending input batch before diagnostics closes its trace.
@@ -2708,6 +2782,7 @@ pub fn push_editor_toolbar(app: &AppWindow, controller: &AppController) {
     app.set_brush_mode_menu_open(view.mode_menu_open);
     app.set_brush_opacity_text(format!("{:.0}%", view.opacity).into());
     app.set_brush_opacity_fraction(view.opacity_fraction);
+    app.set_brush_preview(view.preview);
     app.set_brush_picking(view.picking);
     app.set_can_undo(view.can_undo);
     app.set_can_redo(view.can_redo);
@@ -2723,13 +2798,6 @@ fn push_overlay_controls(app: &AppWindow, controller: &AppController) {
     app.set_overlay_on(overlay.on);
     app.set_overlay_fraction(overlay.opacity);
     app.set_overlay_text(format!("{:.0}%", overlay.opacity * 100.0).into());
-}
-
-/// The cursor glyph's colour: the checkpoint's, transparent without one.
-fn glyph_color(colour: Option<[u8; 3]>) -> slint::Color {
-    colour.map_or(slint::Color::from_argb_u8(0, 0, 0, 0), |[r, g, b]| {
-        slint::Color::from_rgb_u8(r, g, b)
-    })
 }
 
 /// Pushes the brush cursor overlay's own view -- every repaint, since its
@@ -2748,7 +2816,6 @@ fn push_brush_cursor(app: &AppWindow, controller: &AppController) {
     app.set_cursor_mode_tag(view.mode_tag.into());
     app.set_cursor_tag_origin(view.tag_origin);
     app.set_cursor_checkpoint_source(view.checkpoint_colour.is_some());
-    app.set_cursor_glyph_color(glyph_color(view.checkpoint_colour));
     app.set_cursor_pick_color(slint::Color::from_rgb_u8(
         view.pick_color[0],
         view.pick_color[1],
@@ -3734,6 +3801,10 @@ pub fn install(
                 controller.set_overlay_opacity_fraction(fraction);
             });
         }
+    });
+    app.on_brush_preview_toggled({
+        let controller = controller.clone();
+        move || controller.lock().unwrap().toggle_brush_preview()
     });
     app.on_pipette_toggled({
         let controller = controller.clone();

@@ -56,6 +56,7 @@ export component AppWindow inherits Window {
     callback brush-mode-menu-toggled();
     callback brush-mode-menu-dismissed();
     callback brush-mode-selected(string);
+    callback brush-preview-toggled();
     callback pipette-toggled();
     callback undo-requested();
     callback redo-requested();
@@ -85,6 +86,7 @@ export component AppWindow inherits Window {
     in property <bool> brush-mode-menu-open: false;
     in property <string> brush-opacity-text: "";
     in property <float> brush-opacity-fraction: 0.0;
+    in property <bool> brush-preview: false;
     in property <bool> brush-picking: false;
     in property <bool> can-undo: false;
     in property <bool> can-redo: false;
@@ -100,12 +102,16 @@ export component AppWindow inherits Window {
     in property <string> cursor-mode-tag: "";
     in property <length> cursor-tag-origin;
     in property <bool> cursor-checkpoint-source: false;
-    in property <color> cursor-glyph-color;
     in property <bool> cursor-visible: false;
     in property <length> cursor-frame-x;
     in property <length> cursor-frame-y;
     in property <length> cursor-composite-x;
     in property <length> cursor-composite-y;
+    in property <image> cursor-preview;
+    in property <length> cursor-preview-x;
+    in property <length> cursor-preview-y;
+    in property <length> cursor-preview-width;
+    in property <length> cursor-preview-height;
 
     no-frame: true;
     resize-border-width: 8px;
@@ -224,6 +230,7 @@ export component AppWindow inherits Window {
         mode-menu-open: root.brush-mode-menu-open;
         opacity-text: root.brush-opacity-text;
         opacity-fraction: root.brush-opacity-fraction;
+        preview: root.brush-preview;
         picking: root.brush-picking;
         can-undo: root.can-undo;
         can-redo: root.can-redo;
@@ -233,6 +240,7 @@ export component AppWindow inherits Window {
         brush-softness-fraction-changed(f) => { root.brush-softness-fraction-changed(f); }
         brush-opacity-fraction-changed(f) => { root.brush-opacity-fraction-changed(f); }
         brush-mode-menu-toggled => { root.brush-mode-menu-toggled(); }
+        brush-preview-toggled => { root.brush-preview-toggled(); }
         pipette-toggled => { root.pipette-toggled(); }
         undo-requested => { root.undo-requested(); }
         redo-requested => { root.redo-requested(); }
@@ -446,12 +454,16 @@ export component AppWindow inherits Window {
             cursor-mode-tag: root.cursor-mode-tag;
             cursor-tag-origin: root.cursor-tag-origin;
             cursor-checkpoint-source: root.cursor-checkpoint-source;
-            cursor-glyph-color: root.cursor-glyph-color;
         cursor-visible: root.cursor-visible;
         cursor-frame-x: root.cursor-frame-x;
         cursor-frame-y: root.cursor-frame-y;
         cursor-composite-x: root.cursor-composite-x;
         cursor-composite-y: root.cursor-composite-y;
+        cursor-preview: root.cursor-preview;
+        cursor-preview-x: root.cursor-preview-x;
+        cursor-preview-y: root.cursor-preview-y;
+        cursor-preview-width: root.cursor-preview-width;
+        cursor-preview-height: root.cursor-preview-height;
 
             frame-undock-requested => { root.frame-undock-requested(); }
             composite-undock-requested => { root.composite-undock-requested(); }

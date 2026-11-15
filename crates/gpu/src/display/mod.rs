@@ -8,6 +8,7 @@
 //! constraint (Slint's `Rgba8Unorm`/`Rgba8UnormSrgb` texture-importer
 //! contract) rather than a performance one.
 
+pub mod preview;
 pub mod readback;
 pub use readback::read_display_texture;
 
@@ -19,7 +20,7 @@ use crate::pipeline::{
 };
 use crate::transfer::create_storage_buffer;
 
-const WGSL_SRC: &str = include_str!("tonemap.wgsl");
+const WGSL_SRC: &str = concat!(include_str!("dither.wgsl"), include_str!("tonemap.wgsl"));
 
 /// The one format Slint's texture importer accepts that this crate uses.
 /// `Rgba8UnormSrgb` would linearise on sample, a second correction on
@@ -187,6 +188,34 @@ fn upload_samples(
     upload_storage(device, queue, &packed, label)
 }
 
+/// A storage buffer kept across calls: it is re-created, at exactly the bytes
+/// needed, only when `needed` leaves `[needed, 4 * needed]` of the capacity,
+/// so the retained capacity always lies in that range of the current draw.
+#[derive(Default)]
+pub(crate) struct Retained {
+    buffer: Option<wgpu::Buffer>,
+    capacity: u64,
+}
+
+impl Retained {
+    pub(crate) fn ensure(&mut self, device: &wgpu::Device, needed: u64, label: &str) {
+        let reuse = self.buffer.is_some() && needed <= self.capacity && needed * 4 >= self.capacity;
+        if reuse {
+            return;
+        }
+        self.buffer = Some(create_storage_buffer(device, needed, label));
+        record_timing(TimingCounter::AllocationBytes, needed);
+        record_timing(TimingCounter::AllocationOperations, 1);
+        self.capacity = needed;
+    }
+
+    pub(crate) fn buffer(&self) -> &wgpu::Buffer {
+        self.buffer
+            .as_ref()
+            .expect("ensure always leaves a buffer set")
+    }
+}
+
 /// The display kernel's pipeline, params buffer, source buffer and pack
 /// scratch, retained across calls to [`Self::render`] rather than rebuilt
 /// per frame -- one instance per attached device, shared by every pane that
@@ -194,8 +223,7 @@ fn upload_samples(
 pub struct DisplayRenderer {
     pipeline: Pipeline,
     params_buffer: wgpu::Buffer,
-    source_buffer: Option<wgpu::Buffer>,
-    source_capacity: u64,
+    source: Retained,
     pack_scratch: Vec<u8>,
 }
 
@@ -216,28 +244,9 @@ impl DisplayRenderer {
         Self {
             pipeline,
             params_buffer,
-            source_buffer: None,
-            source_capacity: 0,
+            source: Retained::default(),
             pack_scratch: Vec::new(),
         }
-    }
-
-    /// Keeps the source buffer while `needed <= capacity <= 4 * needed`,
-    /// otherwise re-creates it at exactly `needed` bytes, so after every call
-    /// the retained capacity lies within `[needed, 4 * needed]` of the
-    /// current draw.
-    fn ensure_source_buffer(&mut self, device: &wgpu::Device, needed: u64) {
-        let reuse = self.source_buffer.is_some()
-            && needed <= self.source_capacity
-            && needed * 4 >= self.source_capacity;
-        if reuse {
-            return;
-        }
-        let buffer = create_storage_buffer(device, needed, "focusforge-gpu-display-src");
-        record_timing(TimingCounter::AllocationBytes, needed);
-        record_timing(TimingCounter::AllocationOperations, 1);
-        self.source_buffer = Some(buffer);
-        self.source_capacity = needed;
     }
 
     /// Runs the display kernel: packs `src` (`crate::pack::pack_samples_into`,
@@ -262,14 +271,11 @@ impl DisplayRenderer {
             self.pack_scratch.len() as u64
         };
         record_timing(TimingCounter::PackedBytes, packed_len);
-        self.ensure_source_buffer(device, packed_len);
+        self.source
+            .ensure(device, packed_len, "focusforge-gpu-display-src");
         {
             let _scope = measurement_scope("gpu_display_upload");
-            let source_buffer = self
-                .source_buffer
-                .as_ref()
-                .expect("ensure_source_buffer always leaves a buffer set");
-            queue.write_buffer(source_buffer, 0, &self.pack_scratch);
+            queue.write_buffer(self.source.buffer(), 0, &self.pack_scratch);
             record_timing(TimingCounter::UploadBytes, packed_len);
         }
 
@@ -293,11 +299,7 @@ impl DisplayRenderer {
             &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self
-                        .source_buffer
-                        .as_ref()
-                        .expect("ensure_source_buffer always leaves a buffer set")
-                        .as_entire_binding(),
+                    resource: self.source.buffer().as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,

@@ -16,6 +16,10 @@ pub use focusforge_ui_theme_sheet as theme_sheet;
 #[cfg(feature = "theme-sheet")]
 pub use theme_sheet::ThemeSheet;
 
+/// Specimen images for the theme sheet, read from the fixture frames.
+#[cfg(feature = "theme-sheet")]
+pub mod sheet_specimens;
+
 /// Plain-Rust shell state and the callback-forwarding seam -- no
 /// `use slint::` anywhere in it. Reachable from `cargo test` without a
 /// window, the same way
@@ -120,6 +124,7 @@ pub mod export_settings;
 pub mod performance_settings;
 
 pub mod appearance_settings;
+pub mod editor_settings;
 pub mod source_previews;
 pub mod update_settings;
 

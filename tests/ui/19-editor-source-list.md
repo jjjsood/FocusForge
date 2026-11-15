@@ -18,7 +18,7 @@ Use a fresh settings directory, where the source presentation is Image list. The
 ## Save a stroke as a third result
 6. Drag across the Composite pane from its centre to window point 1000,400 (`FFCanvas::pane-right`).
    Expect: (within 120 s) `buttons AppWindow::editor-toolbar` lists **Save checkpoint** with enabled true.
-7. Click **Save checkpoint** (`AppWindow::editor-toolbar`, top right): drive it with `click "Save checkpoint"` alone, without the container id, which finds no button.
+7. Click **Save checkpoint** (`AppWindow::editor-toolbar`, top right).
    Expect: the CHECKPOINTS list shows 3 rows; the list shows "Results" with the count "2"; the first result row reads "Details" and "· 1 stroke" with the pills "BASE" and "UNSAVED", the second reads "Details" with the pills "FUSION" and "UNSAVED", and the line "1 hidden: different alignment" is still under them.
 ## Collapse and expand "Results"
 8. Click the heading "Results" (`FFSectionHeading::root` 0).

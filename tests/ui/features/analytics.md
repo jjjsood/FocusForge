@@ -12,5 +12,5 @@ Gotchas:
 - Not covered by the journey: the failed state (red panel "Analysis failed" over the core message, no bar and no rows; a frame deleted after the folder was opened, reachable only by deleting a file during the hold), the one-frame panel "Not enough images" (no checked-in frames folder holds one image), the thinning of the bar's numbers on long stacks, the bar's entry and sweep motion, the partial fills (a single-tile fixture goes from pending straight to final; `--analytics-tile-size 96` with `--analytics-tile-pause-ms` makes them watchable), a list taller than the body with its scrollbar (needs a stack of more frames than fits, none is checked in, and the wheel is a human-only input), and the editor mode. Check them by hand with a copy of a fixture under `.scratch/`.
 - Opening the overlay with a driver needs a build with the `mcp` feature (`tools/gui/run-gui.sh` builds it); a binary built without it answers no request.
 Guides: 22-analytics.md
-Sources: crates/ui/ui/shell/analytics_overlay.slint
 Book: guide/gui.md#count-the-sharp-areas-of-each-frame
+Sources: crates/ui/ui/shell/analytics_overlay.slint, crates/ui/ui/shell/icon_bar.slint, crates/gui/src/analytics.rs

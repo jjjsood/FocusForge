@@ -1317,6 +1317,12 @@ fn preview_row(chip: [u8; 3], name: &str, time: &str) -> focusforge_gui::ImageRo
 fn run_sheet(args: &Args, inspection: &Inspection) -> i32 {
     let sheet = ThemeSheet::new().expect("failed to instantiate ThemeSheet");
     fill_stage_sheet(&sheet);
+    match focusforge_gui::sheet_specimens::preview_specimens() {
+        Ok(specimens) => {
+            sheet.set_preview_specimens(slint::ModelRc::new(slint::VecModel::from(specimens)));
+        }
+        Err(e) => eprintln!("brush preview specimens: {e}"),
+    }
     run_window(sheet, args, None, None, None, inspection)
 }
 
@@ -1976,6 +1982,7 @@ fn install_recent(
             focusforge_gui::performance_settings::PerformanceSettings::default(),
         );
         controller.install_updates(focusforge_gui::update_settings::UpdateSettings::default());
+        controller.install_editor(focusforge_gui::editor_settings::EditorSettings::default());
         return;
     };
     let entries = focusforge_gui::recent::load(&config_dir);
@@ -1983,11 +1990,13 @@ fn install_recent(
     let performance = focusforge_gui::performance_settings::load(&config_dir);
     let appearance = focusforge_gui::appearance_settings::load(&config_dir);
     let updates = focusforge_gui::update_settings::load(&config_dir);
+    let editor = focusforge_gui::editor_settings::load(&config_dir);
     let mut controller = controller.lock().unwrap();
     controller.install_export_choice(choice);
     controller.install_performance(performance);
     controller.install_appearance(appearance);
     controller.install_updates(updates);
+    controller.install_editor(editor);
     app.set_appearance_presentation(controller.source_presentation().slug().into());
     app.set_appearance_sharpness_heatmap(controller.sharpness_heatmap());
     app.set_appearance_reduce_motion(controller.reduce_motion());

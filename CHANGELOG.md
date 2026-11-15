@@ -17,6 +17,10 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 - `focusforge-cli stack --dry-run` no longer prints a predicted duration, and the `stack --json` and `stack --dry-run --json` documents no longer carry the `run_plan` and `prediction` fields.
 - The `FOCUSFORGE_SHOW_ETA` environment variable no longer shows a time-remaining estimate in the window or in the progress lines of `focusforge-cli`.
 
+### Fixed
+
+- Exported DNG files open and edit in Lightroom, Camera Raw and Adobe DNG Converter; before, Adobe software refused them.
+
 ## [0.2.1] - 2026-11-13
 
 ### Changed

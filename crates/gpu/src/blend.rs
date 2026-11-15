@@ -19,19 +19,20 @@ use crate::pipeline::{
 };
 use crate::transfer::{create_storage_buffer, download_buffer, upload_storage};
 
-const WGSL_SRC: &str = include_str!("blend.wgsl");
-const DETAIL_WGSL_SRC: &str = include_str!("detail.wgsl");
+const WGSL_SRC: &str = concat!(include_str!("mask.wgsl"), include_str!("blend.wgsl"));
+pub(crate) const DETAIL_WGSL_SRC: &str = include_str!("detail.wgsl");
 
 /// Coordinates the kernel accepts lie strictly between `-COORD_LIMIT` and
 /// `COORD_LIMIT`.
-const COORD_LIMIT: i32 = 1 << 14;
+pub(crate) const COORD_LIMIT: i32 = 1 << 14;
 /// The mask radius, in sixteenths of a pixel, the kernel refuses from.
-const RADIUS_LIMIT_16: u64 = 1 << 16;
+pub(crate) const RADIUS_LIMIT_16: u64 = 1 << 16;
 /// Most samples a pixel may have: a channel sum of that many full-scale
 /// samples still fits `u32`.
 const MAX_SPP: usize = 65_537;
 
-/// Why [`Blender::apply`] did not blend.
+/// Why [`Blender::apply`] or the brush-preview plan
+/// ([`crate::display::preview::plan`]) did not compute.
 #[derive(Debug, thiserror::Error)]
 pub enum BlendError {
     /// The stroke or the buffers are invalid, as for the CPU blend.
@@ -39,7 +40,7 @@ pub enum BlendError {
     Retouch(#[from] RetouchError),
 
     /// The stroke lies outside what the kernel computes exactly; the CPU
-    /// blend handles it. `limit` names the bound: `coordinate`, `radius`,
+    /// path handles it. `limit` names the bound: `coordinate`, `radius`,
     /// `buffer` or `samples`.
     #[error("the blend kernel refuses this stroke: {limit} {detail}")]
     Refused { limit: &'static str, detail: String },
@@ -49,7 +50,7 @@ pub enum BlendError {
     Gpu(#[from] GpuError),
 }
 
-fn refused(limit: &'static str, detail: String) -> BlendError {
+pub(crate) fn refused(limit: &'static str, detail: String) -> BlendError {
     BlendError::Refused { limit, detail }
 }
 
@@ -231,7 +232,7 @@ fn gather(samples: &[u16], rect: Rect, active: Rect, spp: usize) -> Vec<u8> {
     bytes
 }
 
-fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+pub(crate) fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: buffer.as_entire_binding(),
@@ -240,7 +241,7 @@ fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 
 /// The kernel's mode word: 0 mixes toward the source (Normal, and Detail's
 /// target), 1 Lighten, 2 Darken.
-fn mode_code(mode: BrushMode) -> u32 {
+pub(crate) fn mode_code(mode: BrushMode) -> u32 {
     match mode {
         BrushMode::Normal | BrushMode::Detail => 0,
         BrushMode::Lighten => 1,
@@ -249,7 +250,7 @@ fn mode_code(mode: BrushMode) -> u32 {
 }
 
 /// `words` as little-endian bytes.
-fn words_to_bytes(words: &[u32]) -> Vec<u8> {
+pub(crate) fn words_to_bytes(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
@@ -272,7 +273,7 @@ fn params_bytes(plan: &Plan, spp: usize) -> Vec<u8> {
 }
 
 /// The box pass uniform: eight words, the last three padding.
-fn box_params_bytes(read: Rect, spp: usize, p: u32, horizontal: bool) -> Vec<u8> {
+pub(crate) fn box_params_bytes(read: Rect, spp: usize, p: u32, horizontal: bool) -> Vec<u8> {
     words_to_bytes(&[
         read.width,
         read.height,
@@ -301,6 +302,37 @@ fn target_params_bytes(plan: &Plan, spp: usize) -> Vec<u8> {
         plan.source_read.width,
         0,
     ])
+}
+
+/// Runs the six box passes of `chain`: pass `i` reads `chain[i]` and writes
+/// `chain[i + 1]`, horizontal when `i` is even, each over `read` at `spp`
+/// samples a pixel with radius `p`.
+pub(crate) fn blur_chain(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    box_pass: &Pipeline,
+    chain: [&wgpu::Buffer; 7],
+    (read, spp, p): (Rect, usize, u32),
+) {
+    let params = [true, false].map(|horizontal| {
+        upload_params(device, queue, &box_params_bytes(read, spp, p, horizontal))
+    });
+    for i in 0..6 {
+        let lines = if i % 2 == 0 { read.height } else { read.width };
+        run_pass_2d(
+            device,
+            queue,
+            box_pass,
+            &[
+                entry(0, chain[i]),
+                entry(1, chain[i + 1]),
+                entry(2, &params[i % 2]),
+            ],
+            lines,
+            spp as u32,
+            "focusforge-gpu-detail-box",
+        );
+    }
 }
 
 /// The blend kernel bound to a device. Built once on the device it runs on --
@@ -436,29 +468,15 @@ impl Blender {
         target
     }
 
-    /// Runs the six box passes of `chain`: pass `i` reads `chain[i]` and
-    /// writes `chain[i + 1]`, horizontal when `i` is even.
-    fn blur(&self, chain: [&wgpu::Buffer; 7], (read, spp, p): (Rect, usize, u32)) {
-        let (device, queue) = (&self.device, &self.queue);
-        let params = [true, false].map(|horizontal| {
-            upload_params(device, queue, &box_params_bytes(read, spp, p, horizontal))
-        });
-        for i in 0..6 {
-            let lines = if i % 2 == 0 { read.height } else { read.width };
-            run_pass_2d(
-                device,
-                queue,
-                &self.pipelines.box_pass,
-                &[
-                    entry(0, chain[i]),
-                    entry(1, chain[i + 1]),
-                    entry(2, &params[i % 2]),
-                ],
-                lines,
-                spp as u32,
-                "focusforge-gpu-detail-box",
-            );
-        }
+    /// [`blur_chain`] on this device.
+    fn blur(&self, chain: [&wgpu::Buffer; 7], args: (Rect, usize, u32)) {
+        blur_chain(
+            &self.device,
+            &self.queue,
+            &self.pipelines.box_pass,
+            chain,
+            args,
+        );
     }
 
     /// [`blend::apply`] on the device: blends `op`'s source samples `src` (of
@@ -545,7 +563,7 @@ impl Blender {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use focusforge_core::project::{BrushMode, Point, StrokeSource};
     use focusforge_core::zmap::ZMapInfo;
@@ -882,7 +900,7 @@ mod tests {
     /// The kernel's arithmetic written out in the kernel's own `u32` and
     /// `i32` steps. Debug builds panic on an overflow the shader would wrap,
     /// so a pass shows every intermediate fits.
-    mod kernel {
+    pub(crate) mod kernel {
         const SATURATED: u32 = u32::MAX;
 
         fn point_d2_256(dx: i32, dy: i32) -> u32 {

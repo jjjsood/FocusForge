@@ -121,6 +121,7 @@ fn defaults_match_the_settled_table() {
         ('2', Action::BrushModeLighten),
         ('3', Action::BrushModeDarken),
         ('4', Action::BrushModeDetail),
+        ('p', Action::ToggleBrushPreview),
     ];
     let expected: Vec<_> = expected
         .into_iter()
@@ -129,7 +130,7 @@ fn defaults_match_the_settled_table() {
         )
         .collect();
 
-    assert_eq!(DEFAULT_BINDINGS.len(), 13);
+    assert_eq!(DEFAULT_BINDINGS.len(), 14);
     assert_eq!(DEFAULT_BINDINGS.len(), expected.len());
     for (i, (binding, (trigger, stacking, editor))) in
         DEFAULT_BINDINGS.iter().zip(expected.iter()).enumerate()
@@ -138,6 +139,30 @@ fn defaults_match_the_settled_table() {
         assert_eq!(binding.stacking, *stacking, "row {i}: stacking");
         assert_eq!(binding.editor, *editor, "row {i}: editor");
     }
+
+    let rows = InputTable::default().display_rows();
+    let preview_row = rows.last().expect("the table has display rows");
+    assert_eq!(
+        (
+            preview_row.input.as_str(),
+            preview_row.stacking.as_str(),
+            preview_row.editor.as_str()
+        ),
+        ("p", "—", "toggle-brush-preview")
+    );
+
+    assert_eq!(
+        "toggle-brush-preview".parse::<Action>(),
+        Ok(Action::ToggleBrushPreview)
+    );
+    assert_eq!(
+        Action::ToggleBrushPreview.to_string(),
+        "toggle-brush-preview"
+    );
+    assert!(Action::ALL.contains(&Action::ToggleBrushPreview));
+    for action in Action::ALL {
+        assert_eq!(action.to_string().parse::<Action>(), Ok(action));
+    }
 }
 
 #[test]
@@ -145,7 +170,7 @@ fn modes_differ_only_by_declared_overrides() {
     // Only the Shift wheel row, the undo/redo rows, the paint drag and the
     // four mode keys differ -- the table's explicit overrides. Every other
     // row's stacking and editor columns must match.
-    let overridden = [2usize, 5, 6, 8, 9, 10, 11, 12];
+    let overridden = [2usize, 5, 6, 8, 9, 10, 11, 12, 13];
     let table = InputTable::default();
     for (i, binding) in table.bindings.iter().enumerate() {
         if overridden.contains(&i) {
@@ -1021,6 +1046,77 @@ fn mode_keys_respect_mode_and_modal_blocking() {
 }
 
 #[test]
+fn preview_key_toggles_only_in_editor_mode() {
+    let mut editor = AppController::new_with_mode_for_test(ShellMode::Editor);
+    let (events, cb) = sink();
+    editor.set_sink(cb);
+    assert!(!editor.brush_preview(), "the switch starts off");
+
+    press_key(&mut editor, "p", NONE);
+    assert_eq!(fired(&events), vec![Action::ToggleBrushPreview]);
+    assert!(editor.brush_preview());
+    assert!(editor.brush_toolbar_view().preview);
+    press_key(&mut editor, "p", NONE);
+    assert_eq!(fired(&events), vec![Action::ToggleBrushPreview]);
+    assert!(!editor.brush_preview(), "one flip per press");
+
+    editor.key(false, "p", NONE);
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "a release is not a press"
+    );
+    assert!(!editor.brush_preview());
+
+    for mods in [
+        Modifiers { ctrl: true, ..NONE },
+        Modifiers {
+            shift: true,
+            ..NONE
+        },
+        Modifiers { alt: true, ..NONE },
+        Modifiers {
+            space: true,
+            ..NONE
+        },
+    ] {
+        assert_eq!(
+            InputTable::default().action(&Trigger::Key { key: 'p', mods }, ShellMode::Editor),
+            None,
+            "{mods:?}"
+        );
+        press_key(&mut editor, "p", mods);
+        assert!(events.lock().unwrap().is_empty(), "{mods:?}: no event");
+        assert!(!editor.brush_preview(), "{mods:?}");
+    }
+
+    editor.open_settings();
+    press_key(&mut editor, "p", NONE);
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "settings modal: no event"
+    );
+    assert!(!editor.brush_preview());
+    editor.close_settings();
+
+    editor.toggle_projects_overlay();
+    events.lock().unwrap().clear();
+    press_key(&mut editor, "p", NONE);
+    assert!(fired(&events).is_empty(), "projects overlay: no action");
+    assert!(!editor.brush_preview());
+    editor.toggle_projects_overlay();
+
+    let mut stacking = AppController::new();
+    let (events, cb) = sink();
+    stacking.set_sink(cb);
+    press_key(&mut stacking, "p", NONE);
+    assert!(events.lock().unwrap().is_empty(), "stacking mode: no event");
+    assert!(!stacking.brush_preview());
+
+    press_key(&mut editor, "p", NONE);
+    assert!(editor.brush_preview(), "unblocked again, the key works");
+}
+
+#[test]
 fn alt_is_only_the_pipette() {
     let alt = Modifiers { alt: true, ..NONE };
     let alt_wheel = Trigger::Wheel(alt);
@@ -1041,7 +1137,7 @@ fn alt_is_only_the_pipette() {
     assert!(DEFAULT_BINDINGS.iter().all(|b| b.trigger != alt_wheel));
 
     let rows = table.display_rows();
-    assert_eq!(rows.len(), 10);
+    assert_eq!(rows.len(), 11);
     assert!(
         rows.iter()
             .all(|row| !row.input.to_lowercase().contains("alt + wheel")
@@ -1175,7 +1271,7 @@ fn paint_drag_is_a_hidden_table_row() {
     assert_eq!(table.action(&left_drag, ShellMode::Stacking), None);
 
     let rows = table.display_rows();
-    assert_eq!(rows.len(), 10, "the settings table has ten rows");
+    assert_eq!(rows.len(), 11, "the settings table has eleven rows");
     assert!(
         rows.iter()
             .all(|row| !format!("{} {} {}", row.input, row.stacking, row.editor).contains("paint")),

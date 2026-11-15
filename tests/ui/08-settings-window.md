@@ -37,13 +37,13 @@ Start: --open fixtures/mantis-64/frames
     Expect: Must not: the line under the row reads "Cleared"; the heading "CACHE" shows the row "Stage cache" with the grey text "Deletes cached fuse stages." and an enabled **Clear cache** button (read with `buttons AppWindow::settings-modal`), and the line under the row is empty.
 ## Input map
 17. Click **Input map** (`FFNavRailEntry::area` 3).
-    Expect: the heading "BINDINGS" shows a line under it that names either the built-in bindings ("Built-in bindings.") or the settings file ("Read from <path to settings.toml>: <n> bindings differ from the built-in ones."; which one depends on whether this machine already has a settings file) and no red line; below it a table header "INPUT", "STACKING", "EDITOR"; the INPUT column (`FFInputTableRow::input-cell`) holds ten rows, top to bottom "wheel", "ctrl+wheel", "shift+wheel", "middle-drag / space+left-drag", "ctrl+z / ctrl+shift+z", "alt+left-click", "1", "2", "3" and "4" (within 1 s).
+    Expect: the heading "BINDINGS" shows a line under it that names either the built-in bindings ("Built-in bindings.") or the settings file ("Read from <path to settings.toml>: <n> bindings differ from the built-in ones."; which one depends on whether this machine already has a settings file) and no red line; below it a table header "INPUT", "STACKING", "EDITOR"; the INPUT column (`FFInputTableRow::input-cell`) holds eleven rows, top to bottom "wheel", "ctrl+wheel", "shift+wheel", "middle-drag / space+left-drag", "ctrl+z / ctrl+shift+z", "alt+left-click", "1", "2", "3", "4" and "p" (within 1 s). The last row, "p", lies at the bottom edge of the table and may be cut off; `FFInputTableRow::input-cell` then has 12 matches, the header and eleven rows.
 18. Click the header "STACKING" (`FFInputTableRow::stacking-cell` 0).
-    Expect: the STACKING column holds ten rows, top to bottom "zoom-at-cursor", "step-source-frame", "pan-horizontal", "pan", "—", "pick-source-under-pointer" and four rows of "—".
+    Expect: the STACKING column holds eleven rows, top to bottom "zoom-at-cursor", "step-source-frame", "pan-horizontal", "pan", "—", "pick-source-under-pointer" and five rows of "—".
 19. Click the header "EDITOR" (`FFInputTableRow::editor-cell` 0).
-    Expect: the EDITOR column holds ten rows, top to bottom "zoom-at-cursor", "step-source-frame", "brush-size", "pan", "undo / redo", "pick-source-under-pointer", "brush-mode-normal", "brush-mode-lighten", "brush-mode-darken" and "brush-mode-detail".
+    Expect: the EDITOR column holds eleven rows, top to bottom "zoom-at-cursor", "step-source-frame", "brush-size", "pan", "undo / redo", "pick-source-under-pointer", "brush-mode-normal", "brush-mode-lighten", "brush-mode-darken", "brush-mode-detail" and "toggle-brush-preview" (the last row may be cut off, its text over two lines).
 20. Click the text "wheel" in the first row (`FFInputTableRow::input-cell` 1).
-    Expect: Must not: a field opens or a row changes; the table still shows ten rows.
+    Expect: Must not: a field opens or a row changes; the table still shows eleven rows.
 ## Diagnostics
 21. Click **Diagnostics** (`FFNavRailEntry::area` 4).
     Expect: (within 10 s) the heading "DIAGNOSTICS" shows a file list holding the rows "adapter.json", "configuration.json", "system.json" and "version.json", each followed by a size, and no "Collecting…" text; "BINDINGS" is gone.
@@ -67,7 +67,7 @@ Start: --open fixtures/mantis-64/frames
     Expect: the "Settings" window is open (within 1 s).
 30. Click **Performance** (`FFNavRailEntry::area` 0).
     Expect: the "Backend" row reads "cpu — GPU processing is off" and the GPU switch knob is at the left end on a grey track (within 1 s).
-31. Click the GPU processing switch (`FFToggle::area` 1).
+31. Click the GPU processing switch (`FFToggle::area` 2; the editor is shown after the **Keep**, so match 0 is the editor toolbar's Preview switch and match 1 the bottom bar's overlay switch).
     Expect: the knob is at the right end on an accent-coloured track.
 32. Click **Close settings** (`FFSettingsModal::close`).
     Expect: the "Settings" window is gone (within 1 s).

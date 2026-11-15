@@ -18,9 +18,9 @@ Start: --open fixtures/mantis-64/frames
    Expect: a list with the options 16-bit and 8-bit opens under the field, with a check mark beside 16-bit.
 8. Click the option 8-bit (`FFMenuList::option-area`, match 1).
    Expect: the list is closed and the "Bit depth" field reads "8-bit".
-9. Click the switch beside "Metadata" (`FFToggle::area`, match 1; match 0 is the bottom bar's overlay switch).
+9. Click the switch beside "Metadata" (`FFToggle::area`, match 2; match 0 is the editor toolbar's Preview switch and match 1 the bottom bar's overlay switch).
    Expect: the switch's knob is at its left end (it was at its right end before the click).
-10. Click the switch beside "Metadata" (`FFToggle::area`, match 1).
+10. Click the switch beside "Metadata" (`FFToggle::area`, match 2).
    Expect: the switch's knob is at its right end again.
 11. Click the "Compression" field showing "None" (`FFMenu::root`, match 2; match 1 is "Bit depth" and match 0 is the editor toolbar's mode menu).
    Expect: a list with the options None, LZW and Deflate opens under the field, with a check mark beside None.

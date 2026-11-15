@@ -22,5 +22,5 @@ Gotchas:
 - Opening a folder raises the stack-grouping question only when its frames fall into several stacks (capture times more than 60 s apart). The mantis fixtures are one stack, so no such question is expected.
 - A camera-RAW stack develops every frame once before alignment: the bottom bar reads "Developing", a step text "<k> of N" for roughly 10 to 40 seconds with 20 large copies, then "Aligning" with its own count. It needs real camera files, so it is walked by hand in `manual/20-raw-develop-pass-bar.md` (not a numbered journey).
 Guides: 01-fuse-first-run.md, 02-fuse-control.md, 17-queue-past-a-decision.md
-Sources: crates/ui/ui/shell/toolbar.slint, crates/ui/ui/shell/bottom_bar.slint, crates/ui/ui/shell/bottom_bar/*.slint, crates/ui/ui/shell/dock/mode_switch.slint
 Book: guide/first-stack.md#fuse-the-stack, guide/first-stack.md#keep-or-discard-the-result, guide/first-stack.md#pause-resume-and-cancel
+Sources: crates/ui/ui/shell/toolbar.slint, crates/ui/ui/shell/bottom_bar.slint, crates/ui/ui/shell/tab_strip.slint, crates/ui/ui/shell/dock/mode_switch.slint, crates/ui/ui/shell/dock/checkpoint_panel.slint, crates/gui/src/job.rs, crates/ui/ui/shell/bottom_bar/*.slint

@@ -9,7 +9,9 @@ mod common;
 
 use std::num::NonZeroU32;
 
-use focusforge_core::algorithm::{AlgorithmError, TileReader, read_tile_step_into};
+use focusforge_core::algorithm::{
+    AlgorithmError, TileReader, read_tile_step_f32_into, read_tile_step_into,
+};
 use focusforge_core::align::{Registration, Transform, WarpingReader, crop_rect};
 use focusforge_core::fuse::{FusionConsumer, FusionGeometry};
 use focusforge_core::io::{Rect, TiffStack};
@@ -277,4 +279,33 @@ fn read_tile_step_into_matches_tiffstacks_own() {
         .expect("TiffStack's own step read");
 
     assert_eq!(via_generic, via_native);
+}
+
+#[test]
+fn read_tile_step_f32_into_matches_tiffstacks_own() {
+    let stack =
+        TiffStack::open(common::fixtures_dir().join("mantis-64")).expect("open fixtures/mantis-64");
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let rect = Rect {
+        x: 3,
+        y: 5,
+        width: (width - 3).min(40),
+        height: (height - 5).min(31),
+    };
+
+    for step in [1, 2, 3] {
+        let len = (rect.width.div_ceil(step) * rect.height.div_ceil(step) * spp) as usize;
+        let step = NonZeroU32::new(step).unwrap();
+        let mut via_generic = vec![0f32; len];
+        read_tile_step_f32_into(&stack, 0, rect, step, spp, &mut via_generic)
+            .expect("generic f32 step read over a TiffStack");
+
+        let mut via_native = vec![0f32; len];
+        stack
+            .read_tile_step_f32_into(0, rect, step, &mut via_native)
+            .expect("TiffStack's own f32 step read");
+
+        assert_eq!(via_generic, via_native, "step {step}");
+    }
 }

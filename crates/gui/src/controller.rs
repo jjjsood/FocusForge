@@ -33,6 +33,7 @@ use crate::diagnostics::{
     DiagnosticsEntryView, DiagnosticsScan, DiagnosticsScanEntry, DiagnosticsStatus,
     DiagnosticsView, clamp_manifest_scroll, manifest_content_height, measurement_scope, size_text,
 };
+use crate::editor_settings::{self, EditorSettings};
 use crate::entry;
 use crate::export_settings::{self, ExportChoice, ExportView};
 use crate::images;
@@ -504,6 +505,8 @@ pub struct BrushToolbarView {
     /// The opacity slider's thumb position, `0.01..=1.0`.
     pub opacity_fraction: f32,
     pub mode_menu_open: bool,
+    /// Whether the brush circle previews the stroke's result.
+    pub preview: bool,
     pub picking: bool,
     /// Whether the active tab's edit session has an op to undo/redo.
     pub can_undo: bool,
@@ -2500,6 +2503,8 @@ pub struct AppController {
     performance: PerformanceSettings,
     appearance: AppearanceSettings,
     appearance_save_error: Option<String>,
+    /// The `[editor]` settings: window-wide, shared by every tab.
+    editor: EditorSettings,
     /// Owns the persistent source decoder. It is created with the controller
     /// and never runs on the window thread.
     previews: Option<PreviewWorker>,
@@ -4399,6 +4404,10 @@ impl AppController {
                 ..
             } => self.pick_source_under_pointer(),
             ActionEvent::Fired {
+                action: Action::ToggleBrushPreview,
+                ..
+            } => self.toggle_brush_preview(),
+            ActionEvent::Fired {
                 action: Action::BrushModeNormal,
                 ..
             } => self.set_brush_mode(job::BrushMode::Normal),
@@ -4613,6 +4622,7 @@ impl AppController {
             opacity: self.state.brush.opacity,
             opacity_fraction: self.state.brush.opacity / 100.0,
             mode_menu_open: self.state.brush.mode_menu_open,
+            preview: self.editor.preview,
             picking: self.state.brush.picking,
             can_undo: self.edit_session().is_some_and(job::EditState::can_undo),
             can_redo: self.edit_session().is_some_and(job::EditState::can_redo),
@@ -4687,6 +4697,44 @@ impl AppController {
         })
     }
 
+    /// The brush the preview layer would draw: the one-point stroke a press
+    /// at the cursor's anchor would record. `None` with the preview off, outside
+    /// the editor, while [`Self::brush_cursor_view`] is `None` or picking (the
+    /// pipette armed or `Alt` held), during a live stroke, and while the
+    /// anchor's source point is off the image.
+    pub fn brush_preview_spec(&self) -> Option<brush::BrushPreviewSpec> {
+        if !self.editor.preview || self.mode() != ShellMode::Editor {
+            return None;
+        }
+        if self.brush_cursor_view()?.picking {
+            return None;
+        }
+        let tab = self.state.active()?;
+        let edit = tab.edit.as_ref().filter(|edit| edit.stroke.is_none())?;
+        let (pane, local) = self.anchor_pane();
+        let (sx, sy) = tab
+            .viewport
+            .as_ref()?
+            .to_source_in(local, self.pane_rect(pane)?);
+        let info = edit.info();
+        if sx < 0.0
+            || sy < 0.0
+            || sx.floor() as u32 >= info.width()
+            || sy.floor() as u32 >= info.height()
+        {
+            return None;
+        }
+        let (radius, softness) = self.brush_radius_softness();
+        let (mode, opacity) = self.brush_mode_opacity();
+        Some(brush::preview_spec(
+            (sx, sy),
+            radius,
+            softness,
+            mode,
+            opacity,
+        ))
+    }
+
     /// The slider's own callback: `fraction` is `0.0..=1.0` along the
     /// logarithmic track.
     pub fn set_brush_size_fraction(&mut self, fraction: f32) {
@@ -4732,6 +4780,18 @@ impl AppController {
             self.state.brush.mode_menu_open = false;
             self.emit(ShellEvent::EditorChanged);
         }
+    }
+
+    /// Whether the brush circle previews the stroke's result.
+    pub fn brush_preview(&self) -> bool {
+        self.editor.preview
+    }
+
+    /// Flips the brush preview for every tab and saves it.
+    pub fn toggle_brush_preview(&mut self) {
+        self.editor.preview = !self.editor.preview;
+        self.save_editor();
+        self.emit(ShellEvent::EditorChanged);
     }
 
     /// Toggles the pipette's armed state.
@@ -9570,6 +9630,11 @@ impl AppController {
         self.performance = settings;
     }
 
+    /// Installs the `[editor]` settings loaded at startup.
+    pub fn install_editor(&mut self, settings: EditorSettings) {
+        self.editor = settings;
+    }
+
     pub fn install_appearance(&mut self, settings: AppearanceSettings) {
         self.appearance = settings;
         self.appearance_save_error = None;
@@ -9730,6 +9795,16 @@ impl AppController {
             && let Err(e) = performance_settings::save(dir, &self.performance)
         {
             tracing::warn!(error = %e, "the performance settings could not be saved");
+        }
+    }
+
+    /// Saves `editor` when a config directory is installed; a failed save is
+    /// logged, never an error.
+    fn save_editor(&self) {
+        if let Some(dir) = &self.state.config_dir
+            && let Err(e) = editor_settings::save(dir, self.editor)
+        {
+            tracing::warn!(error = %e, "the editor settings could not be saved");
         }
     }
 
