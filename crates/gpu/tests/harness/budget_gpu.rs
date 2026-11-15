@@ -77,7 +77,7 @@ fn scratch_base(label: &str) -> PathBuf {
 /// levels = 5`, 160 px margin -- the same geometry `parity_pipeline.rs`'s `run_gpu`
 /// establishes) through `backend`, returning every tile's composite samples
 /// and Z-Map keyed by its read rect.
-fn run_plan(backend: &dyn TileBackend, label: &str) -> BTreeMap<TileKey, TileOutputSamples> {
+fn fuse_every_tile(backend: &dyn TileBackend, label: &str) -> BTreeMap<TileKey, TileOutputSamples> {
     let stack = TiffStack::open(common::mantis_512_dir()).expect("open mantis-512 fixture");
     let (width, height) = stack.dimensions();
     let spp = stack.header(0).samples_per_pixel;
@@ -109,7 +109,7 @@ fn tiny_budget_serializes_tiles_and_keeps_the_result() {
         return;
     }
     let default_backend = gpu_backend().expect("gpu backend");
-    let default_result = run_plan(default_backend, "default");
+    let default_result = fuse_every_tile(default_backend, "default");
     // Diagnostic only: the test binary runs its tests in parallel over one
     // device, so the default backend's own peak/limit are printed, never
     // asserted.
@@ -119,7 +119,7 @@ fn tiny_budget_serializes_tiles_and_keeps_the_result() {
     );
 
     let tiny_backend = GpuBackend::with_max_device_bytes(1).expect("tiny gpu backend");
-    let tiny_result = run_plan(&tiny_backend, "tiny");
+    let tiny_result = fuse_every_tile(&tiny_backend, "tiny");
 
     // The fixture-scale per-tile byte cost (512x512x3, warped).
     let bytes = device_bytes_per_tile(512, 512, 3, LEVELS, true, SampleFormat::U16);

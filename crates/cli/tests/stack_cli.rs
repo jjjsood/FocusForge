@@ -2058,47 +2058,6 @@ fn dry_run_reports_its_plan_without_an_estimate() {
     }
 }
 
-/// Runs the CLI over `fixtures/mantis-64` with `data_dir` as its data
-/// directory, in `cwd`.
-fn run_mantis_64(data_dir: &Path, cwd: &Path, out_dir: &Path, extra: &[&str]) -> CliOutput {
-    let frames = common::fixtures_dir().join("mantis-64").join("frames");
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_focusforge-cli"));
-    cmd.env("FOCUSFORGE_DATA_DIR", data_dir);
-    let mut args = vec![
-        "stack",
-        frames.to_str().unwrap(),
-        "-o",
-        out_dir.to_str().unwrap(),
-        "--algorithm",
-        "laplacian",
-        "--align-algorithm",
-        "dummy-align",
-        "--no-crop",
-    ];
-    args.extend(extra);
-    common::run_in(&mut cmd, cwd, &common::push_no_gpu(args))
-}
-
-#[test]
-fn a_run_leaves_the_data_folder_without_a_duration_history() {
-    let cmd = common::cli_bin("no_duration_history");
-    let data = common::data_dir_of(&cmd);
-    let file = data.join("focusforge").join("machine-history.json");
-    let cwd = tmp_dir("no_duration_history");
-    let out_dir = tmp_dir("no_duration_history_out");
-
-    let run = run_mantis_64(&data, &cwd, &out_dir, &[]);
-    assert!(run.success, "stderr: {}", run.stderr);
-    assert!(!file.exists(), "a run must not write a duration history");
-
-    let corrupt = b"\x00 not a history";
-    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    std::fs::write(&file, corrupt).unwrap();
-    let run = run_mantis_64(&data, &cwd, &out_dir, &[]);
-    assert!(run.success, "stderr: {}", run.stderr);
-    assert_eq!(std::fs::read(&file).unwrap(), corrupt);
-}
-
 #[test]
 fn fuse_tiles_cover_the_plan_when_accounting_is_on() {
     let frames = common::fixtures_dir().join("mantis-64").join("frames");

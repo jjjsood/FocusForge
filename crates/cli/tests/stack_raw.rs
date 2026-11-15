@@ -129,9 +129,6 @@ fn raw_dry_run_reports_the_run_budget() {
         ),
         "a RAW dry run develops: {plan}"
     );
-    for key in ["run_plan", "prediction"] {
-        assert!(plan.get(key).is_none(), "{key} in {plan}");
-    }
 
     let refused = dry_run(reservation - 1);
     assert!(!refused.status.success());

@@ -352,17 +352,12 @@ mod stage_tests {
             stage: JobStage::Fuse,
             units_done,
             unit_total: 8,
-            pixels_done: 0,
-            pixel_total: 0,
-            running: Duration::ZERO,
-            eta: None,
             align_done: 0,
             align_total: 0,
             prepare_done: 0,
             prepare_total: 0,
             develop_done: 0,
             develop_total: 0,
-            total_eta: None,
         }
     }
 
@@ -655,7 +650,6 @@ pub fn fuse_request(
         cache: true,
         poll: POLL,
         free_space: None,
-        machine: None,
     }
 }
 
@@ -1172,17 +1166,12 @@ impl StageObserver for GuiObserver {
             stage,
             units_done: 0,
             unit_total: 0,
-            pixels_done: 0,
-            pixel_total: 0,
-            running: Duration::ZERO,
-            eta: None,
             align_done: 0,
             align_total: 0,
             prepare_done: 0,
             prepare_total,
             develop_done: 0,
             develop_total,
-            total_eta: None,
         };
         match stage {
             RunStage::Develop { frames } => self.tick(&snapshot(JobStage::Develop, 0, frames)),

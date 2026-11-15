@@ -58,11 +58,6 @@ pub trait TileBackend: Send + Sync {
         false
     }
 
-    /// Whether this backend runs on a discrete GPU. Defaults to `false`.
-    fn discrete(&self) -> bool {
-        false
-    }
-
     /// The largest side, in pixels, of a square read rect this backend accepts
     /// at `samples_per_pixel`; the tile planner never plans a larger tile.
     /// Defaults to no limit.

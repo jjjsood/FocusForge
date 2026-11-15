@@ -1017,9 +1017,6 @@ fn groups_json_carries_trace_accounting_per_group() {
         .map(|g| g["frame_count"].as_u64().expect("frame_count"))
         .collect();
     assert_eq!(counts, [2, 3], "each group reports its own frame count");
-    for g in groups {
-        assert!(g.get("run_plan").is_none(), "{g}");
-    }
     let decoded: Vec<u64> = groups
         .iter()
         .map(|g| {

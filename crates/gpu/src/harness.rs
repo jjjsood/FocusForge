@@ -189,10 +189,6 @@ impl TileBackend for GpuBackend {
         self.device.info().clone()
     }
 
-    fn discrete(&self) -> bool {
-        self.device.adapter().get_info().device_type == wgpu::DeviceType::DiscreteGpu
-    }
-
     fn max_tile_size(&self, samples_per_pixel: u32) -> u32 {
         let limits = self.device.limits();
         max_tile_side(

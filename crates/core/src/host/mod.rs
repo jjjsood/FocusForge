@@ -17,9 +17,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use sysinfo::{
-    CpuRefreshKind, MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
-};
+use sysinfo::{MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 /// Where a [`HostFacts`] value came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,21 +303,6 @@ pub fn snapshot() -> HostFacts {
     *SNAPSHOT.get_or_init(|| SysinfoProbe::new().facts())
 }
 
-/// The brand string of the first CPU, read once per process; `None` when the
-/// platform reports none.
-pub fn cpu_brand() -> Option<String> {
-    static BRAND: OnceLock<Option<String>> = OnceLock::new();
-    BRAND
-        .get_or_init(|| {
-            let system = System::new_with_specifics(
-                RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()),
-            );
-            let brand = system.cpus().first()?.brand().trim().to_string();
-            (!brand.is_empty()).then_some(brand)
-        })
-        .clone()
-}
-
 /// What operating system this is, as far as the platform will say. Each
 /// field is `None` when the platform does not answer.
 ///
@@ -452,15 +435,6 @@ mod tests {
         assert_eq!(facts.logical_cores(), 1);
         assert_eq!(facts.usable_memory(), 0);
         assert_eq!(facts.usable_available(), 0);
-    }
-
-    #[test]
-    fn cpu_brand_is_stable_and_never_empty() {
-        let first = cpu_brand();
-        assert_eq!(first, cpu_brand());
-        if let Some(brand) = first {
-            assert!(!brand.is_empty() && brand == brand.trim());
-        }
     }
 
     #[test]

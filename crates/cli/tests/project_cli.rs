@@ -366,7 +366,7 @@ fn cancel_keeps_the_staged_planes_for_resume() {
     // The fuse-stage entry line is written the instant the job starts.
     for line in lines.by_ref() {
         let line = line.unwrap();
-        if line.contains("eta") || line.contains("tile") {
+        if line.contains("tile") {
             break;
         }
     }

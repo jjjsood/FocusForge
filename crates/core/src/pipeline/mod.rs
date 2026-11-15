@@ -36,10 +36,8 @@ use crate::io::raw::document_clip;
 use crate::io::tiff::writer::file_len;
 use crate::io::{
     COMPOSITE_FILENAME, DevelopStore, FrameDesc, FrameReader, ReaderKind, Rect, TiffStack,
-    ZMAP_FILENAME, open_frame_set, source_bits_per_sample,
+    ZMAP_FILENAME, open_frame_set,
 };
-use crate::job::machine::{MachineHistory, MachineKey, MachineTerm};
-use crate::job::prediction::{RawSource, RunPrediction, fuse_tile_cost, predict_run};
 use crate::job::{
     AlignIdentity, ControlState, EqualizeKey, FrameFingerprint, Job, JobControl, JobOutcome,
     JobProgress, JobRecord, JobStage, RecordingConsumer, Resumable, ResumeStore, StackFingerprint,
@@ -100,9 +98,6 @@ pub struct FuseRequest {
     /// Answers which volume holds a directory and how many bytes are free on
     /// it; `None` asks the operating system.
     pub free_space: Option<FreeSpaceProbe>,
-    /// What this machine's finished runs taught the pre-start estimate;
-    /// `None` leaves the estimate at the shipped seconds.
-    pub machine: Option<MachineHistory>,
 }
 
 /// A free-space query, replaceable by a caller that needs a fixed answer.
@@ -183,9 +178,6 @@ pub struct FuseAlignReport {
 /// builds its own report from one source.
 pub struct FuseReport {
     pub product: FuseProduct,
-    /// The cold-run plan the duration estimate was made from; `None` when a
-    /// frame header could not be read, so no estimate was made.
-    pub run_plan: Option<RunPlanFeatures>,
     pub frame_count: usize,
     pub frames: Vec<String>,
     pub width: u32,
@@ -219,8 +211,6 @@ pub struct FuseReport {
     pub accounted_bytes_in_flight: u64,
     pub budget_provenance: Provenance,
     pub backed_off: bool,
-    /// A pause held the job at some point.
-    pub paused: bool,
     /// Why the run fused on the host although the request carried a backend:
     /// the backend's own account of the tile that did not fit its device.
     /// `None` when the backend ran, or the request carried none.
@@ -274,85 +264,6 @@ pub fn host_workers(frames: usize, admission_cap: usize) -> usize {
         .max(1)
 }
 
-/// The run-plan inputs a duration model reads, all known before the first
-/// stage starts. [`Self::new`] describes a cold run; the driver's report
-/// fills the two hit fields with what the run resolved.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RunPlanFeatures {
-    /// Frames in the stack.
-    pub frame_count: usize,
-    /// Pixels in one frame (width times height), not samples.
-    pub frame_pixels: u64,
-    /// Bit depth of one source sample: 8, 16, or 32 for developed RAW.
-    pub source_bits_per_sample: u16,
-    /// The reader serving the frames, which names the input format.
-    pub reader: ReaderKind,
-    /// Whether the plan targets the GPU backend. A mid-run fallback to the
-    /// host shows in the report's `gpu_fallback`, not here.
-    pub gpu: bool,
-    /// Whether the align stage is planned on a GPU accelerator, as offered
-    /// before the run. What alignment actually used shows in the report's
-    /// `align_backend`.
-    pub align_gpu: bool,
-    /// Host worker threads the develop, prepare and align stages use.
-    pub workers: usize,
-    /// The blend method's algorithm id.
-    pub algorithm: String,
-    /// Whether the alignment was taken from the stage cache.
-    pub align_cache_hit: bool,
-    /// Fuse tiles skipped because a `--resume` ledger already held them.
-    pub resumed_units: usize,
-}
-
-impl RunPlanFeatures {
-    /// Describes a cold run of `ctx` (no cache hit, nothing resumed) without
-    /// touching the filesystem. `admission_cap` is the job's worker cap
-    /// (`usize::MAX` for none).
-    pub fn new(
-        ctx: &crate::params::StackContext,
-        reader: ReaderKind,
-        source_bits_per_sample: u16,
-        gpu: bool,
-        align_gpu: bool,
-        algorithm: &str,
-        admission_cap: usize,
-    ) -> Self {
-        Self {
-            frame_count: ctx.frame_count,
-            frame_pixels: u64::from(ctx.width) * u64::from(ctx.height),
-            source_bits_per_sample,
-            reader,
-            gpu,
-            align_gpu,
-            workers: host_workers(ctx.frame_count, admission_cap),
-            algorithm: algorithm.to_string(),
-            align_cache_hit: false,
-            resumed_units: 0,
-        }
-    }
-}
-
-/// The cold-run plan of `request`. Its align stage is planned on a GPU
-/// accelerator when the request aligns and offers one.
-fn run_plan_for(
-    request: &FuseRequest,
-    ctx: &crate::params::StackContext,
-    reader: ReaderKind,
-    source_bits_per_sample: u16,
-    fuse_gpu: bool,
-    admission_cap: usize,
-) -> RunPlanFeatures {
-    RunPlanFeatures::new(
-        ctx,
-        reader,
-        source_bits_per_sample,
-        fuse_gpu,
-        request.align.is_some() && request.align_backend.is_some(),
-        request.algorithm.id(),
-        admission_cap,
-    )
-}
-
 /// One fused tile's size and wall duration, as noted when trace accounting
 /// is on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -391,24 +302,6 @@ fn touches_edge(tile: &crate::tile::PlannedTile, extent: (u32, u32)) -> bool {
         || interior.y == 0
         || interior.x + interior.width == extent.0
         || interior.y + interior.height == extent.1
-}
-
-/// The relative cost of every fuse tile of `plan` over `frame_count` frames,
-/// in tile index order, which weights the fuse stage's progress.
-pub(crate) fn fuse_costs(
-    plan: &crate::tile::TilePlan,
-    gpu: bool,
-    frame_count: usize,
-    extent: (u32, u32),
-) -> Vec<f64> {
-    plan.tiles()
-        .iter()
-        .map(|tile| {
-            let read = tile.read();
-            let read_pixels = u64::from(read.width) * u64::from(read.height);
-            fuse_tile_cost(gpu, frame_count, read_pixels, touches_edge(tile, extent))
-        })
-        .collect()
 }
 
 /// The intensity encoding of the code values a reader delivers: RAW frames
@@ -798,7 +691,6 @@ pub fn run(
     let start = Instant::now();
     let mut timer = StageTimer::from_start(start);
     timer.enter(Stage::Setup);
-    control.enter_stage(Stage::Setup);
 
     let mut options = TileSchedulerOptions::new(&request.scratch_root);
     options.budget = options.budget.capped_to(request.max_host_memory);
@@ -885,32 +777,6 @@ pub fn run(
             request.backend.is_some() && cap_fallback.is_none(),
         ),
     )?;
-    // A header that cannot be read leaves the run without a prediction, and
-    // so without a total ETA.
-    let run_plan = request.frames.first().and_then(|first| {
-        let bits = source_bits_per_sample(opened.kind, first).ok()?;
-        Some(run_plan_for(
-            request,
-            &stack_ctx,
-            opened.kind,
-            bits,
-            request.backend.is_some() && cap_fallback.is_none(),
-            control.admission_cap(),
-        ))
-    });
-    if let (Some(features), Some(first)) = (&run_plan, request.frames.first()) {
-        let raw = developed_store
-            .zip(first.extension().and_then(|ext| ext.to_str()))
-            .map(|(store, extension)| RawSource { extension, store });
-        if let Some(prediction) =
-            seeded_prediction(request, features, raw, MachineKey::current().as_ref())
-        {
-            control.seed_prediction(&prediction.stages);
-            if developed_store.is_none() {
-                control.drop_prediction(Stage::Develop);
-            }
-        }
-    }
     // Frames held in memory come off the tiles' budget.
     if developed_store == Some(DevelopStore::Memory) {
         options.budget = develop_budget.reduced_by(scratch_needed);
@@ -960,7 +826,6 @@ pub fn run(
     if let Some(store) = developed_store {
         timer.mark(Stage::Setup);
         timer.enter(Stage::Develop);
-        control.enter_stage(Stage::Develop);
         let developed = control.begin_develop(frame_reader.len());
         control.set_stage(JobStage::Develop);
         observer.stage(RunStage::Develop {
@@ -978,7 +843,6 @@ pub fn run(
         });
         timer.mark(Stage::Develop);
         timer.enter(Stage::Setup);
-        control.enter_stage(Stage::Setup);
         // Workers that claimed their frame before a cancel finish it, so the
         // pass can return Ok with the cancel already raised.
         let cancelled = match result {
@@ -1098,7 +962,6 @@ pub fn run(
 
     if let Some(align_req) = &request.align {
         timer.enter(Stage::Align);
-        control.enter_stage(Stage::Align);
         // The control exists before this stage starts (`Job::with_control`'s
         // whole point), so a poller reading `control.progress()` right now
         // sees `stage == Align`.
@@ -1139,7 +1002,6 @@ pub fn run(
 
         if let Some(alignment) = peeked.flatten() {
             used_peeked_alignment = true;
-            control.drop_prediction(Stage::Align);
             align_source = "resumed".to_string();
             alignment_result = Some((align_req.algorithm, align_resolved, policy, alignment));
         } else {
@@ -1152,7 +1014,6 @@ pub fn run(
 
             if let Some(alignment) = cache_hit {
                 align_cached = true;
-                control.drop_prediction(Stage::Align);
                 align_source = "cached".to_string();
                 observer.stage(RunStage::Align {
                     frames: frame_reader.len(),
@@ -1213,11 +1074,7 @@ pub fn run(
                             budget: options.budget,
                             frames_done: Some(frames_done),
                             control: Some(Arc::clone(&control)),
-                            on_pause: Some(&|control| {
-                                let held = Instant::now();
-                                observer.paused(control);
-                                control.add_hold(held.elapsed());
-                            }),
+                            on_pause: Some(&|control| observer.paused(control)),
                             align_backend: request.align_backend,
                             preview: feed.as_ref().and_then(PreviewFeed::aligned_sink),
                         },
@@ -1272,7 +1129,6 @@ pub fn run(
         timer.mark(Stage::Align);
     }
     timer.enter(Stage::Fuse);
-    control.enter_stage(Stage::Fuse);
 
     let alignment_for_crop: StackAlignment = match &alignment_result {
         Some((_, _, _, alignment)) => alignment.clone(),
@@ -1500,12 +1356,6 @@ pub fn run(
     let sink = sink.with_preview(mosaic, preview_clip, heat);
 
     control.set_stage(JobStage::Fuse);
-    control.set_fuse_costs(fuse_costs(
-        scheduler.plan(),
-        backend.is_some(),
-        frame_reader.len(),
-        (width, height),
-    ));
     // `Job::with_control` is what credits `control` with the plan's real
     // unit/pixel totals (and any already-completed units on a resume);
     // constructing it before `observer.stage` fires means the very first
@@ -1577,7 +1427,6 @@ pub fn run(
     }
     timer.mark(Stage::Fuse);
     timer.enter(Stage::Finalize);
-    control.enter_stage(Stage::Finalize);
     debug_assert_eq!(
         outcome,
         JobOutcome::Completed,
@@ -1691,7 +1540,6 @@ pub fn run(
     observer.stage(RunStage::Finished);
 
     timer.mark(Stage::Finalize);
-    control.finish_stages();
     let wall_seconds = timer.total_seconds();
     let stages = timer.finish();
     let plan = scheduler.plan();
@@ -1721,7 +1569,6 @@ pub fn run(
 
     Ok(FuseOutcome::Completed(Box::new(FuseReport {
         product,
-        run_plan,
         frame_count: frame_reader.len(),
         frames: frame_names,
         width,
@@ -1743,7 +1590,6 @@ pub fn run(
         accounted_bytes_in_flight: in_flight_limit as u64 * scheduler.bytes_per_tile(),
         budget_provenance: scheduler.budget().provenance(),
         backed_off: scheduler.final_in_flight_limit() < in_flight_limit,
-        paused: control.was_paused(),
         gpu_fallback,
         output_width: applied_crop.map(|r| r.width).unwrap_or(width),
         output_height: applied_crop.map(|r| r.height).unwrap_or(height),
@@ -1766,43 +1612,6 @@ pub fn run(
         metrics,
         preview_cost: feed.as_ref().map(PreviewFeed::cost).unwrap_or_default(),
     })))
-}
-
-/// The pre-start prediction of a run, scaled by what the request's machine
-/// history says about the machine `key`; the shipped seconds when the request
-/// carries no history.
-fn seeded_prediction(
-    request: &FuseRequest,
-    features: &RunPlanFeatures,
-    raw: Option<RawSource<'_>>,
-    key: Option<&MachineKey>,
-) -> Option<RunPrediction> {
-    predicted_run(
-        request.machine.as_ref(),
-        key,
-        features,
-        request.align.is_some(),
-        raw,
-        request.backend.is_some_and(|backend| backend.discrete()),
-    )
-}
-
-/// The pre-start prediction of a run of `features` on the machine `key`, as
-/// the live ledger is seeded with it: scaled by `history`, the shipped seconds
-/// without one. `discrete_adapter` is whether the fuse backend is a discrete
-/// GPU.
-pub fn predicted_run(
-    history: Option<&MachineHistory>,
-    key: Option<&MachineKey>,
-    features: &RunPlanFeatures,
-    align: bool,
-    raw: Option<RawSource<'_>>,
-    discrete_adapter: bool,
-) -> Option<RunPrediction> {
-    let term = history.map_or(MachineTerm::IDENTITY, |history| {
-        history.term_for(key, features, raw, discrete_adapter)
-    });
-    predict_run(features, align, raw, &term)
 }
 
 /// Moves the staged planes into `dir`, where `held` already names them.
@@ -1842,9 +1651,7 @@ fn drive_job(
                     // A cancel raced the pause within the same segment.
                     continue;
                 }
-                let held = Instant::now();
                 observer.paused(control);
-                control.add_hold(held.elapsed());
             }
         }
     }
@@ -2529,178 +2336,12 @@ mod tests {
         assert!(fits.scratch > 16 * u64::from(u32::MAX));
     }
 
-    fn plan_features(ctx: &crate::params::StackContext, cap: usize) -> RunPlanFeatures {
-        RunPlanFeatures::new(ctx, ReaderKind::Mmap, 16, false, false, "laplacian", cap)
-    }
-
     #[test]
-    fn run_plan_features_serialize_the_ten_stable_names() {
-        let ctx = crate::params::StackContext::new(3, 64, 48, 3);
-        let value = serde_json::to_value(plan_features(&ctx, usize::MAX)).unwrap();
-        let object = value.as_object().expect("a record serializes as an object");
-        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        assert_eq!(
-            keys,
-            [
-                "algorithm",
-                "align_cache_hit",
-                "align_gpu",
-                "frame_count",
-                "frame_pixels",
-                "gpu",
-                "reader",
-                "resumed_units",
-                "source_bits_per_sample",
-                "workers",
-            ]
-        );
-        assert_eq!(object["reader"], "mmap");
-        assert_eq!(object["frame_pixels"], 64 * 48);
-    }
-
-    #[test]
-    fn run_plan_features_start_cold_and_map_the_context() {
-        let ctx = crate::params::StackContext::new(7, 100, 50, 3);
-        let features =
-            RunPlanFeatures::new(&ctx, ReaderKind::Raw, 32, true, true, "pmax", usize::MAX);
-        assert_eq!(features.frame_count, 7);
-        assert_eq!(features.frame_pixels, 5000);
-        assert_eq!(features.source_bits_per_sample, 32);
-        assert_eq!(features.reader, ReaderKind::Raw);
-        assert!(features.gpu);
-        assert!(features.align_gpu);
-        assert_eq!(features.algorithm, "pmax");
-        assert!(!features.align_cache_hit);
-        assert_eq!(features.resumed_units, 0);
-    }
-
-    #[test]
-    fn run_plan_features_frame_pixels_do_not_wrap() {
-        let ctx = crate::params::StackContext::new(2, 70_000, 70_000, 3);
-        assert_eq!(plan_features(&ctx, usize::MAX).frame_pixels, 4_900_000_000);
-    }
-
-    #[test]
-    fn run_plan_features_workers_respect_frames_and_cap() {
-        let one = crate::params::StackContext::new(1, 8, 8, 1);
-        assert_eq!(plan_features(&one, 2).workers, 1);
-        let many = crate::params::StackContext::new(100_000, 8, 8, 1);
+    fn host_workers_respect_frames_and_cap() {
         let host = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-        assert_eq!(plan_features(&many, usize::MAX).workers, host);
-        assert_eq!(plan_features(&many, 1).workers, 1);
-        let none = crate::params::StackContext::new(0, 8, 8, 1);
-        assert_eq!(plan_features(&none, usize::MAX).workers, 1);
-    }
-
-    /// An align backend that offers an accelerator but opens no session.
-    struct OfferedAlign;
-
-    impl AlignBackend for OfferedAlign {
-        fn open_ecc(
-            &self,
-            _request: &crate::gpu::EccSessionRequest<'_>,
-        ) -> Result<Option<Box<dyn crate::gpu::EccMomentSession>>, AlgorithmError> {
-            Ok(None)
-        }
-    }
-
-    static OFFERED_ALIGN: OfferedAlign = OfferedAlign;
-
-    fn depth_map_request(aligned: bool, offered: bool) -> FuseRequest {
-        FuseRequest {
-            frames: Vec::new(),
-            output: FuseOutput::Seal(PathBuf::new()),
-            scratch_root: PathBuf::new(),
-            staging_key: String::new(),
-            algorithm: crate::registry::find_stack("depth-map").expect("depth-map is registered"),
-            explicit: ParamValues::new(),
-            align: aligned.then(|| AlignRequest {
-                algorithm: crate::registry::find_align("dummy-align")
-                    .expect("dummy-align is registered"),
-                explicit: ParamValues::new(),
-                lax: false,
-            }),
-            crop: false,
-            equalize: None,
-            tile_size: None,
-            max_host_memory: None,
-            backend: None,
-            align_backend: offered.then_some(&OFFERED_ALIGN as &'static dyn AlignBackend),
-            resume: false,
-            cache: true,
-            poll: Duration::from_millis(5),
-            free_space: None,
-            machine: None,
-        }
-    }
-
-    #[test]
-    fn the_prediction_seed_follows_the_requests_align_backend() {
-        let ctx = crate::params::StackContext::new(30, 5000, 3000, 3);
-        let plan = |aligned, offered| {
-            let request = depth_map_request(aligned, offered);
-            let features = run_plan_for(&request, &ctx, ReaderKind::Mmap, 16, false, usize::MAX);
-            let prediction = predict_run(&features, aligned, None, &MachineTerm::IDENTITY)
-                .expect("frames and pixels");
-            (features, prediction)
-        };
-        let (offered, on_accelerator) = plan(true, true);
-        let (declined, on_cpu) = plan(true, false);
-        let (unaligned, without_align) = plan(false, true);
-        assert!(offered.align_gpu, "an offered accelerator with alignment");
-        assert!(!declined.align_gpu, "no accelerator offered");
-        assert!(!unaligned.align_gpu, "no alignment, whatever is offered");
-        assert!(on_accelerator.calibrated && on_cpu.calibrated);
-        let (fast, slow) = (on_accelerator.stages.align, on_cpu.stages.align);
-        assert!(
-            fast.zip(slow).is_some_and(|(fast, slow)| fast < slow),
-            "accelerated align {fast:?} must undercut the CPU align {slow:?}"
-        );
-        assert_eq!(without_align.stages.align, None);
-    }
-
-    #[test]
-    fn a_request_with_history_seeds_the_scaled_stages() {
-        use crate::job::machine::{RunOutcome, TermSource};
-
-        let ctx = crate::params::StackContext::new(30, 5000, 3000, 3);
-        let key = MachineKey::new("Test CPU", 16).expect("a brand and cores");
-        let mut request = depth_map_request(true, false);
-        let features = run_plan_for(&request, &ctx, ReaderKind::Mmap, 16, false, usize::MAX);
-        let shipped = predict_run(&features, true, None, &MachineTerm::IDENTITY).unwrap();
-
-        let seed = |request: &FuseRequest| {
-            seeded_prediction(request, &features, None, Some(&key)).expect("frames and pixels")
-        };
-        assert_eq!(
-            seed(&request).stages,
-            shipped.stages,
-            "no history: as shipped"
-        );
-        assert_eq!(seed(&request).source, TermSource::Shipped);
-
-        let mut history = MachineHistory::default();
-        let halved = |v: Option<f64>| v.map(|v| v * 0.5);
-        let actual = StageTimings {
-            setup: halved(shipped.stages.setup),
-            develop: None,
-            align: halved(shipped.stages.align),
-            fuse: halved(shipped.stages.fuse),
-            warp_write: None,
-            finalize: halved(shipped.stages.finalize),
-        };
-        history.observe(
-            &key,
-            &features,
-            None,
-            &shipped.stages,
-            &actual,
-            &RunOutcome::default(),
-        );
-        request.machine = Some(history);
-        let seeded = seed(&request);
-        assert_eq!(seeded.source, TermSource::History);
-        assert_eq!(seeded.stages, actual);
+        assert_eq!(host_workers(1, 2), 1);
+        assert_eq!(host_workers(100_000, usize::MAX), host);
+        assert_eq!(host_workers(100_000, 1), 1);
+        assert_eq!(host_workers(0, usize::MAX), 1);
     }
 }

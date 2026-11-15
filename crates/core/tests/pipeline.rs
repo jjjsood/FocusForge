@@ -38,7 +38,7 @@ use focusforge_core::pipeline::{
 };
 use focusforge_core::project::{self, Project};
 use focusforge_core::registry;
-use focusforge_core::tile::{Rect, SampleFormat, Tile, TileError, TilePlan};
+use focusforge_core::tile::{Rect, SampleFormat, Tile, TileError};
 use focusforge_core::zmap::ZMapReader;
 use raw_dng::{DngSpec, write_dng};
 
@@ -106,7 +106,6 @@ fn base_request(label: &str, frames: Vec<PathBuf>, explicit: ParamValues) -> Fus
         cache: true,
         poll: Duration::from_millis(5),
         free_space: None,
-        machine: None,
     }
 }
 
@@ -972,29 +971,29 @@ fn align_progress_counts_every_frame() {
     assert_eq!(progress.align_total, 0);
 }
 
-/// Logs the stage, align tally and ETA of every tick, and the tally and ETA
-/// at the moment a hold begins; holds for 500 ms, then resumes.
+/// Logs the stage and align tally of every tick, and the tally and tick
+/// count at the moment a hold begins; holds for 500 ms, then resumes.
 #[derive(Default)]
-struct AlignEtaLog {
-    ticks: Mutex<Vec<(JobStage, usize, Option<Duration>)>>,
+struct AlignPauseLog {
+    ticks: Mutex<Vec<(JobStage, usize)>>,
     tick_count: Arc<AtomicUsize>,
-    hold_entry: Mutex<Option<(usize, Option<Duration>)>>,
+    hold_entry: Mutex<Option<(usize, usize)>>,
 }
 
-impl StageObserver for AlignEtaLog {
+impl StageObserver for AlignPauseLog {
     fn tick(&self, progress: &JobProgress) {
-        self.ticks.lock().expect("no panic while logging").push((
-            progress.stage,
-            progress.align_done,
-            progress.eta,
-        ));
+        self.ticks
+            .lock()
+            .expect("no panic while logging")
+            .push((progress.stage, progress.align_done));
         self.tick_count.fetch_add(1, Ordering::SeqCst);
     }
 
     fn paused(&self, control: &JobControl) {
         let progress = control.progress();
+        let ticks = self.ticks.lock().expect("no panic while logging").len();
         *self.hold_entry.lock().expect("no panic while logging") =
-            Some((progress.align_done, progress.eta));
+            Some((progress.align_done, ticks));
         std::thread::sleep(Duration::from_millis(500));
         control.clear();
     }
@@ -1009,7 +1008,7 @@ fn timed_align_request(
     control: &Arc<JobControl>,
     pause_on: usize,
     delay: Duration,
-    observer: &AlignEtaLog,
+    observer: &AlignPauseLog,
 ) -> FuseRequest {
     let algorithm: &'static PausingAlign = Box::leak(Box::new(PausingAlign {
         control: Arc::clone(control),
@@ -1034,193 +1033,39 @@ fn timed_align_request(
 }
 
 #[test]
-fn align_progress_carries_an_eta() {
+fn align_count_holds_through_a_pause_and_finishes() {
     let control = JobControl::new();
-    let observer = AlignEtaLog::default();
-    let request = timed_align_request(
-        "align_eta",
-        5,
-        &control,
-        usize::MAX,
-        Duration::from_millis(20),
-        &observer,
-    );
-    let cache = StageCache::open(&request.scratch_root).expect("stage cache must open");
-
-    let outcome = focusforge_core::pipeline::run(&request, &observer, control, Some(&cache))
-        .expect("a computed alignment must complete");
-    assert!(matches!(outcome, FuseOutcome::Completed(_)));
-    let ticks = observer.ticks.lock().expect("no panic while logging");
-    let align: Vec<_> = ticks.iter().filter(|t| t.0 == JobStage::Align).collect();
-    assert!(
-        align.iter().filter(|t| t.1 == 0).all(|t| t.2.is_some()),
-        "before a frame completes the ETA is the scaled align prediction: {align:?}"
-    );
-    assert!(
-        align.iter().any(|t| 0 < t.1 && t.1 < 5 && t.2.is_some()),
-        "a mid-stage tick must carry an ETA: {align:?}"
-    );
-    drop(ticks);
-
-    // The same request against the same cache is served from it.
-    let observer = AlignEtaLog::default();
-    let outcome =
-        focusforge_core::pipeline::run(&request, &observer, JobControl::new(), Some(&cache))
-            .expect("a cached alignment must complete");
-    assert!(matches!(outcome, FuseOutcome::Completed(_)));
-    let ticks = observer.ticks.lock().expect("no panic while logging");
-    assert!(
-        !ticks
-            .iter()
-            .any(|t| t.0 == JobStage::Align && t.2.is_some()),
-        "a cached alignment has no per-frame work to estimate: {ticks:?}"
-    );
-}
-
-#[test]
-fn align_eta_excludes_a_pause() {
-    let control = JobControl::new();
-    let observer = AlignEtaLog::default();
+    let observer = AlignPauseLog::default();
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
     let request = timed_align_request(
-        "align_eta_pause",
+        "align_count_pause",
         2 + workers + 8,
         &control,
         2,
         Duration::from_millis(20),
         &observer,
     );
-    let outcome = focusforge_core::pipeline::run(&request, &observer, control, None)
+    let outcome = focusforge_core::pipeline::run(&request, &observer, Arc::clone(&control), None)
         .expect("a paused-then-resumed alignment must complete");
     assert!(matches!(outcome, FuseOutcome::Completed(_)));
 
-    let (done_at_hold, eta_at_hold) = observer
+    let (done_at_hold, ticks_before_hold) = observer
         .hold_entry
         .lock()
         .expect("no panic while logging")
         .expect("the hold must be entered");
-    let eta_at_hold = eta_at_hold.expect("frames were done when the hold began");
+    assert!(done_at_hold > 0, "frames were done when the hold began");
     let ticks = observer.ticks.lock().expect("no panic while logging");
-    let after: Vec<_> = ticks
-        .iter()
-        .filter(|t| t.0 == JobStage::Align && t.1 > done_at_hold)
-        .filter_map(|t| t.2)
-        .collect();
-    assert!(
-        !after.is_empty(),
-        "ticks after the resume must carry an ETA"
-    );
-    for eta in after {
-        assert!(
-            eta <= eta_at_hold + Duration::from_millis(250),
-            "{eta:?} after the hold vs {eta_at_hold:?} before it"
-        );
-    }
-}
-
-/// Logs every tick's snapshot, and the snapshot at the moment the seal and
-/// the end of the run are announced.
-struct TotalEtaLog {
-    control: Arc<JobControl>,
-    ticks: Mutex<Vec<JobProgress>>,
-    finalizing: Mutex<Vec<JobProgress>>,
-}
-
-impl StageObserver for TotalEtaLog {
-    fn tick(&self, progress: &JobProgress) {
-        self.ticks
-            .lock()
-            .expect("no panic while logging")
-            .push(*progress);
-    }
-
-    fn stage(&self, stage: RunStage) {
-        if matches!(stage, RunStage::Seal | RunStage::Finished) {
-            self.finalizing
-                .lock()
-                .expect("no panic while logging")
-                .push(self.control.progress());
+    for &(stage, done) in &ticks[ticks_before_hold..] {
+        if stage == JobStage::Align {
+            assert!(
+                done >= done_at_hold,
+                "the align count fell from {done_at_hold} to {done} across the hold"
+            );
         }
     }
-}
-
-#[test]
-fn total_run_eta() {
-    let control = JobControl::new();
-    control.set_min_running(Duration::from_millis(150));
-    let observer = TotalEtaLog {
-        control: Arc::clone(&control),
-        ticks: Mutex::default(),
-        finalizing: Mutex::default(),
-    };
-    let mut explicit = ParamValues::new();
-    explicit.insert("levels".to_string(), ParamValue::Int(3));
-    let mut request = base_request(
-        "total_run_eta",
-        brightness_stack("total_run_eta", 1, &[1.0, 1.0, 1.0]),
-        explicit,
-    );
-    // The smallest tile size that plans at three levels: a 3 x 3 grid on
-    // the 300 px frame, one interior tile among eight edge tiles.
-    request.tile_size = Some(160);
-    request.poll = Duration::from_millis(1);
-    request.align = Some(dummy_align_request());
-
-    let outcome = focusforge_core::pipeline::run(&request, &observer, Arc::clone(&control), None)
-        .expect("the run must complete");
-    assert!(matches!(outcome, FuseOutcome::Completed(_)));
-
-    let plan = TilePlan::new(EQ_SIZE, EQ_SIZE, 160, 3).expect("the frame plans at tile size 160");
-    let edge_tiles = plan
-        .tiles()
-        .iter()
-        .filter(|tile| {
-            let i = tile.interior();
-            i.x == 0 || i.y == 0 || i.x + i.width == EQ_SIZE || i.y + i.height == EQ_SIZE
-        })
-        .count();
-    assert!(
-        edge_tiles > 0 && edge_tiles < plan.len(),
-        "{edge_tiles} of {} tiles touch an edge",
-        plan.len()
-    );
-
-    let ticks = observer.ticks.lock().expect("no panic while logging");
-    assert!(!ticks.is_empty(), "the slow-run hook must yield fuse ticks");
-    assert_eq!(
-        ticks.last().map(|tick| tick.unit_total),
-        Some(plan.len()),
-        "the run fused the planned grid"
-    );
-    for tick in ticks.iter() {
-        let total = tick.total_eta.expect("a seeded run reports a total");
-        assert!(
-            total >= tick.eta.unwrap_or_default(),
-            "total {total:?} below stage ETA {:?}: {tick:?}",
-            tick.eta
-        );
-    }
-    for pair in ticks.windows(2) {
-        let (before, after) = (pair[0].total_eta, pair[1].total_eta);
-        assert!(
-            after <= before,
-            "the total rose from {before:?} to {after:?}: {:?} then {:?}",
-            pair[0],
-            pair[1]
-        );
-    }
-    let finalizing = observer.finalizing.lock().expect("no panic while logging");
-    assert!(!finalizing.is_empty(), "the seal must be announced");
-    for snapshot in finalizing.iter() {
-        assert_eq!(snapshot.pixels_done, snapshot.pixel_total);
-        assert!(
-            snapshot
-                .total_eta
-                .is_some_and(|total| total > Duration::ZERO),
-            "the total stays positive through finalize: {snapshot:?}"
-        );
-    }
-    assert_eq!(control.progress().total_eta, Some(Duration::ZERO));
+    let finished = control.progress();
+    assert_eq!(finished.align_done, finished.align_total);
 }
 
 /// Logs the announced Prepare stage, the Prepare-stage tally of every tick,

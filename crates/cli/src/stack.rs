@@ -1282,7 +1282,6 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         cache: job_opts.cache,
         poll: job::POLL,
         free_space: None,
-        machine: None,
     };
 
     // Resolved once: the report's `backend` field, and the ledger's own
@@ -1407,9 +1406,9 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
                 frames,
                 source: AlignSource::Computed,
             } => renderer.stage(&format!("align {frames} frames")),
-            // A fuse-stage entry line, unconditional and immediate, carrying
-            // the whole run's remaining time: it gives a script or a human
-            // watching a redirected log a fact the instant the job starts.
+            // A fuse-stage entry line, unconditional and immediate: it gives
+            // a script or a human watching a redirected log a fact the
+            // instant the job starts.
             RunStage::Fuse => renderer.start(&self.control.progress()),
             RunStage::Seal => renderer.stage("seal project"),
             // The completion line's exact wording is what `job_cli.rs`

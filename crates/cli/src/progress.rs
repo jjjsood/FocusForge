@@ -210,47 +210,26 @@ impl ProgressRenderer {
 mod tests {
     use super::*;
     use focusforge_core::job::JobStage;
-    use std::time::Duration;
-
-    /// The per-stage value every fixture carries: a front end that read it
-    /// would print `12:57`, a token no assertion below expects.
-    const STAGE_ETA: Duration = Duration::from_secs(777);
-
-    fn progress(units_done: usize, unit_total: usize, total_eta: Option<Duration>) -> JobProgress {
+    fn progress(units_done: usize, unit_total: usize) -> JobProgress {
         JobProgress {
             stage: JobStage::Fuse,
             units_done,
             unit_total,
-            pixels_done: units_done as u64,
-            pixel_total: unit_total as u64,
-            running: Duration::from_secs(1),
-            eta: Some(STAGE_ETA),
             align_done: 0,
             align_total: 0,
             prepare_done: 0,
             prepare_total: 0,
             develop_done: 0,
             develop_total: 0,
-            total_eta,
         }
     }
 
     fn align_progress(align_done: usize, align_total: usize) -> JobProgress {
         JobProgress {
             stage: JobStage::Align,
-            units_done: 0,
-            unit_total: 0,
-            pixels_done: 0,
-            pixel_total: 0,
-            running: Duration::from_secs(1),
-            eta: Some(STAGE_ETA),
             align_done,
             align_total,
-            prepare_done: 0,
-            prepare_total: 0,
-            develop_done: 0,
-            develop_total: 0,
-            total_eta: None,
+            ..progress(0, 0)
         }
     }
 
@@ -259,14 +238,7 @@ mod tests {
             stage: JobStage::Prepare,
             prepare_done,
             prepare_total,
-            ..progress(0, 0, None)
-        }
-    }
-
-    fn with_eta(progress: JobProgress, total_eta: Option<Duration>) -> JobProgress {
-        JobProgress {
-            total_eta,
-            ..progress
+            ..progress(0, 0)
         }
     }
 
@@ -275,7 +247,7 @@ mod tests {
             stage: JobStage::Develop,
             develop_done,
             develop_total,
-            ..progress(0, 0, None)
+            ..progress(0, 0)
         }
     }
 
@@ -298,23 +270,12 @@ mod tests {
 
     #[test]
     fn every_stage_line_ends_at_its_count() {
-        let total = Some(Duration::from_secs(125));
         for (expected, line) in [
-            (
-                "develop 2/9 frames",
-                with_eta(develop_progress(2, 9), total),
-            ),
-            (
-                "prepare 2/9 strips",
-                with_eta(prepare_progress(2, 9), total),
-            ),
-            ("align 3/8 frames", with_eta(align_progress(3, 8), total)),
-            (
-                "align 61/61 frames",
-                with_eta(align_progress(61, 61), total),
-            ),
-            ("fuse 12/64 tiles 18%", progress(12, 64, total)),
-            ("fuse 12/64 tiles 18%", progress(12, 64, None)),
+            ("develop 2/9 frames", develop_progress(2, 9)),
+            ("prepare 2/9 strips", prepare_progress(2, 9)),
+            ("align 3/8 frames", align_progress(3, 8)),
+            ("align 61/61 frames", align_progress(61, 61)),
+            ("fuse 12/64 tiles 18%", progress(12, 64)),
         ] {
             assert_eq!(format_line(&line), expected);
         }
@@ -327,7 +288,7 @@ mod tests {
         // branch, which this test exercises for a panic/no-op guarantee.
         let mut renderer = ProgressRenderer::new(ProgressMode::Quiet);
         renderer.stage("align 61 frames");
-        renderer.tick(&progress(1, 10, Some(Duration::from_secs(1))));
+        renderer.tick(&progress(1, 10));
         renderer.finish("done");
         assert_eq!(renderer.mode, ProgressMode::Quiet);
     }
@@ -339,7 +300,7 @@ mod tests {
         // not yet elapsed) -- pins the line-count bound this module's docs
         // promise rather than firing on the very first poll.
         let before = renderer.last_emit;
-        renderer.tick(&progress(1, 10, Some(Duration::from_secs(1))));
+        renderer.tick(&progress(1, 10));
         assert_eq!(
             renderer.last_emit, before,
             "a tick inside the interval must not update last_emit"

@@ -174,54 +174,37 @@ fn count_lines(stderr: &str) -> Vec<&str> {
 #[test]
 fn stage_lines_never_carry_an_eta() {
     let frames = common::fixtures_dir().join("mantis-64");
-    // Each run gets its own folder, so the second is not served from the stage cache.
-    let run_in = |env: Option<&str>| {
-        let dir = tmp_dir(&format!("job_cli_eta_display_{}", env.unwrap_or("unset")));
-        let args = common::push_no_gpu(vec![
-            "stack",
-            frames.to_str().unwrap(),
-            "-o",
-            dir.to_str().unwrap(),
-            "--algorithm",
-            "laplacian",
-            "--align-algorithm",
-            "dummy-align",
-            "--set",
-            "equalize=true",
-        ]);
-        let mut cmd = bin();
-        match env {
-            Some(value) => cmd.env("FOCUSFORGE_SHOW_ETA", value),
-            None => cmd.env_remove("FOCUSFORGE_SHOW_ETA"),
-        };
-        common::run_in(&mut cmd, &dir, &args)
-    };
-    for (env, run) in [("unset", run_in(None)), ("1", run_in(Some("1")))] {
-        assert!(run.success, "{env}: stderr: {}", run.stderr);
-        assert!(
-            !run.stderr.contains(" eta "),
-            "FOCUSFORGE_SHOW_ETA {env}: {}",
-            run.stderr
-        );
-        let counts = count_lines(&run.stderr);
-        assert!(
-            counts.iter().any(|line| line.starts_with("prepare 0/")),
-            "{env}: no `prepare 0/N strips` line: {}",
-            run.stderr
-        );
-        assert!(
-            counts.iter().any(|line| line.starts_with("fuse ")),
-            "{env}: no fuse count line: {}",
-            run.stderr
-        );
-        for line in &counts {
-            let ends_at_count =
-                line.ends_with(" frames") || line.ends_with(" strips") || line.ends_with('%');
-            assert!(
-                ends_at_count,
-                "{env}: line does not end at its count: {line:?}"
-            );
-        }
+    let dir = tmp_dir("job_cli_stage_lines");
+    let args = common::push_no_gpu(vec![
+        "stack",
+        frames.to_str().unwrap(),
+        "-o",
+        dir.to_str().unwrap(),
+        "--algorithm",
+        "laplacian",
+        "--align-algorithm",
+        "dummy-align",
+        "--set",
+        "equalize=true",
+    ]);
+    let run = common::run_in(&mut bin(), &dir, &args);
+    assert!(run.success, "stderr: {}", run.stderr);
+    assert!(!run.stderr.contains(" eta "), "{}", run.stderr);
+    let counts = count_lines(&run.stderr);
+    assert!(
+        counts.iter().any(|line| line.starts_with("prepare 0/")),
+        "no `prepare 0/N strips` line: {}",
+        run.stderr
+    );
+    assert!(
+        counts.iter().any(|line| line.starts_with("fuse ")),
+        "no fuse count line: {}",
+        run.stderr
+    );
+    for line in &counts {
+        let ends_at_count =
+            line.ends_with(" frames") || line.ends_with(" strips") || line.ends_with('%');
+        assert!(ends_at_count, "line does not end at its count: {line:?}");
     }
 }
 

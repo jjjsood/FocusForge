@@ -63,20 +63,6 @@ fn format_name(path: &Path) -> &'static str {
     }
 }
 
-/// The bit depth of the samples a `kind` reader's source holds: the first
-/// TIFF channel's depth for the TIFF readers, 8 for JPEG, and 32 for RAW
-/// (developed to `f32`). Reads only `first_frame`'s header.
-pub fn source_bits_per_sample(kind: ReaderKind, first_frame: &Path) -> Result<u16, TiffError> {
-    match kind {
-        ReaderKind::Mmap | ReaderKind::Decoded => {
-            let header = TiffHeader::open(first_frame)?;
-            Ok(header.bits_per_sample.first().copied().unwrap_or(16))
-        }
-        ReaderKind::Jpeg => Ok(8),
-        ReaderKind::Raw => Ok(32),
-    }
-}
-
 /// Open `paths` with the reader their headers permit.
 pub fn open_frame_set(paths: &[PathBuf], budget: HostBudget) -> Result<FrameSet, FrameError> {
     let Some(first_path) = paths.first() else {
