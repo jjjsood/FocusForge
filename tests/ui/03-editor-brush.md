@@ -1,5 +1,5 @@
 # Retouch a fused result in the editor
-Start: --open fixtures/mantis-64/frames --fuse-tabs 0 --enter-editor
+Start: --open fixtures/mantis-64/frames --fuse-tabs 0 --enter-editor --size 1200x700
 ## Enter the editor
 1. Click **Keep** (`AppWindow::divergence-warning`).
    Expect: the dialog "Keep this fused result?" is gone; the bottom bar reads "fused" followed by a time (for example "fused 16:34"); the toolbar row shows the captions "Size" and "Soft"; the CHECKPOINTS list in the right dock shows 1 row (within 60 s).
@@ -14,7 +14,7 @@ Start: --open fixtures/mantis-64/frames --fuse-tabs 0 --enter-editor
 6. Click **Save checkpoint** (`AppWindow::editor-toolbar`) before any stroke.
    Expect: Must not: the CHECKPOINTS list grows; it still shows 1 row and `buttons AppWindow::editor-toolbar` lists **Save checkpoint** with enabled false.
 ## Brush size and softness
-7. Drag the Size slider thumb a quarter of the way along its track, to window point 116,56 (`FFSlider::drag-area` 0). In a window whose toolbar is narrower than 974 px the Size track runs from x 104 to x 148 and the Soft track from x 256 to x 300; the Opacity slider (`FFSlider::drag-area` 2) is the third slider and is not used here. The Size scale is logarithmic, so a quarter of the way reads a small number.
+7. Drag the Size slider thumb a quarter of the way along its track, to window point 116,56 (`FFSlider::drag-area` 0). In a 1200x700 window the editor toolbar is 892 px wide, narrower than 1068 px, so the Size track runs from x 104 to x 148 and the Soft track from x 256 to x 300; the Opacity slider (`FFSlider::drag-area` 2) is the third slider and is not used here. The Size scale is logarithmic, so a quarter of the way reads a small number.
    Expect: the text beside the Size slider reads "3"; the text beside the Soft slider still reads "30%".
 8. Drag the Size slider thumb to the left end of its track, to window point 104,56 (`FFSlider::drag-area` 0).
    Expect: the text beside the Size slider reads "1".
@@ -42,7 +42,7 @@ Start: --open fixtures/mantis-64/frames --fuse-tabs 0 --enter-editor
 19. Alt+click the Composite pane (`FFCanvas::pane-right`).
     Expect: the left pane label shows one of "00.tif", "01.tif" or "02.tif", the frame picked at that point; `buttons AppWindow::editor-toolbar` still lists **Pipette** with checked=false.
 ## Stroke, undo and redo
-20. Drag across the Composite pane from its centre to window point 1000,400 (`FFCanvas::pane-right`).
+20. Drag across the Composite pane from its centre to window point 880,400 (`FFCanvas::pane-right`).
     Expect: (within 120 s) `buttons AppWindow::editor-toolbar` lists **Undo** and **Save checkpoint** with enabled true and **Redo** with enabled false; **Undo** is drawn bright on a filled button.
 21. Click **Undo** (`FFEditorToolbar::undo`).
     Expect: `buttons AppWindow::editor-toolbar` lists **Undo** with enabled false and **Redo** with enabled true.
@@ -54,7 +54,7 @@ Start: --open fixtures/mantis-64/frames --fuse-tabs 0 --enter-editor
     Expect: Must not: **Redo** becomes enabled or **Undo** becomes greyed out; `buttons AppWindow::editor-toolbar` still lists **Redo** with enabled false and **Undo** with enabled true.
 25. Click **Undo** (`FFEditorToolbar::undo`).
     Expect: `buttons AppWindow::editor-toolbar` lists **Undo** with enabled false and **Redo** with enabled true.
-26. Drag across the Composite pane from its centre to window point 1000,400 (`FFCanvas::pane-right`).
+26. Drag across the Composite pane from its centre to window point 880,400 (`FFCanvas::pane-right`).
     Expect: Must not: **Redo** stays enabled; (within 120 s) `buttons AppWindow::editor-toolbar` lists **Redo** with enabled false and **Undo** with enabled true.
 27. (human only) Drag a long curve across the Composite pane, holding the button down for several seconds.
     Expect: a ring outline follows the pointer for the whole drag and the Composite shows a soft trail along the curve.

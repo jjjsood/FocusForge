@@ -26,6 +26,7 @@ use focusforge_core::retouch::blend::{self, Blend};
 use focusforge_core::tile::{HostBudget, Sample};
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 
+use common::read_tiff;
 use raw_dng::{DngSpec, write_dng};
 
 fn tmp_dir(name: &str) -> PathBuf {
@@ -42,19 +43,6 @@ fn full(width: u32, height: u32) -> Rect {
         width,
         height,
     }
-}
-
-/// `path`'s first image: its width, height, samples per pixel and samples,
-/// a float file narrowed to `u16`.
-fn read_tiff(path: &Path) -> (u32, u32, u32, Vec<u16>) {
-    let stack = TiffStack::open_staged(path).unwrap();
-    let (width, height) = stack.dimensions();
-    let spp = stack.header(0).samples_per_pixel;
-    let mut samples = vec![0u16; (width * height * spp) as usize];
-    stack
-        .read_tile_into(0, full(width, height), &mut samples)
-        .unwrap();
-    (width, height, spp, samples)
 }
 
 fn write_tiff(path: &Path, width: u32, height: u32, spp: u32, samples: &[u16]) {

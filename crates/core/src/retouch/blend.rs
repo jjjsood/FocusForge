@@ -61,6 +61,33 @@ pub(super) fn validate<'a>(op: &'a Op, info: ZMapInfo) -> Result<Stroke<'a>, Ret
         mode,
         opacity,
     } = op;
+    validate_parts(
+        source,
+        Stroke {
+            path: path.as_slice(),
+            radius: *radius,
+            softness: *softness,
+            mode: *mode,
+            opacity: *opacity,
+        },
+        info,
+    )
+}
+
+/// [`validate`] for a stroke that is not an [`Op`]: the same checks, in the same
+/// order, on `stroke` and the `source` it blends from.
+pub(super) fn validate_parts<'a>(
+    source: &StrokeSource,
+    stroke: Stroke<'a>,
+    info: ZMapInfo,
+) -> Result<Stroke<'a>, RetouchError> {
+    let Stroke {
+        path,
+        radius,
+        softness,
+        opacity,
+        ..
+    } = &stroke;
     if path.is_empty() {
         return Err(RetouchError::EmptyPath);
     }
@@ -83,13 +110,7 @@ pub(super) fn validate<'a>(op: &'a Op, info: ZMapInfo) -> Result<Stroke<'a>, Ret
     if !(*opacity > 0.0 && *opacity <= 1.0) {
         return Err(RetouchError::InvalidOpacity { opacity: *opacity });
     }
-    Ok(Stroke {
-        path: path.as_slice(),
-        radius: *radius,
-        softness: *softness,
-        mode: *mode,
-        opacity: *opacity,
-    })
+    Ok(stroke)
 }
 
 /// The dirty region a stroke reports: its path's bounding box widened by
@@ -358,8 +379,13 @@ const MAX_PASS_RADIUS: u64 = 1 << 20;
 /// sixteenths of a pixel as [`mask_ramp`] rounds it, so three passes reach
 /// about the brush radius. Capped at 2^20.
 pub fn pass_radius(op: &Op, info: ZMapInfo) -> Result<u32, RetouchError> {
-    let radius16 = Ramp::new(&validate(op, info)?).radius;
-    Ok(((radius16 + 24) / 48).clamp(1, MAX_PASS_RADIUS) as u32)
+    Ok(stroke_pass_radius(&validate(op, info)?))
+}
+
+/// [`pass_radius`] of a validated stroke.
+pub(super) fn stroke_pass_radius(stroke: &Stroke) -> u32 {
+    let radius16 = Ramp::new(stroke).radius;
+    ((radius16 + 24) / 48).clamp(1, MAX_PASS_RADIUS) as u32
 }
 
 /// How far outside its footprint a stroke reads the result and its source

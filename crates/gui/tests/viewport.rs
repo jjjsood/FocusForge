@@ -587,7 +587,12 @@ fn panes_share_one_viewport() {
     let canvas_slint =
         fs::read_to_string(common::ui_dir().join("shell").join("canvas.slint")).unwrap();
     let needle = "pixelated: root.pixelated";
-    let count = canvas_slint.matches(needle).count();
+    // The brush cursor's own `preview-pixelated: root.pixelated` is another
+    // property and is not a pane's.
+    let count = canvas_slint
+        .lines()
+        .filter(|line| line.trim_start().starts_with(needle))
+        .count();
     assert_eq!(
         count, 2,
         "pixelated must be forwarded identically to both panes, found {count} occurrence(s)"

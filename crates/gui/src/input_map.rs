@@ -176,7 +176,7 @@ impl fmt::Display for Trigger {
     }
 }
 
-/// The fourteen actions the table can name.
+/// The fifteen actions the table can name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     ZoomAtCursor,
@@ -193,10 +193,11 @@ pub enum Action {
     BrushModeLighten,
     BrushModeDarken,
     BrushModeDetail,
+    ToggleBrushPreview,
 }
 
 impl Action {
-    pub const ALL: [Action; 14] = [
+    pub const ALL: [Action; 15] = [
         Action::ZoomAtCursor,
         Action::StepSourceFrame,
         Action::PanHorizontal,
@@ -211,6 +212,7 @@ impl Action {
         Action::BrushModeLighten,
         Action::BrushModeDarken,
         Action::BrushModeDetail,
+        Action::ToggleBrushPreview,
     ];
 }
 
@@ -220,7 +222,7 @@ impl Action {
     "unknown action {spelling:?} -- accepted actions: zoom-at-cursor, step-source-frame, \
      pan-horizontal, pan, brush-size, brush-softness, undo, redo, \
      pick-source-under-pointer, paint, brush-mode-normal, brush-mode-lighten, \
-     brush-mode-darken, brush-mode-detail"
+     brush-mode-darken, brush-mode-detail, toggle-brush-preview"
 )]
 pub struct ActionParseError {
     pub spelling: String,
@@ -245,6 +247,7 @@ impl FromStr for Action {
             "brush-mode-lighten" => Ok(Action::BrushModeLighten),
             "brush-mode-darken" => Ok(Action::BrushModeDarken),
             "brush-mode-detail" => Ok(Action::BrushModeDetail),
+            "toggle-brush-preview" => Ok(Action::ToggleBrushPreview),
             _ => Err(ActionParseError {
                 spelling: s.to_string(),
             }),
@@ -269,6 +272,7 @@ impl fmt::Display for Action {
             Action::BrushModeLighten => "brush-mode-lighten",
             Action::BrushModeDarken => "brush-mode-darken",
             Action::BrushModeDetail => "brush-mode-detail",
+            Action::ToggleBrushPreview => "toggle-brush-preview",
         };
         write!(f, "{s}")
     }
@@ -284,10 +288,10 @@ pub struct Binding {
 
 const M: Modifiers = Modifiers::NONE;
 
-/// Thirteen trigger-keyed entries, presented as ten display rows -- the ninth
+/// Fourteen trigger-keyed entries, presented as eleven display rows -- the ninth
 /// (`Paint`'s drag) is a hidden row, absent from `DISPLAY_GROUPS`.
 /// `defaults_match_the_settled_table` asserts the mapping row for row.
-pub const DEFAULT_BINDINGS: [Binding; 13] = [
+pub const DEFAULT_BINDINGS: [Binding; 14] = [
     Binding {
         trigger: Trigger::Wheel(M),
         stacking: Some(Action::ZoomAtCursor),
@@ -375,9 +379,14 @@ pub const DEFAULT_BINDINGS: [Binding; 13] = [
         stacking: None,
         editor: Some(Action::BrushModeDetail),
     },
+    Binding {
+        trigger: Trigger::Key { key: 'p', mods: M },
+        stacking: None,
+        editor: Some(Action::ToggleBrushPreview),
+    },
 ];
 
-/// The ten display rows the settings table shows, `—` where the column is
+/// The eleven display rows the settings table shows, `—` where the column is
 /// `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputRowView {
@@ -386,10 +395,10 @@ pub struct InputRowView {
     pub editor: String,
 }
 
-/// The `DEFAULT_BINDINGS` indices each of the ten display rows groups --
+/// The `DEFAULT_BINDINGS` indices each of the eleven display rows groups --
 /// `[5, 6]` (Ctrl+Z / Ctrl+Shift+Z) is the one row whose two triggers name
 /// *different* actions per mode column.
-const DISPLAY_GROUPS: [&[usize]; 10] = [
+const DISPLAY_GROUPS: [&[usize]; 11] = [
     &[0],
     &[1],
     &[2],
@@ -400,6 +409,7 @@ const DISPLAY_GROUPS: [&[usize]; 10] = [
     &[10],
     &[11],
     &[12],
+    &[13],
 ];
 
 fn column(
@@ -450,7 +460,7 @@ impl InputTable {
         }
     }
 
-    /// The ten display rows the settings table shows.
+    /// The eleven display rows the settings table shows.
     pub fn display_rows(&self) -> Vec<InputRowView> {
         DISPLAY_GROUPS
             .iter()

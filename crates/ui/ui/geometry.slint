@@ -223,12 +223,18 @@ export global ShellGeometry {
     out property <length> editor-toolbar-mode-menu-width: 80px;
     out property <length> editor-toolbar-opacity-caption-x: 472px;
     out property <length> editor-toolbar-opacity-track-x: 522px;
-    out property <length> editor-toolbar-pipette-x: 662px;
-    out property <length> editor-toolbar-undo-x: 722px;
-    out property <length> editor-toolbar-redo-x: 754px;
+    out property <length> editor-toolbar-preview-caption-x: 650px;
+    out property <length> editor-toolbar-preview-x: 710px;
+    out property <length> editor-toolbar-pipette-x: 754px;
+    out property <length> editor-toolbar-undo-x: 814px;
+    out property <length> editor-toolbar-redo-x: 846px;
     // Below this toolbar width the three sliders draw their narrow tracks:
     // the 72 px row would leave Save checkpoint less than 17 px of clearance.
-    out property <length> editor-toolbar-narrow-below: 974px;
+    out property <length> editor-toolbar-narrow-below: 1068px;
+    // Below this toolbar width the Preview caption is hidden and Save
+    // checkpoint narrows, for the same clearance.
+    out property <length> editor-toolbar-caption-below: 984px;
+    out property <length> editor-toolbar-preview-caption-width: 60px;
     out property <length> editor-toolbar-track-width: 72px;
     out property <length> editor-toolbar-narrow-track-width: 44px;
     // Each narrowed track pulls every later control left by this much.
@@ -236,13 +242,23 @@ export global ShellGeometry {
     public pure function editor-toolbar-narrow(toolbar-width: length) -> bool {
         toolbar-width < editor-toolbar-narrow-below
     }
+    public pure function editor-toolbar-caption-hidden(toolbar-width: length) -> bool {
+        toolbar-width < editor-toolbar-caption-below
+    }
     // How far left a control that follows `tracks` sliders sits.
     public pure function editor-toolbar-shift(toolbar-width: length, tracks: int) -> length {
         editor-toolbar-narrow(toolbar-width) ? tracks * editor-toolbar-track-shrink : 0px
     }
+    // How far left the Preview switch and every control after it sits: the
+    // three narrowed tracks, plus the caption once it is hidden.
+    public pure function editor-toolbar-tail-shift(toolbar-width: length) -> length {
+        editor-toolbar-shift(toolbar-width, 3)
+            + (editor-toolbar-caption-hidden(toolbar-width) ? editor-toolbar-preview-caption-width : 0px)
+    }
     out property <length> editor-toolbar-icon-width: 27px;
     out property <length> editor-toolbar-save-checkpoint-right-inset: 13px;
     out property <length> editor-toolbar-save-checkpoint-width: 163px;
+    out property <length> editor-toolbar-save-checkpoint-narrow-width: 132px;
     // The step calculator's summary band and its columns.
     out property <length> summary-band-height: 84px;
     out property <length> summary-cell-width: 102px;
@@ -298,6 +314,4 @@ export global ShellGeometry {
     out property <length> overlap-legend-swatch: 8px;
     // The brush cursor's mode chip: a square of this side.
     out property <length> brush-tag-side: 16px;
-    // The layers glyph centred in a checkpoint-source cursor.
-    out property <length> cursor-glyph-side: 10px;
 }

@@ -7,3 +7,4 @@ Escape: pressing Escape while a close question (`AppWindow::close-guard`) is ope
 Corner control: Every modal dialog except "Keep this fused result?" and the refusal dialog (`AppWindow::refusal-dialog`, titled "This project cannot be opened", "No frames here", "This folder cannot be read", "These images are not one stack", "These frames cannot be read", "These are not the project's frames", "A frame is no longer there" or "This run cannot start") also has a **Close dialog** icon button (`FFIconButton`) at its top-right corner that does what the dialog's own Cancel (or Close) does; click it by that label within the dialog's id (`click "Close dialog" AppWindow::close-guard`); a footer button named "Close" is a different element.
 Guides: 06-close-quit.md
 Book: guide/batch-runs.md#close-a-project, guide/batch-runs.md#quit-focusforge
+Sources: crates/ui/ui/shell/dialogs.slint, crates/ui/ui/shell/tab_strip.slint

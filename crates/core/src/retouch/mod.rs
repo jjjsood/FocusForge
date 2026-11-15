@@ -3,6 +3,7 @@
 //! The soft brush stroke blended over an image from a source frame.
 
 pub mod blend;
+pub mod preview;
 
 use crate::tile::Rect;
 use crate::zmap::ZMapError;
