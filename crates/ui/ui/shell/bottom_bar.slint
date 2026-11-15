@@ -27,7 +27,6 @@ export component FFBottomBar inherits Rectangle {
     in property <float> bar-fraction: 0.0;
     // "running" | "held" | "failed" -- `FFProgressBar`'s own tone vocabulary.
     in property <string> bar-tone: "running";
-    in property <string> eta-text: "";
 
     // The overlay controls, shown in both modes; the toggle and slider are
     // greyed and inert while the active tab has no finished fuse.
@@ -71,28 +70,14 @@ export component FFBottomBar inherits Rectangle {
     }
 
     // Stretches with the window so its right edge stays `Theme.space-4`
-    // before the ETA at every width, never a fixed literal.
+    // before the overlay caption at every width, never a fixed literal.
     progress-bar := FFProgressBar {
         x: ShellGeometry.progress-bar-x;
         y: (parent.height - self.height) / 2;
-        width: eta-text.x - Theme.space-4 - ShellGeometry.progress-bar-x;
+        width: overlay-caption.x - Theme.space-4 - ShellGeometry.progress-bar-x;
         visible: root.project-loaded;
         fraction: root.bar-fraction;
         tone: root.bar-tone;
-    }
-
-    eta-text := Text {
-        x: overlay-caption.x - Theme.space-4 - ShellGeometry.eta-width;
-        y: 0px;
-        width: ShellGeometry.eta-width;
-        height: parent.height;
-        visible: root.project-loaded && root.eta-text != "";
-        text: root.eta-text;
-        overflow: elide;
-        color: Theme.text-secondary;
-        font-size: Theme.text-value.size;
-        font-weight: Theme.text-value.weight;
-        vertical-alignment: center;
     }
 
     // The 1 px rule along the bar's top edge, full window width.

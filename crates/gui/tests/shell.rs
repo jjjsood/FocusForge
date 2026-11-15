@@ -2042,9 +2042,9 @@ fn stacking_toolbar_has_no_save_checkpoint_caption() {
     );
 }
 
-/// The bottom bar's progress track, in reading order (stage -> step -> bar
-/// -> ETA), at the base width and at the 1200px minimum: the bar's width is
-/// dynamic, always ending `Theme.space-4` before the ETA.
+/// The bottom bar's progress track, in reading order (stage -> step -> bar),
+/// at the base width and at the 1200px minimum: the bar's width is dynamic,
+/// always ending `Theme.space-4` before the overlay caption.
 #[test]
 fn bottom_bar_progress() {
     let app = app_at(1440, 900);
@@ -2052,58 +2052,51 @@ fn bottom_bar_progress() {
     app.set_stage_word("Aligning".into());
     app.set_step_text("42 of 61".into());
     app.set_bar_fraction(0.5);
-    app.set_eta_text("ETA 1:12".into());
 
     let (step_x, step_y, _, _) = rect(&app, "FFBottomBar::step-text");
     assert_eq!((step_x, step_y), (166.0, 856.0));
     assert_rect(
         &app,
         "FFBottomBar::progress-bar",
-        (250.0, 876.0, 562.0, 4.0),
+        (250.0, 876.0, 658.0, 4.0),
     );
-    let (eta_x, eta_y, _, _) = rect(&app, "FFBottomBar::eta-text");
-    assert_eq!((eta_x, eta_y), (828.0, 856.0));
 
     let app_min = app_at(1200, 760);
     app_min.set_project_loaded(true);
     app_min.set_stage_word("Aligning".into());
     app_min.set_step_text("42 of 61".into());
     app_min.set_bar_fraction(0.5);
-    app_min.set_eta_text("ETA 1:12".into());
 
     let (step_x, step_y, _, _) = rect(&app_min, "FFBottomBar::step-text");
     assert_eq!((step_x, step_y), (166.0, 716.0));
     assert_rect(
         &app_min,
         "FFBottomBar::progress-bar",
-        (250.0, 736.0, 322.0, 4.0),
+        (250.0, 736.0, 418.0, 4.0),
     );
-    let (eta_x, eta_y, _, _) = rect(&app_min, "FFBottomBar::eta-text");
-    assert_eq!((eta_x, eta_y), (588.0, 716.0));
 }
 
-/// The ETA readout never reaches the overlay caption to its right, at the
-/// minimum width and wider, even for an hours-long estimate.
+/// The progress track ends exactly `Theme.space-4` before the overlay caption
+/// at every window width from the minimum up.
 #[test]
-fn bottom_bar_eta_clears_the_overlay_caption() {
-    for width in [1200, 1280, 1440] {
+fn bottom_bar_progress_ends_before_the_overlay_caption() {
+    for width in [1200, 1280, 1440, 1920] {
         let app = app_at(width, 900);
         app.set_project_loaded(true);
         app.set_bar_fraction(0.5);
-        app.set_eta_text("ETA 12:34:56".into());
 
-        let (eta_x, _, eta_w, _) = rect(&app, "FFBottomBar::eta-text");
-        let (caption_x, _, _, _) = rect(&app, "FFBottomBar::overlay-caption");
-        assert!(
-            eta_x + eta_w <= caption_x,
-            "{width}px wide: ETA spans {eta_x}..{}, overlay caption starts at {caption_x}",
-            eta_x + eta_w
-        );
         let (bar_x, _, bar_w, _) = rect(&app, "FFBottomBar::progress-bar");
-        assert!(
-            bar_x + bar_w <= eta_x,
-            "{width}px wide: track ends at {}, ETA starts at {eta_x}",
-            bar_x + bar_w
+        let (caption_x, _, _, _) = rect(&app, "FFBottomBar::overlay-caption");
+        assert_eq!(bar_x, 250.0, "{width}px wide: track start");
+        assert_eq!(
+            bar_x + bar_w,
+            width as f32 - 532.0,
+            "{width}px wide: track end"
+        );
+        assert_eq!(
+            caption_x - (bar_x + bar_w),
+            16.0,
+            "{width}px wide: gap between track and overlay caption"
         );
     }
 }

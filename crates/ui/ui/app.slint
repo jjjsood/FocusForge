@@ -692,7 +692,6 @@ export component AppWindow inherits Window {
     in property <string> step-text: "";
     in property <float> bar-fraction: 0.0;
     in property <string> bar-tone: "running";
-    in property <string> eta-text: "";
 
     // The bottom bar's overlay controls; disabled without a finished fuse.
     in property <bool> overlay-available: false;
@@ -742,7 +741,6 @@ export component AppWindow inherits Window {
         step-text: root.step-text;
         bar-fraction: root.bar-fraction;
         bar-tone: root.bar-tone;
-        eta-text: root.eta-text;
         overlay-available: root.overlay-available;
         overlay-on: root.overlay-on;
         overlay-fraction: root.overlay-fraction;
