@@ -35,7 +35,7 @@ SHA256 = {
     "res_best.pth": "483ffdcde63220560da6b3625c85690eaf0fa5691788625776165670d5abe401",
     "resnext.zip": "c34cca9003338cbcd00c8067cb5a7e7d47dd85b3340c37b91b803eaa8fafbcdc",
     "resnext_101_32x4d.pth": "f3edcb80fe5f8875ea2c9fdc21fd488f1928ab9c0d88e9527cd854fd6fe18b64",
-}  # file name -> hex digest; the sums the first `fetch` printed
+}  # file name -> hex digest
 SIZES = ("320", "native")
 GRID = dict(threshold=(4, 8, 16, 32, 64), band_hi=(12, 24, 48), median=(1, 5, 9, 15))  # threshold in 8-bit depth units
 # Chosen by `tune` on the calibration split, per size (cells at limit, then summed margin).
