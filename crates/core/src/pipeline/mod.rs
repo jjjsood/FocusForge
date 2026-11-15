@@ -38,7 +38,8 @@ use crate::io::{
     COMPOSITE_FILENAME, DevelopStore, FrameDesc, FrameReader, ReaderKind, Rect, TiffStack,
     ZMAP_FILENAME, open_frame_set, source_bits_per_sample,
 };
-use crate::job::prediction::{RawSource, fuse_tile_cost, predict_run};
+use crate::job::machine::{MachineHistory, MachineKey, MachineTerm};
+use crate::job::prediction::{RawSource, RunPrediction, fuse_tile_cost, predict_run};
 use crate::job::{
     AlignIdentity, ControlState, EqualizeKey, FrameFingerprint, Job, JobControl, JobOutcome,
     JobProgress, JobRecord, JobStage, RecordingConsumer, Resumable, ResumeStore, StackFingerprint,
@@ -99,6 +100,9 @@ pub struct FuseRequest {
     /// Answers which volume holds a directory and how many bytes are free on
     /// it; `None` asks the operating system.
     pub free_space: Option<FreeSpaceProbe>,
+    /// What this machine's finished runs taught the pre-start estimate;
+    /// `None` leaves the estimate at the shipped seconds.
+    pub machine: Option<MachineHistory>,
 }
 
 /// A free-space query, replaceable by a caller that needs a fixed answer.
@@ -179,6 +183,9 @@ pub struct FuseAlignReport {
 /// builds its own report from one source.
 pub struct FuseReport {
     pub product: FuseProduct,
+    /// The cold-run plan the duration estimate was made from; `None` when a
+    /// frame header could not be read, so no estimate was made.
+    pub run_plan: Option<RunPlanFeatures>,
     pub frame_count: usize,
     pub frames: Vec<String>,
     pub width: u32,
@@ -212,6 +219,8 @@ pub struct FuseReport {
     pub accounted_bytes_in_flight: u64,
     pub budget_provenance: Provenance,
     pub backed_off: bool,
+    /// A pause held the job at some point.
+    pub paused: bool,
     /// Why the run fused on the host although the request carried a backend:
     /// the backend's own account of the tile that did not fit its device.
     /// `None` when the backend ran, or the request carried none.
@@ -878,21 +887,24 @@ pub fn run(
     )?;
     // A header that cannot be read leaves the run without a prediction, and
     // so without a total ETA.
-    if let Some(first) = request.frames.first()
-        && let Ok(bits) = source_bits_per_sample(opened.kind, first)
-    {
-        let features = run_plan_for(
+    let run_plan = request.frames.first().and_then(|first| {
+        let bits = source_bits_per_sample(opened.kind, first).ok()?;
+        Some(run_plan_for(
             request,
             &stack_ctx,
             opened.kind,
             bits,
             request.backend.is_some() && cap_fallback.is_none(),
             control.admission_cap(),
-        );
+        ))
+    });
+    if let (Some(features), Some(first)) = (&run_plan, request.frames.first()) {
         let raw = developed_store
             .zip(first.extension().and_then(|ext| ext.to_str()))
             .map(|(store, extension)| RawSource { extension, store });
-        if let Some(prediction) = predict_run(&features, request.align.is_some(), raw) {
+        if let Some(prediction) =
+            seeded_prediction(request, features, raw, MachineKey::current().as_ref())
+        {
             control.seed_prediction(&prediction.stages);
             if developed_store.is_none() {
                 control.drop_prediction(Stage::Develop);
@@ -1709,6 +1721,7 @@ pub fn run(
 
     Ok(FuseOutcome::Completed(Box::new(FuseReport {
         product,
+        run_plan,
         frame_count: frame_reader.len(),
         frames: frame_names,
         width,
@@ -1730,6 +1743,7 @@ pub fn run(
         accounted_bytes_in_flight: in_flight_limit as u64 * scheduler.bytes_per_tile(),
         budget_provenance: scheduler.budget().provenance(),
         backed_off: scheduler.final_in_flight_limit() < in_flight_limit,
+        paused: control.was_paused(),
         gpu_fallback,
         output_width: applied_crop.map(|r| r.width).unwrap_or(width),
         output_height: applied_crop.map(|r| r.height).unwrap_or(height),
@@ -1752,6 +1766,43 @@ pub fn run(
         metrics,
         preview_cost: feed.as_ref().map(PreviewFeed::cost).unwrap_or_default(),
     })))
+}
+
+/// The pre-start prediction of a run, scaled by what the request's machine
+/// history says about the machine `key`; the shipped seconds when the request
+/// carries no history.
+fn seeded_prediction(
+    request: &FuseRequest,
+    features: &RunPlanFeatures,
+    raw: Option<RawSource<'_>>,
+    key: Option<&MachineKey>,
+) -> Option<RunPrediction> {
+    predicted_run(
+        request.machine.as_ref(),
+        key,
+        features,
+        request.align.is_some(),
+        raw,
+        request.backend.is_some_and(|backend| backend.discrete()),
+    )
+}
+
+/// The pre-start prediction of a run of `features` on the machine `key`, as
+/// the live ledger is seeded with it: scaled by `history`, the shipped seconds
+/// without one. `discrete_adapter` is whether the fuse backend is a discrete
+/// GPU.
+pub fn predicted_run(
+    history: Option<&MachineHistory>,
+    key: Option<&MachineKey>,
+    features: &RunPlanFeatures,
+    align: bool,
+    raw: Option<RawSource<'_>>,
+    discrete_adapter: bool,
+) -> Option<RunPrediction> {
+    let term = history.map_or(MachineTerm::IDENTITY, |history| {
+        history.term_for(key, features, raw, discrete_adapter)
+    });
+    predict_run(features, align, raw, &term)
 }
 
 /// Moves the staged planes into `dir`, where `held` already names them.
@@ -2580,6 +2631,7 @@ mod tests {
             cache: true,
             poll: Duration::from_millis(5),
             free_space: None,
+            machine: None,
         }
     }
 
@@ -2589,7 +2641,8 @@ mod tests {
         let plan = |aligned, offered| {
             let request = depth_map_request(aligned, offered);
             let features = run_plan_for(&request, &ctx, ReaderKind::Mmap, 16, false, usize::MAX);
-            let prediction = predict_run(&features, aligned, None).expect("frames and pixels");
+            let prediction = predict_run(&features, aligned, None, &MachineTerm::IDENTITY)
+                .expect("frames and pixels");
             (features, prediction)
         };
         let (offered, on_accelerator) = plan(true, true);
@@ -2605,5 +2658,49 @@ mod tests {
             "accelerated align {fast:?} must undercut the CPU align {slow:?}"
         );
         assert_eq!(without_align.stages.align, None);
+    }
+
+    #[test]
+    fn a_request_with_history_seeds_the_scaled_stages() {
+        use crate::job::machine::{RunOutcome, TermSource};
+
+        let ctx = crate::params::StackContext::new(30, 5000, 3000, 3);
+        let key = MachineKey::new("Test CPU", 16).expect("a brand and cores");
+        let mut request = depth_map_request(true, false);
+        let features = run_plan_for(&request, &ctx, ReaderKind::Mmap, 16, false, usize::MAX);
+        let shipped = predict_run(&features, true, None, &MachineTerm::IDENTITY).unwrap();
+
+        let seed = |request: &FuseRequest| {
+            seeded_prediction(request, &features, None, Some(&key)).expect("frames and pixels")
+        };
+        assert_eq!(
+            seed(&request).stages,
+            shipped.stages,
+            "no history: as shipped"
+        );
+        assert_eq!(seed(&request).source, TermSource::Shipped);
+
+        let mut history = MachineHistory::default();
+        let halved = |v: Option<f64>| v.map(|v| v * 0.5);
+        let actual = StageTimings {
+            setup: halved(shipped.stages.setup),
+            develop: None,
+            align: halved(shipped.stages.align),
+            fuse: halved(shipped.stages.fuse),
+            warp_write: None,
+            finalize: halved(shipped.stages.finalize),
+        };
+        history.observe(
+            &key,
+            &features,
+            None,
+            &shipped.stages,
+            &actual,
+            &RunOutcome::default(),
+        );
+        request.machine = Some(history);
+        let seeded = seed(&request);
+        assert_eq!(seeded.source, TermSource::History);
+        assert_eq!(seeded.stages, actual);
     }
 }

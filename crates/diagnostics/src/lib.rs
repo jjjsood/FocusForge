@@ -8,6 +8,7 @@
 pub mod bundle;
 mod crash;
 pub mod crash_notice;
+pub mod machine_history;
 mod native;
 mod ring;
 mod rotating;

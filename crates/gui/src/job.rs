@@ -44,6 +44,7 @@ use focusforge_core::retouch::replay_mode_conditions;
 use focusforge_core::tile::SampleFormat;
 pub use focusforge_core::tile::{HostBudget, Rect};
 use focusforge_core::zmap::{ZMapError, ZMapInfo, ZMapReader};
+use focusforge_diagnostics::machine_history::{learn, load_for_run};
 use focusforge_gpu::blend::Blender;
 
 /// Re-exported so `crate::controller` -- which names no algorithm crate --
@@ -299,17 +300,21 @@ pub fn spawn(
     algorithms: Algorithms,
     control: Arc<JobControl>,
     observer: Arc<GuiObserver>,
+    data_dir: Option<PathBuf>,
 ) -> std::thread::JoinHandle<Result<FuseOutcome, PipelineError>> {
-    spawn_after(request, algorithms, control, observer, || {})
+    spawn_after(request, algorithms, control, observer, data_dir, || {})
 }
 
 /// [`spawn`] after a caller-owned background barrier. The barrier runs on
 /// this worker before backend probing and never blocks the UI thread.
+/// `data_dir` holds the duration history the run's estimate reads and a
+/// completed run teaches.
 pub fn spawn_after(
     request: JobRequest,
     algorithms: Algorithms,
     control: Arc<JobControl>,
     observer: Arc<GuiObserver>,
+    data_dir: Option<PathBuf>,
     before: impl FnOnce() + Send + 'static,
 ) -> std::thread::JoinHandle<Result<FuseOutcome, PipelineError>> {
     std::thread::spawn(move || {
@@ -326,13 +331,28 @@ pub fn spawn_after(
                 None
             }
         };
-        let fuse_request = fuse_request(request, &algorithms, backend, align_backend);
-        pipeline::run(
+        let first_frame = request.frames.first().cloned();
+        let aligned = algorithms.align.is_some();
+        let mut fuse_request = fuse_request(request, &algorithms, backend, align_backend);
+        fuse_request.machine = load_for_run(data_dir.as_deref());
+        let outcome = pipeline::run(
             &fuse_request,
             observer.as_ref(),
             control,
             stage_cache.as_ref(),
-        )
+        );
+        if let Ok(FuseOutcome::Completed(report)) = &outcome {
+            let align_adapter = observer.align_adapter.get().and_then(|cell| cell.get());
+            learn(
+                data_dir.as_deref(),
+                report,
+                aligned,
+                first_frame.as_deref(),
+                backend,
+                align_adapter.map(String::as_str),
+            );
+        }
+        outcome
     })
 }
 
@@ -613,6 +633,7 @@ mod spawn_tests {
             algorithms,
             JobControl::new(),
             Arc::clone(&observer),
+            None,
             move || {
                 entered_tx.send(std::thread::current().id()).unwrap();
                 release_rx.recv().unwrap();
@@ -630,6 +651,89 @@ mod spawn_tests {
         assert!(observer.backend_line().is_some());
         assert!(scratch_root.exists());
         assert!(matches!(result, Err(PipelineError::Input(_))));
+    }
+}
+
+#[cfg(test)]
+mod machine_history {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use focusforge_core::job::machine::{MachineKey, TermSource};
+    use focusforge_core::pipeline::{FuseOutcome, FuseReport};
+    use focusforge_diagnostics::machine_history::{self, FILE_NAME};
+
+    use super::{GuiObserver, JobControl, JobRequest, resolve_request, spawn};
+
+    fn frames() -> Vec<PathBuf> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/mantis-64/frames");
+        let mut frames: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        frames.sort();
+        frames.truncate(3);
+        frames
+    }
+
+    /// One real run over three fixture frames, learning into `data_dir`.
+    fn run(scratch: &Path, data_dir: Option<PathBuf>) -> FuseReport {
+        let request = JobRequest {
+            frames: frames(),
+            hold_dir: scratch.join("held"),
+            scratch_root: scratch.join("cache"),
+            staging_key: "machine-history".into(),
+            fuse_id: focusforge_core::registry::default_stack()
+                .unwrap()
+                .id()
+                .to_string(),
+            fuse_values: Default::default(),
+            align_id: None,
+            align_values: Default::default(),
+            align_lax: false,
+            crop: false,
+            equalize: None,
+            gpu: false,
+            max_host_memory: None,
+            max_vram: None,
+        };
+        let algorithms = resolve_request(&request).unwrap();
+        let outcome = spawn(
+            request,
+            algorithms,
+            JobControl::new(),
+            Arc::new(GuiObserver::new()),
+            data_dir,
+        )
+        .join()
+        .unwrap()
+        .unwrap();
+        let FuseOutcome::Completed(report) = outcome else {
+            panic!("the run was not cancelled");
+        };
+        *report
+    }
+
+    #[test]
+    fn a_completed_run_writes_the_file_the_cli_reads_and_the_next_load_learns_from_it() {
+        let scratch = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let report = run(scratch.path(), Some(data.path().to_path_buf()));
+        assert!(data.path().join(FILE_NAME).is_file());
+        let history = machine_history::load(data.path()).unwrap();
+        let plan = report.run_plan.as_ref().expect("the run's plan");
+        let term = history.term_for(MachineKey::current().as_ref(), plan, None, false);
+        assert_eq!(term.source, TermSource::History);
+    }
+
+    #[test]
+    fn an_unreadable_path_is_left_alone_and_the_run_still_completes() {
+        let scratch = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir(data.path().join(FILE_NAME)).unwrap();
+        run(scratch.path(), Some(data.path().to_path_buf()));
+        assert!(data.path().join(FILE_NAME).is_dir());
+        assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 1);
     }
 }
 
@@ -670,6 +774,7 @@ pub fn fuse_request(
         cache: true,
         poll: POLL,
         free_space: None,
+        machine: None,
     }
 }
 

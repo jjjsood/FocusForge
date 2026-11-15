@@ -3,11 +3,13 @@
 //! A pure estimate of how long a stacking run takes, from its plan.
 //!
 //! [`predict_run`] maps a [`RunPlanFeatures`] record to seconds per stage
-//! and a total, before any stage has started. The seconds are for the
-//! reference machine, a 4-core Intel Core i5-8265U laptop (turbo on,
+//! and a total, before any stage has started. The table's seconds are the
+//! shipped ones, measured on a 4-core Intel Core i5-8265U laptop (turbo on,
 //! default host budget; Intel UHD Graphics 620 for the GPU), on a cold run
-//! of a `focusforge-cli 0.2.0` release build. They are a scale, not a
-//! promise for another machine.
+//! of a `focusforge-cli 0.2.0` release build. A [`MachineTerm`] rescales
+//! them per stage for the machine that runs, so the estimate learns from
+//! that machine's own finished runs; see [`super::machine`] for the tiers.
+//! With [`MachineTerm::IDENTITY`] the shipped seconds come back unchanged.
 //!
 //! # Form
 //!
@@ -80,6 +82,7 @@
 
 use serde::Serialize;
 
+use super::machine::{MachineTerm, StageMultipliers, TermSource};
 use crate::io::{DevelopStore, ReaderKind};
 use crate::pipeline::RunPlanFeatures;
 use crate::timing::StageTimings;
@@ -356,7 +359,8 @@ pub struct RawSource<'a> {
     pub store: DevelopStore,
 }
 
-/// Predicted seconds for a cold run on the reference machine.
+/// Predicted seconds for a cold run: the shipped seconds of the matching
+/// class, each stage times the term's multiplier for it.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct RunPrediction {
     /// Per stage; `None` for a stage the plan does not enter.
@@ -365,6 +369,10 @@ pub struct RunPrediction {
     pub total_seconds: f64,
     /// Whether the input matches a measured class (see the module docs).
     pub calibrated: bool,
+    /// The multipliers already applied to `stages`.
+    pub multipliers: StageMultipliers,
+    /// Where the multipliers came from.
+    pub source: TermSource,
 }
 
 /// The row for `features`, and whether it is an exact match. A RAW record
@@ -401,10 +409,16 @@ fn calibration<'t>(
 /// Predicts the stages of a cold run. `align` is whether the run computes
 /// an alignment; it is spent only when the record shows no cache hit and
 /// nothing resumed. `None` when the stack has no frames or no pixels.
+///
+/// The shipped seconds are scaled by `term`, which comes from the machine's
+/// earlier finished runs; with none it is a core-count estimate that can read
+/// high on the first run. The estimate cannot see a CPU's per-core speed
+/// before the first run, nor the disk speed of the final write.
 pub fn predict_run(
     features: &RunPlanFeatures,
     align: bool,
     raw: Option<RawSource<'_>>,
+    term: &MachineTerm,
 ) -> Option<RunPrediction> {
     if features.frame_count == 0 || features.frame_pixels == 0 {
         return None;
@@ -413,14 +427,17 @@ pub fn predict_run(
     let cost = if features.gpu { row.gpu } else { row.cpu };
     let frames = features.frame_count as f64;
     let megapixels = features.frame_pixels as f64 / 1e6;
+    let k = term.multipliers;
     let stages = StageTimings {
-        setup: Some(cost.setup_fixed + cost.setup_per_frame * frames),
-        develop: (features.reader == ReaderKind::Raw).then_some(cost.develop * frames * megapixels),
-        align: (align && !features.align_cache_hit && features.resumed_units == 0)
-            .then(|| cost.align * features.frame_count.saturating_sub(1) as f64 * megapixels),
-        fuse: Some(cost.fuse * frames * megapixels),
+        setup: Some((cost.setup_fixed + cost.setup_per_frame * frames) * k.setup),
+        develop: (features.reader == ReaderKind::Raw)
+            .then_some(cost.develop * frames * megapixels * k.develop),
+        align: (align && !features.align_cache_hit && features.resumed_units == 0).then(|| {
+            cost.align * features.frame_count.saturating_sub(1) as f64 * megapixels * k.align
+        }),
+        fuse: Some(cost.fuse * frames * megapixels * k.fuse),
         warp_write: None,
-        finalize: Some(cost.finalize * megapixels),
+        finalize: Some(cost.finalize * megapixels * k.finalize),
     };
     let total_seconds = [
         stages.setup,
@@ -436,6 +453,8 @@ pub fn predict_run(
         stages,
         total_seconds,
         calibrated,
+        multipliers: term.multipliers,
+        source: term.source,
     })
 }
 
@@ -540,7 +559,8 @@ mod tests {
                             let at = format!(
                                 "{reader:?} gpu={gpu} F={frames} px={pixels} {align}/{hit}/{resumed}"
                             );
-                            let p = predict_run(&rec, align, CR3).expect(&at);
+                            let p =
+                                predict_run(&rec, align, CR3, &MachineTerm::IDENTITY).expect(&at);
                             let s = p.stages;
                             assert!(
                                 s.setup.is_some() && s.fuse.is_some() && s.finalize.is_some(),
@@ -561,7 +581,8 @@ mod tests {
 
                             let mut other = rec.clone();
                             other.workers = 64;
-                            let q = predict_run(&other, align, CR3).expect(&at);
+                            let q =
+                                predict_run(&other, align, CR3, &MachineTerm::IDENTITY).expect(&at);
                             assert_eq!(q.stages, p.stages, "{at}: workers move seconds");
 
                             let family = if reader == ReaderKind::Raw {
@@ -574,8 +595,10 @@ mod tests {
                             fallback.resumed_units = resumed;
                             let mut unknown = rec.clone();
                             unknown.algorithm = "no-such-algorithm".to_string();
-                            let u = predict_run(&unknown, align, CR3).expect(&at);
-                            let f = predict_run(&fallback, align, CR3).expect(&at);
+                            let u = predict_run(&unknown, align, CR3, &MachineTerm::IDENTITY)
+                                .expect(&at);
+                            let f = predict_run(&fallback, align, CR3, &MachineTerm::IDENTITY)
+                                .expect(&at);
                             assert!(!u.calibrated, "{at}");
                             assert_eq!(u.stages, f.stages, "{at}: unknown id misses the fallback");
                         }
@@ -618,11 +641,12 @@ mod tests {
             };
             for gpu in [false, true] {
                 let at = format!("{:?} {} gpu={gpu}", row.reader, row.algorithm);
-                let base = predict_run(&key(gpu, 10, 1_000_000), true, raw).unwrap();
+                let base = predict_run(&key(gpu, 10, 1_000_000), true, raw, &MachineTerm::IDENTITY)
+                    .unwrap();
                 assert!(base.calibrated, "{at}");
                 assert!(base.total_seconds > 0.0);
                 for bigger in [key(gpu, 20, 1_000_000), key(gpu, 10, 2_000_000)] {
-                    let p = predict_run(&bigger, true, raw).unwrap();
+                    let p = predict_run(&bigger, true, raw, &MachineTerm::IDENTITY).unwrap();
                     assert!(p.total_seconds >= base.total_seconds);
                     for (a, b) in stage_list(&p.stages)
                         .into_iter()
@@ -636,7 +660,7 @@ mod tests {
                 let mut resumed = key(gpu, 10, 1_000_000);
                 resumed.resumed_units = 5;
                 for rec in [hit, resumed] {
-                    let p = predict_run(&rec, true, raw).unwrap();
+                    let p = predict_run(&rec, true, raw, &MachineTerm::IDENTITY).unwrap();
                     assert!(p.total_seconds <= base.total_seconds);
                     assert!(p.stages.align.unwrap_or(0.0) <= base.stages.align.unwrap());
                 }
@@ -736,7 +760,13 @@ mod tests {
         ];
         for (frames, pixels, reader, gpu, want, total) in rows {
             let at = format!("{reader:?} gpu={gpu} F={frames}");
-            let p = predict_run(&record(reader, gpu, frames, pixels), true, CR3).expect(&at);
+            let p = predict_run(
+                &record(reader, gpu, frames, pixels),
+                true,
+                CR3,
+                &MachineTerm::IDENTITY,
+            )
+            .expect(&at);
             assert!(p.calibrated, "{at}");
             let s = p.stages;
             let got = [s.setup, s.develop, s.align, s.fuse, s.finalize];
@@ -967,7 +997,7 @@ mod tests {
             let mut rec = record(reader, gpu, frames, pixels);
             rec.algorithm = algorithm.to_string();
             rec.align_gpu = align_gpu;
-            let p = predict_run(&rec, true, source).expect(class);
+            let p = predict_run(&rec, true, source, &MachineTerm::IDENTITY).expect(class);
             assert!(p.calibrated, "{class}");
             let s = p.stages;
             let got = [s.setup, s.develop, s.align, s.fuse, s.finalize];
@@ -996,7 +1026,12 @@ mod tests {
         for (frames, pixels) in [(0usize, 1_000_000u64), (5, 0), (0, 0)] {
             for reader in READERS {
                 assert_eq!(
-                    predict_run(&record(reader, false, frames, pixels), true, CR3),
+                    predict_run(
+                        &record(reader, false, frames, pixels),
+                        true,
+                        CR3,
+                        &MachineTerm::IDENTITY
+                    ),
                     None
                 );
             }
@@ -1005,7 +1040,7 @@ mod tests {
             for align_gpu in [false, true] {
                 let mut rec = record(reader, true, 200, u64::MAX);
                 rec.align_gpu = align_gpu;
-                let p = predict_run(&rec, true, CR3).unwrap();
+                let p = predict_run(&rec, true, CR3, &MachineTerm::IDENTITY).unwrap();
                 assert!(p.total_seconds.is_finite() && p.total_seconds >= 0.0);
             }
         }
@@ -1058,7 +1093,11 @@ mod tests {
             r.algorithm = algorithm.to_string();
             r
         };
-        let flag = |rec: &RunPlanFeatures, raw| predict_run(rec, true, raw).unwrap().calibrated;
+        let flag = |rec: &RunPlanFeatures, raw| {
+            predict_run(rec, true, raw, &MachineTerm::IDENTITY)
+                .unwrap()
+                .calibrated
+        };
         let on_align = |mut rec: RunPlanFeatures, align_gpu| {
             rec.align_gpu = align_gpu;
             rec
@@ -1110,14 +1149,26 @@ mod tests {
                 rec.algorithm,
                 raw.map(|r| r.extension)
             );
-            let p = predict_run(&on_align(rec.clone(), align_gpu), true, *raw).unwrap();
+            let p = predict_run(
+                &on_align(rec.clone(), align_gpu),
+                true,
+                *raw,
+                &MachineTerm::IDENTITY,
+            )
+            .unwrap();
             assert!(!p.calibrated, "{at}");
             let family = if rec.reader == ReaderKind::Raw {
                 ReaderKind::Raw
             } else {
                 ReaderKind::Mmap
             };
-            let base = predict_run(&with(family, "laplacian"), true, cr3("cr3", mem)).unwrap();
+            let base = predict_run(
+                &with(family, "laplacian"),
+                true,
+                cr3("cr3", mem),
+                &MachineTerm::IDENTITY,
+            )
+            .unwrap();
             assert_eq!(p.stages, base.stages, "{at}");
         }
 
@@ -1162,8 +1213,12 @@ mod tests {
                 .zip(row.raw_store)
                 .map(|(extension, store)| RawSource { extension, store });
             assert_eq!(
-                predict_run(&on, true, raw).unwrap().stages,
-                predict_run(&off, true, raw).unwrap().stages,
+                predict_run(&on, true, raw, &MachineTerm::IDENTITY)
+                    .unwrap()
+                    .stages,
+                predict_run(&off, true, raw, &MachineTerm::IDENTITY)
+                    .unwrap()
+                    .stages,
                 "{}",
                 row.algorithm
             );
@@ -1180,8 +1235,12 @@ mod tests {
             let mut off = on.clone();
             off.gpu = false;
             assert_eq!(
-                predict_run(&on, true, None).unwrap().stages,
-                predict_run(&off, true, None).unwrap().stages
+                predict_run(&on, true, None, &MachineTerm::IDENTITY)
+                    .unwrap()
+                    .stages,
+                predict_run(&off, true, None, &MachineTerm::IDENTITY)
+                    .unwrap()
+                    .stages
             );
         }
 
@@ -1210,5 +1269,95 @@ mod tests {
             let (b, fb) = calibration(CALIBRATIONS, &rec, raw);
             assert!(fa && fb && a == b);
         }
+    }
+
+    #[test]
+    fn the_identity_term_returns_the_shipped_seconds_bit_for_bit() {
+        for (at, row, gpu) in CALIBRATIONS
+            .iter()
+            .flat_map(|row| [(row, false), (row, true)])
+            .enumerate()
+            .map(|(i, (row, gpu))| (i, row, gpu))
+        {
+            let mut rec = record(row.reader, gpu, 30, 15_000_000);
+            rec.algorithm = row.algorithm.to_string();
+            rec.align_gpu = row.align_gpu.unwrap_or(false);
+            let raw = row
+                .raw_extension
+                .zip(row.raw_store)
+                .map(|(extension, store)| RawSource { extension, store });
+            let cost = if gpu { row.gpu } else { row.cpu };
+            let (frames, mpx) = (30.0, 15.0);
+            let p =
+                predict_run(&rec, true, raw, &MachineTerm::IDENTITY).expect("frames and pixels");
+            let bits = |v: Option<f64>| v.map(f64::to_bits);
+            let at = format!("row {at} gpu={gpu}");
+            assert!(p.calibrated, "{at}");
+            assert_eq!(
+                bits(p.stages.setup),
+                bits(Some(cost.setup_fixed + cost.setup_per_frame * frames)),
+                "{at}"
+            );
+            assert_eq!(
+                bits(p.stages.develop),
+                bits((row.reader == ReaderKind::Raw).then_some(cost.develop * frames * mpx)),
+                "{at}"
+            );
+            assert_eq!(
+                bits(p.stages.align),
+                bits(Some(cost.align * 29.0 * mpx)),
+                "{at}"
+            );
+            assert_eq!(
+                bits(p.stages.fuse),
+                bits(Some(cost.fuse * frames * mpx)),
+                "{at}"
+            );
+            assert_eq!(
+                bits(p.stages.finalize),
+                bits(Some(cost.finalize * mpx)),
+                "{at}"
+            );
+            assert_eq!(p.multipliers, StageMultipliers::IDENTITY);
+            assert_eq!(p.source, TermSource::Shipped);
+        }
+    }
+
+    #[test]
+    fn a_term_scales_each_present_stage_by_its_own_multiplier() {
+        let term = MachineTerm {
+            multipliers: StageMultipliers {
+                setup: 2.0,
+                develop: 3.0,
+                align: 5.0,
+                fuse: 7.0,
+                finalize: 11.0,
+            },
+            source: TermSource::History,
+        };
+        let rec = record(ReaderKind::Raw, false, 25, 17_258_496);
+        let shipped = predict_run(&rec, true, CR3, &MachineTerm::IDENTITY).unwrap();
+        let scaled = predict_run(&rec, true, CR3, &term).unwrap();
+        let (a, b) = (shipped.stages, scaled.stages);
+        assert_eq!(b.setup, a.setup.map(|v| v * 2.0));
+        assert_eq!(b.develop, a.develop.map(|v| v * 3.0));
+        assert_eq!(b.align, a.align.map(|v| v * 5.0));
+        assert_eq!(b.fuse, a.fuse.map(|v| v * 7.0));
+        assert_eq!(b.finalize, a.finalize.map(|v| v * 11.0));
+        assert_eq!(b.warp_write, None);
+        let sum: f64 = stage_list(&b).into_iter().flatten().sum();
+        assert!(rel_close(scaled.total_seconds, sum, 1e-12));
+        assert_eq!(
+            (scaled.multipliers, scaled.source),
+            (term.multipliers, TermSource::History)
+        );
+
+        let mut cached = rec.clone();
+        cached.align_cache_hit = true;
+        let without_align = predict_run(&cached, true, CR3, &term).unwrap();
+        assert_eq!(
+            without_align.stages.align, None,
+            "a skipped stage stays absent"
+        );
     }
 }

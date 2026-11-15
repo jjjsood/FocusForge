@@ -72,6 +72,7 @@ fn run_once(
         algorithms,
         JobControl::new(),
         Arc::clone(&observer),
+        None,
     )
     .join()
     .expect("the worker does not panic")

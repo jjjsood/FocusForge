@@ -106,6 +106,7 @@ fn base_request(label: &str, frames: Vec<PathBuf>, explicit: ParamValues) -> Fus
         cache: true,
         poll: Duration::from_millis(5),
         free_space: None,
+        machine: None,
     }
 }
 

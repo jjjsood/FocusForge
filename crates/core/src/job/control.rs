@@ -307,6 +307,11 @@ impl JobControl {
         self.hold_nanos.fetch_add(nanos, Ordering::SeqCst);
     }
 
+    /// Whether a pause has held the job at any point so far.
+    pub(crate) fn was_paused(&self) -> bool {
+        self.hold_nanos.load(Ordering::SeqCst) > 0
+    }
+
     fn ledger(&self) -> MutexGuard<'_, Ledger> {
         self.ledger
             .lock()
@@ -979,6 +984,32 @@ mod tests {
         let pace = pace(&control).expect("every frame was credited");
         assert!(pace < 0.5, "{pace}");
         approx(total(&control), pace * 0.2398);
+    }
+
+    #[test]
+    fn a_seed_scaled_down_or_up_by_the_machine_keeps_the_live_guarantees() {
+        let plan = plan_512();
+        for scale in [0.25, 4.0] {
+            let control = control_over(&plan, None);
+            control.seed_prediction(&timings(0.0, None, Some(0.02 * scale), scale, 0.1));
+            control.enter_stage(Stage::Setup);
+            align_over(&control, 30, 30, 40);
+            control.enter_stage(Stage::Fuse);
+            let pace = pace(&control).expect("every frame was credited");
+            assert!((0.02..=1.0).contains(&pace), "scale {scale}: {pace}");
+            let mut previous = total(&control);
+            approx(previous, pace * (scale + 0.1));
+            for tile in plan.tiles() {
+                control.unit_completed(tile);
+                let now = total(&control);
+                assert!(now <= previous, "scale {scale}: {now} after {previous}");
+                previous = now;
+            }
+            control.enter_stage(Stage::Finalize);
+            assert!(control.progress().total_eta.unwrap() > Duration::ZERO);
+            control.finish_stages();
+            assert_eq!(control.progress().total_eta, Some(Duration::ZERO));
+        }
     }
 
     #[test]

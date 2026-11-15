@@ -55,6 +55,7 @@
 pub mod control;
 pub mod fingerprint;
 pub mod ledger;
+pub mod machine;
 pub mod prediction;
 pub mod progress;
 pub mod record;
@@ -64,6 +65,7 @@ pub use control::{ControlState, JobControl};
 pub use fingerprint::{FingerprintMismatch, FrameCount, FrameFingerprint, StackFingerprint};
 pub use ledger::{
     Ledger, RecordingConsumer, Resumable, ResumeError, ResumeStore, TimingConsumer, read_alignment,
+    write_atomic,
 };
 pub use progress::JobProgress;
 pub use record::{ALIGN_SOLVER_VERSION, AlignIdentity, DRIVER_POLICY_FIELDS, JobRecord};

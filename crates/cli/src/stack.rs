@@ -20,17 +20,18 @@ use focusforge_core::io::{
     DevelopStore, FrameReader, Group, Proposal, Rect, open_frame_set, propose,
     source_bits_per_sample,
 };
-use focusforge_core::job::prediction::{RawSource, RunPrediction, predict_run};
+use focusforge_core::job::machine::{MachineHistory, MachineKey, TermSource};
+use focusforge_core::job::prediction::{RawSource, RunPrediction};
 use focusforge_core::job::{JobControl, StageCache};
 use focusforge_core::params::{self, ParamValue, ParamValues, Provenance};
 use focusforge_core::pipeline::{
-    FuseTileTiming, RunPlanFeatures, develop_tile_share, host_workers,
+    FuseTileTiming, RunPlanFeatures, develop_tile_share, host_workers, predicted_run,
 };
 use focusforge_core::project::{self, PROJECT_EXTENSION};
 use focusforge_core::registry;
 use focusforge_core::tile::{InFlightBound, TileScheduler, TileSchedulerOptions};
 use focusforge_core::timing::{TimingSnapshot, timing_snapshot};
-use focusforge_diagnostics::MIRRORED_OUTPUT_TARGET;
+use focusforge_diagnostics::{MIRRORED_OUTPUT_TARGET, machine_history};
 use serde::Serialize;
 
 use crate::align::{AlignOptions, AlignmentEntry, resolve_align_algo};
@@ -557,6 +558,8 @@ pub fn run(
         }
     }
 
+    let data_dir = focusforge_diagnostics::data_dir_from_env();
+    let machine = machine_history::load_for_run(data_dir.as_deref());
     let setup = RunSetup {
         algo,
         backend,
@@ -574,6 +577,8 @@ pub fn run(
         argv,
         signals: &signals,
         input: dir,
+        data_dir: data_dir.as_deref(),
+        machine,
     };
 
     let mut results: Vec<GroupResult> = Vec::new();
@@ -699,6 +704,11 @@ struct RunSetup<'a> {
     /// The directory the run was pointed at, as the user wrote it: what
     /// `StackReport::input` reports, for every group.
     input: &'a Path,
+    /// The per-user data directory the duration history lives in.
+    data_dir: Option<&'a Path>,
+    /// What earlier runs on this machine taught the estimate; `None` when
+    /// there is no data directory or the file cannot be read.
+    machine: Option<MachineHistory>,
 }
 
 /// What one group's run ended as. The outer driver owns every print of a
@@ -1006,6 +1016,8 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         argv,
         signals,
         input: dir,
+        data_dir,
+        machine,
     } = setup;
     let (algo, backend, device_budget_report, device_peak, explicit, file) = (
         *algo,
@@ -1218,10 +1230,13 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         // One project, and nothing else: a run writes no image at all.
         let would_write = vec![output.display().to_string()];
         let raw = developed_store.zip(paths[0].extension().and_then(|ext| ext.to_str()));
-        let prediction = predict_run(
+        let prediction = predicted_run(
+            machine.as_ref(),
+            MachineKey::current().as_ref(),
             &run_plan,
             align_prepared.is_some(),
             raw.map(|(store, extension)| RawSource { extension, store }),
+            backend.is_some_and(|b| b.discrete()),
         );
         let plan = DryRunPlan {
             dry_run: true,
@@ -1323,6 +1338,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         cache: job_opts.cache,
         poll: job::POLL,
         free_space: None,
+        machine: machine.clone(),
     };
 
     // Resolved once: the report's `backend` field, and the ledger's own
@@ -1375,6 +1391,14 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
             cancelled(&status, start)
         }
         Ok(focusforge_core::pipeline::FuseOutcome::Completed(report)) => {
+            machine_history::learn(
+                *data_dir,
+                &report,
+                request.align.is_some(),
+                paths.first().map(PathBuf::as_path),
+                backend,
+                Some(align_choice.report_name(true).as_str()),
+            );
             let outputs = vec![sealed_path(&report)];
             status.completed(&outputs);
             let stack_report = build_stack_report(
@@ -1518,6 +1542,18 @@ fn sealed_path(report: &focusforge_core::pipeline::FuseReport) -> String {
         focusforge_core::pipeline::FuseProduct::Held(_) => {
             unreachable!("a seal request always reports a sealed project")
         }
+    }
+}
+
+/// How the human summary says where a prediction's seconds come from.
+fn source_note(source: TermSource) -> &'static str {
+    match source {
+        TermSource::History => "learned from this machine's earlier runs",
+        TermSource::ComputeScalar => "scaled from this machine's earlier runs of other kinds",
+        TermSource::CorePrior => {
+            "estimated from this machine's core count; the first run here can read high"
+        }
+        TermSource::Shipped => "reference estimate, not adjusted to this machine",
     }
 }
 
@@ -1850,8 +1886,9 @@ fn render_plan(plan: &DryRunPlan) -> String {
     }
     lines.push(match &plan.prediction {
         Some(p) if p.calibrated => format!(
-            "predicted duration: {:.1} s (estimate for the reference machine, cold run)",
-            p.total_seconds
+            "predicted duration: {:.1} s ({})",
+            p.total_seconds,
+            source_note(p.source)
         ),
         Some(p) => format!(
             "predicted duration: ~{:.1} s (not calibrated for this input)",

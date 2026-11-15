@@ -2013,6 +2013,7 @@ fn raw_request(
         cache: false,
         poll: std::time::Duration::from_millis(5),
         free_space: None,
+        machine: None,
     }
 }
 

@@ -198,6 +198,7 @@ fn no_align_request(label: &str, frame_count: usize) -> FuseRequest {
         cache: true,
         poll: Duration::from_millis(5),
         free_space: None,
+        machine: None,
     }
 }
 
@@ -8061,6 +8062,7 @@ fn stage_view_writes_nothing_and_keeps_the_composite_identical() {
         algorithms,
         focusforge_core::job::JobControl::new(),
         Arc::new(job::GuiObserver::new()),
+        None,
     )
     .join()
     .expect("the worker does not panic")

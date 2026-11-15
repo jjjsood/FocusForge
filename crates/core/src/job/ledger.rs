@@ -313,11 +313,11 @@ pub fn read_alignment(path: &Path) -> Result<Option<StackAlignment>, ResumeError
 /// [`Ledger::record_unit`]'s per-unit path having **no** sync at all, is the
 /// whole of this module's crash-safety budget: write-once files are made
 /// durable before they are visible; the append-only log relies on ordering
-/// plus [`crate::io::TiffWriter::holds_rows`] instead.
+/// plus `TiffWriter::holds_rows` instead.
 ///
-/// `pub(super)`: shared with [`super::stage_cache`], the stage cache
-/// module, rather than copied there.
-pub(super) fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), ResumeError> {
+/// Shared with [`super::stage_cache`] and the per-user history file rather
+/// than copied there.
+pub fn write_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), ResumeError> {
     let json = serde_json::to_vec(value).map_err(|source| ResumeError::Json {
         path: path.to_path_buf(),
         source,

@@ -2119,7 +2119,16 @@ fn dry_run_reports_prediction() {
         .map(String::as_str)
         .collect();
     prediction_keys.sort_unstable();
-    assert_eq!(prediction_keys, ["calibrated", "stages", "total_seconds"]);
+    assert_eq!(
+        prediction_keys,
+        [
+            "calibrated",
+            "multipliers",
+            "source",
+            "stages",
+            "total_seconds"
+        ]
+    );
     assert_eq!(prediction["calibrated"], true, "{prediction}");
     let stages = &prediction["stages"];
     assert_eq!(stages.as_object().unwrap().len(), 6, "{stages}");
@@ -2145,6 +2154,25 @@ fn dry_run_reports_prediction() {
     );
     let crop = human.find("crop: not computed").expect("crop line");
     assert!(human.find("predicted duration:").unwrap() < crop, "{human}");
+
+    // An empty data directory: the core-count prior, or the shipped seconds
+    // on a machine with exactly the calibration machine's 8 threads.
+    let threads = std::thread::available_parallelism().unwrap().get();
+    let k = (8.0 / threads as f64).max(0.25);
+    let multipliers = &prediction["multipliers"];
+    let line = lines[0];
+    if k == 1.0 {
+        assert_eq!(prediction["source"], "shipped", "{prediction}");
+        assert!(line.contains("not adjusted"), "{line}");
+    } else {
+        assert_eq!(prediction["source"], "core prior", "{prediction}");
+        assert!(line.contains("core count"), "{line}");
+        for stage in ["setup", "develop", "align", "fuse"] {
+            let m = multipliers[stage].as_f64().unwrap();
+            assert!((m - k).abs() < 1e-12, "{stage}: {multipliers}");
+        }
+        assert_eq!(multipliers["finalize"].as_f64(), Some(1.0), "{multipliers}");
+    }
 
     let (no_align, _) = dry_run_prediction(
         "prediction_no_align",
@@ -2200,6 +2228,96 @@ fn dry_run_reports_prediction() {
             && line.ends_with("(not calibrated for this input)"),
         "{line}"
     );
+}
+
+/// Runs the CLI over `fixtures/mantis-64` with `data_dir` as its data
+/// directory, in `cwd`.
+fn run_mantis_64(data_dir: &Path, cwd: &Path, out_dir: &Path, extra: &[&str]) -> CliOutput {
+    let frames = common::fixtures_dir().join("mantis-64").join("frames");
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_focusforge-cli"));
+    cmd.env("FOCUSFORGE_DATA_DIR", data_dir);
+    let mut args = vec![
+        "stack",
+        frames.to_str().unwrap(),
+        "-o",
+        out_dir.to_str().unwrap(),
+        "--algorithm",
+        "laplacian",
+        "--align-algorithm",
+        "dummy-align",
+        "--no-crop",
+    ];
+    args.extend(extra);
+    common::run_in(&mut cmd, cwd, &common::push_no_gpu(args))
+}
+
+/// The prediction source the dry run reports for `data_dir`.
+fn dry_run_source(data_dir: &Path, cwd: &Path, out_dir: &Path) -> String {
+    let out = run_mantis_64(data_dir, cwd, out_dir, &["--dry-run", "--json"]);
+    assert!(out.success, "stderr: {}", out.stderr);
+    let plan: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+    plan["prediction"]["source"].as_str().unwrap().to_string()
+}
+
+/// The history file's place for the data directory `cli_bin` set.
+fn history_file(cmd: &std::process::Command) -> PathBuf {
+    common::data_dir_of(cmd)
+        .join("focusforge")
+        .join(focusforge_diagnostics::machine_history::FILE_NAME)
+}
+
+fn learned_history(file: &Path) -> bool {
+    let bytes = std::fs::read(file).expect("the history file");
+    focusforge_core::job::machine::MachineHistory::parse(&bytes)
+        != focusforge_core::job::machine::MachineHistory::default()
+}
+
+#[test]
+fn machine_history_a_run_writes_the_file_and_the_next_dry_run_reports_it() {
+    let cmd = common::cli_bin("machine_history_learn");
+    let data = common::data_dir_of(&cmd);
+    let file = history_file(&cmd);
+    let cwd = tmp_dir("machine_history_learn");
+    let out_dir = tmp_dir("machine_history_learn_out");
+    assert_ne!(dry_run_source(&data, &cwd, &out_dir), "history");
+    assert!(!file.exists(), "a dry run learns nothing");
+
+    let run = run_mantis_64(&data, &cwd, &out_dir, &[]);
+    assert!(run.success, "stderr: {}", run.stderr);
+    assert!(learned_history(&file));
+    assert_eq!(dry_run_source(&data, &cwd, &out_dir), "history");
+}
+
+#[test]
+fn machine_history_a_corrupt_file_is_replaced_by_a_valid_one() {
+    let cmd = common::cli_bin("machine_history_corrupt");
+    let data = common::data_dir_of(&cmd);
+    let file = history_file(&cmd);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, b"\x00 not a history").unwrap();
+    let cwd = tmp_dir("machine_history_corrupt");
+    let out_dir = tmp_dir("machine_history_corrupt_out");
+    assert_ne!(dry_run_source(&data, &cwd, &out_dir), "history");
+
+    let run = run_mantis_64(&data, &cwd, &out_dir, &[]);
+    assert!(run.success, "stderr: {}", run.stderr);
+    assert!(learned_history(&file));
+}
+
+#[test]
+fn machine_history_a_directory_in_the_files_place_is_left_untouched() {
+    let cmd = common::cli_bin("machine_history_directory");
+    let data = common::data_dir_of(&cmd);
+    let file = history_file(&cmd);
+    std::fs::create_dir_all(&file).unwrap();
+    let cwd = tmp_dir("machine_history_directory");
+    let out_dir = tmp_dir("machine_history_directory_out");
+    assert_ne!(dry_run_source(&data, &cwd, &out_dir), "history");
+
+    let run = run_mantis_64(&data, &cwd, &out_dir, &[]);
+    assert!(run.success, "stderr: {}", run.stderr);
+    assert!(file.is_dir());
+    assert_eq!(std::fs::read_dir(&file).unwrap().count(), 0);
 }
 
 #[test]
