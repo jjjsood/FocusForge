@@ -155,7 +155,8 @@ reference-cache binaries and kills any test after 180 s. The align
 determinism test is six tests that nextest starts first (`.config/nextest.toml`);
 the `quick` profile leaves exactly those to the full gate. The
 `hit_cap_behaviour` tests are `measurement:` ignores, run by hand with
-`--ignored`.
+`--ignored`. Under the `gpu` profile the two `device_lost` tests run with
+`FF_FORCE_DEVICE_LOST=3`, set by a wrapper script for those two alone.
 
 `tests/ui/` holds 25 journeys, each one whole path through the window as
 numbered clicks, keys and hovers with an `Expect:` line per step, plus
