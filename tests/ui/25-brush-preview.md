@@ -70,7 +70,7 @@ The preview is the picture drawn inside the brush ring of the Composite while th
 30. Hover the Composite at its centre, window point 713,396 (`FFCanvas::pane-right`).
     Expect: the preview is present after the stroke, the undo and the redo; **Preview** still lists checked=true.
 31. (human only) Press in the Composite, move the pointer slowly, hold still, then release.
-    Expect: the ring has no picture while the button is down; the picture is back after the release.
+    Expect: the ring never shows the old, unpainted picture: it shows the preview from the press until the stroke paints, the painted result while the button is down, and the preview again after the release.
 ## The switch off
 32. Press p.
     Expect: `buttons AppWindow::editor-toolbar` lists **Preview** with checked=false; the preview is absent although the pointer still rests on the Composite.

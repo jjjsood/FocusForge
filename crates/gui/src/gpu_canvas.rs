@@ -898,6 +898,55 @@ mod tests {
     }
 
     #[test]
+    fn only_an_accepted_exact_composite_job_reports_its_generation() {
+        let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+            return;
+        };
+        let mut renderer = renderer_with(shared, &fixture_512_frame());
+        let draw = draw_of((200, 200, 64, 64), 1);
+        let coarse = draw_of((0, 0, SIDE, SIDE), 8);
+        let publish = |renderer: &mut CanvasRenderer, job: &PaneJob| {
+            let (width, height) = job.draw.extent();
+            let samples = pattern(
+                width as usize * height as usize * job.reader.samples_per_pixel() as usize,
+                3,
+            );
+            renderer.publish_for_generation(job, &samples, &[], None)
+        };
+
+        // A composite from an earlier session carries a high generation.
+        let old = renderer
+            .request_planes(&draw, Some(9), None)
+            .expect("composite job");
+        assert_eq!(publish(&mut renderer, &old), Some(9), "the exact composite");
+
+        let frame = renderer.request_frame(&draw).expect("frame job");
+        assert_eq!(publish(&mut renderer, &frame), None, "the frame pane");
+        let backdrop = renderer
+            .request_plane_backdrop(&coarse, Some(12), None)
+            .expect("composite backdrop job");
+        assert_eq!(publish(&mut renderer, &backdrop), None, "the backdrop");
+        let frame_backdrop = renderer
+            .request_frame_backdrop(&coarse)
+            .expect("frame backdrop job");
+        assert_eq!(
+            publish(&mut renderer, &frame_backdrop),
+            None,
+            "frame backdrop"
+        );
+
+        // The newer job publishes; the one issued before it is refused.
+        let first = renderer
+            .request_planes(&draw, Some(2), None)
+            .expect("first job");
+        let second = renderer
+            .request_planes(&draw, Some(3), None)
+            .expect("second job");
+        assert_eq!(publish(&mut renderer, &second), Some(3), "the newer job");
+        assert_eq!(publish(&mut renderer, &first), None, "a stale job");
+    }
+
+    #[test]
     fn brush_preview_kernel_draws_on_the_calling_thread() {
         let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
             return;
@@ -2095,6 +2144,22 @@ impl CanvasRenderer {
         self.preview_inputs += 1;
         texture.mark_covered(job.draw.src, job.draw.step, job.state.clone());
         Some(texture.image())
+    }
+
+    /// [`Self::publish_edited`] for a job that reports what it put on the
+    /// Composite: the job's edit generation when it was an exact Composite
+    /// job issued under one and the pane took it, `None` for every other job
+    /// and for one the pane refused.
+    pub fn publish_for_generation(
+        &mut self,
+        job: &PaneJob,
+        samples: &[u16],
+        colors: &[[u8; 3]],
+        edited: Option<&EditedView>,
+    ) -> Option<u64> {
+        let exact_composite = job.pane == Pane::Composite && !job.backdrop;
+        let taken = self.publish_edited(job, samples, colors, edited).is_some();
+        job.state.generation.filter(|_| exact_composite && taken)
     }
 
     /// The result and source samples behind a brush preview at `spec`: the

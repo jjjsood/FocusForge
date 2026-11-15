@@ -34,7 +34,8 @@ pub fn preview_spec(
 /// One freehand stroke while its drag is still live: the raw `f32` trace in
 /// image coordinates, the index of the last point a tick has already
 /// consumed, and the footprint of each tick applied so far (for the commit
-/// pass's dilation).
+/// pass's dilation). It also holds the preview the press showed until the
+/// stroke's first painted region is on the Composite.
 #[derive(Debug, Clone)]
 pub struct LiveStroke {
     source: StrokeSource,
@@ -44,6 +45,14 @@ pub struct LiveStroke {
     opacity: f32,
     points: Vec<(f32, f32)>,
     flushed: usize,
+    /// The preview at the press point; `None` when the press was off the
+    /// image.
+    preview: Option<BrushPreviewSpec>,
+    /// The resident tiles' generation once the first of this stroke's own
+    /// ticks was installed.
+    painted_at: Option<u64>,
+    /// The newest generation the Composite has published since the press.
+    published: u64,
     /// Every tick's own re-rendered region, oldest first -- empty until a
     /// caller records one.
     pub tick_rects: Vec<Rect>,
@@ -71,8 +80,36 @@ impl LiveStroke {
             opacity,
             points: vec![(x, y)],
             flushed: 0,
+            preview: None,
+            painted_at: None,
+            published: 0,
             tick_rects: Vec::new(),
         }
+    }
+
+    /// Sets the preview the press showed, `None` for a press off the image.
+    pub fn with_preview(mut self, preview: Option<BrushPreviewSpec>) -> Self {
+        self.preview = preview;
+        self
+    }
+
+    /// The press's preview while the stroke has not yet painted the
+    /// Composite, `None` once it has.
+    pub fn held_preview(&self) -> Option<BrushPreviewSpec> {
+        let shown = self.painted_at.is_some_and(|at| self.published >= at);
+        self.preview.filter(|_| !shown)
+    }
+
+    /// Records the first install of one of this stroke's own ticks, which left
+    /// the resident tiles at `generation`.
+    pub(crate) fn painted(&mut self, generation: u64) {
+        self.painted_at.get_or_insert(generation);
+    }
+
+    /// Records that the Composite now shows the resident tiles as of
+    /// `generation`.
+    pub(crate) fn composite_published(&mut self, generation: u64) {
+        self.published = self.published.max(generation);
     }
 
     pub fn source(&self) -> &StrokeSource {

@@ -12741,9 +12741,10 @@ fn brush_preview_hides_during_stroke_pipette_alt_outside_and_blocked() {
     hover(&mut c, RIGHT, inside, NO_MODS);
     assert!(c.brush_preview_spec().is_some(), "visible before");
 
-    // A live stroke.
+    // A live stroke holds the preview until it paints.
+    let hovered = c.brush_preview_spec();
     press(&mut c, (RIGHT.x + inside.0, inside.1));
-    assert_eq!(c.brush_preview_spec(), None, "during a stroke");
+    assert_eq!(c.brush_preview_spec(), hovered, "held from the press");
     assert!(c.brush_cursor_view().is_some(), "the ring stays");
     release(&mut c, (RIGHT.x + inside.0, inside.1));
     common::settle_region_renders(&mut c);
@@ -12803,6 +12804,171 @@ fn brush_preview_hides_during_stroke_pipette_alt_outside_and_blocked() {
     assert!(c.brush_cursor_view().is_none(), "settings: no cursor");
     c.close_settings();
     assert!(c.brush_preview_spec().is_some(), "settings closed");
+}
+
+/// The resident tiles' generation: what a repaint's composite read is issued
+/// under.
+fn tile_generation(c: &AppController) -> u64 {
+    c.edited_view().expect("an edit session").tiles.generation()
+}
+
+/// A press at `spot` over `pane`, two moves by non-integer deltas, the
+/// queueing tick and the install, then the publish; checks the preview spec
+/// at each step and returns after the release.
+fn held_stroke(c: &mut AppController, pane: PaneRect, spot: (f32, f32), case: &str) {
+    let ops_before = ops(c).len();
+    hover(c, pane, spot, NO_MODS);
+    let hovered = c.brush_preview_spec().expect("the hover previews");
+    let at = (pane.x + spot.0, spot.1);
+
+    press(c, at);
+    assert_eq!(c.brush_preview_spec(), Some(hovered), "{case}: the press");
+    let (first, second) = ((at.0 + 13.7, at.1 + 9.3), (at.0 + 21.1, at.1 + 17.9));
+    c.pointer_moved(first.0, first.1);
+    assert_eq!(c.brush_preview_spec(), Some(hovered), "{case}: a move");
+    c.flush_live_stroke();
+    assert_eq!(c.brush_preview_spec(), Some(hovered), "{case}: queued");
+    common::settle_region_renders(c);
+    assert!(
+        !c.take_rendered_regions().is_empty(),
+        "{case}: the tick installed"
+    );
+    assert_eq!(
+        c.brush_preview_spec(),
+        Some(hovered),
+        "{case}: installed, not yet published"
+    );
+    let installed = tile_generation(c);
+    c.composite_published(installed - 1);
+    assert_eq!(
+        c.brush_preview_spec(),
+        Some(hovered),
+        "{case}: a composite from before the install"
+    );
+    c.composite_published(installed);
+    assert_eq!(c.brush_preview_spec(), None, "{case}: the stroke shows");
+
+    c.pointer_moved(second.0, second.1);
+    c.flush_live_stroke();
+    common::settle_region_renders(c);
+    c.composite_published(tile_generation(c));
+    assert_eq!(c.brush_preview_spec(), None, "{case}: still painting");
+    assert!(c.brush_cursor_view().is_some(), "{case}: the ring stays");
+
+    release(c, second);
+    common::settle_region_renders(c);
+    let spec = c.brush_preview_spec().expect("the hover returns");
+    assert_eq!(
+        spec.centre,
+        press_centre(c, pane, second),
+        "{case}: the hover spec at the pointer"
+    );
+    assert_eq!(ops(c).len(), ops_before + 1, "{case}: one op");
+    let session = c.edit_session().unwrap();
+    assert!(session.can_undo() && !session.can_redo(), "{case}: history");
+}
+
+#[test]
+fn brush_preview_is_held_from_the_press_until_the_stroke_paints() {
+    let (mut c, _) = open_editor("brush_preview_held");
+    c.toggle_brush_preview();
+    set_size(&mut c, 8.0);
+    c.select_frame(1);
+    // Off the 4-px lattice, so a rounding slip shows.
+    held_stroke(&mut c, RIGHT, (83.3, BAND + 121.1), "frame, composite pane");
+    held_stroke(&mut c, LEFT, (40.1, BAND + 57.7), "frame, frame pane");
+
+    let mut c = editor_over_several_checkpoints("brush_preview_held_checkpoint");
+    c.toggle_brush_preview();
+    set_size(&mut c, 8.0);
+    let key = checkpoint_keys(&c)[0].clone();
+    select_checkpoint_source(&mut c, &key);
+    held_stroke(&mut c, RIGHT, (83.3, BAND + 121.1), "checkpoint, composite");
+    held_stroke(&mut c, LEFT, (40.1, BAND + 57.7), "checkpoint, frame pane");
+}
+
+#[test]
+fn brush_preview_is_held_through_a_stroke_that_paints_nothing() {
+    let (mut c, _) = open_editor("brush_preview_held_nothing");
+    c.toggle_brush_preview();
+    set_size(&mut c, 8.0);
+    c.select_frame(1);
+    let spot = (83.3, BAND + 121.1);
+    let at = (RIGHT.x + spot.0, spot.1);
+    hover(&mut c, RIGHT, spot, NO_MODS);
+    let hovered = c.brush_preview_spec().expect("the hover previews");
+
+    // A click without a move.
+    press(&mut c, at);
+    c.flush_live_stroke();
+    common::settle_region_renders(&mut c);
+    c.composite_published(u64::MAX);
+    assert_eq!(c.brush_preview_spec(), Some(hovered), "a click");
+    release(&mut c, at);
+    common::settle_region_renders(&mut c);
+    assert_eq!(c.brush_preview_spec(), Some(hovered), "after the click");
+
+    // A render that fails leaves the tiles as they were.
+    c.take_rendered_regions();
+    let gate = Gate::install(&mut c);
+    gate.open();
+    for (fault, case) in [(Fault::Error, "a failed read"), (Fault::Panic, "a panic")] {
+        gate.set_fault(fault);
+        press(&mut c, at);
+        c.pointer_moved(at.0 + 13.7, at.1 + 9.3);
+        c.flush_live_stroke();
+        common::settle_region_renders(&mut c);
+        assert!(
+            c.take_rendered_regions().is_empty(),
+            "{case}: nothing installed"
+        );
+        c.composite_published(u64::MAX);
+        assert_eq!(c.brush_preview_spec(), Some(hovered), "{case}");
+        release(&mut c, (at.0 + 13.7, at.1 + 9.3));
+        common::settle_region_renders(&mut c);
+        c.take_rendered_regions();
+    }
+
+    // A press off the image never holds a preview.
+    let margin = (RIGHT.x + 100.0, 8.0);
+    press(&mut c, margin);
+    c.pointer_moved(margin.0 + 13.7, margin.1 + 3.3);
+    c.flush_live_stroke();
+    assert_eq!(c.brush_preview_spec(), None, "a press off the image");
+    release(&mut c, margin);
+    common::settle_region_renders(&mut c);
+
+    // The pipette's pick and an Alt click open no stroke.
+    hover(&mut c, RIGHT, spot, NO_MODS);
+    c.toggle_pipette();
+    assert_eq!(c.brush_preview_spec(), None, "the pipette is armed");
+    press(&mut c, at);
+    assert_eq!(
+        c.brush_preview_spec(),
+        Some(hovered),
+        "the pick disarms the pipette and opens no stroke"
+    );
+    release(&mut c, at);
+    hover(&mut c, RIGHT, spot, ALT);
+    c.pointer(PointerKind::Down, Button::Left, at.0, at.1, ALT);
+    assert_eq!(c.brush_preview_spec(), None, "an Alt click");
+    c.pointer(PointerKind::Up, Button::Left, at.0, at.1, ALT);
+    hover(&mut c, RIGHT, spot, NO_MODS);
+    assert_eq!(c.brush_preview_spec(), Some(hovered), "hover again");
+
+    // A checkpoint that is still rendering is no stroke source.
+    let mut c = editor_over_several_checkpoints("brush_preview_held_rendering");
+    c.toggle_brush_preview();
+    set_size(&mut c, 8.0);
+    let key = checkpoint_keys(&c)[0].clone();
+    c.select_image_row(checkpoint_row(&c, &key));
+    assert_eq!(c.stroke_source(), None, "the render is still running");
+    hover(&mut c, RIGHT, spot, NO_MODS);
+    let before = (c.brush_preview_spec(), ops(&c).len());
+    press(&mut c, at);
+    assert_eq!(c.brush_preview_spec(), before.0, "no stroke opened");
+    release(&mut c, at);
+    assert_eq!(ops(&c).len(), before.1, "and no op appended");
 }
 
 #[test]
