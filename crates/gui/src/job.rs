@@ -2605,7 +2605,14 @@ impl EditState {
             }
             for (region, result) in parked.rendered {
                 match result {
-                    Ok(samples) => self.tiles.install(region, &samples),
+                    Ok(samples) => {
+                        self.tiles.install(region, &samples);
+                        if let Some(stroke) = self.stroke.as_mut()
+                            && stroke.tick_rects.contains(&region)
+                        {
+                            stroke.painted(self.tiles.generation());
+                        }
+                    }
                     Err(error) => {
                         tracing::error!(%error, ?region, "background region render failed");
                     }

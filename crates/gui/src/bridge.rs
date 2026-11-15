@@ -127,6 +127,12 @@ impl Canvas {
         self.renderer.as_mut()?.brush_preview_layer(spec, draw)
     }
 
+    /// The renderer, once a device is attached or a project's planes are
+    /// loaded.
+    pub fn renderer(&self) -> Option<&CanvasRenderer> {
+        self.renderer.as_ref()
+    }
+
     /// Whether no exact pane read is queued, running or waiting to be taken;
     /// `true` without a preparer.
     pub fn exact_idle(&self) -> bool {
@@ -297,12 +303,12 @@ impl Canvas {
     }
 
     /// Renders whatever the worker completed into the panes' textures, the
-    /// live `edited` session applied over the sealed reads; `false` when
-    /// nothing had completed.
-    fn publish_prepared(&mut self, edited: Option<&EditedView>) -> bool {
-        let Some(done) = self.preparer.as_ref().and_then(Preparer::take) else {
-            return false;
-        };
+    /// live `edited` session applied over the sealed reads. `None` when
+    /// nothing had completed; otherwise the newest edit generation an exact
+    /// Composite read of this batch put on the Composite, if any.
+    fn publish_prepared(&mut self, edited: Option<&EditedView>) -> Option<Option<u64>> {
+        let done = self.preparer.as_ref().and_then(Preparer::take)?;
+        let mut composite = None;
         if let Some(renderer) = self.renderer.as_mut() {
             for prepared in &done {
                 let stamp = prepared.job.stamp;
@@ -319,13 +325,19 @@ impl Canvas {
                     false,
                     0,
                 );
-                renderer.publish_edited(&prepared.job, &prepared.samples, &prepared.colors, edited);
+                let shown = renderer.publish_for_generation(
+                    &prepared.job,
+                    &prepared.samples,
+                    &prepared.colors,
+                    edited,
+                );
+                composite = composite.max(shown);
             }
         }
         if let Some(preparer) = self.preparer.as_ref() {
             preparer.recycle(done);
         }
-        true
+        Some(composite)
     }
 }
 
@@ -372,18 +384,19 @@ pub fn push_input_map_view(app: &AppWindow, controller: &AppController) {
 
 /// Publishes the worker's completed reads and shows every pane where the
 /// controller's current view puts it.
-fn publish_completed(
+pub fn publish_completed(
     app: &AppWindow,
     controller: &Arc<Mutex<AppController>>,
     canvas: &Rc<RefCell<Canvas>>,
 ) {
     let (frame_draw, plane_draw) = {
-        let controller = controller.lock().unwrap();
-        if !canvas
-            .borrow_mut()
-            .publish_prepared(controller.edited_view().as_ref())
-        {
+        let mut controller = controller.lock().unwrap();
+        let mut canvas = canvas.borrow_mut();
+        let Some(composite) = canvas.publish_prepared(controller.edited_view().as_ref()) else {
             return;
+        };
+        if let Some(generation) = composite {
+            controller.composite_published(generation);
         }
         (controller.frame_draw(), controller.plane_draw())
     };

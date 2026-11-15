@@ -463,6 +463,23 @@ impl Default for OverlayState {
     }
 }
 
+/// The preview of the one-point stroke a press at source point `point` would
+/// store; `None` when that point is off the image.
+fn press_preview(
+    info: focusforge_core::zmap::ZMapInfo,
+    (sx, sy): (f64, f64),
+    radius: f32,
+    softness: f32,
+    mode: job::BrushMode,
+    opacity: f32,
+) -> Option<brush::BrushPreviewSpec> {
+    let on_image = sx >= 0.0
+        && sy >= 0.0
+        && (sx.floor() as u32) < info.width()
+        && (sy.floor() as u32) < info.height();
+    on_image.then(|| brush::preview_spec((sx, sy), radius, softness, mode, opacity))
+}
+
 /// `size = ceiling^fraction` -- the logarithmic slider mapping, so the
 /// track's right end is always the ceiling.
 fn size_from_fraction(fraction: f32, ceiling: u32) -> f32 {
@@ -4701,10 +4718,12 @@ impl AppController {
     }
 
     /// The brush the preview layer would draw: the one-point stroke a press
-    /// at the cursor's anchor would record. `None` with the preview off, outside
-    /// the editor, while [`Self::brush_cursor_view`] is `None` or picking (the
-    /// pipette armed or `Alt` held), during a live stroke, and while the
-    /// anchor's source point is off the image.
+    /// at the cursor's anchor would record. `None` with the preview off,
+    /// outside the editor, while [`Self::brush_cursor_view`] is `None` or
+    /// picking (the pipette armed or `Alt` held), and while the anchor's
+    /// source point is off the image. During a live stroke it is the press's
+    /// own spec, held from the press until the stroke's first painted region
+    /// shows on the Composite and `None` from then until the release.
     pub fn brush_preview_spec(&self) -> Option<brush::BrushPreviewSpec> {
         if !self.editor.preview || self.mode() != ShellMode::Editor {
             return None;
@@ -4713,29 +4732,32 @@ impl AppController {
             return None;
         }
         let tab = self.state.active()?;
-        let edit = tab.edit.as_ref().filter(|edit| edit.stroke.is_none())?;
+        let edit = tab.edit.as_ref()?;
+        if let Some(stroke) = &edit.stroke {
+            return stroke.held_preview();
+        }
         let (pane, local) = self.anchor_pane();
-        let (sx, sy) = tab
+        let point = tab
             .viewport
             .as_ref()?
             .to_source_in(local, self.pane_rect(pane)?);
-        let info = edit.info();
-        if sx < 0.0
-            || sy < 0.0
-            || sx.floor() as u32 >= info.width()
-            || sy.floor() as u32 >= info.height()
-        {
-            return None;
-        }
         let (radius, softness) = self.brush_radius_softness();
         let (mode, opacity) = self.brush_mode_opacity();
-        Some(brush::preview_spec(
-            (sx, sy),
-            radius,
-            softness,
-            mode,
-            opacity,
-        ))
+        press_preview(edit.info(), point, radius, softness, mode, opacity)
+    }
+
+    /// The Composite now shows the resident tiles as of `generation`: a live
+    /// stroke's held preview ends once this reaches the generation its first
+    /// painted region was installed at.
+    pub fn composite_published(&mut self, generation: u64) {
+        if let Some(stroke) = self
+            .state
+            .active_mut()
+            .and_then(|tab| tab.edit.as_mut())
+            .and_then(|edit| edit.stroke.as_mut())
+        {
+            stroke.composite_published(generation);
+        }
     }
 
     /// The slider's own callback: `fraction` is `0.0..=1.0` along the
@@ -5028,15 +5050,19 @@ impl AppController {
         let Some(edit) = tab.edit.as_mut() else {
             return;
         };
-        edit.stroke = Some(brush::LiveStroke::new(
-            source,
-            radius,
-            softness,
-            mode,
-            opacity,
-            sx as f32 - 0.5,
-            sy as f32 - 0.5,
-        ));
+        let preview = press_preview(edit.info(), (sx, sy), radius, softness, mode, opacity);
+        edit.stroke = Some(
+            brush::LiveStroke::new(
+                source,
+                radius,
+                softness,
+                mode,
+                opacity,
+                sx as f32 - 0.5,
+                sy as f32 - 0.5,
+            )
+            .with_preview(preview),
+        );
     }
 
     /// `Paint`'s `Update`: integrates a screen-space delta into the live

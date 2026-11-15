@@ -4899,3 +4899,198 @@ fn checkpoint_source_view_unreadable_scratch_render_is_refused_as_a_checkpoint()
     canvas.show_frame_pane(Some(FramePane::Rendering), label);
     assert!(canvas.frame_refusal().is_empty(), "rendering shows nothing");
 }
+
+/// One repaint's view of the composite ring: whether a preview layer is on the
+/// cursor, and whether the Composite's retained samples at the press point
+/// differ from the pre-stroke ones.
+struct RingFrame {
+    label: String,
+    layer: bool,
+    painted: bool,
+}
+
+#[test]
+fn brush_preview_hands_over_to_the_painted_stroke_without_a_gap() {
+    use focusforge_gui::bridge::{publish_completed, repaint};
+    use focusforge_gui::input_map::{Button, Modifiers, PointerKind};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    common::init_window_backend();
+    let app = AppWindow::new().unwrap();
+    app.window().set_size(slint::PhysicalSize::new(1440, 900));
+    let pane = |x| PaneRect {
+        x,
+        y: 0.0,
+        width: 512.0,
+        height: 512.0,
+        scale_factor: 1.0,
+    };
+    let (left, right) = (pane(0.0), pane(520.0));
+
+    let mut opened = common::scratch_controller("brush_preview_handover");
+    open_fixture_tab(&mut opened, "brush_preview_handover", "mantis-512", 2);
+    assert!(opened.start_fuse());
+    common::settle_all(&mut opened);
+    opened.set_pane_geometry(left, right);
+    common::enter_editor(&mut opened);
+    opened.toggle_brush_preview();
+    opened.select_frame(1);
+    // The window's own polls would keep the canvas alive in a timer past the
+    // test's thread.
+    opened.take_session_started();
+    opened.take_render_started();
+    opened.take_origin_started();
+    opened.take_thumbnails_started();
+    let controller = Arc::new(Mutex::new(opened));
+    let canvas = common::empty_canvas();
+    canvas
+        .borrow_mut()
+        .attach_device(shared.device().clone(), shared.queue().clone());
+    // The installed window keeps its own handle on the canvas until the
+    // thread's statics are torn down, too late to release the device's
+    // resources.
+    struct Detach(std::rc::Rc<RefCell<focusforge_gui::bridge::Canvas>>);
+    impl Drop for Detach {
+        fn drop(&mut self) {
+            self.0.borrow_mut().detach_device();
+        }
+    }
+    let _detach = Detach(canvas.clone());
+    let _installed = focusforge_gui::bridge::install(
+        &app,
+        controller.clone(),
+        canvas.clone(),
+        Rc::new(RefCell::new(None)),
+    );
+
+    let frames = RefCell::new(Vec::<RingFrame>::new());
+    let press_at = RefCell::new(None);
+    let before = RefCell::new(None::<Vec<u16>>);
+    let observe = |label: &str| {
+        let layer = app.get_cursor_preview().size().width > 0;
+        let sample = press_at.borrow().and_then(|(spec, x, y)| {
+            let canvas = canvas.borrow();
+            let grids = canvas.renderer()?.brush_preview_grids(&spec)?;
+            Some(grids.result.nearest(x, y)?.to_vec())
+        });
+        let painted = match (&*before.borrow(), sample) {
+            (Some(was), Some(now)) => *was != now,
+            _ => false,
+        };
+        frames.borrow_mut().push(RingFrame {
+            label: label.to_string(),
+            layer,
+            painted,
+        });
+    };
+    // One repaint, then every publish its reads lead to, each observed.
+    let show = |label: &str| {
+        repaint(&app, &controller, &canvas);
+        observe(&format!("{label}: repaint"));
+        let start = Instant::now();
+        while !canvas.borrow().exact_idle() {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "{label}: the reads did not publish"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+            publish_completed(&app, &controller, &canvas);
+            observe(&format!("{label}: publish"));
+        }
+    };
+    // Installs what the region-render worker rendered.
+    let install = || {
+        common::settle_region_renders(&mut controller.lock().unwrap());
+    };
+    let pointer = |kind, x: f32, y: f32| {
+        controller
+            .lock()
+            .unwrap()
+            .pointer(kind, Button::Left, x, y, Modifiers::NONE);
+    };
+
+    let spot = (right.x + 256.3, 256.7);
+    pointer(PointerKind::Move, spot.0, spot.1);
+    for round in 0..4 {
+        show(&format!("hover {round}"));
+    }
+    assert!(
+        frames.borrow().last().unwrap().layer,
+        "the hover shows the preview layer: {:?}",
+        frames.borrow().iter().map(|f| &f.label).collect::<Vec<_>>()
+    );
+
+    let spec = controller
+        .lock()
+        .unwrap()
+        .brush_preview_spec()
+        .expect("the hover previews");
+    let (x, y) = (spec.centre.x as u32, spec.centre.y as u32);
+    *press_at.borrow_mut() = Some((spec, x, y));
+    *before.borrow_mut() = canvas
+        .borrow()
+        .renderer()
+        .and_then(|r| r.brush_preview_grids(&spec))
+        .and_then(|g| g.result.nearest(x, y).map(<[u16]>::to_vec));
+    assert!(
+        before.borrow().is_some(),
+        "the composite's samples are held"
+    );
+    frames.borrow_mut().clear();
+
+    pointer(PointerKind::Down, spot.0, spot.1);
+    show("press");
+    controller
+        .lock()
+        .unwrap()
+        .pointer_moved(spot.0 + 3.7, spot.1 + 2.3);
+    show("first move");
+    install();
+    show("first install");
+    controller
+        .lock()
+        .unwrap()
+        .pointer_moved(spot.0 + 9.1, spot.1 + 4.9);
+    show("second move");
+    install();
+    show("second install");
+
+    let stroke = frames.borrow_mut().drain(..).collect::<Vec<_>>();
+    for frame in &stroke {
+        assert!(
+            frame.layer || frame.painted,
+            "{}: neither the preview nor the painted stroke is shown",
+            frame.label
+        );
+    }
+    assert!(
+        stroke.iter().any(|f| f.layer && !f.painted),
+        "the preview is held while the stroke is unpainted"
+    );
+    let first_painted = stroke
+        .iter()
+        .position(|f| f.painted)
+        .expect("the stroke paints the Composite");
+    for frame in &stroke[first_painted..] {
+        assert!(
+            frame.painted && !frame.layer,
+            "{}: once painted, the ring shows no layer",
+            frame.label
+        );
+    }
+
+    pointer(PointerKind::Up, spot.0 + 9.1, spot.1 + 4.9);
+    install();
+    for round in 0..4 {
+        show(&format!("released {round}"));
+    }
+    assert!(
+        frames.borrow().last().unwrap().layer,
+        "the hover preview is back after the release"
+    );
+}
