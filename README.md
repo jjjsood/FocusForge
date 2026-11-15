@@ -49,7 +49,7 @@
 **Working through a whole session**
 - Use the desktop app, or script the same steps from the command line
 - Pause, cancel and pick up long runs later without starting over
-- See how long a run will take before it starts: `focusforge-cli stack --dry-run` prints a predicted duration
+- Check a run before it starts: `focusforge-cli stack --dry-run` shows the resolved settings and the projects it would write
 - Save your favourite settings as presets; re-run only the one stack you want to tweak
 - A summary after each batch shows which stacks worked, so nothing goes missing quietly
 - Problems and notices collect in one place, and reach you as a system notification while you're in another app

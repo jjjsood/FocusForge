@@ -10094,7 +10094,6 @@ impl AppController {
             algorithms,
             control,
             observer,
-            self.state.diagnostics.data_dir.clone(),
             move || {
                 if let Some(barrier) = preview_barrier {
                     barrier.wait();

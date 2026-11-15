@@ -1799,9 +1799,9 @@ fn laplacian_constant_stack_round_trips() {
     }
 }
 
-/// One `stack --json` (or `--dry-run --json`) document over a fixture's
-/// frames, into a fresh working directory so the run is cold.
-fn run_plan_json(label: &str, frames: &Path, extra: &[&str]) -> serde_json::Value {
+/// One `stack --json` document over a fixture's frames, into a fresh
+/// working directory so the run is cold.
+fn cold_stack_json(label: &str, frames: &Path, extra: &[&str]) -> serde_json::Value {
     let cwd = tmp_dir(label);
     let out_dir = cwd.join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
@@ -1878,7 +1878,7 @@ fn stack_json_reports_trace_accounting_when_asked() {
 #[test]
 fn stack_json_trace_accounting_is_null_by_default() {
     let frames = common::fixtures_dir().join("mantis-64").join("frames");
-    let report = run_plan_json("trace_accounting_null", &frames, &[]);
+    let report = cold_stack_json("trace_accounting_null", &frames, &[]);
     assert_eq!(report["trace_accounting"], serde_json::Value::Null);
     assert_eq!(report["fuse_tiles"], serde_json::Value::Null);
     let baseline = [
@@ -1933,7 +1933,7 @@ fn stack_json_trace_accounting_is_null_by_default() {
     let mut expected: Vec<&str> = baseline
         .iter()
         .copied()
-        .chain(["run_plan", "trace_accounting", "fuse_tiles"])
+        .chain(["trace_accounting", "fuse_tiles"])
         .collect();
     expected.sort_unstable();
     let mut keys: Vec<&str> = report
@@ -1953,86 +1953,10 @@ fn stack_json_trace_accounting_is_null_by_default() {
     assert_eq!(out.code, Some(2), "stderr: {}", out.stderr);
 }
 
-#[test]
-fn run_plan_matches_between_dry_run_and_run() {
-    for (label, fixture, reader, bits) in [
-        ("run_plan_8bit", "mantis8-64", "decoded", 8),
-        ("run_plan_16bit", "mantis-64", "mmap", 16),
-    ] {
-        let frames = common::fixtures_dir().join(fixture).join("frames");
-        let run = run_plan_json(&format!("{label}_run"), &frames, &[]);
-        let dry = run_plan_json(&format!("{label}_dry"), &frames, &["--dry-run"]);
-        assert_eq!(run["run_plan"], dry["run_plan"], "{fixture}");
-        assert_eq!(run["run_plan"]["reader"], reader, "{fixture}");
-        assert_eq!(run["run_plan"]["source_bits_per_sample"], bits, "{fixture}");
-        assert_eq!(run["run_plan"]["frame_count"], 3, "{fixture}");
-        assert_eq!(run["run_plan"]["frame_pixels"], 64 * 64, "{fixture}");
-        assert_eq!(run["run_plan"]["gpu"], false, "{fixture}");
-        assert_eq!(run["run_plan"]["align_gpu"], false, "{fixture}");
-        assert_eq!(run["run_plan"]["algorithm"], "dummy-stack", "{fixture}");
-        let not_computed = dry["not_computed"].as_array().expect("not_computed");
-        assert!(
-            not_computed.iter().any(|v| v == "alignment cache"),
-            "the dry run names the alignment cache: {dry}"
-        );
-    }
-}
-
-/// `run_plan.align_gpu` of one aligned `stack --json` over the 16-bit
-/// fixture, as a dry run or a real run.
-fn align_gpu_of(
-    label: &str,
-    align_algorithm: &str,
-    dry: bool,
-    extra: &[&str],
-) -> serde_json::Value {
-    let frames = common::fixtures_dir().join("mantis-64").join("frames");
-    let cwd = tmp_dir(label);
-    let out_dir = cwd.join("out");
-    std::fs::create_dir_all(&out_dir).unwrap();
-    let mut args = vec![
-        "stack",
-        frames.to_str().unwrap(),
-        "-o",
-        out_dir.to_str().unwrap(),
-        "--algorithm",
-        "dummy-stack",
-        "--align-algorithm",
-        align_algorithm,
-        "--no-crop",
-        "--json",
-    ];
-    if dry {
-        args.push("--dry-run");
-    }
-    args.extend(extra);
-    let out = run_cli_in(&cwd, &args);
-    assert!(out.success, "stderr: {}", out.stderr);
-    let report: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
-    report["run_plan"].clone()
-}
-
-#[test]
-fn run_plan_reports_the_planned_align_backend() {
-    let offered = cfg!(feature = "gpu");
-    let plan = align_gpu_of("align_gpu_ecc", "pyramidal-ecc", true, &[]);
-    assert_eq!(plan["align_gpu"], offered, "pyramidal-ecc: {plan}");
-    if offered {
-        let plan = align_gpu_of("align_gpu_ecc_cpu", "pyramidal-ecc", true, &["--cpu"]);
-        assert_eq!(plan["align_gpu"], false, "--cpu: {plan}");
-    }
-    let plan = align_gpu_of("align_gpu_none", "pyramidal-ecc", true, &["--no-align"]);
-    assert_eq!(plan["align_gpu"], false, "--no-align: {plan}");
-    let dry = align_gpu_of("align_gpu_dummy_dry", "dummy-align", true, &[]);
-    assert_eq!(dry["align_gpu"], false, "an aligner without a GPU path");
-    let run = align_gpu_of("align_gpu_dummy_run", "dummy-align", false, &[]);
-    assert_eq!(run, dry, "the run plans what the dry run planned");
-}
-
 /// One `stack --dry-run` over `fixtures/<fixture>/frames` with a computed
 /// alignment half, in an empty working directory that must stay empty:
 /// the `--json` document and the human summary.
-fn dry_run_prediction(
+fn dry_run_outputs(
     label: &str,
     fixture: &str,
     algorithm: &str,
@@ -2073,15 +1997,7 @@ fn dry_run_prediction(
 }
 
 #[test]
-fn dry_run_reports_prediction() {
-    let (plan, human) = dry_run_prediction("prediction_calibrated", "mantis-64", "laplacian", &[]);
-    let mut keys: Vec<&str> = plan
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    keys.sort_unstable();
+fn dry_run_reports_its_plan_without_an_estimate() {
     let mut expected = vec![
         "dry_run",
         "input",
@@ -2102,132 +2018,44 @@ fn dry_run_reports_prediction() {
         "page_cache_bytes_per_tile",
         "max_bytes_in_flight",
         "developed_store",
-        "run_plan",
         "backend",
         "would_write",
         "not_computed",
-        "prediction",
     ];
     expected.sort_unstable();
-    assert_eq!(keys, expected, "the plan keys, `prediction` included");
-
-    let prediction = &plan["prediction"];
-    let mut prediction_keys: Vec<&str> = prediction
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    prediction_keys.sort_unstable();
-    assert_eq!(
-        prediction_keys,
-        [
-            "calibrated",
-            "multipliers",
-            "source",
-            "stages",
-            "total_seconds"
-        ]
-    );
-    assert_eq!(prediction["calibrated"], true, "{prediction}");
-    let stages = &prediction["stages"];
-    assert_eq!(stages.as_object().unwrap().len(), 6, "{stages}");
-    for key in ["develop", "warp_write"] {
-        assert!(stages[key].is_null(), "{key} in {stages}");
-    }
-    let mut sum = 0.0;
-    for key in ["setup", "align", "fuse", "finalize"] {
-        sum += stages[key]
-            .as_f64()
-            .unwrap_or_else(|| panic!("{key} in {stages}"));
-    }
-    let total = prediction["total_seconds"].as_f64().unwrap();
-    assert!((total - sum).abs() <= 1e-9 * total, "{total} vs {sum}");
-    let lines: Vec<&str> = human
-        .lines()
-        .filter(|l| l.starts_with("predicted duration:"))
-        .collect();
-    assert_eq!(lines.len(), 1, "{human}");
-    assert!(
-        !lines[0].contains('~') && !lines[0].contains("not calibrated"),
-        "{human}"
-    );
-    let crop = human.find("crop: not computed").expect("crop line");
-    assert!(human.find("predicted duration:").unwrap() < crop, "{human}");
-
-    // An empty data directory: the core-count prior, or the shipped seconds
-    // on a machine with exactly the calibration machine's 8 threads.
-    let threads = std::thread::available_parallelism().unwrap().get();
-    let k = (8.0 / threads as f64).max(0.25);
-    let multipliers = &prediction["multipliers"];
-    let line = lines[0];
-    if k == 1.0 {
-        assert_eq!(prediction["source"], "shipped", "{prediction}");
-        assert!(line.contains("not adjusted"), "{line}");
-    } else {
-        assert_eq!(prediction["source"], "core prior", "{prediction}");
-        assert!(line.contains("core count"), "{line}");
-        for stage in ["setup", "develop", "align", "fuse"] {
-            let m = multipliers[stage].as_f64().unwrap();
-            assert!((m - k).abs() < 1e-12, "{stage}: {multipliers}");
-        }
-        assert_eq!(multipliers["finalize"].as_f64(), Some(1.0), "{multipliers}");
-    }
-
-    let (no_align, _) = dry_run_prediction(
-        "prediction_no_align",
-        "mantis-64",
-        "laplacian",
-        &["--no-align"],
-    );
-    let no_align = &no_align["prediction"];
-    assert!(no_align["stages"]["align"].is_null(), "{no_align}");
-    assert!(no_align["total_seconds"].as_f64().unwrap() < total);
-    assert_eq!(no_align["calibrated"], true);
-
-    for (label, fixture, algorithm, reader) in [
+    for (label, fixture, extra, align_line) in [
+        ("dry_aligned", "mantis-64", &[][..], "align: "),
         (
-            "prediction_deflate",
-            "mantis-64-deflate-p2-strip-ii",
-            "laplacian",
-            "decoded",
-        ),
-        ("prediction_decoded", "mantis8-64", "laplacian", "decoded"),
-        ("prediction_depth_map", "mantis-64", "depth-map", "mmap"),
-        (
-            "prediction_weighted_average",
-            "mantis-64",
-            "weighted-average",
-            "mmap",
+            "dry_no_align",
+            "mantis8-64",
+            &["--no-align"][..],
+            "align: skipped (--no-align)",
         ),
     ] {
-        let (plan, human) = dry_run_prediction(label, fixture, algorithm, &[]);
-        assert_eq!(plan["run_plan"]["reader"], reader, "{label}");
-        assert_eq!(plan["prediction"]["calibrated"], true, "{label}");
-        assert!(plan["prediction"]["total_seconds"].as_f64().unwrap() > 0.0);
-        let line = human
-            .lines()
-            .find(|l| l.starts_with("predicted duration:"))
-            .unwrap_or_else(|| panic!("{label}: {human}"));
+        let (plan, human) = dry_run_outputs(label, fixture, "laplacian", extra);
+        let mut keys: Vec<&str> = plan
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, expected, "{label}: the plan keys");
+        let not_computed = plan["not_computed"].as_array().expect("not_computed");
         assert!(
-            !line.contains('~') && !line.contains("not calibrated"),
-            "{label}: {line}"
+            not_computed.iter().any(|v| v == "alignment cache"),
+            "{label}: the dry run names the alignment cache: {plan}"
         );
+        assert!(!human.contains("predicted duration"), "{label}: {human}");
+        for needle in [
+            "dry run --",
+            "would write:",
+            "crop: not computed",
+            align_line,
+        ] {
+            assert!(human.contains(needle), "{label}: no `{needle}`: {human}");
+        }
     }
-
-    let (plan, human) =
-        dry_run_prediction("prediction_dummy_stack", "mantis-64", "dummy-stack", &[]);
-    assert_eq!(plan["prediction"]["calibrated"], false);
-    assert!(plan["prediction"]["total_seconds"].as_f64().unwrap() > 0.0);
-    let line = human
-        .lines()
-        .find(|l| l.starts_with("predicted duration:"))
-        .unwrap_or_else(|| panic!("{human}"));
-    assert!(
-        line.starts_with("predicted duration: ~")
-            && line.ends_with("(not calibrated for this input)"),
-        "{line}"
-    );
 }
 
 /// Runs the CLI over `fixtures/mantis-64` with `data_dir` as its data
@@ -2251,73 +2079,24 @@ fn run_mantis_64(data_dir: &Path, cwd: &Path, out_dir: &Path, extra: &[&str]) ->
     common::run_in(&mut cmd, cwd, &common::push_no_gpu(args))
 }
 
-/// The prediction source the dry run reports for `data_dir`.
-fn dry_run_source(data_dir: &Path, cwd: &Path, out_dir: &Path) -> String {
-    let out = run_mantis_64(data_dir, cwd, out_dir, &["--dry-run", "--json"]);
-    assert!(out.success, "stderr: {}", out.stderr);
-    let plan: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
-    plan["prediction"]["source"].as_str().unwrap().to_string()
-}
-
-/// The history file's place for the data directory `cli_bin` set.
-fn history_file(cmd: &std::process::Command) -> PathBuf {
-    common::data_dir_of(cmd)
-        .join("focusforge")
-        .join(focusforge_diagnostics::machine_history::FILE_NAME)
-}
-
-fn learned_history(file: &Path) -> bool {
-    let bytes = std::fs::read(file).expect("the history file");
-    focusforge_core::job::machine::MachineHistory::parse(&bytes)
-        != focusforge_core::job::machine::MachineHistory::default()
-}
-
 #[test]
-fn machine_history_a_run_writes_the_file_and_the_next_dry_run_reports_it() {
-    let cmd = common::cli_bin("machine_history_learn");
+fn a_run_leaves_the_data_folder_without_a_duration_history() {
+    let cmd = common::cli_bin("no_duration_history");
     let data = common::data_dir_of(&cmd);
-    let file = history_file(&cmd);
-    let cwd = tmp_dir("machine_history_learn");
-    let out_dir = tmp_dir("machine_history_learn_out");
-    assert_ne!(dry_run_source(&data, &cwd, &out_dir), "history");
-    assert!(!file.exists(), "a dry run learns nothing");
+    let file = data.join("focusforge").join("machine-history.json");
+    let cwd = tmp_dir("no_duration_history");
+    let out_dir = tmp_dir("no_duration_history_out");
 
     let run = run_mantis_64(&data, &cwd, &out_dir, &[]);
     assert!(run.success, "stderr: {}", run.stderr);
-    assert!(learned_history(&file));
-    assert_eq!(dry_run_source(&data, &cwd, &out_dir), "history");
-}
+    assert!(!file.exists(), "a run must not write a duration history");
 
-#[test]
-fn machine_history_a_corrupt_file_is_replaced_by_a_valid_one() {
-    let cmd = common::cli_bin("machine_history_corrupt");
-    let data = common::data_dir_of(&cmd);
-    let file = history_file(&cmd);
+    let corrupt = b"\x00 not a history";
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    std::fs::write(&file, b"\x00 not a history").unwrap();
-    let cwd = tmp_dir("machine_history_corrupt");
-    let out_dir = tmp_dir("machine_history_corrupt_out");
-    assert_ne!(dry_run_source(&data, &cwd, &out_dir), "history");
-
+    std::fs::write(&file, corrupt).unwrap();
     let run = run_mantis_64(&data, &cwd, &out_dir, &[]);
     assert!(run.success, "stderr: {}", run.stderr);
-    assert!(learned_history(&file));
-}
-
-#[test]
-fn machine_history_a_directory_in_the_files_place_is_left_untouched() {
-    let cmd = common::cli_bin("machine_history_directory");
-    let data = common::data_dir_of(&cmd);
-    let file = history_file(&cmd);
-    std::fs::create_dir_all(&file).unwrap();
-    let cwd = tmp_dir("machine_history_directory");
-    let out_dir = tmp_dir("machine_history_directory_out");
-    assert_ne!(dry_run_source(&data, &cwd, &out_dir), "history");
-
-    let run = run_mantis_64(&data, &cwd, &out_dir, &[]);
-    assert!(run.success, "stderr: {}", run.stderr);
-    assert!(file.is_dir());
-    assert_eq!(std::fs::read_dir(&file).unwrap().count(), 0);
+    assert_eq!(std::fs::read(&file).unwrap(), corrupt);
 }
 
 #[test]
@@ -2325,7 +2104,7 @@ fn fuse_tiles_cover_the_plan_when_accounting_is_on() {
     let frames = common::fixtures_dir().join("mantis-64").join("frames");
     // 16 px tiles give interior tiles; 48 px tiles leave a ragged edge.
     for (tile_size, expect_interior) in [("16", true), ("48", false)] {
-        let report = run_plan_json(
+        let report = cold_stack_json(
             &format!("fuse_tiles_{tile_size}"),
             &frames,
             &["--tile-size", tile_size, "--trace-accounting"],

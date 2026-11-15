@@ -1,10 +1,9 @@
 # Watch the progress bar while a camera-RAW stack is developed, then hand over to alignment
 Start: --open .scratch/develop-bar/frames
-The remaining-time text is hidden unless the window is launched with the environment variable `FOCUSFORGE_SHOW_ETA=1` (`FOCUSFORGE_SHOW_ETA=1 target/debug/focusforge-gui --open .scratch/develop-bar/frames`); this guide launches it that way so steps 7, 12 and 20 can read it.
 Before the first step, make a folder of 20 copies of one real camera RAW file (a Fujifilm X-S10 `.raf` of about 19 MB, about 380 MB in all; it is never part of the repository). Take the file from your local camera-sample folder, `$FOCUSFORGE_RAW_SAMPLES`:
 `mkdir -p .scratch/develop-bar/frames`
 `for i in $(seq -w 1 20); do cp "$FOCUSFORGE_RAW_SAMPLES/fujifilm-x-s10.raf" .scratch/develop-bar/frames/frame-$i.raf; done`
-The window then shows one project named "frame-01-20" with 20 frames. A stack of RAW files first develops every frame once, before the stack moves on to alignment. With 20 copies that pass takes from about 10 to 40 seconds, and the bottom bar shows it: the word "Developing", a count "<k> of 20" and a time estimate. The alignment of 20 RAW frames then runs for minutes, so the journey stops it with **Cancel** and never waits for a fused result. Read the bottom bar (`AppWindow::bottom-bar`) with a screenshot right after each step: the develop pass is short.
+The window then shows one project named "frame-01-20" with 20 frames. A stack of RAW files first develops every frame once, before the stack moves on to alignment. With 20 copies that pass takes from about 10 to 40 seconds, and the bottom bar shows it: the word "Developing" and a count "<k> of 20". The alignment of 20 RAW frames then runs for minutes, so the journey stops it with **Cancel** and never waits for a fused result. Read the bottom bar (`AppWindow::bottom-bar`) with a screenshot right after each step: the develop pass is short.
 ## The folder before any run
 1. Click **Images** (`FFDockTabs::images-tab`).
    Expect: the dock header reads "20 frames · 0 excluded".
@@ -20,7 +19,7 @@ The window then shows one project named "frame-01-20" with 20 frames. A stack of
 6. Hover the progress bar (`FFBottomBar::progress-bar`).
    Expect: the step text (`FFBottomBar::step-text`) reads "<k> of 20" with a whole number k from 0 to 20.
 7. Hover the progress bar (`FFBottomBar::progress-bar`).
-   Expect: the time text (`FFBottomBar::eta-text`) reads "estimating" or "ETA" followed by minutes and seconds (M:SS), and is not empty.
+   Expect: Must not: the bar shows a time estimate ("estimating" or "ETA"); it shows the status text and the count only.
 8. Click the second frame row (`FFImageRow::area` 1) while the run goes on.
    Expect: the left pane label (`FFCanvas::pane-left`) reads "frame-02.raf".
 9. Hover the progress bar (`FFBottomBar::progress-bar`).
@@ -31,7 +30,7 @@ The window then shows one project named "frame-01-20" with 20 frames. A stack of
 11. Hover the progress bar (`FFBottomBar::progress-bar`).
     Expect: the step text (`FFBottomBar::step-text`) reads "1 of 20", "2 of 20" or "3 of 20": the count starts again from the beginning.
 12. Hover the progress bar (`FFBottomBar::progress-bar`).
-    Expect: Must not: the status text reads "Developing" again; the time text (`FFBottomBar::eta-text`) reads "ETA" followed by minutes and seconds.
+    Expect: Must not: the status text reads "Developing" again.
 ## Stop the first run
 13. Click **Cancel** (`FFToolbar::cancel-button`).
     Expect: (within 180 s) the toolbar shows **Fuse stack** and neither **Pause** nor **Cancel** (read with `buttons AppWindow::toolbar`).
@@ -50,4 +49,4 @@ The window then shows one project named "frame-01-20" with 20 frames. A stack of
     Expect: the overlay is gone and the toolbar shows **Fuse stack** (`FFToolbar::fuse-button`).
 ## A last look at the develop pass
 20. Click **Fuse stack** (`FFToolbar::fuse-button`).
-    Expect: (within 30 s) the status text (`FFBottomBar::status-text`) reads "Developing", the step text (`FFBottomBar::step-text`) reads "<k> of 20" and the time text (`FFBottomBar::eta-text`) reads "estimating" or "ETA" followed by minutes and seconds.
+    Expect: (within 30 s) the status text (`FFBottomBar::status-text`) reads "Developing", and the step text (`FFBottomBar::step-text`) reads "<k> of 20".

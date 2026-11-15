@@ -144,50 +144,18 @@ there is nothing to resume or the inputs differ.
 
 ### Dry run
 
-`--dry-run` prints the resolved method and settings, the alignment settings,
-the projects it would write and a predicted duration, then exits `0`:
+`--dry-run` prints the resolved method and settings, the alignment settings and
+the projects it would write, then exits `0`:
 
 ```
 dry run -- resolved only, nothing computed and nothing written
 ...
 would write: .scratch/out/mantis-64.ffp
-predicted duration: 12.3 s (learned from this machine's earlier runs)
 crop: not computed -- --dry-run stops before alignment
 output size: not computed -- it follows from the crop
 ```
 
-The estimate learns from your own machine. After each finished run, `stack`
-(and the graphical app) records how long its stages took, and the next
-estimate scales its built-in seconds by what that machine measured. The line
-names where the number comes from, first match wins:
-
-| Shown after the duration | Meaning |
-| --- | --- |
-| `learned from this machine's earlier runs` | This machine has finished runs of the same kind of stack with the same processor choice (processor or graphics card). |
-| `scaled from this machine's earlier runs of other kinds` | This machine has finished runs with this processor choice, but none of this kind; one overall factor is used. |
-| `estimated from this machine's core count; the first run here can read high` | This machine has no earlier runs with this processor choice, so a first graphics-card run on a machine that has only processor runs gets this too. The estimate assumes a machine with more cores than the built-in one is proportionally faster, never more than four times, so it can read high. |
-| `reference estimate, not adjusted to this machine` | The built-in seconds are shown unchanged: the machine's processor could not be identified, the file of earlier runs could not be read, or the machine has no earlier runs with this processor choice and its core count gives nothing to scale by (exactly eight threads, a graphics card that is not a discrete one, or a graphics card used for alignment alone). |
-
-With `--json`, `prediction.source` carries the same name (`history`, `compute
-scalar`, `core prior` or `shipped`) and `prediction.multipliers` the factor
-applied to each stage.
-
-The record is the file `machine-history.json` in the per-user data folder
-(`~/.local/share/focusforge` on Linux, `~/Library/Application Support/focusforge`
-on macOS, `%APPDATA%\focusforge\data` on Windows; `FOCUSFORGE_DATA_DIR` moves
-it to `<that folder>/focusforge`). `stack` and the graphical app share it.
-Deleting the file resets the learning; the next run starts from the core-count
-estimate again. A file that cannot be read is ignored for that run and left as
-it is. Runs that were paused, resumed, held back by memory or moved from the
-graphics card to the processor do not teach it.
-
-The estimate cannot know how fast one processor core is before a first run on
-the machine. The final write, whose speed depends on the disk, is scaled only
-by a learned estimate, from how long this machine's earlier final writes took;
-the core-count estimate and the one overall factor leave it unchanged. For an
-input FocusForge cannot predict well it reads `predicted duration: ~N s (not
-calibrated for this input)`, and `predicted duration: unknown` when there is
-nothing to estimate. `--dry-run` cannot be combined with `--resume`.
+`--dry-run` cannot be combined with `--resume`.
 
 ### Examples
 
