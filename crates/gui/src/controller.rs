@@ -12637,8 +12637,9 @@ fn unsaved_ops<'a>(ops: impl IntoIterator<Item = &'a job::Op>) -> String {
 }
 
 /// An open card's second meta line: `phase_line` (already rendered, e.g.
-/// `"aligning, 3 of 8"` or `"fusing"`) while a run is live against this tab,
-/// otherwise the checkpoint count -- `"no checkpoint yet"` at zero.
+/// `"aligning, 3 of 8"` or `"fusing, 12 of 64 tiles"`) while a run is live
+/// against this tab, otherwise the checkpoint count -- `"no checkpoint yet"`
+/// at zero.
 fn open_card_meta(frame_count: u32, checkpoints: usize, phase_line: Option<&str>) -> String {
     let frames = frame_word(frame_count as usize);
     if let Some(phase) = phase_line {

@@ -1236,14 +1236,41 @@ fn align_progress_text_counts_frames() {
 }
 
 #[test]
-fn fuse_progress_text_is_the_name_only() {
+fn fuse_progress_text_counts_tiles() {
     use focusforge_gui::job::{RunState, progress_text};
 
-    for (done, total) in [(0, 0), (4, 10), (10, 10)] {
+    for (done, total, expected) in [
+        (0, 10, "0 of 10 tiles"),
+        (4, 10, "4 of 10 tiles"),
+        (9, 10, "9 of 10 tiles"),
+        (175, 176, "175 of 176 tiles"),
+        (0, 1, "0 of 1 tile"),
+        (0, 0, ""),
+        (10, 10, ""),
+        (11, 10, ""),
+    ] {
         assert_eq!(
             progress_text(&RunState::Running, Some(&fuse_progress(done, total))),
+            expected,
+            "a running fuse snapshot at {done}/{total}"
+        );
+    }
+
+    for state in [
+        RunState::Idle,
+        RunState::Queued { position: 1 },
+        RunState::Paused,
+        RunState::Cancelling,
+        RunState::Failed("stopped".into()),
+        RunState::Fused {
+            at: "now".into(),
+            unaligned: 0,
+        },
+    ] {
+        assert_eq!(
+            progress_text(&state, Some(&fuse_progress(4, 10))),
             "",
-            "a fuse snapshot at {done}/{total} must render no count"
+            "a mid-fuse snapshot must render no count in {state:?}"
         );
     }
 }
@@ -1469,7 +1496,7 @@ fn a_computed_alignment_shows_no_reuse_text() {
     );
     assert_eq!(
         progress_text(&RunState::Running, Some(&fuse_progress(2, 10))),
-        ""
+        "2 of 10 tiles"
     );
     assert_eq!(progress_text(&RunState::Running, None), "");
 }
@@ -1507,13 +1534,14 @@ fn progress_text_without_a_total_is_the_name_only() {
     assert_eq!(progress_text(&RunState::Running, Some(&no_total)), "");
 
     // A fuse snapshot that still carries a finished align stage's `8/8`
-    // shows no count -- only Aligning counts frames.
+    // counts tiles, never the align stage's frames -- only Aligning counts
+    // frames.
     let mut finished_align_then_fusing = fuse_progress(0, 10);
     finished_align_then_fusing.align_done = 8;
     finished_align_then_fusing.align_total = 8;
     assert_eq!(
         progress_text(&RunState::Running, Some(&finished_align_then_fusing)),
-        ""
+        "0 of 10 tiles"
     );
 }
 

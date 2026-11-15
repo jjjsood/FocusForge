@@ -2042,38 +2042,87 @@ fn stacking_toolbar_has_no_save_checkpoint_caption() {
     );
 }
 
+/// Right edge of `id`'s element.
+fn right_edge(app: &AppWindow, id: &str) -> f32 {
+    let (x, _, w, _) = rect(app, id);
+    x + w
+}
+
 /// The bottom bar's progress track, in reading order (stage -> step -> bar),
-/// at the base width and at the 1200px minimum: the bar's width is dynamic,
-/// always ending `Theme.space-4` before the overlay caption.
+/// at the base width and at the 1200px minimum: the step text follows the
+/// stage word, the bar starts after the room the longest count needs, and
+/// its width is dynamic, always ending `Theme.space-4` before the overlay
+/// caption.
 #[test]
 fn bottom_bar_progress() {
-    let app = app_at(1440, 900);
-    app.set_project_loaded(true);
-    app.set_stage_word("Aligning".into());
-    app.set_step_text("42 of 61".into());
-    app.set_bar_fraction(0.5);
+    const GAP: f32 = 16.0;
+    for (width, height, step_row, bar_row) in [(1440, 900, 856.0, 876.0), (1200, 760, 716.0, 736.0)]
+    {
+        let app = app_at(width, height);
+        app.set_project_loaded(true);
+        app.set_stage_word("Aligning".into());
+        app.set_step_text("42 of 61".into());
+        app.set_bar_fraction(0.5);
 
-    let (step_x, step_y, _, _) = rect(&app, "FFBottomBar::step-text");
-    assert_eq!((step_x, step_y), (166.0, 856.0));
-    assert_rect(
-        &app,
-        "FFBottomBar::progress-bar",
-        (250.0, 876.0, 658.0, 4.0),
-    );
+        let stage_end = right_edge(&app, "FFBottomBar::status-text");
+        let (step_x, step_y, _, _) = rect(&app, "FFBottomBar::step-text");
+        assert_eq!(
+            (step_x, step_y),
+            (stage_end + GAP, step_row),
+            "{width}px wide: step text"
+        );
 
-    let app_min = app_at(1200, 760);
-    app_min.set_project_loaded(true);
-    app_min.set_stage_word("Aligning".into());
-    app_min.set_step_text("42 of 61".into());
-    app_min.set_bar_fraction(0.5);
+        // The room is the width of the longest count, which the step text
+        // takes when it shows that count.
+        app.set_step_text("9999 of 9999 tiles".into());
+        let (_, _, room_w, _) = rect(&app, "FFBottomBar::step-text");
+        app.set_step_text("42 of 61".into());
+        let (bar_x, bar_y, bar_w, bar_h) = rect(&app, "FFBottomBar::progress-bar");
+        assert_eq!(
+            (bar_x, bar_y, bar_h),
+            (stage_end + GAP + room_w + GAP, bar_row, 4.0),
+            "{width}px wide: bar"
+        );
+        assert!(bar_w > 0.0, "{width}px wide: bar width {bar_w}");
+    }
+}
 
-    let (step_x, step_y, _, _) = rect(&app_min, "FFBottomBar::step-text");
-    assert_eq!((step_x, step_y), (166.0, 716.0));
-    assert_rect(
-        &app_min,
-        "FFBottomBar::progress-bar",
-        (250.0, 736.0, 418.0, 4.0),
-    );
+/// The step text keeps `Theme.space-4` clear of the bar for the longest count
+/// the room is sized for, and the bar's start holds still while the count
+/// gains digits.
+#[test]
+fn bottom_bar_step_text_clears_the_bar() {
+    const GAP: f32 = 16.0;
+    for width in [1200, 1440] {
+        let app = app_at(width, 900);
+        app.set_project_loaded(true);
+        app.set_stage_word("Fusing".into());
+        app.set_bar_fraction(0.5);
+
+        let mut bar_starts = Vec::new();
+        for text in [
+            "9 of 9999 tiles",
+            "10 of 9999 tiles",
+            "100 of 9999 tiles",
+            "1000 of 9999 tiles",
+            "12 of 64 tiles",
+            "444 of 444 tiles",
+            "9999 of 9999 tiles",
+        ] {
+            app.set_step_text(text.into());
+            let step_end = right_edge(&app, "FFBottomBar::step-text");
+            let (bar_x, _, _, _) = rect(&app, "FFBottomBar::progress-bar");
+            assert!(
+                step_end + GAP <= bar_x + EPS,
+                "{width}px wide: {text:?} ends at {step_end}, bar starts at {bar_x}"
+            );
+            bar_starts.push(bar_x);
+        }
+        assert!(
+            bar_starts.windows(2).all(|w| w[0] == w[1]),
+            "{width}px wide: the bar start moved with the count: {bar_starts:?}"
+        );
+    }
 }
 
 /// The progress track ends exactly `Theme.space-4` before the overlay caption
@@ -2085,16 +2134,9 @@ fn bottom_bar_progress_ends_before_the_overlay_caption() {
         app.set_project_loaded(true);
         app.set_bar_fraction(0.5);
 
-        let (bar_x, _, bar_w, _) = rect(&app, "FFBottomBar::progress-bar");
         let (caption_x, _, _, _) = rect(&app, "FFBottomBar::overlay-caption");
-        assert_eq!(bar_x, 250.0, "{width}px wide: track start");
         assert_eq!(
-            bar_x + bar_w,
-            width as f32 - 532.0,
-            "{width}px wide: track end"
-        );
-        assert_eq!(
-            caption_x - (bar_x + bar_w),
+            caption_x - right_edge(&app, "FFBottomBar::progress-bar"),
             16.0,
             "{width}px wide: gap between track and overlay caption"
         );

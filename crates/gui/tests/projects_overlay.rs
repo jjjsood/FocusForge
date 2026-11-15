@@ -270,7 +270,15 @@ fn live_card_meta_names_the_phase() {
     );
     assert_eq!(
         job::phase_line(&RunState::Running, Some(&fuse_progress(4, 10))).as_deref(),
+        Some("fusing, 4 of 10 tiles")
+    );
+    assert_eq!(
+        job::phase_line(&RunState::Running, Some(&fuse_progress(0, 0))).as_deref(),
         Some("fusing")
+    );
+    assert_eq!(
+        job::phase_line(&RunState::Paused, Some(&fuse_progress(4, 10))),
+        None
     );
     assert_eq!(
         job::phase_line(&RunState::Running, Some(&fuse_progress(10, 10))).as_deref(),

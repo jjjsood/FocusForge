@@ -1263,7 +1263,8 @@ impl StageObserver for GuiObserver {
 
 /// The run's own phases, in order. A phase declares its name and whether it
 /// counts frames ([`Phase::frames`]) -- the one place either is decided, so a
-/// phase added later needs only an arm here.
+/// phase added later needs only an arm here. The fuse phase counts tiles,
+/// which [`progress_text`] renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Developing,
@@ -1287,9 +1288,10 @@ impl Phase {
     /// `Some((done, total))` while `self` counts work and `progress`
     /// carries a non-zero total for it, `None` otherwise -- a cached or
     /// resumed alignment included, since its total is `0`. `Developing`,
-    /// `Preparing` and `Aligning` are the phases with a total; the Preparing
-    /// count is in strips read (frames for a RAW source), the others in
-    /// frames.
+    /// `Preparing` and `Aligning` are the phases with a frame total; the
+    /// Preparing count is in strips read (frames for a RAW source), the
+    /// others in frames. `Fusing` counts tiles, not frames, so it is `None`
+    /// here.
     pub fn frames(self, progress: &JobProgress) -> Option<(usize, usize)> {
         match self {
             Phase::Developing if progress.develop_total > 0 => {
@@ -1398,11 +1400,12 @@ pub fn current_phase(state: &RunState, progress: Option<&JobProgress>) -> Option
 }
 
 /// The bottom bar's step-text slot: `"<done> of <total>"` while the current
-/// phase counts work and `progress` carries a total for it
-/// ([`Phase::frames`]), `"from cache"` while the align stage has no total
-/// (the alignment is served from the stage cache), empty for any other
-/// name-only phase, outside a running state, or with no progress to derive a
-/// phase from.
+/// phase counts frames and `progress` carries a total for it
+/// ([`Phase::frames`]), `"<done> of <total> tiles"` (`tile` for a total of 1)
+/// while the fuse stage reports a tile total, `"from cache"` while the align
+/// stage has no total (the alignment is served from the stage cache), empty
+/// for any other name-only phase (`Writing`, a fuse stage with no total yet),
+/// outside a running state, or with no progress to derive a phase from.
 pub fn progress_text(state: &RunState, progress: Option<&JobProgress>) -> String {
     let (Some(phase), Some(p)) = (current_phase(state, progress), progress) else {
         return String::new();
@@ -1410,14 +1413,19 @@ pub fn progress_text(state: &RunState, progress: Option<&JobProgress>) -> String
     match (phase, phase.frames(p)) {
         (_, Some((done, total))) => format!("{done} of {total}"),
         (Phase::Aligning, None) => "from cache".to_string(),
+        (Phase::Fusing, None) if p.unit_total > 0 => {
+            let tiles = if p.unit_total == 1 { "tile" } else { "tiles" };
+            format!("{} of {} {tiles}", p.units_done, p.unit_total)
+        }
         _ => String::new(),
     }
 }
 
 /// The run's phase line for a card or overlay meta text: the lower-cased
-/// phase name, plus `, <k> of <N>` or `, from cache` when [`progress_text`]
-/// has a step text to show. `None` outside `Running` -- a name-only phase
-/// still returns `Some`, so it never falls back to some other line.
+/// phase name, plus `, <k> of <N>`, `, <k> of <N> tiles` or `, from cache`
+/// when [`progress_text`] has a step text to show. `None` outside `Running`
+/// -- a name-only phase still returns `Some`, so it never falls back to some
+/// other line.
 pub fn phase_line(state: &RunState, progress: Option<&JobProgress>) -> Option<String> {
     if !matches!(state, RunState::Running) {
         return None;

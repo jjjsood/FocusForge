@@ -58,7 +58,7 @@ export component FFBottomBar inherits Rectangle {
     }
 
     step-text := Text {
-        x: ShellGeometry.progress-step-x;
+        x: status-text.x + status-text.width + Theme.space-4;
         y: 0px;
         height: parent.height;
         visible: root.project-loaded && root.step-text != "";
@@ -69,12 +69,20 @@ export component FFBottomBar inherits Rectangle {
         vertical-alignment: center;
     }
 
-    // Stretches with the window so its right edge stays `Theme.space-4`
-    // before the overlay caption at every width, never a fixed literal.
+    // Never drawn: its width is the room the longest step text needs, so the
+    // bar's left edge holds still while the count gains digits.
+    step-text-room := FFRowText {
+        visible: false;
+        text: "9999 of 9999 tiles";
+    }
+
+    // Starts `Theme.space-4` after the step text's room and stretches with
+    // the window so its right edge stays `Theme.space-4` before the overlay
+    // caption at every width, never a fixed literal.
     progress-bar := FFProgressBar {
-        x: ShellGeometry.progress-bar-x;
+        x: step-text.x + step-text-room.width + Theme.space-4;
         y: (parent.height - self.height) / 2;
-        width: overlay-caption.x - Theme.space-4 - ShellGeometry.progress-bar-x;
+        width: overlay-caption.x - Theme.space-4 - self.x;
         visible: root.project-loaded;
         fraction: root.bar-fraction;
         tone: root.bar-tone;
