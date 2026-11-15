@@ -120,7 +120,7 @@ fn pass_samples(pass: u32, step: NonZeroU32) -> u32 {
 
 /// The pixel box [`brush_preview`] needs both grids to cover when the result
 /// grid has lattice `step`: the stroke's footprint, grown for Detail by its
-/// three [`pass_samples`] box passes, clipped to the image. Grids that start
+/// three box passes of `pass_samples` samples each, clipped to the image. Grids that start
 /// at or before the box's corner and reach its far edges answer; one that
 /// starts later does not. `None` when the image or the brush is out of range
 /// or the footprint holds no pixel. Allocates nothing.
