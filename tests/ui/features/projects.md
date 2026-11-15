@@ -15,3 +15,4 @@ Gotchas:
 - Journey 18 launches with `--projects-overlay --toolbar-state paused` and two `--open` paths: the overview is up once both folders have loaded (18 step 1) and Esc closes it (18 steps 3, 16 and 19). `--toolbar-state paused` is a held preview, not a run: the toolbar reads **Resume** and **Cancel** with no **Fuse stack**, the bottom bar "Paused" with no remaining-time text, and both buttons do nothing (18 steps 4, 5 and 20). The preview survives tab, dock, zoom, overview and close-project changes; only a real run replaces it, and no step can start one because **Fuse stack** is absent while it is held.
 Guides: 11-projects.md, 16-project-and-folder-refusals.md, 18-launch-overview-and-transport-preview.md
 Book: guide/batch-runs.md#the-projects-overview, guide/batch-runs.md#cards-that-need-attention
+Sources: crates/ui/ui/shell/projects_overlay.slint, crates/ui/ui/shell/projects_overlay/*.slint, crates/gui/src/overlay.rs, crates/gui/src/recent.rs

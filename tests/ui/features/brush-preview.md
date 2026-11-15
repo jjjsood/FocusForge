@@ -15,3 +15,4 @@ Gotchas:
 - Human only, no driver can read it: the preview's look (the selected frame at about 80 % over the result, a soft edge, the frame pane's ring alone with no second picture), on the hardware adapter and on the software adapter.
 Guides: 25-brush-preview.md
 Book: guide/retouch.md#paint-a-stroke
+Sources: crates/ui/ui/shell/editor_toolbar.slint, crates/ui/ui/shell/canvas.slint, crates/ui/ui/comparison_window.slint, crates/gui/src/brush.rs, crates/gui/src/canvas.rs, crates/gui/src/gpu_canvas.rs, crates/gui/src/editor_settings.rs, crates/gui/src/input_map.rs

@@ -15,3 +15,4 @@ Gotchas:
 - Human only: the scroll wheel in the panel, judging that a changed parameter changes the fused pixels.
 Guides: 09-stacking-parameters.md, 14-pre-brightness-target.md
 Book: guide/stacking.md#fuse-choose-how-the-frames-are-combined, guide/stacking.md#reset-all-to-default
+Sources: crates/ui/ui/shell/dock/settings_panel.slint, crates/ui/ui/shell/tab_strip.slint, crates/gui/src/settings_panel.rs

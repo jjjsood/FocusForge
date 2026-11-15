@@ -13,3 +13,4 @@ Gotchas:
 - Opening the overlay with a driver needs a build with the `mcp` feature (`tools/gui/run-gui.sh` builds it); a binary built without it answers no request.
 Guides: 22-analytics.md
 Book: guide/gui.md#count-the-sharp-areas-of-each-frame
+Sources: crates/ui/ui/shell/analytics_overlay.slint, crates/ui/ui/shell/icon_bar.slint, crates/gui/src/analytics.rs

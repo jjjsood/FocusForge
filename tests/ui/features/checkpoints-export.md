@@ -16,3 +16,4 @@ Gotchas:
 Needs: a saved-checkpoint export sentence (needs a project saved to disk); a real refusal from a missing or changed frame (needs a project fixture whose frames moved); judging exported pixels is human only.
 Guides: 04-checkpoints.md, 05-export.md
 Book: guide/history.md#the-checkpoints-list, guide/export.md#open-the-export-dialog
+Sources: crates/ui/ui/shell/dock/checkpoint_panel.slint, crates/ui/ui/shell/dialogs.slint, crates/gui/src/checkpoints.rs, crates/gui/src/export_settings.rs

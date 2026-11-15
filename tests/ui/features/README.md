@@ -21,7 +21,7 @@ Each feature file says how a user reaches the feature, which controls matter, an
 | [retouch-from-checkpoints](retouch-from-checkpoints.md) | 24 | a result chosen as brush source and its left pane label, a stroke painted from it and saved, Alt+click picking that result back, the hidden line refusing a click, the delete question counting the strokes that use a result, hidden and kept after delete, Save project clearing UNSAVED |
 | [brush-preview](brush-preview.md) | 25 | the **Preview** switch and the p key, the switch shared by both tabs, the preview inside the brush ring following the pointer and mirrored from the frame pane, hidden outside the image and with **Pipette** armed, present in the Composite's own window, hovering leaving Undo, Redo and the export line unchanged, a stroke with the switch on, the switch off again |
 
-Each feature file carries a `Book:` line after `Guides:`: the manual sections (`page.md#anchor` under `docs/`) that show the feature, each holding an image. `tools/check-manual-coverage.py` checks it.
+Each feature file carries a `Book:` line after `Guides:`: the manual sections (`page.md#anchor` under `docs/`) that show the feature, each holding an image. `tools/check-manual-coverage.py` checks it. A `Sources:` line follows it: comma-separated path globs of the source files the feature lives in, the source paths whose change makes the feature's journeys worth a run. Files every surface shares (`app.slint`, `components/**`, the shared controllers) belong to no feature, and every glob must match at least one file.
 
 ## Human only
 

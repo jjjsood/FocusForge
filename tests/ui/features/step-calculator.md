@@ -11,3 +11,4 @@ Gotchas:
 - Opening the overlay with a driver needs a build with the `mcp` feature (`tools/gui/run-gui.sh` builds it); a binary built without it answers no request.
 Guides: 21-step-calculator.md, 23-step-calculator-large-window.md
 Book: guide/gui.md#plan-a-stack-with-the-step-calculator
+Sources: crates/ui/ui/shell/calculator_overlay.slint, crates/ui/ui/shell/icon_bar.slint, crates/gui/src/calculator.rs

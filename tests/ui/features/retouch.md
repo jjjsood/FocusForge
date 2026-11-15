@@ -14,3 +14,4 @@ Gotchas:
 - A camera-RAW stack runs the same editor path in `manual/03-editor-brush-raw.md` (three real DNG files copied into `.scratch/raw-gui/frames`, so no numbered journey can start from it): the fuse ends without a "Keep this fused result?" question, a saved project reopens in STACKING mode with its two checkpoints and shows its Composite after one **Fit** click, and the Size slider keeps its last value across the reopen.
 Guides: 03-editor-brush.md, 04-checkpoints.md
 Book: guide/retouch.md#set-the-brush-size-and-soft, guide/retouch.md#paint-a-stroke
+Sources: crates/ui/ui/shell/editor_toolbar.slint, crates/ui/ui/shell/canvas.slint, crates/ui/ui/shell/dialogs.slint, crates/ui/ui/shell/dock/mode_switch.slint, crates/ui/ui/shell/dock/checkpoint_panel.slint, crates/gui/src/brush.rs, crates/gui/src/canvas.rs, crates/gui/src/gpu_canvas.rs, crates/gui/src/editor_settings.rs, crates/gui/src/checkpoints.rs
