@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use focusforge_core::TiffError;
-use focusforge_core::algorithm::{AlgorithmError, read_tile_step_f32_into, read_tile_step_into};
+use focusforge_core::algorithm::{
+    AlgorithmError, TileReader, read_tile_step_f32_into, read_tile_step_into,
+};
 use focusforge_core::align::{Transform, WarpingReader};
 use focusforge_core::display::alpha_from_opacity;
 use focusforge_core::equalize::GainReader;
@@ -238,21 +240,9 @@ fn read_warped(
     let Some(view) = view else {
         return reader.read_tile_step_into(0, rect, step, samples_per_pixel, out);
     };
-    let (transform, origin) = (view.transform, view.origin);
-    let gains = [view.gain];
-    let gained = GainReader::new(reader, &gains);
-    let warped = WarpingReader::new(
-        &gained,
-        reader.dimensions(),
-        samples_per_pixel,
-        vec![transform],
-    );
-    let shifted = Rect {
-        x: rect.x + origin.0,
-        y: rect.y + origin.1,
-        ..rect
-    };
-    read_tile_step_into(&warped, 0, shifted, step, samples_per_pixel, out)
+    through_view(reader, view, rect, |warped, shifted| {
+        read_tile_step_into(warped, 0, shifted, step, samples_per_pixel, out)
+    })
 }
 
 /// [`read_warped`] in `f32` samples.
@@ -267,21 +257,33 @@ fn read_warped_f32(
     let Some(view) = view else {
         return read_tile_step_f32_into(reader, 0, rect, step, samples_per_pixel, out);
     };
-    let (transform, origin) = (view.transform, view.origin);
+    through_view(reader, view, rect, |warped, shifted| {
+        read_tile_step_f32_into(warped, 0, shifted, step, samples_per_pixel, out)
+    })
+}
+
+/// Runs `read` on `reader`'s frame 0 gained and warped by `view`, with `rect`
+/// moved to the view's crop origin.
+fn through_view(
+    reader: &dyn FrameReader,
+    view: FrameView,
+    rect: Rect,
+    read: impl FnOnce(&dyn TileReader, Rect) -> Result<(), AlgorithmError>,
+) -> Result<(), AlgorithmError> {
     let gains = [view.gain];
     let gained = GainReader::new(reader, &gains);
     let warped = WarpingReader::new(
         &gained,
         reader.dimensions(),
-        samples_per_pixel,
-        vec![transform],
+        reader.frame(0).samples_per_pixel,
+        vec![view.transform],
     );
     let shifted = Rect {
-        x: rect.x + origin.0,
-        y: rect.y + origin.1,
+        x: rect.x + view.origin.0,
+        y: rect.y + view.origin.1,
         ..rect
     };
-    read_tile_step_f32_into(&warped, 0, shifted, step, samples_per_pixel, out)
+    read(&warped, shifted)
 }
 
 /// One open frame plus the view it is warped through, readable from a
