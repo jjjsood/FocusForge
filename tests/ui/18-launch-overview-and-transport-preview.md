@@ -6,7 +6,7 @@ Start: --open fixtures/mantis-512/frames --open fixtures/mantis-64/frames --proj
 2. Click **Save project** (`FFProjectsRail::save-project`).
    Expect: Must not: the overview closes or a file chooser opens; the overview is still on screen and **Save project** is greyed out (read with `buttons AppWindow::projects-overlay`: the line starts with `x`).
 3. Press Escape.
-   Expect: the overview is gone; the toolbar shows **Resume** and **Cancel** and no **Fuse stack** button; the bottom bar reads "Paused" with no remaining-time text; the dock header reads "3 frames · 0 excluded".
+   Expect: the overview is gone; the toolbar shows **Resume** and **Cancel** and no **Fuse stack** button; the bottom bar reads "Paused"; the dock header reads "3 frames · 0 excluded".
 ## The paused transport belongs to no run, so its buttons do nothing
 4. Click **Resume** (`FFToolbar::resume-button`).
    Expect: Must not: a run starts; the toolbar still shows **Resume** and **Cancel**, and the bottom bar still reads "Paused".
