@@ -14,6 +14,7 @@ pub mod equalize;
 pub mod fuse;
 pub mod gpu;
 pub mod host;
+pub mod hot_pixels;
 pub mod io;
 pub mod job;
 pub mod params;

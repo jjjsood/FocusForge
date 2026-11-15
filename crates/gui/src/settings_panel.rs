@@ -666,7 +666,7 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
         .iter_mut()
         .skip_while(|r| r.id != "equalize")
         .skip(1)
-        .take_while(|r| r.kind != RowKind::MoreEnd)
+        .take_while(|r| r.kind != RowKind::MoreEnd && r.id != "defect-removal")
     {
         row.disabled = !equalize_on;
     }

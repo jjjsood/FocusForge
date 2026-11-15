@@ -1,0 +1,33 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH focusforge-cli-hot-pixels 1  "hot-pixels 0.2.1" 
+.SH NAME
+focusforge\-cli\-hot\-pixels \- Find hot pixels: pixels that differ from their neighbours at the same sensor position in more than half the frames. Frames are read as they are, without alignment
+.SH SYNOPSIS
+\fBfocusforge\-cli hot\-pixels\fR [\fB\-\-set\fR] [\fB\-\-json\fR] [\fB\-v \fR]... [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDIR\fR> 
+.SH DESCRIPTION
+Find hot pixels: pixels that differ from their neighbours at the same sensor position in more than half the frames. Frames are read as they are, without alignment
+.SH OPTIONS
+.TP
+\fB\-\-set\fR \fI<KEY=VALUE>\fR
+Set a parameter: `\-\-set key=value`, repeatable. A repeated key is last\-wins
+.TP
+\fB\-\-json\fR
+Print the count and the sensor coordinates as one JSON object
+.TP
+\fB\-v\fR
+Increase log detail (repeatable)
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Log errors only
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+<\fIDIR\fR>
+Directory of frames to search (non\-recursive, descending into a `frames` subdirectory)
+.SH EXTRA
+Parameters (\-\-set KEY=VALUE):
+  hot\-pixel\-threshold Hot pixel threshold (default 7, 2 to 50)
+.SH VERSION
+v0.2.1

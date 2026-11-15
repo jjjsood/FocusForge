@@ -1783,6 +1783,16 @@ fn more_rows<'a>(rows: &'a [SettingsRow], section: &str) -> Vec<&'a SettingsRow>
         .collect()
 }
 
+/// The prepare section's parameter ids, in schema order.
+const PREPARE_IDS: [&str; 6] = [
+    "equalize",
+    "equalize-max-gain",
+    "equalize-target",
+    "defect-removal",
+    "hot-pixels",
+    "hot-pixel-threshold",
+];
+
 fn field_ids(rows: &[SettingsRow], section: &str) -> Vec<String> {
     field_rows(rows, section)
         .iter()
@@ -1897,10 +1907,7 @@ fn more_reveals_that_sections_advanced_rows() {
     controller.set_fuse_algorithm("depth-map");
     controller.toggle_section_more("prepare");
     let rows = controller.settings_panel().rows;
-    assert_eq!(
-        field_ids(&rows, "prepare"),
-        ["equalize", "equalize-max-gain", "equalize-target"]
-    );
+    assert_eq!(field_ids(&rows, "prepare"), PREPARE_IDS);
     assert_eq!(field_ids(&rows, "finish"), ["auto-crop"]);
     assert_eq!(
         rows[row_index(&rows, "prepare", "equalize")].selected,
@@ -2230,11 +2237,7 @@ fn prepare_and_finish_sections_hold_the_project_settings() {
 
         controller.toggle_section_more("prepare");
         let rows = controller.settings_panel().rows;
-        assert_eq!(
-            field_ids(&rows, "prepare"),
-            ["equalize", "equalize-max-gain", "equalize-target"],
-            "{method}"
-        );
+        assert_eq!(field_ids(&rows, "prepare"), PREPARE_IDS, "{method}");
         assert_eq!(
             rows[row_index(&rows, "prepare", "equalize")].selected,
             "false",

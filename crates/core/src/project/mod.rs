@@ -296,9 +296,14 @@ pub static FINISH_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     }]
 });
 
+/// The default of `hot-pixel-threshold`: how many times its neighbourhood's
+/// spread a pixel must differ from the neighbourhood's median to count as a
+/// hot pixel.
+pub const HOT_PIXEL_THRESHOLD_DEFAULT: f64 = 7.0;
+
 /// The project parameters that change the frames before alignment and
-/// fusing: the brightness-equalization parameters. The settings panel's
-/// prepare section renders exactly this schema.
+/// fusing: brightness equalization and sensor-defect removal. The settings
+/// panel's prepare section renders exactly this schema.
 pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
     vec![
         ParamDesc {
@@ -350,6 +355,54 @@ pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
                 logarithmic: false,
             },
             default: ParamValue::Float(0.0),
+            advanced: true,
+            auto: None,
+            host_default: None,
+            stack_max: None,
+        },
+        ParamDesc {
+            id: "defect-removal".to_string(),
+            label: "Remove sensor defects".to_string(),
+            help: "Replaces stuck, hot and dead sensor pixels from their \
+                   neighbours before the frames are aligned, leaving the \
+                   source files unchanged."
+                .to_string(),
+            kind: ParamKind::Bool,
+            default: ParamValue::Bool(false),
+            advanced: true,
+            auto: None,
+            host_default: None,
+            stack_max: None,
+        },
+        ParamDesc {
+            id: "hot-pixels".to_string(),
+            label: "Find hot pixels".to_string(),
+            help: "Only used when defect removal is on: finds pixels that \
+                   differ from their neighbours at the same position in more \
+                   than half the frames."
+                .to_string(),
+            kind: ParamKind::Bool,
+            default: ParamValue::Bool(true),
+            advanced: true,
+            auto: None,
+            host_default: None,
+            stack_max: None,
+        },
+        ParamDesc {
+            id: "hot-pixel-threshold".to_string(),
+            label: "Hot pixel threshold".to_string(),
+            help: "Only used when hot pixels are found automatically: how \
+                   many times its neighbourhood's spread a pixel must differ \
+                   from the neighbourhood's median to count as a hot pixel; \
+                   higher finds fewer."
+                .to_string(),
+            kind: ParamKind::Float {
+                min: 2.0,
+                max: 50.0,
+                step: 0.5,
+                logarithmic: false,
+            },
+            default: ParamValue::Float(HOT_PIXEL_THRESHOLD_DEFAULT),
             advanced: true,
             auto: None,
             host_default: None,
@@ -1105,7 +1158,10 @@ mod tests {
                 "auto-crop",
                 "equalize",
                 "equalize-max-gain",
-                "equalize-target"
+                "equalize-target",
+                "defect-removal",
+                "hot-pixels",
+                "hot-pixel-threshold"
             ]
         );
 
@@ -1240,7 +1296,14 @@ mod tests {
         assert_eq!(ids(&ALIGN_PARAMS), ["align"]);
         assert_eq!(
             ids(&PREPARE_PARAMS),
-            ["equalize", "equalize-max-gain", "equalize-target"]
+            [
+                "equalize",
+                "equalize-max-gain",
+                "equalize-target",
+                "defect-removal",
+                "hot-pixels",
+                "hot-pixel-threshold"
+            ]
         );
         assert_eq!(ids(&FINISH_PARAMS), ["auto-crop"]);
         assert_eq!(
@@ -1250,7 +1313,10 @@ mod tests {
                 "auto-crop",
                 "equalize",
                 "equalize-max-gain",
-                "equalize-target"
+                "equalize-target",
+                "defect-removal",
+                "hot-pixels",
+                "hot-pixel-threshold"
             ]
         );
         for d in PROJECT_PARAMS.iter() {
@@ -1270,7 +1336,14 @@ mod tests {
         let finish = params_for_group(&FINISH_PARAMS, focus_map);
         assert_eq!(
             ids(&prepare),
-            ["equalize", "equalize-max-gain", "equalize-target"]
+            [
+                "equalize",
+                "equalize-max-gain",
+                "equalize-target",
+                "defect-removal",
+                "hot-pixels",
+                "hot-pixel-threshold"
+            ]
         );
         assert_eq!(ids(&finish), ["auto-crop"]);
         assert_eq!(default_of(&prepare, "equalize"), ParamValue::Bool(false));
@@ -1282,6 +1355,15 @@ mod tests {
         assert_eq!(
             default_of(&prepare, "equalize-target"),
             ParamValue::Float(0.0)
+        );
+        assert_eq!(
+            default_of(&prepare, "defect-removal"),
+            ParamValue::Bool(false)
+        );
+        assert_eq!(default_of(&prepare, "hot-pixels"), ParamValue::Bool(true));
+        assert_eq!(
+            default_of(&prepare, "hot-pixel-threshold"),
+            ParamValue::Float(HOT_PIXEL_THRESHOLD_DEFAULT)
         );
     }
 

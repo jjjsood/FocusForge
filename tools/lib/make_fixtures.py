@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import filecmp
+import json
 import os
 import re
 import shutil
@@ -296,6 +297,7 @@ def _root_readme(stack_dir: str, frame_names: list, date: str) -> str:
     for fset in COMPRESSED_SETS:
         lines.append(f"| `{fset.name}` | 3 | `4064,2700,64,64` | 64x64 |")
     lines.append("| `blackmagic-micro-dng` | 1 | single DNG | 1952x1104 |")
+    lines.append(f"| `{HOT_PIXEL_SET}` | {HOT_PIXEL_FRAMES} | `{HOT_PIXEL_SOURCE}` with injected defects | 512x512 |")
     lines.append("| `open-two-stacks` | 6 | `4064,2700,64,64` | 64x64 |")
     lines.append("| `open-root-and-subfolder` | 3 | `4064,2700,64,64` | 64x64 |")
     lines.append("| `open-rejected` | 3 | `4064,2700,64,64` | 64x64 |")
@@ -312,6 +314,10 @@ def _root_readme(stack_dir: str, frame_names: list, date: str) -> str:
         "",
         "`blackmagic-micro-dng` is one lossless-JPEG DNG camera frame with its own "
         "README; it has no `frames/` directory or `reference.tif`.",
+        "",
+        f"`{HOT_PIXEL_SET}` is the eight frames of `{HOT_PIXEL_SOURCE}` with stuck pixels "
+        f"written in at the positions `{HOT_PIXEL_SIDECAR}` lists, deflate-compressed; "
+        "it has its own README and no `reference.tif`.",
         "",
         "`open-two-stacks`, `open-root-and-subfolder` and `open-rejected` are folder "
         "shapes for the open paths, copied byte for byte from `mantis-64/frames` "
@@ -509,6 +515,130 @@ def _folder_set_readme(name: str) -> str:
     return f"# Fixture set `{name}`\n\n{body}\n"
 
 
+# `mantis-512` with stuck pixels at fixed positions. Each row is (x, y, value,
+# frames): the sample set on all three channels and the frames carrying it.
+# Five of eight is the smallest majority, so the rows span 8 down to 1 frames,
+# bright and dark, interior, edges and corners. (511, 0) is a natural outlier
+# in frame 2, so its four frames include that one.
+HOT_PIXEL_SET = "mantis-512-hot-pixels"
+HOT_PIXEL_SOURCE = "mantis-512"
+HOT_PIXEL_SIDECAR = "hot-pixels.json"
+HOT_PIXEL_SIZE = 512
+HOT_PIXEL_FRAMES = 8
+# A defect must differ from the median of its 3x3 neighbours by at least this
+# much in every frame that carries it, or the table stops being meaningful.
+HOT_PIXEL_MIN_CONTRAST = 8192
+HOT_PIXELS = (
+    (0, 0, 0, (0, 1, 2, 3, 4, 5, 6, 7)),
+    (255, 0, 65535, (0, 1, 2, 3, 4, 5, 6, 7)),
+    (200, 150, 65535, (0, 1, 2, 3, 4, 5, 6, 7)),
+    (0, 300, 0, (0, 1, 2, 3, 4, 5, 6)),
+    (0, 511, 65535, (0, 1, 2, 3, 4, 5)),
+    (100, 511, 65535, (1, 2, 3, 4, 5, 6)),
+    (511, 200, 0, (2, 3, 4, 5, 6)),
+    (350, 400, 0, (0, 2, 4, 5, 7)),
+    (511, 0, 65535, (0, 1, 2, 3)),
+    (120, 260, 0, (0, 1, 2, 3)),
+    (400, 100, 0, (4, 5, 6, 7)),
+    (511, 511, 65535, (1, 4, 6)),
+    (450, 450, 65535, (0, 3, 7)),
+    (300, 300, 65535, (1, 6)),
+    (50, 50, 0, (3,)),
+)
+
+
+def _hot_pixel_readme() -> str:
+    return "\n".join(
+        [
+            f"# Fixture set `{HOT_PIXEL_SET}`",
+            "",
+            f"The eight frames of `{HOT_PIXEL_SOURCE}` with stuck pixels written in at "
+            "fixed positions: the same sensor position in some or all of the frames, "
+            f"all three channels set to 0 or 65535. `{HOT_PIXEL_SIDECAR}` lists every "
+            "injected pixel as `x`, `y`, `value` and the `frames` (indices of "
+            "`frames/NN.tif`) that carry it. The defects sit in the interior, on every "
+            "edge and on the corners, in 8, 7, 6 and 5 frames (more than half), in "
+            "exactly 4 and in 3, 2 and 1.",
+            "",
+            "Frames are deflate-compressed (Predictor 2, 16 rows per strip).",
+            "",
+        ]
+    )
+
+
+def _generate_hot_pixel_set(source_fixtures: str, out_dir: str) -> list:
+    """Write `mantis-512-hot-pixels` from the committed `mantis-512` frames."""
+    frames = []
+    for index in range(HOT_PIXEL_FRAMES):
+        source = os.path.join(source_fixtures, HOT_PIXEL_SOURCE, "frames", f"{index:02d}.tif")
+        if not os.path.isfile(source):
+            raise FixtureError(f"hot-pixel fixtures need the committed file {source}")
+        info = rawtiff.read_info(source)
+        pixels = rawtiff.read_rect(source, 0, 0, HOT_PIXEL_SIZE, HOT_PIXEL_SIZE, info=info)
+        if info.samples_per_pixel != 3 or info.bits_per_sample[0] != 16:
+            raise FixtureError(f"{source}: hot-pixel fixtures expect 16-bit RGB")
+        frames.append(bytearray(pixels))
+
+    def offset(x: int, y: int, channel: int) -> int:
+        return ((y * HOT_PIXEL_SIZE + x) * 3 + channel) * 2
+
+    def sample(frame: bytearray, x: int, y: int, channel: int) -> int:
+        return struct.unpack_from("<H", frame, offset(x, y, channel))[0]
+
+    # Every defect is checked against the untouched frames, so two defects
+    # close enough to be each other's neighbours cannot hide one another.
+    for x, y, value, carried in HOT_PIXELS:
+        for index in carried:
+            for channel in range(3):
+                around = sorted(
+                    sample(frames[index], nx, ny, channel)
+                    for ny in range(max(0, y - 1), min(HOT_PIXEL_SIZE, y + 2))
+                    for nx in range(max(0, x - 1), min(HOT_PIXEL_SIZE, x + 2))
+                    if (nx, ny) != (x, y)
+                )
+                half = len(around) // 2
+                median = around[half] if len(around) % 2 else (around[half - 1] + around[half]) / 2
+                if abs(value - median) < HOT_PIXEL_MIN_CONTRAST:
+                    raise FixtureError(
+                        f"hot pixel ({x}, {y}) = {value} in frame {index}, channel {channel}: "
+                        f"neighbour median {median} is closer than {HOT_PIXEL_MIN_CONTRAST}"
+                    )
+    for x, y, value, carried in HOT_PIXELS:
+        for index in carried:
+            for channel in range(3):
+                struct.pack_into("<H", frames[index], offset(x, y, channel), value)
+
+    frames_dir = os.path.join(out_dir, HOT_PIXEL_SET, "frames")
+    shutil.rmtree(frames_dir, ignore_errors=True)
+    os.makedirs(frames_dir, exist_ok=True)
+    produced = []
+    for index, pixels in enumerate(frames):
+        rel = f"{HOT_PIXEL_SET}/frames/{index:02d}.tif"
+        rawtiff.write_tiff(
+            os.path.join(out_dir, rel),
+            HOT_PIXEL_SIZE,
+            HOT_PIXEL_SIZE,
+            bytes(pixels),
+            description=f"FocusForge fixture {HOT_PIXEL_SET}/frames/{index:02d}",
+            rows_per_strip=16,
+            compression=8,
+            predictor=2,
+        )
+        produced.append(rel)
+    sidecar = [
+        {"x": x, "y": y, "value": value, "frames": list(carried)}
+        for x, y, value, carried in HOT_PIXELS
+    ]
+    for rel, text in (
+        (f"{HOT_PIXEL_SET}/{HOT_PIXEL_SIDECAR}", json.dumps(sidecar, indent=2) + "\n"),
+        (f"{HOT_PIXEL_SET}/README.md", _hot_pixel_readme()),
+    ):
+        with open(os.path.join(out_dir, rel), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        produced.append(rel)
+    return produced
+
+
 def _generate_folder_sets(source_fixtures: str, out_dir: str) -> list:
     source_frames = os.path.join(source_fixtures, "mantis-64", "frames")
     missing = [
@@ -617,6 +747,7 @@ def generate(stack_dir: str, out_dir: str, date: str) -> list:
 
     produced += _generate_compressed(out_dir, out_dir)
     produced += _generate_folder_sets(out_dir, out_dir)
+    produced += _generate_hot_pixel_set(out_dir, out_dir)
 
     rel = "README.md"
     with open(os.path.join(out_dir, rel), "w", encoding="utf-8", newline="\n") as fh:
@@ -633,6 +764,7 @@ def generate_compressed(source_fixtures: str, out_dir: str, date: str) -> list:
     os.makedirs(out_dir, exist_ok=True)
     produced = _generate_compressed(source_fixtures, out_dir)
     produced += _generate_folder_sets(source_fixtures, out_dir)
+    produced += _generate_hot_pixel_set(source_fixtures, out_dir)
     frame_names = ["00.tif", "01.tif", "02.tif"]
     with open(os.path.join(out_dir, "README.md"), "w", encoding="utf-8", newline="\n") as fh:
         fh.write(_root_readme(source_fixtures, frame_names, date))
@@ -728,7 +860,7 @@ def check(stack_dir: str, out_dir: str) -> int:
     with tempfile.TemporaryDirectory(prefix="focusforge-fixtures-") as tmp:
         produced = generate(stack_dir, tmp, date="<date>")
         differences = _check_generated(produced, out_dir, tmp)
-        differences += _find_orphans(out_dir, set(produced), (*SETS, *COMPRESSED_SETS), FOLDER_SET_NAMES)
+        differences += _find_orphans(out_dir, set(produced), (*SETS, *COMPRESSED_SETS), (*FOLDER_SET_NAMES, HOT_PIXEL_SET))
 
     if differences:
         print(f"FAIL: {out_dir} does not match the generator")
@@ -742,7 +874,7 @@ def check(stack_dir: str, out_dir: str) -> int:
 def _compare_compressed(expected_dir: str, produced: list, out_dir: str) -> list:
     """Differences between `out_dir` and the compressed tree the generator produced in `expected_dir`."""
     differences = _check_generated(produced, out_dir, expected_dir)
-    differences += _find_orphans(out_dir, set(produced), COMPRESSED_SETS, FOLDER_SET_NAMES)
+    differences += _find_orphans(out_dir, set(produced), COMPRESSED_SETS, (*FOLDER_SET_NAMES, HOT_PIXEL_SET))
     return differences
 
 
@@ -826,10 +958,10 @@ def _selftest(source: str) -> int:
             out = os.path.join(tmp, "fixtures")
             shutil.copytree(source, out)
             produced = generate_compressed(source, out, "<date>")
-            # 147 compressed-set paths (24 16-bit sets, five 8-bit `mantis8-64` sets)
-            # plus 16 folder-set files (7 + 5 + 4).
-            if len(produced) != 163:
-                failures.append(f"compressed generation produced {len(produced)} paths, want 163")
+            # 147 compressed-set paths (24 16-bit sets, five 8-bit `mantis8-64` sets),
+            # 16 folder-set files (7 + 5 + 4) and 10 hot-pixel files (8 frames, README, sidecar).
+            if len(produced) != 173:
+                failures.append(f"compressed generation produced {len(produced)} paths, want 173")
             if len(FOLDER_SET_NAMES) != 3:
                 failures.append(f"folder sets {len(FOLDER_SET_NAMES)}, want 3")
             names = {item.name for item in COMPRESSED_SETS}

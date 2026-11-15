@@ -23,6 +23,7 @@ focusforge-cli [OPTIONS] <COMMAND>
 | [`algorithms`](#algorithms) | lists the stacking and alignment methods and their settings |
 | [`step-plan`](#step-plan) | plans a focus bracket: step, frame count, duration, disk need |
 | [`sharp-areas`](#sharp-areas) | counts the sharpest areas per frame |
+| [`hot-pixels`](#hot-pixels) | finds pixels that stay out of line with their neighbours across the frames |
 | [`sharpness-map`](#sharpness-map) | writes the focus score of each frame, and of a composite, as maps on one scale |
 | [`cache`](#cache) | clears the saved alignment and brightness results |
 | [`diagnostics`](#diagnostics) | packs logs and crash reports into one ZIP |
@@ -522,6 +523,35 @@ frames of different sizes all exit `1`.
 
 ```bash
 focusforge-cli sharp-areas frames/ --set cell-size=128
+```
+
+## `hot-pixels`
+
+```
+focusforge-cli hot-pixels [OPTIONS] <DIR>
+```
+
+Finds the hot pixels of a folder's frames: pixels that differ from their
+neighbours at the same sensor position in more than half the frames. Frames
+are read as they are, without alignment. The text output is the number of hot
+pixels found. A pixel counts when it differs from the median of its
+neighbourhood by more than `hot-pixel-threshold` times that neighbourhood's
+spread.
+
+| option | meaning |
+|---|---|
+| `--set <KEY=VALUE>` | set one of the values below; repeatable |
+| `--json` | print the count and the sensor coordinates as one JSON object |
+
+| id | meaning | default | allowed |
+|---|---|---|---|
+| `hot-pixel-threshold` | how many times its neighbourhood's spread a pixel must differ from the neighbourhood's median to count | `7` | 2 to 50 |
+
+A value out of range, a folder without frames, a frame that cannot be read and
+frames of different sizes all exit `1`.
+
+```bash
+focusforge-cli hot-pixels frames/ --set hot-pixel-threshold=10 --json
 ```
 
 ## `sharpness-map`

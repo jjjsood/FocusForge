@@ -362,7 +362,7 @@ fn linear_means_of(
 
 /// The rows one strip holds: about [`STRIP_SAMPLES`] samples, at least one
 /// row, at most the frame.
-fn strip_rows_for(frame: (u32, u32), samples_per_pixel: u32) -> u32 {
+pub(crate) fn strip_rows_for(frame: (u32, u32), samples_per_pixel: u32) -> u32 {
     let row_samples = (frame.0 as usize * samples_per_pixel as usize).max(1);
     (STRIP_SAMPLES / row_samples).clamp(1, frame.1.max(1) as usize) as u32
 }

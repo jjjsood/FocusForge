@@ -375,7 +375,10 @@ fn project_params_json_lists_every_project_descriptor() {
             "auto-crop",
             "equalize",
             "equalize-max-gain",
-            "equalize-target"
+            "equalize-target",
+            "defect-removal",
+            "hot-pixels",
+            "hot-pixel-threshold"
         ]
     );
     for (json, desc) in params
@@ -468,7 +471,14 @@ fn project_params_text_listing_names_them_after_the_algorithms() {
             entry.id()
         );
     }
-    for id in ["auto-crop", "equalize-max-gain", "equalize-target"] {
+    for id in [
+        "auto-crop",
+        "equalize-max-gain",
+        "equalize-target",
+        "defect-removal",
+        "hot-pixels",
+        "hot-pixel-threshold",
+    ] {
         assert!(stdout.contains(&format!("{id} - ")), "{id} in {stdout}");
     }
 }
