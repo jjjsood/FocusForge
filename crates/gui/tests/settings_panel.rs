@@ -1784,13 +1784,14 @@ fn more_rows<'a>(rows: &'a [SettingsRow], section: &str) -> Vec<&'a SettingsRow>
 }
 
 /// The prepare section's parameter ids, in schema order.
-const PREPARE_IDS: [&str; 6] = [
+const PREPARE_IDS: [&str; 7] = [
     "equalize",
     "equalize-max-gain",
     "equalize-target",
     "defect-removal",
     "hot-pixels",
     "hot-pixel-threshold",
+    "defect-grow-radius",
 ];
 
 fn field_ids(rows: &[SettingsRow], section: &str) -> Vec<String> {

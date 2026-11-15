@@ -378,7 +378,8 @@ fn project_params_json_lists_every_project_descriptor() {
             "equalize-target",
             "defect-removal",
             "hot-pixels",
-            "hot-pixel-threshold"
+            "hot-pixel-threshold",
+            "defect-grow-radius"
         ]
     );
     for (json, desc) in params
@@ -478,6 +479,7 @@ fn project_params_text_listing_names_them_after_the_algorithms() {
         "defect-removal",
         "hot-pixels",
         "hot-pixel-threshold",
+        "defect-grow-radius",
     ] {
         assert!(stdout.contains(&format!("{id} - ")), "{id} in {stdout}");
     }

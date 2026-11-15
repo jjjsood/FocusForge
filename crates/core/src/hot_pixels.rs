@@ -3,15 +3,17 @@
 //! Hot-pixel detection on frames as read, before alignment. A stuck, hot or
 //! dead sensor pixel sits at the same sensor position in every frame, so a
 //! pixel is a defect when it is an outlier against its 3×3 neighbourhood in
-//! more than half the frames. The result is a [`DefectMask`] in sensor
-//! coordinates. Frames are read in full-width strips with a one-row halo; the
-//! only whole-frame memory is the `u16` vote counter.
+//! more than half the frames. The result is a [`DefectMask`] (see
+//! [`crate::defect_mask`]) in sensor coordinates. Frames are read in
+//! full-width strips with a one-row halo; the only whole-frame memory is the
+//! `u16` vote counter.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
 use crate::algorithm::{AlgorithmError, TileReader};
+use crate::defect_mask::DefectMask;
 use crate::equalize::strip_rows_for;
 use crate::tile::Rect;
 
@@ -19,84 +21,6 @@ use crate::tile::Rect;
 /// sources arrive ×257). A flat neighbourhood has a median absolute deviation
 /// of zero; the floor keeps its sensor noise from counting as a defect.
 pub const MIN_SPREAD: f64 = 64.0;
-
-/// A set of sensor positions, one bit per pixel of a `width` × `height` frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DefectMask {
-    width: u32,
-    height: u32,
-    bits: Vec<u64>,
-}
-
-impl DefectMask {
-    /// An empty mask for a `width` × `height` frame.
-    pub fn new(width: u32, height: u32) -> Self {
-        let pixels = width as usize * height as usize;
-        DefectMask {
-            width,
-            height,
-            bits: vec![0; pixels.div_ceil(64)],
-        }
-    }
-
-    pub fn width(&self) -> u32 {
-        self.width
-    }
-
-    pub fn height(&self) -> u32 {
-        self.height
-    }
-
-    /// How many positions are set.
-    pub fn count(&self) -> usize {
-        self.bits
-            .iter()
-            .map(|word| word.count_ones() as usize)
-            .sum()
-    }
-
-    /// Whether `(x, y)` is set; a position outside the frame is not.
-    pub fn contains(&self, x: u32, y: u32) -> bool {
-        x < self.width && y < self.height && {
-            let at = self.index(x, y);
-            self.bits[at / 64] >> (at % 64) & 1 == 1
-        }
-    }
-
-    /// Sets `(x, y)`.
-    ///
-    /// # Panics
-    /// When the position is outside the frame.
-    pub fn insert(&mut self, x: u32, y: u32) {
-        assert!(
-            x < self.width && y < self.height,
-            "({x}, {y}) is outside the {}x{} defect mask",
-            self.width,
-            self.height
-        );
-        let at = self.index(x, y);
-        self.bits[at / 64] |= 1 << (at % 64);
-    }
-
-    /// The set positions as `(x, y)`, row by row.
-    pub fn positions(&self) -> Vec<(u32, u32)> {
-        let width = self.width as usize;
-        let mut out = Vec::with_capacity(self.count());
-        for (word_at, &word) in self.bits.iter().enumerate() {
-            let mut rest = word;
-            while rest != 0 {
-                let at = word_at * 64 + rest.trailing_zeros() as usize;
-                out.push(((at % width) as u32, (at / width) as u32));
-                rest &= rest - 1;
-            }
-        }
-        out
-    }
-
-    fn index(&self, x: u32, y: u32) -> usize {
-        y as usize * self.width as usize + x as usize
-    }
-}
 
 /// The units [`detect`] credits to its counter: one per strip read, every
 /// frame in full.

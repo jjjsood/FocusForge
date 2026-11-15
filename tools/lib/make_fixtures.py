@@ -547,6 +547,23 @@ HOT_PIXELS = (
 )
 
 
+# The user-painted mask beside the frames: 8-bit grey, white, with these single
+# black pixels (corners and the middle included) and one black disc.
+DEFECT_MASK_FILE = "defect-mask.tif"
+DEFECT_MASK_DOTS = ((0, 0), (511, 511), (255, 255), (100, 400), (37, 481))
+DEFECT_MASK_DISC = (380, 120, 5)
+
+
+def _defect_mask_black() -> set:
+    cx, cy, radius = DEFECT_MASK_DISC
+    black = set(DEFECT_MASK_DOTS)
+    for y in range(cy - radius, cy + radius + 1):
+        for x in range(cx - radius, cx + radius + 1):
+            if (x - cx) ** 2 + (y - cy) ** 2 <= radius**2:
+                black.add((x, y))
+    return black
+
+
 def _hot_pixel_readme() -> str:
     return "\n".join(
         [
@@ -561,6 +578,12 @@ def _hot_pixel_readme() -> str:
             "exactly 4 and in 3, 2 and 1.",
             "",
             "Frames are deflate-compressed (Predictor 2, 16 rows per strip).",
+            "",
+            f"`{DEFECT_MASK_FILE}` is a user-painted defect mask for these frames: 512x512, "
+            f"8-bit grey, white with {len(_defect_mask_black())} black pixels (black marks a "
+            f"defect) -- {len(DEFECT_MASK_DOTS)} single pixels, among them the corners (0, 0) "
+            f"and (511, 511), and one disc of radius {DEFECT_MASK_DISC[2]} centred on "
+            f"({DEFECT_MASK_DISC[0]}, {DEFECT_MASK_DISC[1]}).",
             "",
         ]
     )
@@ -625,6 +648,23 @@ def _generate_hot_pixel_set(source_fixtures: str, out_dir: str) -> list:
             predictor=2,
         )
         produced.append(rel)
+    mask = bytearray(b"\xff" * (HOT_PIXEL_SIZE * HOT_PIXEL_SIZE))
+    for x, y in _defect_mask_black():
+        mask[y * HOT_PIXEL_SIZE + x] = 0
+    mask_rel = f"{HOT_PIXEL_SET}/{DEFECT_MASK_FILE}"
+    rawtiff.write_tiff(
+        os.path.join(out_dir, mask_rel),
+        HOT_PIXEL_SIZE,
+        HOT_PIXEL_SIZE,
+        bytes(mask),
+        bits=8,
+        spp=1,
+        description=f"FocusForge fixture {mask_rel}",
+        rows_per_strip=16,
+        compression=8,
+        predictor=2,
+    )
+    produced.append(mask_rel)
     sidecar = [
         {"x": x, "y": y, "value": value, "frames": list(carried)}
         for x, y, value, carried in HOT_PIXELS
@@ -959,9 +999,9 @@ def _selftest(source: str) -> int:
             shutil.copytree(source, out)
             produced = generate_compressed(source, out, "<date>")
             # 147 compressed-set paths (24 16-bit sets, five 8-bit `mantis8-64` sets),
-            # 16 folder-set files (7 + 5 + 4) and 10 hot-pixel files (8 frames, README, sidecar).
-            if len(produced) != 173:
-                failures.append(f"compressed generation produced {len(produced)} paths, want 173")
+            # 16 folder-set files (7 + 5 + 4) and 11 hot-pixel files (8 frames, README, sidecar, defect mask).
+            if len(produced) != 174:
+                failures.append(f"compressed generation produced {len(produced)} paths, want 174")
             if len(FOLDER_SET_NAMES) != 3:
                 failures.append(f"folder sets {len(FOLDER_SET_NAMES)}, want 3")
             names = {item.name for item in COMPRESSED_SETS}

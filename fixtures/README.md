@@ -2,7 +2,7 @@
 
 Small crops of the reference focus stack, checked in so `cargo test` has real sensor data to work on without the 16 GB stack being anywhere near the repository.
 
-Generated: 2026-11-15
+Generated: 2026-11-16
 
 ## Sets
 

@@ -494,8 +494,8 @@ fn parameter_help_is_one_plain_sentence() {
     }
     assert_eq!(
         described.len(),
-        8 + 1 + 2 + 2 + 6,
-        "the eight project parameters plus the fusion and alignment schemas"
+        9 + 1 + 2 + 2 + 6,
+        "the nine project parameters plus the fusion and alignment schemas"
     );
     for (owner, p) in described {
         let help = p.help.as_str();

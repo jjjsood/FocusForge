@@ -408,6 +408,19 @@ pub static PREPARE_PARAMS: LazyLock<Vec<ParamDesc>> = LazyLock::new(|| {
             host_default: None,
             stack_max: None,
         },
+        ParamDesc {
+            id: "defect-grow-radius".to_string(),
+            label: "Grow defect mask".to_string(),
+            help: "Only used with a defect mask file: widens every painted \
+                   defect by this many pixels; 0 keeps the mask as painted."
+                .to_string(),
+            kind: ParamKind::Int { min: 0, max: 16 },
+            default: ParamValue::Int(0),
+            advanced: true,
+            auto: None,
+            host_default: None,
+            stack_max: None,
+        },
     ]
 });
 
@@ -1161,7 +1174,8 @@ mod tests {
                 "equalize-target",
                 "defect-removal",
                 "hot-pixels",
-                "hot-pixel-threshold"
+                "hot-pixel-threshold",
+                "defect-grow-radius"
             ]
         );
 
@@ -1302,7 +1316,8 @@ mod tests {
                 "equalize-target",
                 "defect-removal",
                 "hot-pixels",
-                "hot-pixel-threshold"
+                "hot-pixel-threshold",
+                "defect-grow-radius"
             ]
         );
         assert_eq!(ids(&FINISH_PARAMS), ["auto-crop"]);
@@ -1316,7 +1331,8 @@ mod tests {
                 "equalize-target",
                 "defect-removal",
                 "hot-pixels",
-                "hot-pixel-threshold"
+                "hot-pixel-threshold",
+                "defect-grow-radius"
             ]
         );
         for d in PROJECT_PARAMS.iter() {
@@ -1342,7 +1358,8 @@ mod tests {
                 "equalize-target",
                 "defect-removal",
                 "hot-pixels",
-                "hot-pixel-threshold"
+                "hot-pixel-threshold",
+                "defect-grow-radius"
             ]
         );
         assert_eq!(ids(&finish), ["auto-crop"]);
@@ -1364,6 +1381,37 @@ mod tests {
         assert_eq!(
             default_of(&prepare, "hot-pixel-threshold"),
             ParamValue::Float(HOT_PIXEL_THRESHOLD_DEFAULT)
+        );
+        assert_eq!(
+            default_of(&prepare, "defect-grow-radius"),
+            ParamValue::Int(0)
+        );
+    }
+
+    #[test]
+    fn defect_grow_radius_is_an_int_from_0_to_16_after_the_hot_pixel_threshold() {
+        let at = PREPARE_PARAMS
+            .iter()
+            .position(|d| d.id == "defect-grow-radius")
+            .expect("the radius is a PREPARE parameter");
+        assert_eq!(PREPARE_PARAMS[at - 1].id, "hot-pixel-threshold");
+        assert_eq!(at, PREPARE_PARAMS.len() - 1);
+        let radius = &PREPARE_PARAMS[at];
+        assert_eq!(radius.kind, ParamKind::Int { min: 0, max: 16 });
+        assert_eq!(radius.default, ParamValue::Int(0));
+        assert!(radius.advanced);
+        let check = |value| {
+            let values = ParamValues::from([("defect-grow-radius".to_string(), value)]);
+            crate::params::validate(&PREPARE_PARAMS, &values)
+        };
+        assert!(check(ParamValue::Int(0)).is_ok());
+        assert!(check(ParamValue::Int(16)).is_ok());
+        let refused = check(ParamValue::Int(17)).expect_err("17 is out of range");
+        assert!(
+            refused
+                .to_string()
+                .contains("outside the allowed range [0, 16]"),
+            "{refused}"
         );
     }
 
