@@ -914,19 +914,21 @@ mod tests {
 
     #[test]
     fn a_pause_inside_the_stage_does_not_count_toward_its_pace() {
-        let align_pace = |held: Duration| {
+        // The hold is derived from the measured span: a loaded machine can sleep far past 100 ms.
+        let align_pace = |held: fn(Duration) -> Duration| {
             let control = JobControl::new();
             control.seed_prediction(&timings(0.0, None, Some(1.0), 1.0, 0.1));
+            let started = Instant::now();
             control.enter_stage(Stage::Align);
             let counter = control.begin_align(4);
             std::thread::sleep(Duration::from_millis(100));
-            control.add_hold(held);
+            control.add_hold(held(started.elapsed()));
             counter.fetch_add(4, Ordering::SeqCst);
             control.enter_stage(Stage::Fuse);
             pace(&control).expect("every frame was credited")
         };
-        assert!(align_pace(Duration::ZERO) >= 0.1);
-        assert!(align_pace(Duration::from_millis(90)) < 0.06);
+        assert!(align_pace(|_| Duration::ZERO) >= 0.1);
+        assert!(align_pace(|ran| ran.saturating_sub(Duration::from_millis(10))) < 0.06);
     }
 
     #[test]
