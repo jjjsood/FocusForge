@@ -466,17 +466,15 @@ impl Default for OverlayState {
 /// The preview of the one-point stroke a press at source point `point` would
 /// store; `None` when that point is off the image.
 fn press_preview(
-    info: focusforge_core::zmap::ZMapInfo,
+    (width, height): (u32, u32),
     (sx, sy): (f64, f64),
     radius: f32,
     softness: f32,
     mode: job::BrushMode,
     opacity: f32,
 ) -> Option<brush::BrushPreviewSpec> {
-    let on_image = sx >= 0.0
-        && sy >= 0.0
-        && (sx.floor() as u32) < info.width()
-        && (sy.floor() as u32) < info.height();
+    let on_image =
+        sx >= 0.0 && sy >= 0.0 && (sx.floor() as u32) < width && (sy.floor() as u32) < height;
     on_image.then(|| brush::preview_spec((sx, sy), radius, softness, mode, opacity))
 }
 
@@ -4743,7 +4741,15 @@ impl AppController {
             .to_source_in(local, self.pane_rect(pane)?);
         let (radius, softness) = self.brush_radius_softness();
         let (mode, opacity) = self.brush_mode_opacity();
-        press_preview(edit.info(), point, radius, softness, mode, opacity)
+        let info = edit.info();
+        press_preview(
+            (info.width(), info.height()),
+            point,
+            radius,
+            softness,
+            mode,
+            opacity,
+        )
     }
 
     /// The Composite now shows the resident tiles as of `generation`: a live
@@ -5050,7 +5056,15 @@ impl AppController {
         let Some(edit) = tab.edit.as_mut() else {
             return;
         };
-        let preview = press_preview(edit.info(), (sx, sy), radius, softness, mode, opacity);
+        let info = edit.info();
+        let preview = press_preview(
+            (info.width(), info.height()),
+            (sx, sy),
+            radius,
+            softness,
+            mode,
+            opacity,
+        );
         edit.stroke = Some(
             brush::LiveStroke::new(
                 source,
