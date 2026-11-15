@@ -6,6 +6,10 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 ## [Unreleased]
 
+### Fixed
+
+- Exported DNG files open and edit in Lightroom, Camera Raw and Adobe DNG Converter; before, Adobe software refused them.
+
 ## [0.2.1] - 2026-11-13
 
 ### Changed

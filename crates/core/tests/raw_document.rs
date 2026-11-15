@@ -831,6 +831,11 @@ fn check_dng_tags(label: &str, second: Option<([f32; 9], u16)>, exif: bool, cali
         1,
         "{label}"
     );
+    assert_eq!(dng.need(254).longs(), [0], "{label}: NewSubFileType");
+    assert!(
+        dng.ifd0.windows(2).all(|w| w[0].tag < w[1].tag),
+        "{label}: IFD0 ascending"
+    );
     assert_eq!(dng.need(262).shorts(), [34892], "{label}");
     assert_eq!(dng.need(277).shorts(), [3], "{label}");
     assert_eq!(dng.need(258).shorts(), [16, 16, 16], "{label}");
