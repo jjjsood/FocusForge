@@ -321,3 +321,30 @@ match (`reference`).
 Nothing under a `--root` is written: an `--out` inside a root is refused before anything is created.
 A root that does not exist is named on stderr and the others are searched; with none left the exit
 status is 1.
+
+### Stacking a source and choosing crop rects
+
+`run` stacks one source with each registered method and exports the composite and the Z-Map. The source
+is the `mantis` folder of `$FOCUSFORGE_REFERENCE_STACK` (`--mantis`, exactly 61 top-level `.tif` files),
+another folder of it (`--reference NAME`, every top-level frame), or a candidate of the search
+(`--pick ID`, its folder and frames read from `--index`). Frames of the stack's folder that are not part
+of it stay in groups of their own: `run` asks the product to write its proposed grouping
+(`stack --dry-run --write-groups`), moves the stack's frames into a group called `stack`, and runs
+`stack --groups ... --only stack` with the debug build, `--align-algorithm pyramidal-ecc` and `--json`.
+It prints the stack and export wall times, appends them to `<out>/<stack>/times.json`, skips a method
+whose composite and Z-Map exist, and exits 1 naming the sizes when the three composites differ.
+
+```
+python3 spikes/halo-detection/real_stacks.py run (--mantis | --reference NAME | --pick ID) --out .scratch/halo-detection/real
+python3 spikes/halo-detection/real_stacks.py crops --out .scratch/halo-detection/real --preview STACK
+python3 spikes/halo-detection/real_stacks.py crops --out .scratch/halo-detection/real
+```
+
+Every call that stacks goes under the shared GPU lock. `crops --preview STACK` writes a gridded
+quarter-scale PNG of that stack's weighted-average composite (a grid line and label every 512 px of full
+resolution) to choose rects on. `crops` then cuts, for each rect of the `CROPS` table and each method,
+the rect plus a 128 px context margin on every side (clipped at the border) from the composite and the
+Z-Map, and prints the table. The three Mantis rects are given in the coordinates of the reference
+result; each is moved into the composite by the phase-correlation shift of the 1024 px luma tile
+around it, and refused when the moved rect overlaps a moved training window. Images are read by rect
+(`rawtiff.read_rect`), never whole.

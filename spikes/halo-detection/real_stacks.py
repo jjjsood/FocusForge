@@ -9,6 +9,10 @@ Subcommands (run from the repository root):
                  sampled embedded previews fail an alignment or focus-travel test, and write
                  one four-frame preview for each of the top-ranked runs plus an index
     controls     print the image-test measurements of named reference stacks and non-stacks
+    run          stack one source (Mantis, a reference folder or a candidate) with each method
+                 through the product's own grouping file, and export composite and Z-Map
+    crops        cut the context crops of the fixed rects from every method's composite and Z-Map,
+                 or write a gridded quarter-scale preview of one stack to choose rects on
     --self-check   grouping, run cutting, image test, preview layout and boundary cases on
                    constructed answers
 
@@ -27,6 +31,8 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import time
+import tomllib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
@@ -36,6 +42,12 @@ from PIL import Image, ImageDraw
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, "tools", "lib"))
 import rawtiff  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import halo_net as hn  # noqa: E402
+import layered_scene as ls  # noqa: E402
+
+METHODS = ls.gff.ALGOS
 
 GROUP_GAP = 60  # s: frames further apart than this start a new group, as in the product
 MIN_FRAMES = 4
@@ -729,6 +741,341 @@ def cmd_controls(args):
     return 0
 
 
+STACK_GROUP = "stack"
+REFERENCE_VAR = "FOCUSFORGE_REFERENCE_STACK"
+ALIGN_ALGO = "pyramidal-ecc"
+DEFAULT_INDEX = os.path.join(ROOT, ".scratch", "halo-detection", "candidates", "index.json")
+MANTIS_FRAMES = 61
+MANTIS_REFERENCE = os.path.join("mantis", "reference", "zerene-pmax-20261009", "Mantis_Stacked.tif")
+CROP_SIDE, CONTEXT = 512, 128  # px: rect side, context margin per side
+PEAK_MIN = 0.03  # lowest phase-correlation peak of a tile that enters the fit; flat tiles peak below 0.013
+MIN_TILES = 4
+PREVIEW_SCALE, PREVIEW_GRID = 4, 512  # quarter-scale preview, grid line every 512 full-resolution px
+
+# Rects of 512 x 512 px. Mantis `xy` is in the coordinates of the reference result and is moved into the
+# composite by phase correlation; every other `xy` is in composite coordinates. `edge` says what the rect shows.
+CROPS = [
+    {"stack": "mantis", "name": "antenna", "xy": (2112, 384), "edge": "sharp left antenna across defocused grey background"},
+    {"stack": "mantis", "name": "right-eye", "xy": (2880, 960), "edge": "right compound eye's outer edge against the background"},
+    {"stack": "mantis", "name": "reserved", "xy": (3840, 2476), "edge": "featureless defocused background, no depth edge (control)"},
+    {"stack": "damselfly", "name": "eye-edge", "xy": (448, 1152), "edge": "left compound eye's outer edge against the defocused green background"},
+    {"stack": "damselfly", "name": "bark-ridge", "xy": (1792, 1536), "edge": "sharp bark ridge and droplets against the defocused background above"},
+    {"stack": "beetle", "name": "shoulder", "xy": (320, 160), "edge": "left shoulder rim and body silhouette against the yellow background"},
+    {"stack": "beetle", "name": "bristles", "xy": (2048, 3520), "edge": "sharp rear bristles against the defocused background"},
+    {"stack": "spider", "name": "leg-edge", "xy": (1568, 512), "edge": "sharp front leg joint against the defocused rear leg and wall"},
+    {"stack": "spider", "name": "face", "xy": (2304, 896), "edge": "eyes and fangs in focus against defocused body and legs"},
+    {"stack": "pick-006", "name": "iris-rim", "xy": (2432, 2048), "edge": "sharp iris rim and skin against the defocused eye interior and bumps"},
+    {"stack": "pick-006", "name": "bump-edge", "xy": (512, 1408), "edge": "sharp skin bumps and a speck silhouetted against the defocused background"},
+    {"stack": "pick-008", "name": "iris-top", "xy": (3840, 1280), "edge": "sharp speckled iris rim against the eyelid above and the dark pupil"},
+    {"stack": "pick-008", "name": "nostril", "xy": (1152, 2048), "edge": "nostril rim against the defocused background"},
+    {"stack": "pick-012", "name": "antenna", "xy": (3328, 1152), "edge": "sharp antenna segments across the defocused yellow background"},
+    {"stack": "pick-012", "name": "head-scales", "xy": (1792, 1280), "edge": "scales beside the eye against the defocused yellow background"},
+    {"stack": "pick-015", "name": "antenna", "xy": (1024, 1024), "edge": "sharp antenna against the defocused blue and pink background"},
+    {"stack": "pick-015", "name": "leg", "xy": (3456, 2688), "edge": "sharp front leg crossing the defocused background"},
+    {"stack": "pick-002", "name": "joint-left", "xy": (1024, 2048), "edge": "sharp spined leg segment and joint against the defocused background"},
+    {"stack": "pick-002", "name": "leg-right", "xy": (5632, 2304), "edge": "sharp textured leg segment against the defocused background"},
+]
+
+
+def build_groups(walked, stack_frames):
+    """The walked partition with `stack_frames` moved into one group called `stack`; groups left empty are dropped."""
+    found = {f for g in walked["group"] for f in g["frames"]}
+    missing = [f for f in stack_frames if f not in found]
+    if missing:
+        raise ValueError(f"frames the walk did not find: {', '.join(missing)}")
+    want, groups = set(stack_frames), []
+    for g in walked["group"]:
+        rest = [f for f in g["frames"] if f not in want]
+        if rest:
+            groups.append({"name": f"walked-{g['name']}" if g["name"] == STACK_GROUP else g["name"], "frames": rest})
+    return {"group": [{"name": STACK_GROUP, "frames": list(stack_frames)}] + groups}
+
+
+def groups_toml(groups):
+    lines = []
+    for g in groups["group"]:
+        lines += ["[[group]]", f"name = {json.dumps(g['name'], ensure_ascii=False)}", "frames = ["]
+        lines += [f"    {json.dumps(f, ensure_ascii=False)}," for f in g["frames"]] + ["]", ""]
+    return "\n".join(lines)
+
+
+def resolve_stack(args, ref_root):
+    """(name, directory, frames relative to it) of the stack the arguments name; exits when it cannot be read."""
+    if args.pick is not None:
+        with open(args.index) as fh:
+            cand = next((c for c in json.load(fh)["candidates"] if c["id"] == args.pick), None)
+        if cand is None:
+            sys.exit(f"pick {args.pick} is not in {args.index}")
+        return f"pick-{args.pick:03d}", cand["dir"], [os.path.relpath(f, cand["dir"]) for f in cand["frames"]]
+    if not ref_root:
+        sys.exit(f"{REFERENCE_VAR} is not set to the reference stack folder")
+    name = "mantis" if args.mantis else args.reference
+    d = os.path.join(ref_root, name)
+    if name in ("", ".", "..") or os.sep in name or not os.path.isdir(d):
+        sys.exit(f"{d}: not a directory under {REFERENCE_VAR}")
+    frames = sorted(f for f in os.listdir(d) if f.lower().endswith((".tif", ".tiff")) and os.path.isfile(os.path.join(d, f)))
+    if args.mantis and len(frames) != MANTIS_FRAMES:
+        sys.exit(f"{d}: {len(frames)} top-level tif frames found, expected {MANTIS_FRAMES}")
+    return name, d, frames
+
+
+def _save_json(path, doc):
+    with open(path, "w") as fh:
+        json.dump(doc, fh, indent=1)
+
+
+def cmd_run(args):
+    """Stack one source with every method and export composite and Z-Map; resumable per method."""
+    name, d, frames = resolve_stack(args, os.environ.get(REFERENCE_VAR))
+    try:
+        refuse_output_under(args.out, [d])
+    except RefusedOutput as e:
+        print(f"refused: {e}", file=sys.stderr)
+        return 2
+    out = os.path.abspath(args.out)
+    sdir = os.path.join(out, name)
+    cli = ls.gff.CLI
+    ls.check_cli(cli)
+    os.chdir(ROOT)  # the stage cache and resume state live under ./.scratch
+    times_path = os.path.join(sdir, "times.json")
+    times = json.load(open(times_path)) if os.path.exists(times_path) else {}
+    todo = [m for m in METHODS if not all(os.path.exists(os.path.join(sdir, m, f)) for f in ("composite.tif", "zmap.tif"))]
+    if todo:
+        walk = os.path.join(sdir, "walk")
+        os.makedirs(walk, exist_ok=True)
+        walked, groups = os.path.join(sdir, "walked.toml"), os.path.join(sdir, "groups.toml")
+        ls.run_cli(cli, "walk", ["stack", d, "-o", walk, "--dry-run", "--write-groups", walked, "--algorithm", METHODS[0],
+                                 "--align-algorithm", ALIGN_ALGO, "--json"])
+        with open(walked, "rb") as fh:
+            try:
+                built = build_groups(tomllib.load(fh), frames)
+            except ValueError as e:
+                sys.exit(f"{name}: {e}")
+        with open(groups, "w") as fh:
+            fh.write(groups_toml(built))
+    for m in METHODS:
+        mdir = os.path.join(sdir, m)
+        comp, zmap, proj = (os.path.join(mdir, f) for f in ("composite.tif", "zmap.tif", "stack.ffp"))
+        if m not in todo:
+            print(f"{name} {m}: done, skipped", flush=True)
+            continue
+        if not (os.path.exists(proj) and "stack_seconds" in times.get(m, {})):
+            shutil.rmtree(mdir, ignore_errors=True)
+            os.makedirs(mdir)
+            rep = json.loads(ls.run_cli(cli, f"{name} {m}", ["stack", d, "-o", mdir, "--groups", groups, "--only", STACK_GROUP,
+                                                              "--algorithm", m, "--align-algorithm", ALIGN_ALGO, "--json"]).stdout)
+            if rep["frame_count"] != len(frames) or rep["outputs"] != [proj]:
+                sys.exit(f"{name} {m}: the project has {rep['frame_count']} frames and outputs {rep['outputs']}, expected {len(frames)} and [{proj}]")
+            times[m] = {"stack_seconds": rep["wall_seconds"], "frames": rep["frame_count"], "size": [rep["output_width"], rep["output_height"]]}
+            _save_json(times_path, times)
+            print(f"{name} {m}: {rep['frame_count']} frames, {rep['output_width']}x{rep['output_height']}, stack {rep['wall_seconds']:.1f} s", flush=True)
+        t0 = time.monotonic()
+        part = [os.path.join(mdir, f"{k}.part.tif") for k in ("composite", "zmap")]
+        ls.run_cli(cli, f"{name} {m}", ["export", proj, "-o", part[0], "--zmap", part[1], "--json"])
+        os.replace(part[0], comp)
+        os.replace(part[1], zmap)
+        times[m]["export_seconds"] = round(time.monotonic() - t0, 3)
+        _save_json(times_path, times)
+        print(f"{name} {m}: export {times[m]['export_seconds']:.1f} s", flush=True)
+    sizes = {m: (lambda i: [i.width, i.height])(rawtiff.read_info(os.path.join(sdir, m, "composite.tif"))) for m in METHODS}
+    if len({tuple(s) for s in sizes.values()}) != 1:
+        print(f"{name}: the three composites differ in size: {sizes}", file=sys.stderr)
+        return 1
+    print(f"{name}: {len(frames)} frames, composites {sizes[METHODS[0]][0]}x{sizes[METHODS[0]][1]}, times in {times_path}")
+    return 0
+
+
+def phase_shift(a, b):
+    """(dx, dy, peak): content at (x, y) of `a` lies at (x + dx, y + dy) of `b`; `peak` is the correlation maximum in 0..1."""
+    h, w = a.shape
+    win = np.outer(np.hanning(h), np.hanning(w))
+    fa, fb = np.fft.rfft2((a - a.mean()) * win), np.fft.rfft2((b - b.mean()) * win)
+    cross = fb * np.conj(fa)
+    corr = np.fft.irfft2(cross / (np.abs(cross) + 1e-12), s=a.shape)
+    iy, ix = np.unravel_index(np.argmax(corr), corr.shape)
+    return int(ix - w if ix > w // 2 else ix), int(iy - h if iy > h // 2 else iy), float(corr[iy, ix])
+
+
+def read_luma(path, x, y, w, h, info=None):
+    info = info or rawtiff.read_info(path)
+    if info.bits_per_sample[0] != 16:
+        raise ValueError(f"{path}: luma reads 16-bit TIFFs")
+    px = np.frombuffer(rawtiff.read_rect(path, x, y, w, h, info), "<u2").reshape(h, w, info.samples_per_pixel)
+    return px.astype(np.float32).mean(axis=2)
+
+
+def anchor_grid(width, height, cols, rows, inset):
+    """Centres of a cols x rows grid of tiles spread over the image, `inset` px from its border."""
+    return [(int(inset + (width - 2 * inset) * (i + 0.5) / cols), int(inset + (height - 2 * inset) * (j + 0.5) / rows)) for j in range(rows) for i in range(cols)]
+
+
+def local_shifts(ref, comp, anchors, tile, predict=lambda x, y: (0, 0)):
+    """(x, y, dx, dy, peak) per anchor: the `phase_shift` of the `tile` px luma square at (x, y) of `ref` against the one of `comp`
+    displaced by `predict(x, y)`, read through `read_rect`; dx, dy include the prediction. Anchors whose tiles leave an image are skipped."""
+    ri, ci = rawtiff.read_info(ref), rawtiff.read_info(comp)
+    half, out = tile // 2, []
+    for x, y in anchors:
+        px, py = predict(x, y)
+        x0, y0 = x - half, y - half
+        if min(x0, y0, x0 + px, y0 + py) < 0 or x0 + tile > ri.width or y0 + tile > ri.height or x0 + px + tile > ci.width or y0 + py + tile > ci.height:
+            continue
+        dx, dy, peak = phase_shift(read_luma(ref, x0, y0, tile, tile, ri), read_luma(comp, x0 + px, y0 + py, tile, tile, ci))
+        out.append((x, y, dx + px, dy + py, peak))
+    return out
+
+
+def measure_transform(ref, comp, grid=(8, 5), tile=512):
+    """Similarity (a, b, tx, ty) taking `ref` coordinates into `comp`, with the tiles used and the largest residual in px.
+
+    A grid of `tile` px tiles gives local shifts and a robust fit through them; the tiles are read again
+    at the offset the fit predicts, so a few percent of scale no longer decorrelates them, and refitted.
+    """
+    ri, ci = rawtiff.read_info(ref), rawtiff.read_info(comp)
+    w, h = min(ri.width, ci.width), min(ri.height, ci.height)
+    anchors = anchor_grid(w, h, *grid, tile // 2)
+    textured = lambda pts: [p for p in pts if p[4] >= PEAK_MIN]
+    pts = textured(local_shifts(ref, comp, anchors, tile))
+    for tol, _ in ((8.0, 0), (3.0, 1), (3.0, 2)):
+        if len(pts) < MIN_TILES:
+            raise ValueError(f"only {len(pts)} of {len(anchors)} tiles correlate; the images share too little texture")
+        fit = fit_similarity(pts, tol)
+        a, b, tx, ty = fit[0]
+        predict = lambda x, y: (int(np.rint(a * x - b * y + tx - x)), int(np.rint(b * x + a * y + ty - y)))
+        pts = textured(local_shifts(ref, comp, anchors, tile, predict))
+    return fit_similarity(pts)
+
+
+def fit_similarity(points, tolerance=3.0):
+    """Least-squares similarity x' = a x - b y + tx, y' = b x + a y + ty through the points' (x, y) -> (x + dx, y + dy).
+
+    Returns ((a, b, tx, ty), points kept, largest residual in px); a point further than `tolerance` px
+    (or 3 median residuals) from the fit is dropped and the fit repeated while three points remain.
+    """
+    pts = [(x, y, x + dx, y + dy) for x, y, dx, dy, _ in points]
+    while True:
+        m = np.zeros((2 * len(pts), 4))
+        t = np.zeros(2 * len(pts))
+        for i, (x, y, xp, yp) in enumerate(pts):
+            m[2 * i], m[2 * i + 1] = (x, -y, 1, 0), (y, x, 0, 1)
+            t[2 * i], t[2 * i + 1] = xp, yp
+        u = np.linalg.lstsq(m, t, rcond=None)[0]
+        res = np.hypot(*(m @ u - t).reshape(-1, 2).T)
+        limit = max(tolerance, 3 * float(np.median(res)))
+        keep = [p for p, r in zip(pts, res) if r <= limit]
+        if len(keep) == len(pts) or len(keep) < 3:
+            return tuple(float(v) for v in u), len(pts), float(res.max())
+        pts = keep
+
+
+def overlaps(rect, others):
+    x, y, w, h = rect
+    return any(x < ox + ow and ox < x + w and y < oy + oh and oy < y + h for ox, oy, ow, oh in others)
+
+
+def move_rect(rect, transform, width, height):
+    """`rect` seen through the similarity `transform` (a, b, tx, ty), as a square of its own side around the mapped centre.
+
+    ValueError when it leaves the image or overlaps a training window seen through the same transform
+    (the bounding box of the mapped window).
+    """
+    x, y, w, h = rect
+    a, b, tx, ty = transform
+    cx, cy = x + w / 2, y + h / 2
+    moved = (int(np.rint(a * cx - b * cy + tx - w / 2)), int(np.rint(b * cx + a * cy + ty - h / 2)), w, h)
+    if moved[0] < 0 or moved[1] < 0 or moved[0] + w > width or moved[1] + h > height:
+        raise ValueError(f"rect {moved} leaves the {width}x{height} composite")
+    for wx, wy in hn.WINDOWS:
+        win = ls.gff.own_rect((wx, wy, CROP_SIDE, CROP_SIDE), transform)
+        if overlaps(moved, [win]):
+            raise ValueError(f"rect {moved} overlaps training window {win} ({wx},{wy} in the reference result)")
+    return moved
+
+
+def context_rect(rect, width, height, margin=CONTEXT):
+    """`rect` grown by `margin` px per side, clipped to the image."""
+    x, y, w, h = rect
+    x0, y0, x1, y1 = max(0, x - margin), max(0, y - margin), min(width, x + w + margin), min(height, y + h + margin)
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def write_preview(src, out):
+    """Quarter-scale PNG of a 16-bit TIFF read in bands, with a labelled grid every 512 full-resolution px."""
+    info = rawtiff.read_info(src)
+    s, band = PREVIEW_SCALE, 256
+    w, h = info.width // s * s, info.height // s * s
+    rows = []
+    for y in range(0, h, band):
+        n = min(band, h - y)
+        px = np.frombuffer(rawtiff.read_rect(src, 0, y, w, n, info), "<u2").reshape(n // s, s, w // s, s, info.samples_per_pixel)
+        rows.append((px.astype(np.float32).mean(axis=(1, 3)) / 257).round().astype(np.uint8))
+    img = Image.fromarray(np.concatenate(rows, axis=0))
+    draw = ImageDraw.Draw(img)
+    for g in range(0, w, PREVIEW_GRID):
+        draw.line([(g // s, 0), (g // s, h // s)], fill=(0, 255, 255), width=1)
+        draw.text((g // s + 2, 2), str(g), fill=(255, 255, 0))
+    for g in range(0, h, PREVIEW_GRID):
+        draw.line([(0, g // s), (w // s, g // s)], fill=(0, 255, 255), width=1)
+        draw.text((2, g // s + 2), str(g), fill=(255, 255, 0))
+    img.save(out)
+    return img.size
+
+
+def crop_table(rows):
+    lines = ["| stack | name | composite rect x,y,w,h | source rect | transform a,b,tx,ty (tiles, residual px) | context rect | shows |", "|---|---|---|---|---|---|---|"]
+    for r in rows:
+        src = "reference result " + ",".join(map(str, r["source_rect"])) if r["source_rect"] else "composite"
+        shift = "{:.5f},{:.5f},{:.1f},{:.1f} ({}, {:.1f})".format(*r["transform"], r["tiles"], r["residual"]) if r["transform"] else "-"
+        lines.append(f"| {r['stack']} | {r['name']} | {','.join(map(str, r['rect']))} | {src} | {shift} | {','.join(map(str, r['context']))} | {r['edge']} |")
+    return "\n".join(lines)
+
+
+def cmd_crops(args):
+    """`--preview STACK` writes a gridded preview of its weighted-average composite; otherwise every CROPS rect is cut."""
+    out = os.path.abspath(args.out)
+    if args.preview:
+        src = os.path.join(out, args.preview, METHODS[0], "composite.tif")
+        if not os.path.exists(src):
+            sys.exit(f"{src}: run the stack first")
+        dst = os.path.join(out, args.preview, "preview.png")
+        print(f"{dst}: {write_preview(src, dst)}")
+        return 0
+    ref_root = os.environ.get(REFERENCE_VAR)
+    rows, fits = [], {}
+    crops = CROPS
+    if args.rect:  # rects given as STACK:NAME:X:Y in composite coordinates replace the table, for fixtures
+        crops = [{"stack": st, "name": n, "xy": (int(x), int(y)), "edge": "given on the command line"} for st, n, x, y in (r.split(":") for r in args.rect)]
+    for c in crops:
+        comps = {m: os.path.join(out, c["stack"], m, "composite.tif") for m in METHODS}
+        if not all(os.path.exists(p) for p in comps.values()):
+            print(f"{c['stack']} {c['name']}: stack not run, skipped")
+            continue
+        info = rawtiff.read_info(comps[METHODS[0]])
+        rect = c["xy"] + (args.side, args.side)
+        fit = source = None
+        if c["stack"] == "mantis":
+            if not ref_root:
+                sys.exit(f"{REFERENCE_VAR} is not set to the reference stack folder")
+            fit = fits.setdefault("mantis", measure_transform(os.path.join(ref_root, MANTIS_REFERENCE), comps[METHODS[0]]))
+            source = rect
+            try:
+                rect = move_rect(rect, fit[0], info.width, info.height)
+            except ValueError as e:
+                sys.exit(f"{c['stack']} {c['name']}: {e}")
+        elif rect[0] < 0 or rect[1] < 0 or rect[0] + args.side > info.width or rect[1] + args.side > info.height:
+            sys.exit(f"{c['stack']} {c['name']}: rect {rect} is outside the {info.width}x{info.height} composite")
+        ctx = context_rect(rect, info.width, info.height)
+        for m in METHODS:
+            for kind in ("composite", "zmap"):
+                ls.gff.crop_image(os.path.join(out, c["stack"], m, f"{kind}.tif"), ctx, os.path.join(out, "crops", c["stack"], c["name"], m, f"{kind}.tif"))
+        rows.append({"stack": c["stack"], "name": c["name"], "rect": list(rect), "source_rect": list(source) if source else None,
+                     "transform": list(fit[0]) if fit else None, "tiles": fit[1] if fit else None, "residual": fit[2] if fit else None, "context": list(ctx), "edge": c["edge"]})
+    if rows:
+        os.makedirs(os.path.join(out, "crops"), exist_ok=True)
+        _save_json(os.path.join(out, "crops", "crops.json"), rows)
+    print(crop_table(rows))
+    return 0
+
+
 def synthetic_stack(n, kind, h=420, w=640, seed=1):
     """Luma frames of a smooth scene with a texture that is sharp in column band k of frame k
     (`stack`), or: shifted between frames (`moving`), sharp in frame 0 only (`one-sharp`), noise (`noise`)."""
@@ -964,6 +1311,105 @@ def _selftest() -> int:
         check("a run below the frame floor is dropped with its test named and no preview",
               index["counts"]["shortlist"] == 0 and [d["test"] for d in index["dropped"]] == ["prefilter"], index["dropped"])
 
+    print("stack runs (groups file, sources):")
+    walked = {"group": [{"name": "a", "frames": ["s/1.tif", "s/2.tif", "x.dng"]}, {"name": "b", "frames": ["s/3.tif"]},
+                        {"name": "stack", "frames": ["t1.tif", "t2.tif"]}]}
+    stack_frames = ["s/1.tif", "s/2.tif", "s/3.tif"]
+    groups = build_groups(walked, stack_frames)
+    listed = [f for g in groups["group"] for f in g["frames"]]
+    named = {g["name"]: g["frames"] for g in groups["group"]}
+    check("the stack group holds exactly the stack, in order", named.get(STACK_GROUP) == stack_frames, named)
+    check("every walked frame is listed once", sorted(listed) == sorted(f for g in walked["group"] for f in g["frames"]), listed)
+    check("a walked group left empty is dropped and another keeps its frames",
+          "b" not in named and named.get("a") == ["x.dng"], named)
+    check("a walked group already called stack is renamed, not merged", len(named) == 3 and named.get("walked-stack") == ["t1.tif", "t2.tif"], named)
+    check("the groups file reads back as written", tomllib.loads(groups_toml(groups)) == groups)
+    try:
+        build_groups(walked, stack_frames + ["s/9.tif"])
+        check("a stack frame the walk did not find is refused", False)
+    except ValueError as e:
+        check("a stack frame the walk did not find is refused and named", "s/9.tif" in str(e), str(e))
+    with tempfile.TemporaryDirectory() as tmp:
+        refroot, other = os.path.join(tmp, "ref"), os.path.join(tmp, "elsewhere")
+        for d, names in ((os.path.join(refroot, "mantis"), [f"M{i:02d}.tif" for i in range(60)]), (os.path.join(refroot, "beetle"), ["b1.tif", "b2.TIF", "note.txt"])):
+            os.makedirs(os.path.join(d, "sub"))
+            for n in names:
+                open(os.path.join(d, n), "w").close()
+            open(os.path.join(d, "sub", "extra.tif"), "w").close()
+        err, old = io.StringIO(), sys.stderr
+        sys.stderr = err
+        try:
+            unset = [resolve_stack(argparse.Namespace(mantis=True, reference=None, pick=None, index=None), None)]
+        except SystemExit as e:
+            unset = [e]
+        try:
+            sixty = resolve_stack(argparse.Namespace(mantis=True, reference=None, pick=None, index=None), refroot)
+        except SystemExit as e:
+            sixty = e
+        finally:
+            sys.stderr = old
+        check("an unset reference variable stops the Mantis step, naming it", isinstance(unset[0], SystemExit) and "FOCUSFORGE_REFERENCE_STACK" in str(unset[0]), unset)
+        check("a Mantis folder without 61 tiffs is refused with the count", isinstance(sixty, SystemExit) and "60" in str(sixty), sixty)
+        name, d, frames = resolve_stack(argparse.Namespace(mantis=False, reference="beetle", pick=None, index=None), refroot)
+        check("a reference folder yields its top-level tiffs only, sorted", name == "beetle" and frames == ["b1.tif", "b2.TIF"], frames)
+        idx = os.path.join(tmp, "index.json")
+        json.dump({"candidates": [{"id": 7, "dir": other, "frames": [os.path.join(other, "z2.dng"), os.path.join(other, "z1.dng")]}]}, open(idx, "w"))
+        name, d, frames = resolve_stack(argparse.Namespace(mantis=False, reference=None, pick=7, index=idx), refroot)
+        check("a pick reads its folder and frames from the index, relative, in index order", name == "pick-007" and d == other and frames == ["z2.dng", "z1.dng"], (name, d, frames))
+        try:
+            resolve_stack(argparse.Namespace(mantis=False, reference=None, pick=8, index=idx), refroot)
+            check("a pick missing from the index is refused", False)
+        except SystemExit as e:
+            check("a pick missing from the index is refused and named", "8" in str(e), str(e))
+
+    print("crops (shift, windows, context):")
+    rng = np.random.default_rng(7)
+    smooth = np.asarray(Image.fromarray((rng.random((12, 16)) * 255).astype(np.uint8)).resize((1600, 1200), Image.Resampling.BICUBIC), np.float64)
+    big = np.clip(smooth + rng.normal(0, 8, smooth.shape), 0, 255)
+    moved = np.roll(big, (-21, 37), axis=(0, 1))
+    check("phase correlation recovers a known (+37, -21) shift", phase_shift(big[200:1000, 300:1300], moved[200:1000, 300:1300])[:2] == (37, -21))
+    scale, tx, ty = 0.985, -40.0, -20.0
+    warped = np.asarray(Image.fromarray(big.astype(np.float32), "F").transform((1500, 1150), Image.Transform.AFFINE, (1 / scale, 0, -tx / scale, 0, 1 / scale, -ty / scale),
+                                                                              Image.Resampling.BICUBIC), np.float64)
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = []
+        for k, a in enumerate((big, warped)):
+            p = os.path.join(tmp, f"i{k}.tif")
+            rgb = np.repeat((a * 255).astype("<u2")[:, :, None], 3, axis=2)
+            rawtiff.write_tiff(p, a.shape[1], a.shape[0], rgb.tobytes(), bits=16, spp=3)
+            paths.append(p)
+        (a, b, ftx, fty), used, _ = measure_transform(paths[0], paths[1], (4, 3), 512)
+        check("a scale of 0.985 and a shift between two TIFFs are recovered from tiles over the picture",
+              abs(a - scale) < 0.003 and abs(b) < 0.003 and abs(ftx - tx) < 3 and abs(fty - ty) < 3, (a, b, ftx, fty))
+        good = [(x, y, a * x + ftx - x, a * y + fty - y, 0.5) for x, y in anchor_grid(1600, 1200, 4, 3, 256)]
+        good[0] = (good[0][0], good[0][1], good[0][2] + 90, good[0][3] - 70, 0.5)
+        a2, _, tx2, _ = fit_similarity(good)[0]
+        check("one wrong tile does not move the fit", abs(a2 - scale) < 0.003 and abs(tx2 - tx) < 3, (a2, tx2))
+    w0 = hn.WINDOWS[0]
+    ident = (1.0, 0.0, 0.0, 0.0)
+    check("a rect 1 px into a window is refused", overlaps((w0[0] - 511, w0[1], 512, 512), [(w0[0], w0[1], 512, 512)]))
+    check("a rect touching a window is kept", not overlaps((w0[0] - 512, w0[1], 512, 512), [(w0[0], w0[1], 512, 512)]))
+    try:
+        move_rect((w0[0] - 511, w0[1], 512, 512), ident, 5000, 4000)
+        check("a rect on a window is refused", False)
+    except ValueError as e:
+        check("a rect on a window is refused and names the window", f"{w0[0]}" in str(e), str(e))
+    check("a rect clear of every window is moved by the transform", move_rect((2112, 384, 512, 512), (1, 0, -85, -71), 5000, 4000) == (2027, 313, 512, 512))
+    check("a scaled transform keeps the rect 512 px wide around the mapped centre", move_rect((2112, 384, 512, 512), (0.97, 0, -135, -33), 5000, 4000) == (1906, 332, 512, 512))
+    try:
+        move_rect((2112, 384, 512, 512), (1, 0, -3000, 0), 5000, 4000)
+        check("a rect mapped out of the image is refused", False)
+    except ValueError as e:
+        check("a rect mapped out of the image is refused", "leaves" in str(e), str(e))
+    check("a context margin of 128 px stays whole inside the image", context_rect((1000, 900, 512, 512), 4000, 3000) == (872, 772, 768, 768))
+    check("a context margin is clipped at the top-left border", context_rect((0, 50, 512, 512), 4000, 3000) == (0, 0, 640, 690))
+    check("a context margin is clipped at the bottom-right border", context_rect((3488, 2488, 512, 512), 4000, 3000) == (3360, 2360, 640, 640))
+    mantis = [c for c in CROPS if c["stack"] == "mantis"]
+    check("the Mantis rects are the decided three", [(c["name"], c["xy"]) for c in mantis] == [("antenna", (2112, 384)), ("right-eye", (2880, 960)), ("reserved", (3840, 2476))], mantis)
+    check("no Mantis rect touches a training window", not any(overlaps(c["xy"] + (CROP_SIDE, CROP_SIDE), [w + (CROP_SIDE, CROP_SIDE) for w in hn.WINDOWS]) for c in mantis))
+    check("every non-Mantis stack has at most two rects", max(Counter(c["stack"] for c in CROPS if c["stack"] != "mantis").values(), default=0) <= 2)
+    check("every rect has a distinct name within its stack", len({(c["stack"], c["name"]) for c in CROPS}) == len(CROPS))
+
     print("self-check passed" if ok else "self-check FAILED")
     return 0 if ok else 1
 
@@ -981,6 +1427,18 @@ def main(argv=None) -> int:
     k.add_argument("--cache", required=True, help="luma cache folder")
     k.add_argument("--reference", action="append", default=[], help="reference directory to measure; repeat")
     k.add_argument("--negative", action="append", help="DIR:FIRST_STEM:LAST_STEM of a run that is not a stack; repeat")
+    r = sub.add_parser("run", help="stack one source with every method and export composite and Z-Map")
+    src = r.add_mutually_exclusive_group(required=True)
+    src.add_argument("--mantis", action="store_true", help="the 61 frames under the reference stack folder's mantis directory")
+    src.add_argument("--reference", help="a directory of the reference stack folder, all its top-level frames")
+    src.add_argument("--pick", type=int, help="candidate id in --index")
+    r.add_argument("--index", default=DEFAULT_INDEX, help="index.json written by candidates")
+    r.add_argument("--out", required=True, help="folder for <stack>/<method>/...; refused under the stack's folder")
+    p = sub.add_parser("crops", help="cut the context crops of every CROPS rect, or write a gridded preview of one stack")
+    p.add_argument("--out", required=True, help="the folder `run` wrote into")
+    p.add_argument("--preview", metavar="STACK", help="write <out>/<STACK>/preview.png instead")
+    p.add_argument("--rect", action="append", metavar="STACK:NAME:X:Y", help="cut this composite-coordinate rect instead of the CROPS table; repeat")
+    p.add_argument("--side", type=int, default=CROP_SIDE, help="rect side in px")
     args = ap.parse_args(argv)
     if args.self_check:
         return _selftest()
@@ -988,6 +1446,10 @@ def main(argv=None) -> int:
         return cmd_candidates(args)
     if args.cmd == "controls":
         return cmd_controls(args)
+    if args.cmd == "run":
+        return cmd_run(args)
+    if args.cmd == "crops":
+        return cmd_crops(args)
     ap.print_help()
     return 2
 
