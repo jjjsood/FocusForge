@@ -209,3 +209,53 @@ The distilled depth output is quantized to 8 bits as the upstream notebook store
 A, so map A's step threshold is in depth levels. `infer --split` limits the scenes to one split;
 `tune` reads the calibration split only, per size, and its pick is frozen as `PARAMS` before
 `write` runs (`write` refuses without it).
+
+## Trained halo network
+
+`halo_net.py` trains one small U-Net with two outputs on layered scenes and writes both maps as
+`halo_gate.py` arm directories: `net-risk` (map A, a risk score in [0, 1], scored with `--unsigned`)
+and `net-glow` (map B, the signed halo in counts, positive glow, scored with its AUC and sign
+agreement). The weights, generated scenes and arm directories live under `.scratch/` and are not
+tracked.
+
+Input per pixel: the composite's luma over 65535, the Z-Map index over `frames - 1` (0 where the
+index is unset) and a mask of set pixels. Targets, both explicit: map A is `(25 - d) / 25` for a pixel at
+distance `d` (0 to 24 px) from the truth contour on either side, 0 beyond; map B is the signed label
+(`luma(composite) - luma(truth)`, low-passed) over 100, so a positive output is glow and a negative
+one darkening. The network has three poolings, widths 16-32-64-128, two 3x3 convolutions with
+BatchNorm per level and a 1x1 head per map; BatchNorm in evaluation mode acts per pixel, so tiled
+inference equals whole-image inference away from the border. Inference runs in 256 px tiles with a 64 px
+context margin, reflect-padded, so any image size works.
+
+Training scenes are generated at seeds 4-9 only, from the two procedural families (`bright-on-dark`,
+`dark-on-bright`) and from eight 512 x 512 windows of `Mantis_Stacked.tif` (`WINDOWS`; found through
+`FOCUSFORGE_REFERENCE_STACK`, read by tile) in the families `stack<k>-on-dark` and `dark-on-stack<k>`.
+The `mantis` texture and every window within 512 px of the fixture's crop (3840, 2476, 512 x 512) are
+refused, as is any held-out scene or seed outside 4-9; `generate` and `train` check this first.
+Per scene the frame count, depths, blur step and noise are drawn from the seed. The calibration
+scenes (seeds 1-3) pick the checkpoint, and `write` refuses unless `WEIGHTS_SHA256` in the script is
+pinned and the weights file matches it.
+
+From the repository root, with `PY=.scratch/halo-detection/venv/bin/python` (the environment above):
+
+```
+python3 spikes/halo-detection/halo_net.py --self-check                   # numpy only, no torch
+python3 spikes/halo-detection/halo_net.py generate --list-windows
+python3 spikes/halo-detection/halo_net.py generate --seeds 4-9 --out .scratch/halo-train
+$PY spikes/halo-detection/halo_net.py train --seeds 4-9 --scenes .scratch/halo-train --calibration .scratch/halo-scenes
+$PY spikes/halo-detection/halo_net.py tile-check --scenes .scratch/halo-scenes
+$PY spikes/halo-detection/halo_net.py write --scenes .scratch/halo-scenes --out .scratch/halo-detection
+python3 spikes/halo-detection/halo_gate.py score --scenes .scratch/halo-scenes --maps .scratch/halo-detection/net-risk --unsigned
+python3 spikes/halo-detection/halo_gate.py score --scenes .scratch/halo-scenes --maps .scratch/halo-detection/net-glow
+$PY spikes/halo-detection/halo_net.py bench --scenes .scratch/halo-scenes [--device cpu]
+$PY spikes/halo-detection/halo_net.py infer --composite C.tif --zmap Z.tif --frames N --out-dir D
+```
+
+`train` uses the card (6000 steps of 16 random 256 px crops with the eight flips and quarter turns,
+Adam 1e-3 with cosine decay, seed 0; loss is binary cross-entropy on map A plus a smooth-L1 on map B
+weighted 4 times within 24 px of the contour) and stops past 30 minutes or 4 GiB of graphics memory.
+Every 500 steps the checkpoint is scored on the calibration scenes at the gate's measures and the one
+with the most measure-and-method cells at their limit (then the larger summed margin) is kept as
+`.scratch/halo-detection/net/halo-net.pt`. `infer` writes `risk.npy` and `glow.npy` for one composite
+and Z-Map of any size. Commands that use the card run under the shared GPU lock; `generate` and
+`--self-check` need no card.
