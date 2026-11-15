@@ -259,3 +259,65 @@ with the most measure-and-method cells at their limit (then the larger summed ma
 `.scratch/halo-detection/net/halo-net.pt`. `infer` writes `risk.npy` and `glow.npy` for one composite
 and Z-Map of any size. Commands that use the card run under the shared GPU lock; `generate` and
 `--self-check` need no card.
+
+## Real material: finding stacks in a photo library
+
+`real_stacks.py` is the real-material entry point beside `layered_scene.py`'s synthetic one.
+`candidates` looks for likely focus stacks under read-only roots: a metadata pass first, then an
+image test on the embedded previews of a few sampled frames per run:
+
+```
+python3 spikes/halo-detection/real_stacks.py --self-check               # numpy and Pillow only, no roots
+python3 spikes/halo-detection/real_stacks.py candidates --root DIR [--root DIR2 ...] --out .scratch/halo-detection/candidates
+```
+
+It reads metadata through `exiftool -json` (raw extensions as the product lists them, plus `tif` and
+`tiff`) and groups each directory by the product's capture-time rule: frames sorted by (time, name),
+a new group where the gap to the previous frame exceeds 60 s, frames without a usable
+`DateTimeOriginal` listed apart. A group is a candidate when it holds at least four frames with one
+focal length, f-number, exposure time and ISO. Each candidate is marked `focus bracketing` (the
+camera reports it), `focus distance changes`, or `focus constant, possibly rail or burst` (constant
+distance or none in the metadata); none of the three rejects it. Every rejected group is listed with
+its reasons. A time group whose settings change is cut into runs of constant settings, and a group
+is rejected whole only when no run reaches four frames.
+
+Metadata cannot tell a stack from a burst, a handheld series or a shoot of different subjects, so
+each candidate run is cut and then tested on its embedded previews:
+
+- Cut at a capture gap over four median gaps (at least 5 s) and where the reported focus distance
+  turns back against a travel of 0.02 m or more. A run that fails the alignment test is also cut
+  where the picture changes (found by bisection between sampled frames) and its pieces are tested again.
+- Exported TIFFs among raw frames (they share a capture time) are left out first. Metadata prefilter:
+  at least 6 frames and one camera orientation.
+- Alignment: consecutive sampled frames (10 per run, first and last included) must correlate at
+  `ALIGN_MIN_CORR` on 128 px luma and shift by at most `ALIGN_MAX_SHIFT` of the long side by phase
+  correlation.
+- Focus travel: Laplacian variance per tile on an 8 x 6 grid of the sampled frames. In a stack the
+  sharpest frame differs across the picture: enough distinct winning frames, none winning most
+  textured tiles, neighbouring tiles agreeing, and the winner standing clear of the median frame
+  (`TRAVEL_*`).
+
+The thresholds are the constants at the top of the script, fixed from the four reference stacks
+(which must pass) and six runs that are not stacks (which must fail); `controls` prints those
+measurements. A run that passes is ranked by `score` and the top 15 (and any reference match) get a
+preview; `index.md` names, for every dropped run, the test that dropped it.
+
+```
+python3 spikes/halo-detection/real_stacks.py controls --records OUT/records.json --cache OUT/luma-cache \
+    --reference NAME [--reference NAME2 ...] --negative DIR:FIRST_STEM:LAST_STEM [--negative ...]
+python3 spikes/halo-detection/real_stacks.py candidates --root DIR --out OUT --reuse-records   # skip the exiftool pass
+```
+
+Per shown candidate it writes `NNN-<folder>.jpg` to `--out`: first, last and two evenly spaced frames in a
+2x2 layout, each turned upright by the metadata orientation and labelled, under a header of folder,
+frame range and frame count. The frame is the smallest embedded preview of at least 1000 px on the
+long side (`ThumbnailImage`, `PreviewImage`, `JpgFromRaw`, in that order), or a strip-by-strip
+subsample for an uncompressed TIFF. A frame without a usable preview becomes a grey cell, and an
+unreadable file is skipped with exiftool's reason; both appear in the index. `index.json` and
+`index.md` list every candidate (preview, folder, frame range, count, mark, reasons) and, when
+`FOCUSFORGE_REFERENCE_STACK` is set, name the reference directory whose frame stems at least half
+match (`reference`).
+
+Nothing under a `--root` is written: an `--out` inside a root is refused before anything is created.
+A root that does not exist is named on stderr and the others are searched; with none left the exit
+status is 1.
