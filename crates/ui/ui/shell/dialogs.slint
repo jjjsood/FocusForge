@@ -494,11 +494,16 @@ export component FFExportDialog inherits FFModalPanel {
             size: "body";
             text: "Can't export this position";
         }
-        for line[i] in root.refusal-lines: FFErrorRow {
+        VerticalLayout {
             x: 0px;
-            y: refused-heading.y + refused-heading.height + Theme.space-2 + i * Theme.space-4;
+            y: refused-heading.y + refused-heading.height + Theme.space-2;
             width: 528px;
-            message: "• " + line;
+            alignment: start;
+            spacing: 0px;
+            for line in root.refusal-lines: FFErrorRow {
+                message: "• " + line;
+                wrap-message: true;
+            }
         }
     }
 
