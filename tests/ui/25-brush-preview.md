@@ -53,7 +53,7 @@ The preview is the picture drawn inside the brush ring of the Composite while th
     Expect: the preview is present in the second window (`shot <png> --window 1 --crop FFBrushCursor::preview` writes a picture) and absent in the main window (`shot <png> --window 0 --crop FFBrushCursor::preview` reports `0 elements`).
 23. Hover the main window's pane (`FFCanvas::pane-left`, `--window 0`).
     Expect: Must not: the main window shows a preview (its crop shot reports `0 elements`); the second window's crop shot still writes a picture.
-24. Click "Dock pane" (`FFUndockControl::area` 0, in the second window, `--window 1`).
+24. Click the dock control (`FFUndockControl::area` 0, in the second window, `--window 1`, by id: `click-id FFUndockControl::area 0 --window 1`; a lookup by the label "Dock pane" finds no button).
     Expect: the main window shows two panes, the frame pane and the pane labelled "Composite"; `buttons AppWindow::editor-toolbar` lists **Undo**, **Redo** and **Save checkpoint** with enabled false; the CHECKPOINTS list shows 1 row.
 ## Hovering changed nothing
 25. Click **Export image** (`FFCheckpointPanel::checkpoint-export`).
