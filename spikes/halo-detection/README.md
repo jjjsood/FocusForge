@@ -73,3 +73,39 @@ the matte edge there is +1.5, +0.2 and +1.4 counts on `bright-on-dark` seeds 1 t
 +56.3, +80.4 and +62.0 for the layered render, which composites
 `blur(alpha * F) + (1 - blur(alpha)) * background` per frame and so lets the blurred
 foreground reach over the matte edge.
+
+## Classical maps and the scorer
+
+`classical_maps.py` builds two per-pixel maps from a stack method's Z-Map and composite:
+map A (`risk-zones`), the bands beside depth steps, from the Z-Map alone; and map B, the
+signed low-passed luminance inside those bands minus the far-band level on the same side
+of the same step, either against the composite's own far band (`glow-self`) or against the
+`depth-map` composite of the same stack (`glow-focus-map`, not written for `depth-map`).
+A step is a pair of neighbouring Z-Map indices differing by at least `threshold`; unset
+pixels (`65535`) are never a step and never in a band. A `median x median` filter over the
+set Z-Map pixels runs first (`median = 1` is off). A band pixel's side is `+1` where its
+nearest step pixel is the higher index, `-1` where lower. Map A scores `band_hi + 1 - distance`
+inside `band_hi`; map B is NaN outside the band and where no far-band pixel of that side lies
+in the `4 * band_hi + 1` window.
+
+`halo_gate.py` scores map files with the gate: recall of halo pixels inside the top 15 % of
+pixels for map A, AUC and sign agreement within 24 px of the contour for map B. A NaN score
+counts as 0.
+
+```
+python3 spikes/halo-detection/classical_maps.py --self-check
+python3 spikes/halo-detection/halo_gate.py --self-check
+python3 spikes/halo-detection/classical_maps.py tune --scenes .scratch/halo-scenes
+python3 spikes/halo-detection/classical_maps.py write --scenes .scratch/halo-scenes --out .scratch/halo-detection [--zmap-from depth-map]
+python3 spikes/halo-detection/halo_gate.py score --scenes .scratch/halo-scenes --maps .scratch/halo-detection/risk-zones --unsigned
+python3 spikes/halo-detection/halo_gate.py score --scenes .scratch/halo-scenes --maps .scratch/halo-detection/glow-self
+python3 spikes/halo-detection/classical_maps.py map --arm glow-focus-map --composite C.tif --zmap Z.tif --reference R.tif --out M.npy
+```
+
+`tune` reads the calibration scenes only; `PARAMS` in `classical_maps.py` holds the sets it
+chose, and `write` and `map` use them. `write` stores `float32` 512 x 512 maps as
+`<out>/<arm>/<scene>-s<seed>/<method>-map.npy` for the held-out scenes; `--zmap-from depth-map`
+adds `risk-zones-dm-zmap` and `glow-self-dm-zmap`, the same maps read from the `depth-map`
+Z-Map. `score` prints, per method, each measure with its limit and `pass` or `fail`, and
+`n/a` for a method the arm has no maps for; a map for only some scenes, or of a size other
+than the label's, exits non-zero.
