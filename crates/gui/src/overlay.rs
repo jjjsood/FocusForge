@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use focusforge_core::display::{self, Downsampler};
 use focusforge_core::io::TiffStack;
+use focusforge_core::io::raw::document_clip;
 use focusforge_core::project::Plane;
 use focusforge_core::tile::Rect;
 
@@ -265,12 +266,27 @@ pub(crate) fn render_thumbnail_from_file(path: &Path) -> Option<Thumbnail> {
 
 /// A loose TIFF -- an unfused tab's first frame or a held composite, 16-bit or
 /// 32-bit float -- downsampled and tone-mapped the same way, read band by band
-/// via [`TiffStack::read_tile_into`], never as a whole image. `None` on any
+/// via [`TiffStack::read_tile_into`], never as a whole image. A float
+/// composite of a RAW document narrows through the highlight clip built from
+/// `clip_source`, the document's first source frame and equalization gains,
+/// as its 16-bit export does; without one each sample clamps. `None` on any
 /// read failure.
-pub(crate) fn render_thumbnail_from_frame(first_frame: &Path) -> Option<Thumbnail> {
+pub fn render_thumbnail_from_frame(
+    first_frame: &Path,
+    clip_source: Option<(&Path, &[u32])>,
+) -> Option<Thumbnail> {
     let stack = TiffStack::open_staged(first_frame).ok()?;
     let (width, height) = stack.dimensions();
     let samples_per_pixel = stack.header(0).samples_per_pixel;
+    let clip = clip_source.and_then(|(source, gains)| {
+        document_clip(
+            Some(source),
+            gains,
+            stack.sample_format(),
+            samples_per_pixel,
+        )
+    });
+    let mut float_band = Vec::new();
     let mut accumulator = Downsampler::new(
         width,
         height,
@@ -292,7 +308,14 @@ pub(crate) fn render_thumbnail_from_frame(first_frame: &Path) -> Option<Thumbnai
             height: rows,
         };
         let len = rect.width as usize * rect.height as usize * samples_per_pixel as usize;
-        stack.read_tile_into(0, rect, &mut band[..len]).ok()?;
+        match &clip {
+            Some(clip) => {
+                float_band.resize(len, 0f32);
+                stack.read_tile_f32_into(0, rect, &mut float_band).ok()?;
+                clip.narrow_band(&float_band, &mut band[..len]);
+            }
+            None => stack.read_tile_into(0, rect, &mut band[..len]).ok()?,
+        }
         accumulator.add_band(&band[..len], rect);
         y += rows;
     }
@@ -306,7 +329,7 @@ pub(crate) fn render_thumbnail_from_frame(first_frame: &Path) -> Option<Thumbnai
 pub fn render_thumbnail(project: &mut GuiProject, frames: &[PathBuf]) -> Option<Thumbnail> {
     match project {
         GuiProject::Opened(project) => render_thumbnail_from_project(project),
-        GuiProject::Unsaved(_) => render_thumbnail_from_frame(frames.first()?),
+        GuiProject::Unsaved(_) => render_thumbnail_from_frame(frames.first()?, None),
     }
 }
 
@@ -355,11 +378,11 @@ mod tests {
         writer.write_tile(whole(), &clipped).unwrap();
         writer.finish().unwrap();
 
-        let from_float =
-            render_thumbnail_from_frame(&float_path).expect("a float composite has a thumbnail");
+        let from_float = render_thumbnail_from_frame(&float_path, None)
+            .expect("a float composite has a thumbnail");
         assert_eq!(
             Some(from_float),
-            render_thumbnail_from_frame(&clipped_path),
+            render_thumbnail_from_frame(&clipped_path, None),
             "the float composite reads as its samples clipped to 16 bits"
         );
     }

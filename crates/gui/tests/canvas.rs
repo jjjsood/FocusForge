@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use common::open_fixture_tab;
+use common::{RAW_H, RAW_W, open_fixture_tab, raw_whole, write_float_composite};
 use focusforge_core::io::TiffHeader;
 use focusforge_gui::AppWindow;
 use focusforge_gui::canvas::{
@@ -2573,7 +2573,7 @@ fn resident_tiles_allocate_only_the_tiles_a_region_meets() {
     // including the rest of the four tiles the region met.
     const SENTINEL: u16 = 7777;
     let mut samples = vec![SENTINEL; (MAP * MAP * 3) as usize];
-    overlay_edited(&mut samples, whole_map(), NonZeroU32::MIN, 3, &tiles);
+    overlay_edited(&mut samples, whole_map(), NonZeroU32::MIN, 3, &tiles, None);
     for y in 0..MAP {
         for x in 0..MAP {
             let i = ((y * MAP + x) * 3) as usize;
@@ -2622,7 +2622,7 @@ fn a_pending_region_never_shows_unfilled_tile_samples() {
         let out_w = MAP.div_ceil(step.get());
         let texels = (out_w * out_w) as usize;
         let mut samples = vec![SENTINEL; texels * 3];
-        overlay_edited(&mut samples, whole_map(), step, 3, tiles);
+        overlay_edited(&mut samples, whole_map(), step, 3, tiles, None);
         (step.get(), out_w, samples)
     };
     let check = |step: u32, tiles: &ResidentTiles, expected: &dyn Fn(u32, u32) -> Vec<u16>| {
@@ -3952,7 +3952,7 @@ fn overlay_keeps_sealed_pixels_where_index_unchanged() {
         let out_w = MAP.div_ceil(step.get());
         let texels = (out_w * out_w) as usize;
         let mut samples: Vec<u16> = (0..texels * 3).map(sealed_sample).collect();
-        overlay_edited(&mut samples, whole_map(), step, 3, &tiles);
+        overlay_edited(&mut samples, whole_map(), step, 3, &tiles, None);
         for ty in 0..out_w {
             for tx in 0..out_w {
                 let (x, y) = (tx * step.get(), ty * step.get());
@@ -4198,9 +4198,6 @@ fn scale_factor_change_without_resize_reaches_the_next_draw() {
     assert_eq!(after.src, before.src);
 }
 
-const RAW_W: u32 = 37;
-const RAW_H: u32 = 23;
-
 /// Float values around both ends of the 16-bit range and its rounding points.
 const RAW_VALUES: [f32; 13] = [
     -9000.5, -0.25, 0.0, 0.49, 0.5, 1.5, 123.4, 40_000.5, 65_534.5, 65_535.0, 65_535.5, 80_000.0,
@@ -4211,30 +4208,6 @@ fn raw_samples(seed: usize) -> Vec<f32> {
     (0..(RAW_W * RAW_H * 3) as usize)
         .map(|i| RAW_VALUES[(i * seed + seed) % RAW_VALUES.len()])
         .collect()
-}
-
-fn raw_whole() -> Rect {
-    Rect {
-        x: 0,
-        y: 0,
-        width: RAW_W,
-        height: RAW_H,
-    }
-}
-
-fn write_float_composite(path: &Path, samples: &[f32]) {
-    let mut writer = TiffWriter::create_f32(
-        path,
-        TiffSpec {
-            width: RAW_W,
-            height: RAW_H,
-            samples_per_pixel: 3,
-            description: None,
-        },
-    )
-    .unwrap();
-    writer.write_tile_f32(raw_whole(), samples).unwrap();
-    writer.finish().unwrap();
 }
 
 /// `stored` (the whole plane, three samples a pixel) clipped to 16 bits and
@@ -4293,7 +4266,7 @@ fn raw_project_display_clips_once() {
     for step in [1u32, 2] {
         let mut shown = clipped_at(&stored, step);
         let nz = NonZeroU32::new(step).unwrap();
-        overlay_edited(&mut shown, raw_whole(), nz, 3, &tiles);
+        overlay_edited(&mut shown, raw_whole(), nz, 3, &tiles, None);
         let out_w = RAW_W.div_ceil(step);
         for (t, pixel) in shown.chunks_exact(3).enumerate() {
             let (x, y) = ((t as u32 % out_w) * step, (t as u32 / out_w) * step);
@@ -4331,6 +4304,177 @@ fn raw_project_display_clips_once() {
         .read_step_into(raw_whole(), job.draw.step, &mut shown)
         .expect("the renderer's reader reads the float composite");
     assert_eq!(shown, clipped_at(&stored, 1));
+}
+
+/// A 16-bit TIFF export of `files`' composite, the oracle every display site
+/// of a RAW document must match.
+fn export_oracle(files: &common::RawFiles) -> TiffStack {
+    use focusforge_core::project::{
+        self,
+        export::{ExportOptions, MetadataOptions},
+    };
+
+    let out = files.dir.join("export.tif");
+    let metadata = MetadataOptions {
+        exif: false,
+        icc: false,
+        xmp: false,
+        iptc: false,
+    };
+    project::export_pending(
+        &common::raw_pending(files, vec![]),
+        None,
+        &out,
+        &ExportOptions::default(),
+        &metadata,
+    )
+    .expect("the pending composite exports");
+    TiffStack::open_files(&[out]).expect("the export opens")
+}
+
+fn oracle_read(oracle: &TiffStack, rect: Rect, step: u32) -> Vec<u16> {
+    let step = NonZeroU32::new(step).unwrap();
+    let len = (rect.width.div_ceil(step.get()) * rect.height.div_ceil(step.get()) * 3) as usize;
+    let mut out = vec![0u16; len];
+    oracle.read_tile_step_into(0, rect, step, &mut out).unwrap();
+    out
+}
+
+#[test]
+fn raw_composite_pane_clips_like_export() {
+    use focusforge_core::io::raw::highlight_clip;
+    use focusforge_core::tile::Sample;
+    use focusforge_gui::canvas::{ClippedComposite, PaneReader};
+    use focusforge_gui::gpu_canvas::CanvasRenderer;
+    use focusforge_gui::overlay::render_thumbnail_from_frame;
+    use focusforge_gui::viewport::PaneDraw;
+    use std::sync::Arc;
+
+    let files = common::raw_files("raw_composite_pane_clips_like_export");
+    let oracle = export_oracle(&files);
+    let sub = Rect {
+        x: 5,
+        y: 3,
+        width: 20,
+        height: 11,
+    };
+
+    let plain: Vec<u16> = files.stored.iter().map(|&v| u16::narrow(v)).collect();
+    assert_ne!(
+        oracle_read(&oracle, raw_whole(), 1),
+        plain,
+        "(a) the export differs from the per-sample clamp"
+    );
+
+    let composite =
+        Arc::new(TiffStack::open_staged(&files.composite).expect("the composite opens"));
+    let clip = highlight_clip(&files.sources[0], &[])
+        .unwrap()
+        .expect("a colour RAW source has a clip");
+    let reader = ClippedComposite::new(composite.clone(), clip.clone());
+    for (rect, step) in [(raw_whole(), 1u32), (sub, 2)] {
+        let expected = oracle_read(&oracle, rect, step);
+        let mut shown = vec![0u16; expected.len()];
+        reader
+            .read_step_into(rect, NonZeroU32::new(step).unwrap(), &mut shown)
+            .unwrap();
+        assert_eq!(shown, expected, "(b) pane read, step {step}");
+    }
+
+    // (c) Edited texels narrow through the clip over the sealed composite.
+    let edited: Vec<f32> = files.stored.iter().rev().copied().collect();
+    let region = Rect {
+        x: 6,
+        y: 4,
+        width: 18,
+        height: 10,
+    };
+    let installed: Vec<f32> = (region.y..region.y + region.height)
+        .flat_map(|y| {
+            let start = ((y * RAW_W + region.x) * 3) as usize;
+            edited[start..start + region.width as usize * 3].to_vec()
+        })
+        .collect();
+    let mut tiles = ResidentTiles::new(16, RAW_W, RAW_H, 3);
+    tiles.install(region, &installed);
+    let mut clip_matters = false;
+    for step in [1u32, 2] {
+        let mut shown = oracle_read(&oracle, raw_whole(), step);
+        overlay_edited(
+            &mut shown,
+            raw_whole(),
+            NonZeroU32::new(step).unwrap(),
+            3,
+            &tiles,
+            Some(&clip),
+        );
+        let out_w = RAW_W.div_ceil(step);
+        let sealed = oracle_read(&oracle, raw_whole(), step);
+        for (t, pixel) in shown.chunks_exact(3).enumerate() {
+            let (x, y) = ((t as u32 % out_w) * step, (t as u32 / out_w) * step);
+            let expected = if contains(region, x, y) {
+                let at = ((y * RAW_W + x) * 3) as usize;
+                let rgb = [edited[at], edited[at + 1], edited[at + 2]];
+                clip_matters |= clip.narrow(rgb) != rgb.map(u16::narrow);
+                clip.narrow(rgb).to_vec()
+            } else {
+                sealed[t * 3..t * 3 + 3].to_vec()
+            };
+            assert_eq!(
+                pixel,
+                expected.as_slice(),
+                "(c) overlay, step {step} ({x}, {y})"
+            );
+        }
+    }
+    assert!(clip_matters, "(c) the clip changes an edited texel");
+
+    // (d) The held composite's thumbnail is the export's.
+    let from_export = render_thumbnail_from_frame(&files.dir.join("export.tif"), None)
+        .expect("the export has a thumbnail");
+    assert_ne!(
+        render_thumbnail_from_frame(&files.composite, None),
+        Some(from_export.clone()),
+        "(d) the thumbnail without a clip differs from the export's"
+    );
+    assert_eq!(
+        render_thumbnail_from_frame(&files.composite, Some((&files.sources[0], &[]))),
+        Some(from_export),
+        "(d) thumbnail"
+    );
+
+    // (e) The renderer's job reader after set_planes + set_clip_source.
+    let Some(shared) = focusforge_gpu::device::shared_device_or_skip() else {
+        return;
+    };
+    let mut renderer = CanvasRenderer::new();
+    renderer.attach_device(shared.device().clone(), shared.queue().clone());
+    renderer.set_planes(&files.composite, None).unwrap();
+    let draw = PaneDraw {
+        src: (0, 0, RAW_W, RAW_H),
+        dst: (0.0, 0.0, RAW_W as f32, RAW_H as f32),
+        crop: (0.0, 0.0, RAW_W as f32, RAW_H as f32),
+        pixelated: true,
+        step: NonZeroU32::MIN,
+    };
+    let job_read = |renderer: &mut CanvasRenderer| {
+        let job = renderer
+            .request_planes(&draw, None, None)
+            .expect("the float composite needs a read");
+        let mut shown = vec![0u16; (RAW_W * RAW_H * 3) as usize];
+        job.reader
+            .read_step_into(raw_whole(), job.draw.step, &mut shown)
+            .expect("the renderer's reader reads the composite");
+        shown
+    };
+    renderer.set_clip_source(Some((&files.sources[0], &[])));
+    assert_eq!(
+        job_read(&mut renderer),
+        oracle_read(&oracle, raw_whole(), 1),
+        "(e) RAW first frame"
+    );
+    renderer.set_clip_source(Some((&files.composite, &[])));
+    assert_eq!(job_read(&mut renderer), plain, "(e) .tif first frame");
 }
 
 /// The `Image` elements below the element `id` of the main window.

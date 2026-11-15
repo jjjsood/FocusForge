@@ -44,11 +44,12 @@ pub struct JobProgress {
     /// The frame count a computed align stage started with, `0` when no
     /// frame is being counted.
     pub align_total: usize,
-    /// How many frames' brightness equalization has completed during the
-    /// prepare stage. `0` when the run does not equalize; like `align_done`
-    /// it keeps its final tally once the stage ends.
+    /// How many units of brightness equalization have completed during the
+    /// prepare stage: strips read, or frames for a RAW source. `0` when the
+    /// run does not equalize; like `align_done` it keeps its final tally once
+    /// the stage ends.
     pub prepare_done: usize,
-    /// The frame count the prepare stage started with, `0` when the run does
+    /// The unit count the prepare stage started with, `0` when the run does
     /// not equalize.
     pub prepare_total: usize,
     /// How many RAW frames have been developed into scratch during the

@@ -5,9 +5,6 @@
 
 mod common;
 
-#[path = "../../core/tests/common/raw_dng.rs"]
-mod raw_dng;
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -27,7 +24,7 @@ use focusforge_core::zmap::ZMapInfo;
 use focusforge_gui::AppController;
 use focusforge_gui::checkpoints::local_date_and_time;
 
-use common::{open_mantis64_tab, save_to_proposed, scratch_controller, settle_all};
+use common::{open_mantis64_tab, raw_dng, save_to_proposed, scratch_controller, settle_all};
 
 const SETTLE: Duration = Duration::from_secs(60);
 

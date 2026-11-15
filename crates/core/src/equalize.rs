@@ -290,14 +290,20 @@ const BINS: usize = 1 << 16;
 /// Samples held by one strip buffer, about.
 const STRIP_SAMPLES: usize = 1 << 21;
 
+/// The estimator's revision. Bump it on any change that can move a gain or a
+/// figure of an [`EqualizationReport`], so reports computed before the change
+/// are not reused from the stage cache.
+pub const EQUALIZE_ESTIMATE_VERSION: u32 = 1;
+
 /// One gain per frame bringing its whole-image mean (every sample of every
 /// channel) to `neutral * 2^target_stops`, `neutral` being the mean of the
 /// frames' means. The gain is `target / mean` limited to
 /// `[1/max_gain, max_gain]`, in Q16; a zero-mean frame keeps unit gain and is
 /// flagged black. Frames are read on `workers` threads, each holding one
 /// strip buffer; the report is the same for any worker count. `cancelled` is
-/// polled before every strip read, and `frames_done` is incremented once as
-/// each frame's histogram completes.
+/// polled before every strip read. `frames_done` counts the work in the units
+/// of [`prepare_units`]: one per strip read, or one per frame when the reader
+/// has linear-light means and reads no pixels.
 #[allow(clippy::too_many_arguments)] // one input apiece; a struct wrapper would only rename this list
 pub fn estimate(
     reader: &dyn TileReader,
@@ -361,8 +367,25 @@ fn strip_rows_for(frame: (u32, u32), samples_per_pixel: u32) -> u32 {
     (STRIP_SAMPLES / row_samples).clamp(1, frame.1.max(1) as usize) as u32
 }
 
+/// The units [`estimate`] credits to its counter: one per strip read, or one
+/// per frame when the reader has linear-light means.
+pub fn prepare_units(
+    reader: &dyn TileReader,
+    frame_count: usize,
+    frame: (u32, u32),
+    samples_per_pixel: u32,
+) -> Result<usize, AlgorithmError> {
+    if reader.linear_means(0)?.is_some() {
+        return Ok(frame_count);
+    }
+    let strips = frame.1.div_ceil(strip_rows_for(frame, samples_per_pixel));
+    Ok(frame_count * strips as usize)
+}
+
 /// The histogram of every sample of frame `index`, read in strips of
-/// `strip_rows` rows through the reusable `strip` buffer.
+/// `strip_rows` rows through the reusable `strip` buffer; each strip read is
+/// credited to `strips_done`.
+#[allow(clippy::too_many_arguments)] // one input apiece
 fn frame_histogram(
     reader: &dyn TileReader,
     index: usize,
@@ -370,6 +393,7 @@ fn frame_histogram(
     samples_per_pixel: u32,
     strip_rows: u32,
     strip: &mut [u16],
+    strips_done: &AtomicUsize,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<Box<[u64]>, AlgorithmError> {
     let (width, height) = frame;
@@ -389,6 +413,7 @@ fn frame_histogram(
             height: rows,
         };
         reader.read_tile_into(index, rect, samples)?;
+        strips_done.fetch_add(1, Ordering::SeqCst);
         for &s in samples.iter() {
             histogram[usize::from(s)] += 1;
         }
@@ -428,17 +453,16 @@ fn estimate_in_strips(
             .map_init(
                 || vec![0u16; strip_len],
                 |strip, index| {
-                    let histogram = frame_histogram(
+                    frame_histogram(
                         reader,
                         index,
                         frame,
                         samples_per_pixel,
                         strip_rows,
                         strip,
+                        frames_done,
                         cancelled,
-                    )?;
-                    frames_done.fetch_add(1, Ordering::SeqCst);
-                    Ok(histogram)
+                    )
                 },
             )
             .collect::<Result<Vec<_>, AlgorithmError>>()
@@ -932,8 +956,105 @@ mod tests {
         assert!(matches!(result, Err(AlgorithmError::Cancelled)));
         assert!(polls.load(Ordering::SeqCst) >= 3);
         assert!(
-            frames_done.load(Ordering::SeqCst) < 2,
-            "the cancel landed before every frame finished"
+            frames_done.load(Ordering::SeqCst) < 2 * 23usize.div_ceil(5),
+            "the cancel landed before every strip was read"
+        );
+    }
+
+    /// A reader whose encoded samples are not the linear ones.
+    struct LinearLight<'a>(&'a Stack);
+
+    impl TileReader for LinearLight<'_> {
+        fn read_tile_into(
+            &self,
+            frame: usize,
+            rect: Rect,
+            out: &mut [u16],
+        ) -> Result<(), AlgorithmError> {
+            self.0.read_tile_into(frame, rect, out)
+        }
+
+        fn read_scratch_bytes(&self, width: u32, height: u32) -> u64 {
+            self.0.read_scratch_bytes(width, height)
+        }
+
+        fn linear_means(&self, _frame: usize) -> Result<Option<[f64; 3]>, AlgorithmError> {
+            Ok(Some([0.25; 3]))
+        }
+    }
+
+    #[test]
+    fn prepare_units_match_what_the_estimate_credits() {
+        // A 2^19-sample row gives 4-row strips: 8 rows is two whole strips,
+        // 10 rows leaves a short last one.
+        let w = 1 << 19;
+        for (h, strips) in [(8u32, 2usize), (10, 3)] {
+            let stack = shifted_stack(w, h, 1, &[1.0, 1.1]);
+            assert_eq!(strip_rows_for((w, h), 1), 4);
+            let frames_done = AtomicUsize::new(0);
+            estimate(
+                &stack,
+                2,
+                (w, h),
+                1,
+                settings(1.25, 0.0),
+                WORKERS,
+                &frames_done,
+                &never,
+            )
+            .unwrap();
+            let credited = frames_done.load(Ordering::SeqCst);
+            assert_eq!(credited, 2 * strips, "height {h}");
+            assert_eq!(prepare_units(&stack, 2, (w, h), 1).unwrap(), credited);
+        }
+
+        let stack = shifted_stack(37, 23, 1, &[1.0, 1.1, 0.9]);
+        let reader = LinearLight(&stack);
+        let frames_done = AtomicUsize::new(0);
+        estimate(
+            &reader,
+            3,
+            (37, 23),
+            1,
+            settings(1.25, 0.0),
+            WORKERS,
+            &frames_done,
+            &never,
+        )
+        .unwrap();
+        assert_eq!(frames_done.load(Ordering::SeqCst), 3);
+        assert_eq!(prepare_units(&reader, 3, (37, 23), 1).unwrap(), 3);
+    }
+
+    #[test]
+    fn estimate_credits_one_unit_per_strip() {
+        let (w, h) = (37, 23);
+        let stack = shifted_stack(w, h, 1, &[1.0, 1.1, 0.9]);
+        let frames_done = AtomicUsize::new(0);
+        let polls = AtomicUsize::new(0);
+        let at_second_poll = AtomicUsize::new(usize::MAX);
+        let observe = || {
+            if polls.fetch_add(1, Ordering::SeqCst) == 1 {
+                at_second_poll.store(frames_done.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+            false
+        };
+        estimate_in_strips(
+            &stack,
+            3,
+            (w, h),
+            1,
+            settings(1.25, 0.0),
+            5,
+            1,
+            &frames_done,
+            &observe,
+        )
+        .unwrap();
+        assert_eq!(frames_done.load(Ordering::SeqCst), 3 * 23usize.div_ceil(5));
+        assert!(
+            at_second_poll.load(Ordering::SeqCst) >= 1,
+            "the first strip is credited before any frame is finished"
         );
     }
 
@@ -990,7 +1111,11 @@ mod tests {
             Err(AlgorithmError::Failed { detail, .. }) => assert_eq!(detail, "frame is unreadable"),
             other => panic!("expected the read error, got {other:?}"),
         }
-        assert_eq!(frames_done.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            frames_done.load(Ordering::SeqCst),
+            23usize.div_ceil(7),
+            "frame 0's strips are credited, frame 1 fails before its first"
+        );
     }
 
     /// The reference loop: frames read one after another on this thread.
@@ -1016,9 +1141,9 @@ mod tests {
                 samples_per_pixel,
                 strip_rows,
                 &mut strip,
+                frames_done,
                 cancelled,
             )?);
-            frames_done.fetch_add(1, Ordering::SeqCst);
         }
         Ok(report_from_histograms(&histograms, settings))
     }
@@ -1055,7 +1180,9 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(parallel, sequential, "{workers} workers, {strip_rows} rows");
-                assert_eq!(parallel_done.load(Ordering::SeqCst), 5);
+                let strips = 5 * 23usize.div_ceil(strip_rows as usize);
+                assert_eq!(parallel_done.load(Ordering::SeqCst), strips);
+                assert_eq!(sequential_done.load(Ordering::SeqCst), strips);
             }
         }
 
@@ -1091,8 +1218,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parallel, sequential, "mantis-512 reports differ");
-        assert_eq!(parallel_done.load(Ordering::SeqCst), frames);
-        assert_eq!(sequential_done.load(Ordering::SeqCst), frames);
+        assert_eq!(
+            parallel_done.load(Ordering::SeqCst),
+            prepare_units(&stack, frames, frame, spp).unwrap()
+        );
+        assert_eq!(
+            sequential_done.load(Ordering::SeqCst),
+            frames * frame.1.div_ceil(strip_rows) as usize
+        );
     }
 
     /// Times the bare `estimate` work on the reference stack, sequential

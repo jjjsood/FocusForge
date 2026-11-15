@@ -421,12 +421,13 @@ impl JobControl {
         }
     }
 
-    /// Starts the prepare stage: stores `frames` as its total, zeroes the
+    /// Starts the prepare stage: stores `units` as its total, zeroes the
     /// counter, stamps the stage's start and hands back the shared counter
-    /// the equalization credits as each frame's histogram completes.
-    pub(crate) fn begin_prepare(&self, frames: usize) -> Arc<AtomicUsize> {
+    /// the equalization credits once per strip read, or once per frame for a
+    /// RAW source.
+    pub(crate) fn begin_prepare(&self, units: usize) -> Arc<AtomicUsize> {
         self.prepare_done.store(0, Ordering::SeqCst);
-        self.prepare_total.store(frames, Ordering::SeqCst);
+        self.prepare_total.store(units, Ordering::SeqCst);
         self.prepare_start_nanos
             .store(self.epoch.elapsed().as_nanos() as u64, Ordering::SeqCst);
         Arc::clone(&self.prepare_done)
@@ -535,7 +536,7 @@ impl JobControl {
     }
 
     /// The prepare stage's progress fraction and remaining time at the
-    /// frame rate. The stage never pauses -- its only stop check is a cancel
+    /// unit rate. The stage never pauses -- its only stop check is a cancel
     /// -- so the time since it began is its running clock and no hold needs
     /// excluding.
     fn prepare_rate(&self) -> (Option<f64>, Option<Duration>) {

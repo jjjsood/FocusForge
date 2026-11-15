@@ -17,10 +17,11 @@ use focusforge_core::algorithm::AlignStatus;
 use focusforge_core::align::{
     FailurePolicy, FrameAlignment, ReferencePolicy, StackAlignment, Transform,
 };
+use focusforge_core::equalize::{EqualizationReport, EqualizeSettings, FrameEstimate};
 use focusforge_core::io::{FrameDesc, RawIdentity, TiffHeader};
 use focusforge_core::job::{
-    ALIGN_SOLVER_VERSION, AlignIdentity, DRIVER_POLICY_FIELDS, FrameFingerprint, StackFingerprint,
-    StageCache, StageKey,
+    ALIGN_SOLVER_VERSION, AlignIdentity, DRIVER_POLICY_FIELDS, EqualizeKey, FrameFingerprint,
+    StackFingerprint, StageCache, StageKey,
 };
 use focusforge_core::params::{self, ParamValue, ParamValues, StackContext};
 use focusforge_core::project::source_hash_change_checked;
@@ -761,5 +762,286 @@ fn the_cache_key_projects_the_resume_fingerprint() {
     for (k, f) in key.frames.iter().zip(fingerprint.frames.iter()) {
         assert_eq!(k.file_size, f.file_size);
         assert_eq!(k.strip_offsets, f.strip_offsets);
+    }
+}
+
+/// The digest of a fixed align key. Changing the equalization stage's key
+/// must leave every existing align entry findable under this value.
+#[test]
+fn equalization_stage_leaves_the_align_digest_unchanged() {
+    let key = StageKey::align(
+        &sample_fingerprint(2),
+        &sample_identity("ecc", FailurePolicy::Strict),
+    );
+    assert_eq!(
+        key.digest(),
+        "965031ea1e456299362cb5196694a6850e06fb70f9447bdbe4e1c652052e7eb6"
+    );
+}
+
+const EQ_SETTINGS: EqualizeSettings = EqualizeSettings {
+    max_gain: 4.0,
+    target_stops: 0.0,
+};
+
+fn next_up(x: f64) -> f64 {
+    f64::from_bits(x.to_bits() + 1)
+}
+
+fn eq_key(fingerprint: &StackFingerprint) -> EqualizeKey {
+    EqualizeKey::new(fingerprint, EQ_SETTINGS)
+}
+
+/// Three frames: one ordinary with a thirds-valued mean and a `-0.0`
+/// residual, one clamped with clipped samples, one black.
+fn eq_report() -> EqualizationReport {
+    EqualizationReport {
+        max_gain: EQ_SETTINGS.max_gain,
+        target_stops: EQ_SETTINGS.target_stops,
+        neutral: 1.0 / 3.0,
+        target: 2.0 / 3.0,
+        frames: vec![
+            FrameEstimate {
+                mean: 1.0 / 3.0,
+                estimated: 1.0 / 7.0,
+                applied: 1.0 / 7.0,
+                gain: 9362,
+                clamped: false,
+                black: false,
+                clipped_samples: 0,
+                output_mean: 2.0 / 3.0,
+                residual: -0.0,
+            },
+            FrameEstimate {
+                mean: 0.1,
+                estimated: 6.5,
+                applied: 4.0,
+                gain: 4 << 16,
+                clamped: true,
+                black: false,
+                clipped_samples: u64::MAX - 1,
+                output_mean: f64::MIN_POSITIVE,
+                residual: -123.456_789_012_345_67,
+            },
+            FrameEstimate {
+                mean: 0.0,
+                estimated: f64::INFINITY,
+                applied: 1.0,
+                gain: 1 << 16,
+                clamped: false,
+                black: true,
+                clipped_samples: 0,
+                output_mean: 0.0,
+                residual: -2.0 / 3.0,
+            },
+        ],
+    }
+}
+
+#[test]
+fn equalization_key_digest_moves_with_each_input() {
+    let fingerprint = sample_fingerprint(3);
+    let base = eq_key(&fingerprint).digest();
+
+    let mut moved = Vec::new();
+    let mut header = fingerprint.clone();
+    header.frames[1].width += 1;
+    moved.push(("a frame header", eq_key(&header).digest()));
+    let mut reordered = fingerprint.clone();
+    reordered.frames.swap(0, 2);
+    moved.push(("the frame order", eq_key(&reordered).digest()));
+    moved.push(("a dropped frame", eq_key(&sample_fingerprint(2)).digest()));
+    moved.push(("an added frame", eq_key(&sample_fingerprint(4)).digest()));
+    moved.push((
+        "the last bit of max_gain",
+        EqualizeKey::new(
+            &fingerprint,
+            EqualizeSettings {
+                max_gain: next_up(EQ_SETTINGS.max_gain),
+                ..EQ_SETTINGS
+            },
+        )
+        .digest(),
+    ));
+    moved.push((
+        "the last bit of target_stops",
+        EqualizeKey::new(
+            &fingerprint,
+            EqualizeSettings {
+                target_stops: next_up(EQ_SETTINGS.target_stops),
+                ..EQ_SETTINGS
+            },
+        )
+        .digest(),
+    ));
+    let mut other_version = eq_key(&fingerprint);
+    other_version.version += 1;
+    moved.push(("the estimator version", other_version.digest()));
+    for (what, digest) in &moved {
+        assert_ne!(*digest, base, "{what} must change the digest");
+    }
+
+    let mut renamed = fingerprint.clone();
+    renamed.frames[0].path = PathBuf::from("elsewhere/other-name.tif");
+    assert_eq!(
+        eq_key(&renamed).digest(),
+        base,
+        "a frame path is not part of the key"
+    );
+    assert_ne!(
+        base,
+        StageKey::align(&fingerprint, &sample_identity("ecc", FailurePolicy::Strict)).digest(),
+        "the two stages never share a digest"
+    );
+}
+
+#[test]
+fn equalization_report_round_trips_every_bit() {
+    let scratch = tmp_dir("eq-round-trip");
+    let cache = StageCache::open(scratch.path()).unwrap();
+    let key = eq_key(&sample_fingerprint(3));
+    let report = eq_report();
+    cache
+        .put_equalization(&key, &[], &sample_content(3), &report)
+        .unwrap();
+
+    let back = cache
+        .get_equalization(&key, sample_hash)
+        .expect("a freshly written entry hits");
+    assert_eq!(
+        common::equalization_bits(&back),
+        common::equalization_bits(&report)
+    );
+    assert!(back.frames[0].residual.is_sign_negative());
+    assert_eq!(back.frames[2].estimated, f64::INFINITY);
+}
+
+#[test]
+fn equalization_entry_that_cannot_be_trusted_is_a_miss() {
+    let fingerprint = sample_fingerprint(3);
+    let key = eq_key(&fingerprint);
+    let scratch = tmp_dir("eq-misses");
+    let cache = StageCache::open(scratch.path()).unwrap();
+    let path = cache.equalization_entry_path(&key);
+
+    assert!(
+        cache
+            .get_equalization(&key, |_| panic!("a hash was asked for without an entry"))
+            .is_none(),
+        "absent entry"
+    );
+
+    cache
+        .put_equalization(&key, &[], &sample_content(3), &eq_report())
+        .unwrap();
+    assert!(cache.get_equalization(&key, sample_hash).is_some());
+    let intact = fs::read_to_string(&path).unwrap();
+    let edited = |edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut value: serde_json::Value = serde_json::from_str(&intact).unwrap();
+        edit(&mut value);
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    };
+
+    fs::write(&path, &intact[..intact.len() / 2]).unwrap();
+    assert!(
+        cache.get_equalization(&key, sample_hash).is_none(),
+        "truncated entry"
+    );
+
+    let align_key = StageKey::align(&fingerprint, &sample_identity("ecc", FailurePolicy::Strict));
+    cache
+        .put_alignment(&align_key, &[], &sample_content(3), &sample_alignment(3))
+        .unwrap();
+    fs::copy(cache.entry_path(&align_key), &path).unwrap();
+    assert!(
+        cache.get_equalization(&key, sample_hash).is_none(),
+        "an align entry's JSON"
+    );
+
+    edited(&|v| v["key_digest"] = serde_json::json!("0".repeat(64)));
+    assert!(
+        cache.get_equalization(&key, sample_hash).is_none(),
+        "a stored digest that is another key's"
+    );
+
+    edited(&|v| v["frame_count"] = serde_json::json!(2));
+    assert!(
+        cache.get_equalization(&key, sample_hash).is_none(),
+        "a stored frame count that disagrees"
+    );
+
+    edited(&|v| {
+        v["frames"].as_array_mut().unwrap().pop();
+    });
+    assert!(
+        cache.get_equalization(&key, sample_hash).is_none(),
+        "fewer stored frames than the key's"
+    );
+
+    fs::write(&path, &intact).unwrap();
+    assert!(
+        cache
+            .get_equalization(&key, |i| {
+                if i == 2 {
+                    Some("f".repeat(64))
+                } else {
+                    sample_hash(i)
+                }
+            })
+            .is_none(),
+        "one frame with other content"
+    );
+    assert!(
+        cache
+            .get_equalization(&key, |i| if i == 1 { None } else { sample_hash(i) })
+            .is_none(),
+        "one frame that cannot be hashed"
+    );
+    assert!(
+        cache.get_equalization(&key, sample_hash).is_some(),
+        "the intact entry still hits"
+    );
+}
+
+#[test]
+fn equalization_entry_of_other_settings_or_frames_is_a_miss() {
+    let scratch = tmp_dir("eq-other-key");
+    let cache = StageCache::open(scratch.path()).unwrap();
+    let fingerprint = sample_fingerprint(3);
+    cache
+        .put_equalization(&eq_key(&fingerprint), &[], &sample_content(3), &eq_report())
+        .unwrap();
+
+    let other_gain = EqualizeKey::new(
+        &fingerprint,
+        EqualizeSettings {
+            max_gain: next_up(EQ_SETTINGS.max_gain),
+            ..EQ_SETTINGS
+        },
+    );
+    let other_stops = EqualizeKey::new(
+        &fingerprint,
+        EqualizeSettings {
+            target_stops: next_up(EQ_SETTINGS.target_stops),
+            ..EQ_SETTINGS
+        },
+    );
+    let mut other_version = eq_key(&fingerprint);
+    other_version.version += 1;
+    let mut reordered = fingerprint.clone();
+    reordered.frames.swap(0, 1);
+    let mut grown = fingerprint.clone();
+    grown.frames.push(sample_frame(3));
+    for (what, key) in [
+        ("max_gain", other_gain),
+        ("target_stops", other_stops),
+        ("version", other_version),
+        ("frame order", eq_key(&reordered)),
+        ("an added frame", eq_key(&grown)),
+    ] {
+        assert!(
+            cache.get_equalization(&key, sample_hash).is_none(),
+            "{what} differs"
+        );
     }
 }

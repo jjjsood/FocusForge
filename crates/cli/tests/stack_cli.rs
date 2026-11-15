@@ -1920,6 +1920,7 @@ fn stack_json_trace_accounting_is_null_by_default() {
         "device_budget_provenance",
         "device_peak_in_flight",
         "gpu_fallback",
+        "equalization_cached",
         "align_cached",
         "stages",
         "develop_counts",

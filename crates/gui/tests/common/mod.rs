@@ -944,3 +944,117 @@ pub fn select_panel_row(controller: &mut AppController, id: &str) {
         .unwrap_or_else(|| panic!("no checkpoint row for {id}"));
     controller.select_checkpoint_row(index);
 }
+
+// ---------------------------------------------------------------------
+// A RAW project: an f32 document over three DNG frames.
+// ---------------------------------------------------------------------
+
+#[allow(dead_code)]
+#[path = "../../../core/tests/common/raw_dng.rs"]
+pub mod raw_dng;
+
+#[allow(dead_code)]
+pub const RAW_W: u32 = 37;
+#[allow(dead_code)]
+pub const RAW_H: u32 = 23;
+
+/// The whole `RAW_W` x `RAW_H` plane.
+#[allow(dead_code)]
+pub fn raw_whole() -> focusforge_core::io::Rect {
+    focusforge_core::io::Rect {
+        x: 0,
+        y: 0,
+        width: RAW_W,
+        height: RAW_H,
+    }
+}
+
+/// Three DNG frames of `RAW_W` x `RAW_H`, an f32 staged composite holding
+/// samples above 65535, below 0 and inside, and a Z-Map over them.
+#[allow(dead_code)]
+pub struct RawFiles {
+    pub dir: PathBuf,
+    pub _frames: Vec<tempfile::NamedTempFile>,
+    pub sources: Vec<PathBuf>,
+    pub composite: PathBuf,
+    pub zmap: PathBuf,
+    pub stored: Vec<f32>,
+}
+
+#[allow(dead_code)]
+pub fn raw_files(name: &str) -> RawFiles {
+    use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
+
+    let dir = tree(name);
+    let frames: Vec<_> = (0..3u32)
+        .map(|frame| {
+            let samples = (0..RAW_W * RAW_H)
+                .map(|i| {
+                    let (x, y) = (i % RAW_W, i / RAW_W);
+                    let checker = if (x / 2 + y / 2) % 2 == 0 { 0 } else { 380 };
+                    (2_700 + frame * 40 + checker) as u16
+                })
+                .collect();
+            let mut spec = raw_dng::DngSpec::new(12, 64, 4095, [0, 1, 1, 2], samples);
+            spec.width = RAW_W;
+            spec.height = RAW_H;
+            spec.as_shot_neutral = Some([0.5, 1.0, 0.625]);
+            raw_dng::write_dng(&spec, false)
+        })
+        .collect();
+    let sources = frames.iter().map(|f| f.path().to_path_buf()).collect();
+    let stored: Vec<f32> = (0..(RAW_W * RAW_H * 3) as usize)
+        .map(|i| (i * 7919 % 120_000) as f32 * 0.9 - 20_000.0)
+        .collect();
+    let composite = dir.join("composite.tif");
+    write_float_composite(&composite, &stored);
+    let zmap = dir.join("zmap.tif");
+    let mut map = ZMapWriter::create(&zmap, ZMapInfo::new(RAW_W, RAW_H, 3).unwrap()).unwrap();
+    map.write_tile(raw_whole(), &vec![0u16; (RAW_W * RAW_H) as usize])
+        .unwrap();
+    map.finish().unwrap();
+    RawFiles {
+        dir,
+        _frames: frames,
+        sources,
+        composite,
+        zmap,
+        stored,
+    }
+}
+
+/// An f32 three-sample `RAW_W` x `RAW_H` TIFF of `samples`.
+#[allow(dead_code)]
+pub fn write_float_composite(path: &Path, samples: &[f32]) {
+    use focusforge_core::io::{TiffSpec, TiffWriter};
+
+    let mut writer = TiffWriter::create_f32(
+        path,
+        TiffSpec {
+            width: RAW_W,
+            height: RAW_H,
+            samples_per_pixel: 3,
+            description: Some("staged composite".to_string()),
+        },
+    )
+    .unwrap();
+    writer.write_tile_f32(raw_whole(), samples).unwrap();
+    writer.finish().unwrap();
+}
+
+/// The pending state of `files`' composite under `ops`.
+#[allow(dead_code)]
+pub fn raw_pending(
+    files: &RawFiles,
+    ops: Vec<focusforge_core::project::Op>,
+) -> focusforge_core::project::PendingState {
+    focusforge_core::project::PendingState {
+        held: Vec::new(),
+        composite: files.composite.clone(),
+        ops,
+        sources: files.sources.clone(),
+        registration: focusforge_core::align::Registration::default(),
+        reference: 0,
+        description: "staged composite".to_string(),
+    }
+}

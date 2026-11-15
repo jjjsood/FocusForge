@@ -23,7 +23,7 @@ Start: --open fixtures/mantis-64/frames
 10. Click "MiB" (`FFMenuList::option-area` 0).
     Expect: the list is gone, the VRAM unit field reads "MiB" and the VRAM number field is still empty with the grey hint "Not probed yet".
 11. Type "512" into the VRAM number (`FFTextField::input` 1).
-    Expect: the field shows "512" in the neutral tone beside "MiB" and the grey hint is gone; the note "Caps only lower the probed budgets. Changes apply from the next start." shows below the LIMITS rows (opening the frames already fixed this session's device budget, so an edited cap waits for the next start).
+    Expect: the field shows "512" in the neutral tone beside "MiB" and the grey hint is gone, and the line "Caps only lower the probed budgets. Changes apply from the next start." shows below the LIMITS rows (an opened stack's background count has already fixed the VRAM cap, so the note shows from the first edit).
 12. Click **Close settings** (`FFSettingsModal::close`).
    Expect: the "Settings" window is gone; the canvas panes are visible again (within 3 s).
 13. Click **Settings** (`FFIconBar::settings`, icon bar at the bottom-left).
@@ -55,7 +55,7 @@ Start: --open fixtures/mantis-64/frames
     Expect: the field shows a non-empty path text (the field is narrower than the path, so its end is cut off); the result line (`FFDiagnosticsPanel::message`) is empty and **Create bundle** is listed enabled (read with `buttons AppWindow::settings-modal`).
 ## About
 25. Click **About** (`FFNavRailEntry::area` 5).
-    Expect: the heading "FOCUSFORGE" shows "Version" with a number of the form "0.1.0", which may carry a pre-release suffix such as "-rc.1" and "License" with "GPL-3.0"; the heading "NOTICE" shows the line "Copyright © 2026 Johannes Sood" and a paragraph starting "FocusForge is free software"; the row "Source" shows the accent-coloured text "github.com/jjjsood/FocusForge" (within 1 s).
+    Expect: the heading "FOCUSFORGE" shows "Version" with a version number of the form "0.1.0", with or without a pre-release suffix such as "-rc.1" and "License" with "GPL-3.0"; the heading "NOTICE" shows the line "Copyright © 2026 Johannes Sood" and a paragraph starting "FocusForge is free software"; the row "Source" shows the accent-coloured text "github.com/jjjsood/FocusForge" (within 1 s).
 ## The backend line after a fuse with the GPU switch off
 26. Press Escape (step 24 focused the "Save to" field and step 25 switched to About).
     Expect: the "Settings" window and its rail are gone; the canvas panes are visible again (within 1 s).

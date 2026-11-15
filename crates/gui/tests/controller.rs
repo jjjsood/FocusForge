@@ -4081,7 +4081,7 @@ impl Sealed {
     fn displayed(&self, controller: &AppController) -> Vec<u16> {
         let view = controller.edited_view().unwrap();
         let mut samples = self.composite.clone();
-        overlay_edited(&mut samples, self.map, NonZeroU32::MIN, 3, view.tiles);
+        overlay_edited(&mut samples, self.map, NonZeroU32::MIN, 3, view.tiles, None);
         samples
     }
 
@@ -4139,7 +4139,7 @@ fn displayed_whole(controller: &mut AppController) -> Vec<u16> {
     let (composite, _) = controller.materialize_active_tab_planes().unwrap();
     let mut samples = read_plane(&composite, map);
     let view = controller.edited_view().unwrap();
-    overlay_edited(&mut samples, map, NonZeroU32::MIN, 3, view.tiles);
+    overlay_edited(&mut samples, map, NonZeroU32::MIN, 3, view.tiles, None);
     samples
 }
 
@@ -7912,7 +7912,7 @@ fn background_region_render_matches_the_synchronous_one() {
     let view = c.edited_view().unwrap();
     let shown = |tiles: &focusforge_gui::canvas::ResidentTiles| {
         let mut samples = sealed.composite.clone();
-        overlay_edited(&mut samples, sealed.map, NonZeroU32::MIN, 3, tiles);
+        overlay_edited(&mut samples, sealed.map, NonZeroU32::MIN, 3, tiles, None);
         samples
     };
     assert!(

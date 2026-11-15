@@ -30,8 +30,8 @@ use focusforge_gui::{
 };
 
 use common::{
-    controller_with_frames, copy_frame, open_mantis64_tab, record_events, save_to_proposed,
-    settle_all,
+    RAW_H, RAW_W, RawFiles, controller_with_frames, copy_frame, open_mantis64_tab, raw_dng,
+    raw_files, raw_pending, raw_whole, record_events, save_to_proposed, settle_all,
 };
 
 // ---------------------------------------------------------------------
@@ -1632,15 +1632,23 @@ fn eta_text_holds_a_dash_outside_a_running_state_whatever_the_total() {
 }
 
 #[test]
-fn prepare_stage_announcement_records_the_frame_total() {
+fn prepare_stage_announcement_records_the_unit_total() {
     use focusforge_core::job::JobStage;
     use focusforge_core::pipeline::{RunStage, StageObserver};
 
     let observer = job::GuiObserver::new();
-    observer.stage(RunStage::Prepare { frames: 7 });
+    observer.stage(RunStage::Prepare {
+        frames: 7,
+        units: 21,
+        source: focusforge_core::pipeline::PrepareSource::Computed,
+    });
     let recorded = observer.last_progress().expect("a Prepare snapshot");
     assert_eq!(recorded.stage, JobStage::Prepare);
-    assert_eq!((recorded.prepare_done, recorded.prepare_total), (0, 7));
+    assert_eq!((recorded.prepare_done, recorded.prepare_total), (0, 21));
+    assert_eq!(
+        job::phase_line(&job::RunState::Running, Some(&recorded)).as_deref(),
+        Some("preparing, 0 of 21")
+    );
 }
 
 #[test]
@@ -1651,7 +1659,14 @@ fn stage_announcement_carries_the_last_total_run_estimate_forward() {
     let announcements = || {
         [
             (RunStage::Fuse, JobStage::Fuse),
-            (RunStage::Prepare { frames: 7 }, JobStage::Prepare),
+            (
+                RunStage::Prepare {
+                    frames: 7,
+                    units: 7,
+                    source: focusforge_core::pipeline::PrepareSource::Computed,
+                },
+                JobStage::Prepare,
+            ),
             (
                 RunStage::Align {
                     frames: 9,
@@ -1698,7 +1713,11 @@ fn a_cached_alignment_reads_as_reused() {
     let alone = job::GuiObserver::new();
     alone.stage(cached());
     let after_prepare = job::GuiObserver::new();
-    after_prepare.stage(RunStage::Prepare { frames: 5 });
+    after_prepare.stage(RunStage::Prepare {
+        frames: 5,
+        units: 5,
+        source: focusforge_core::pipeline::PrepareSource::Computed,
+    });
     after_prepare.stage(cached());
 
     for observer in [&alone, &after_prepare] {
@@ -1727,7 +1746,11 @@ fn a_computed_alignment_shows_no_reuse_text() {
     use focusforge_gui::job::{RunState, progress_text};
 
     let observer = job::GuiObserver::new();
-    observer.stage(RunStage::Prepare { frames: 8 });
+    observer.stage(RunStage::Prepare {
+        frames: 8,
+        units: 8,
+        source: focusforge_core::pipeline::PrepareSource::Computed,
+    });
     observer.stage(RunStage::Align {
         frames: 8,
         source: AlignSource::Computed,
@@ -8102,7 +8125,16 @@ fn stage_view_leaves_the_bottom_bar_unchanged() {
         assert_eq!(bar(&plain), bar(&shown));
     };
 
-    step(&|o| o.stage(RunStage::Prepare { frames: 3 }), &[]);
+    step(
+        &|o| {
+            o.stage(RunStage::Prepare {
+                frames: 3,
+                units: 3,
+                source: focusforge_core::pipeline::PrepareSource::Computed,
+            });
+        },
+        &[],
+    );
     step(
         &|o| {
             o.stage(RunStage::Align {
@@ -8192,86 +8224,6 @@ fn stage_view_on_the_gpu_path_shows_no_stale_image() {
 // Edit sessions over a RAW project: an f32 document, three DNG frames.
 // ---------------------------------------------------------------------
 
-#[path = "../../core/tests/common/raw_dng.rs"]
-mod raw_dng;
-
-const RAW_W: u32 = 37;
-const RAW_H: u32 = 23;
-
-fn raw_whole() -> Rect {
-    Rect {
-        x: 0,
-        y: 0,
-        width: RAW_W,
-        height: RAW_H,
-    }
-}
-
-/// Three DNG frames of `RAW_W` x `RAW_H`, an f32 staged composite holding
-/// samples above 65535, below 0 and inside, and a Z-Map over them.
-struct RawFiles {
-    dir: PathBuf,
-    _frames: Vec<tempfile::NamedTempFile>,
-    sources: Vec<PathBuf>,
-    composite: PathBuf,
-    zmap: PathBuf,
-    stored: Vec<f32>,
-}
-
-fn raw_files(name: &str) -> RawFiles {
-    let dir = common::tree(name);
-    let frames: Vec<_> = (0..3u32)
-        .map(|frame| {
-            let samples = (0..RAW_W * RAW_H)
-                .map(|i| {
-                    let (x, y) = (i % RAW_W, i / RAW_W);
-                    let checker = if (x / 2 + y / 2) % 2 == 0 { 0 } else { 380 };
-                    (2_700 + frame * 40 + checker) as u16
-                })
-                .collect();
-            let mut spec = raw_dng::DngSpec::new(12, 64, 4095, [0, 1, 1, 2], samples);
-            spec.width = RAW_W;
-            spec.height = RAW_H;
-            spec.as_shot_neutral = Some([0.5, 1.0, 0.625]);
-            raw_dng::write_dng(&spec, false)
-        })
-        .collect();
-    let sources = frames.iter().map(|f| f.path().to_path_buf()).collect();
-    let stored: Vec<f32> = (0..(RAW_W * RAW_H * 3) as usize)
-        .map(|i| (i * 7919 % 120_000) as f32 * 0.9 - 20_000.0)
-        .collect();
-    let composite = dir.join("composite.tif");
-    write_float_composite(&composite, &stored);
-    let zmap = dir.join("zmap.tif");
-    let mut map = ZMapWriter::create(&zmap, ZMapInfo::new(RAW_W, RAW_H, 3).unwrap()).unwrap();
-    map.write_tile(raw_whole(), &vec![0u16; (RAW_W * RAW_H) as usize])
-        .unwrap();
-    map.finish().unwrap();
-    RawFiles {
-        dir,
-        _frames: frames,
-        sources,
-        composite,
-        zmap,
-        stored,
-    }
-}
-
-fn write_float_composite(path: &Path, samples: &[f32]) {
-    let mut writer = TiffWriter::create_f32(
-        path,
-        TiffSpec {
-            width: RAW_W,
-            height: RAW_H,
-            samples_per_pixel: 3,
-            description: Some("staged composite".to_string()),
-        },
-    )
-    .unwrap();
-    writer.write_tile_f32(raw_whole(), samples).unwrap();
-    writer.finish().unwrap();
-}
-
 fn open_session(
     files: &RawFiles,
     composite: &Path,
@@ -8344,18 +8296,6 @@ fn live_region(session: &mut job::EditState, region: Rect, ops: Vec<Op>) -> Vec<
     out
 }
 
-fn raw_pending(files: &RawFiles, ops: Vec<Op>) -> project::PendingState {
-    project::PendingState {
-        held: Vec::new(),
-        composite: files.composite.clone(),
-        ops,
-        sources: files.sources.clone(),
-        registration: Registration::default(),
-        reference: 0,
-        description: "staged composite".to_string(),
-    }
-}
-
 fn pending_f32(state: &project::PendingState) -> Vec<f32> {
     let image = project::CheckpointImage::prepare_pending(state, None).unwrap();
     let mut out = vec![0f32; (RAW_W * RAW_H * 3) as usize];
@@ -8385,7 +8325,6 @@ fn cut(plane: &[f32], region: Rect) -> Vec<f32> {
 #[test]
 fn raw_project_live_retouch_matches_saved_and_export() {
     use focusforge_core::project::export::{ExportOptions, MetadataOptions};
-    use focusforge_core::tile::Sample;
 
     let files = raw_files("raw_live_retouch");
     let whole = raw_whole();
@@ -8438,8 +8377,13 @@ fn raw_project_live_retouch_matches_saved_and_export() {
     let exported = focusforge_core::io::TiffStack::open_files(std::slice::from_ref(&out)).unwrap();
     let mut got = vec![0u16; live.len()];
     exported.read_tile_into(0, whole, &mut got).unwrap();
-    let narrowed: Vec<u16> = live.iter().map(|&s| u16::narrow(s)).collect();
-    assert_eq!(got, narrowed, "16-bit export");
+    let clip =
+        focusforge_core::io::raw::highlight_clip(&stroked.sources[0], stroked.registration.gains())
+            .unwrap()
+            .expect("a colour RAW source has a clip");
+    let mut clipped = vec![0u16; live.len()];
+    clip.narrow_band(&live, &mut clipped);
+    assert_eq!(got, clipped, "16-bit export");
 }
 
 fn raw_stroke_in(mode: BrushMode, source_id: u16, (x, y): (i32, i32), radius: f32) -> Op {

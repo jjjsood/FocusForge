@@ -1,7 +1,7 @@
 # Notifications: bell, center and Projects
 Start: --open fixtures/mantis-512/frames --dock-tab settings
 
-Use a fresh settings directory and a fresh data directory. The 48 px icon bar at the left edge holds the bell (`FFIconBar::bell`, with a number badge when records are unread) above Settings (`FFIconBar::settings`). The bell opens and closes the notification center, a 380 px panel that slides in from the icon bar. Records are listed newest first; each row shows a kind icon, a title and a context line such as `frames · 03.tif · 13:13` (project title, frame file, time). The project title is the folder name, `frames`. Clicking a row selects it and shows its full message.
+Use a fresh settings directory and a fresh data directory. Before the launch, write `[updates]` and `check_on_start = false` as two lines into `focusforge/settings.toml` inside that settings directory (create the folder), so the window makes no release check at start and no "FocusForge … is available" record appears. The 48 px icon bar at the left edge holds the bell (`FFIconBar::bell`, with a number badge when records are unread) above Settings (`FFIconBar::settings`). The bell opens and closes the notification center, a 380 px panel that slides in from the icon bar. Records are listed newest first; each row shows a kind icon, a title and a context line such as `frames · 03.tif · 13:13` (project title, frame file, time). The project title is the folder name, `frames`. Clicking a row selects it and shows its full message.
 
 The bell reads the records: opening the center reads every record, so the bell number counts only the records that arrived since the center was last opened.
 

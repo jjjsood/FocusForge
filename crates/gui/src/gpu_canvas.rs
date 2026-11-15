@@ -14,6 +14,7 @@ use std::sync::Arc;
 use focusforge_core::timing::measurement_scope;
 
 use focusforge_core::TiffError;
+use focusforge_core::io::raw::{HighlightClip, document_clip};
 use focusforge_core::io::{FrameError, TiffStack};
 use focusforge_core::retouch::preview::{
     BRUSH_PREVIEW_STRENGTH_Q16, BrushPreviewGrid, BrushPreviewSpec, brush_preview_bounds,
@@ -25,8 +26,8 @@ use focusforge_gpu::display::{DisplayRenderer, DisplayTexture, render_overlay};
 use slint::wgpu_29::wgpu;
 
 use crate::canvas::{
-    EditState, EditedView, FrameView, OverlayDraw, Pane, PaneJob, PaneReader, StampFloor,
-    TextureSpec,
+    ClippedComposite, EditState, EditedView, FrameView, OverlayDraw, Pane, PaneJob, PaneReader,
+    StampFloor, TextureSpec,
 };
 use crate::viewport::{ImageSize, PaneDraw};
 
@@ -879,6 +880,7 @@ mod tests {
             job.draw.step,
             3,
             &tiles,
+            None,
         );
         assert_ne!(merged, sealed, "the edit changes samples");
         let grids = renderer.brush_preview_grids(&spec).expect("answers");
@@ -1462,6 +1464,7 @@ mod tests {
                 job.draw.step,
                 3,
                 tiles,
+                None,
             );
             (sealed, merged, renderer.composite_pane.retained.clone())
         };
@@ -1602,6 +1605,10 @@ pub struct CanvasRenderer {
     zmap: Option<Arc<ZMapReader>>,
     /// The files [`Self::set_planes`] last opened.
     planes: Option<(PlaneFile, Option<PlaneFile>)>,
+    /// What [`Self::set_clip_source`] last built `clip` from.
+    clip_source: Option<(PathBuf, Vec<u32>)>,
+    /// The highlight clip the open composite narrows with, for a RAW document.
+    clip: Option<HighlightClip>,
     composite_pane: PaneTexture,
     frame: crate::canvas::FrameSource,
     frame_pane: PaneTexture,
@@ -1635,6 +1642,8 @@ impl CanvasRenderer {
             composite: None,
             zmap: None,
             planes: None,
+            clip_source: None,
+            clip: None,
             composite_pane: PaneTexture::default(),
             frame: crate::canvas::FrameSource::default(),
             frame_pane: PaneTexture::default(),
@@ -1757,8 +1766,38 @@ impl CanvasRenderer {
         });
         self.composite = Some(Arc::new(composite));
         self.planes = files;
+        self.clip_source = None;
+        self.clip = None;
         self.reset_planes();
         Ok(())
+    }
+
+    /// Sets the first source frame and equalization gains the open
+    /// composite's highlight clip is built from, `None` for a document with
+    /// none. A float, three-sample composite of a RAW source then reads
+    /// through the clip, as the 16-bit export narrows it. Setting the source
+    /// already set changes nothing; [`Self::set_planes`] reopening the
+    /// composite forgets it.
+    pub fn set_clip_source(&mut self, source: Option<(&Path, &[u32])>) {
+        let source = source.map(|(first, gains)| (first.to_path_buf(), gains.to_vec()));
+        if source == self.clip_source {
+            return;
+        }
+        let clip = self.composite.as_ref().and_then(|composite| {
+            let (first, gains) = source.as_ref()?;
+            let header = composite.header(0);
+            document_clip(
+                Some(first),
+                gains,
+                composite.sample_format(),
+                header.samples_per_pixel,
+            )
+        });
+        self.clip_source = source;
+        if clip != self.clip {
+            self.clip = clip;
+            self.reset_planes();
+        }
     }
 
     /// Drops the open planes, leaving the frame half untouched.
@@ -1766,6 +1805,8 @@ impl CanvasRenderer {
         self.composite = None;
         self.zmap = None;
         self.planes = None;
+        self.clip_source = None;
+        self.clip = None;
         self.reset_planes();
     }
 
@@ -1844,12 +1885,16 @@ impl CanvasRenderer {
             generation,
             overlay: overlay.cloned(),
         };
+        let reader: Arc<dyn PaneReader> = match &self.clip {
+            Some(clip) => Arc::new(ClippedComposite::new(composite, clip.clone())),
+            None => composite,
+        };
         self.request(
             Pane::Composite,
             backdrop,
             draw,
             size,
-            composite,
+            reader,
             indices,
             state,
         )
@@ -1995,6 +2040,7 @@ impl CanvasRenderer {
                         step,
                         samples_per_pixel,
                         view.tiles,
+                        self.clip.as_ref(),
                     );
                     merged
                 });

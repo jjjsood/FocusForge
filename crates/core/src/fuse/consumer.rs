@@ -14,6 +14,7 @@ use std::time::Instant;
 use crate::algorithm::{AlgorithmError, Sharpness, StackAlgorithm, TileOutput};
 use crate::display::preview::{PreviewMosaic, heat16};
 use crate::fuse::error::algorithm_error;
+use crate::io::raw::HighlightClip;
 use crate::io::{TiffError, TiffSpec, TiffWriter};
 use crate::params::ParamValues;
 use crate::tile::{Rect, Sample, SampleFormat, TileConsumer, TileJob, TilePlan};
@@ -57,6 +58,9 @@ pub struct FusionConsumer {
     /// Folded each written tile when a front end subscribed to the
     /// composite preview.
     preview: Option<Arc<PreviewMosaic>>,
+    /// How the composite preview narrows an `f32` RAW composite to 16 bits;
+    /// `None` clamps each sample.
+    clip: Option<HighlightClip>,
     /// Folded each written tile when a front end subscribed to the heat
     /// preview, with the score that maps to the hottest value.
     heat: Option<(Arc<PreviewMosaic>, f64)>,
@@ -164,6 +168,7 @@ impl FusionConsumer {
             format,
             crop,
             preview: None,
+            clip: None,
             heat: None,
         })
     }
@@ -248,6 +253,7 @@ impl FusionConsumer {
             format,
             crop,
             preview: None,
+            clip: None,
             heat: None,
         })
     }
@@ -355,13 +361,16 @@ impl FusionConsumer {
 
     /// Folds every tile this consumer writes into `composite`, and its
     /// sharpness into `heat` (with the score that maps to the hottest value);
-    /// `None` keeps the consumer free of that preview work.
+    /// `None` keeps the consumer free of that preview work. `clip` narrows an
+    /// `f32` RAW composite for the preview as the export does.
     pub fn with_preview(
         mut self,
         composite: Option<Arc<PreviewMosaic>>,
+        clip: Option<HighlightClip>,
         heat: Option<(Arc<PreviewMosaic>, f64)>,
     ) -> Self {
         self.preview = composite;
+        self.clip = clip;
         self.heat = heat;
         self
     }
@@ -439,13 +448,20 @@ impl FusionConsumer {
             &cropped_composite,
         )?;
         if let Some(mosaic) = &self.preview {
-            // The preview shows what the display shows: an `f32` composite
-            // clamped onto the 16-bit scale.
+            // The preview narrows as the export does.
             let start = Instant::now();
-            let shown: Vec<u16> = cropped_composite
-                .iter()
-                .map(|sample| u16::narrow(sample.widen()))
-                .collect();
+            let shown: Vec<u16> = match &self.clip {
+                Some(clip) => {
+                    let wide: Vec<f32> = cropped_composite.iter().map(|s| s.widen()).collect();
+                    let mut shown = vec![0u16; wide.len()];
+                    clip.narrow_band(&wide, &mut shown);
+                    shown
+                }
+                None => cropped_composite
+                    .iter()
+                    .map(|sample| u16::narrow(sample.widen()))
+                    .collect(),
+            };
             mosaic.charge(start.elapsed());
             mosaic.fold(target_written, &shown);
         }

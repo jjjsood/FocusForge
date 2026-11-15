@@ -24,7 +24,7 @@ focusforge-cli [OPTIONS] <COMMAND>
 | [`step-plan`](#step-plan) | plans a focus bracket: step, frame count, duration, disk need |
 | [`sharp-areas`](#sharp-areas) | counts the sharpest areas per frame |
 | [`sharpness-map`](#sharpness-map) | writes the focus score of each frame, and of a composite, as maps on one scale |
-| [`cache`](#cache) | clears the saved alignment results |
+| [`cache`](#cache) | clears the saved alignment and brightness results |
 | [`diagnostics`](#diagnostics) | packs logs and crash reports into one ZIP |
 | [`check-update`](#check-update) | tells you whether a newer release exists |
 
@@ -110,7 +110,7 @@ before it starts.
 | `--json` | print the report as JSON |
 | `--status <PATH>` | append one JSON line per stack to this file: its name, outcome, outputs and error |
 | `--no-progress` | print no progress line |
-| `--no-cache` | align afresh and do not store the result for later runs |
+| `--no-cache` | align and measure brightness afresh and do not store the results for later runs |
 | `--cpu` | use the processor only, not the graphics card (only in builds with graphics-card support) |
 | `--max-host-memory <SIZE>` | upper limit on the RAM the run may use, for example `8GiB` or `512MiB`; it can only lower what FocusForge would use |
 | `--max-vram <SIZE>` | the same limit for graphics-card memory (only in builds with graphics-card support) |
@@ -566,7 +566,7 @@ focusforge-cli cache [OPTIONS] <COMMAND>
 
 | subcommand | does |
 |---|---|
-| [`clear`](#cache-clear) | removes the saved alignment results |
+| [`clear`](#cache-clear) | removes the saved alignment and brightness results |
 
 ### `cache clear`
 
@@ -578,7 +578,7 @@ focusforge-cli cache clear [OPTIONS]
 |---|---|
 | `--json` | print the result as JSON |
 
-Removes the saved alignment results under `.scratch/stage-cache/`. It never
+Removes the saved alignment and brightness results under `.scratch/stage-cache/`. It never
 touches a cancelled run that `--resume` can continue, or any project. With
 `--json` it prints `{"removed": <count>}`.
 

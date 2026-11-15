@@ -3789,7 +3789,7 @@ impl AppController {
             GuiProject::Unsaved(_) => {
                 let first = tab.frames.first().cloned();
                 self.request_thumbnail(index, move || {
-                    overlay::render_thumbnail_from_frame(&first?)
+                    overlay::render_thumbnail_from_frame(&first?, None)
                 });
             }
         }
@@ -10749,6 +10749,10 @@ impl AppController {
         tab.drop_session();
         tab.failure = None;
         let planes = (held.composite.clone(), held.zmap.clone());
+        let clip_source = held
+            .sources
+            .first()
+            .map(|first| (first.clone(), held.registration.gains().to_vec()));
         tab.compressing
             .push((planes.0.clone(), job::spawn_compression(planes.0.clone())));
         tab.selected_checkpoint = Some(checkpoints::held_key(tab.held.len()));
@@ -10768,7 +10772,10 @@ impl AppController {
         self.enter_editor_if_viewing(index);
         let composite = planes.0.clone();
         self.request_thumbnail(index, move || {
-            overlay::render_thumbnail_from_frame(&composite)
+            let clip_source = clip_source
+                .as_ref()
+                .map(|(first, gains)| (first.as_path(), gains.as_slice()));
+            overlay::render_thumbnail_from_frame(&composite, clip_source)
         });
         planes
     }
@@ -11573,11 +11580,19 @@ impl AppController {
             self.active_tab_planes()
         };
         match planes {
-            TabPlanes::Ready(composite, zmap) => crate::canvas::CanvasFeed::Load {
-                tab,
-                composite,
-                zmap,
-            },
+            TabPlanes::Ready(composite, zmap) => {
+                let clip_source = self.state.active().and_then(ProjectTab::fused).and_then(
+                    |(sources, registration)| {
+                        Some((sources.into_iter().next()?, registration.gains().to_vec()))
+                    },
+                );
+                crate::canvas::CanvasFeed::Load {
+                    tab,
+                    composite,
+                    zmap,
+                    clip_source,
+                }
+            }
             TabPlanes::Pending if loaded == Some(tab) => crate::canvas::CanvasFeed::Keep,
             TabPlanes::Pending | TabPlanes::None => crate::canvas::CanvasFeed::Clear,
         }

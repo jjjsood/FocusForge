@@ -163,7 +163,9 @@ fn count_lines(stderr: &str) -> Vec<&str> {
         .lines()
         .filter(|line| {
             let counts_frames = ["develop ", "prepare ", "align "].iter().any(|stage| {
-                line.starts_with(stage) && line.contains("/") && line.contains(" frames")
+                line.starts_with(stage)
+                    && line.contains("/")
+                    && (line.contains(" frames") || line.contains(" strips"))
             });
             counts_frames || (line.starts_with("fuse ") && line.contains(" tiles"))
         })
@@ -193,7 +195,7 @@ fn stage_lines_carry_no_eta_unless_the_eta_display_is_on() {
     let counts = count_lines(&off.stderr);
     assert!(
         counts.iter().any(|line| line.starts_with("prepare 0/")),
-        "no `prepare 0/N frames` line: {}",
+        "no `prepare 0/N strips` line: {}",
         off.stderr
     );
     assert!(
@@ -202,7 +204,8 @@ fn stage_lines_carry_no_eta_unless_the_eta_display_is_on() {
         off.stderr
     );
     for line in &counts {
-        let ends_at_count = line.ends_with(" frames") || line.ends_with('%');
+        let ends_at_count =
+            line.ends_with(" frames") || line.ends_with(" strips") || line.ends_with('%');
         assert!(ends_at_count, "line does not end at its count: {line:?}");
     }
 
@@ -259,15 +262,15 @@ fn prepare_progress_reaches_a_redirected_log() {
     let prepare: Vec<usize> = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| line.starts_with("prepare ") && line.contains(" frames eta "))
+        .filter(|(_, line)| line.starts_with("prepare ") && line.contains(" strips eta "))
         .filter(|(_, line)| line.contains('/'))
         .map(|(at, _)| at)
         .collect();
     let first = prepare
         .first()
-        .unwrap_or_else(|| panic!("no `prepare <k>/<N> frames eta` line: {}", out.stderr));
+        .unwrap_or_else(|| panic!("no `prepare <k>/<N> strips eta` line: {}", out.stderr));
     assert!(
-        lines[*first].starts_with("prepare 0/8 frames"),
+        lines[*first].starts_with("prepare 0/8 strips"),
         "the first count line: {}",
         lines[*first]
     );
