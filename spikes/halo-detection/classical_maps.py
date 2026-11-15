@@ -21,7 +21,7 @@ NO_SOURCE = 65535  # Z-Map value of a pixel no frame supplied
 ARMS = ("risk-zones", "glow-self", "glow-focus-map")
 EXTRA_ARMS = {"risk-zones-dm-zmap": "risk-zones", "glow-self-dm-zmap": "glow-self"}  # the same maps read from depth-map's Z-Map
 GRID = dict(threshold=(1, 2, 3, 4), band_hi=(12, 24, 48), sigma=(1.0, 2.0, 4.0), median=(1, 5, 9, 15))
-# Chosen by `tune` on the calibration split (cells at their limit, then summed margin); not changed after the held-out run.
+# Chosen by `tune` on the calibration split (cells at their limit, then summed margin).
 PARAMS = {
     "risk-zones": dict(threshold=4, band_hi=48, median=15),
     "glow-self": dict(threshold=4, band_hi=24, sigma=4.0, median=15),
