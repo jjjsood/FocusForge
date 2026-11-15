@@ -13,4 +13,5 @@ Gotchas:
 - Human only, no journey step: Ctrl+Z and Ctrl+Shift+Z, Shift+wheel brush size, multi-segment strokes, and judging the pixels of a stroke. The tab's "UNSAVED" chip is lit from the first fuse, so it does not mark a stroke.
 - A camera-RAW stack runs the same editor path in `manual/03-editor-brush-raw.md` (three real DNG files copied into `.scratch/raw-gui/frames`, so no numbered journey can start from it): the fuse ends without a "Keep this fused result?" question, a saved project reopens in STACKING mode with its two checkpoints and shows its Composite after one **Fit** click, and the Size slider keeps its last value across the reopen.
 Guides: 03-editor-brush.md, 04-checkpoints.md
+Sources: crates/ui/ui/shell/editor_toolbar.slint
 Book: guide/retouch.md#set-the-brush-size-and-soft, guide/retouch.md#paint-a-stroke

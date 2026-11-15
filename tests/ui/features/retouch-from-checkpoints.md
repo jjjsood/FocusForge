@@ -13,4 +13,5 @@ Gotchas:
 - **Save project** writes `frames.ffp` into the launch's `--save-folder` with no chooser. It clears the "UNSAVED" pills and the tab marker; the project card then reads one checkpoint fewer than were made (the hidden one is not counted).
 - Human only, no driver can read them: the brush ring's colour and its small layers glyph over a chosen result (journey 24, step 14), Ctrl+wheel stepping through the result rows first and then the frames with the label following in step 28, painting from a different result covering a stroke and painting from the base restoring it in steps 29 and 31 (pixel judgements, no pixel compare), the overlay's colours over a stroke painted from a result, and the preview pictures in Image list and Large previews being drawn from the results and not the frames.
 Guides: 24-retouch-from-checkpoints.md
+Sources: crates/ui/ui/shell/editor_toolbar.slint, crates/ui/ui/shell/dock/checkpoint_panel.slint
 Book: guide/retouch.md#choose-the-frame-to-paint-from
