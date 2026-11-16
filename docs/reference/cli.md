@@ -143,6 +143,12 @@ run:
 | `hot-pixel-threshold` | 2.0 to 50.0 | `7.0` | how many times its neighbourhood's spread a pixel must differ from the neighbourhood's median to count as a hot pixel; higher finds fewer |
 | `defect-grow-radius` | 0 to 16 | `0` | widen every pixel painted in the `--defect-mask` file by this many pixels |
 
+The text report has one defect line: `defects=off` while `defect-removal` is off
+(the result is then identical to a run without the feature), otherwise
+`defects=on repaired=N detected=D file=F`, with the pixels replaced, the ones
+found automatically and the ones the mask file marks (`-` where that source is
+not in use).
+
 ### Cancel, pause, resume
 
 Ctrl-C stops the run cleanly and prints the command that resumes it; the
