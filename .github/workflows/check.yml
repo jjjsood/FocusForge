@@ -34,14 +34,14 @@ jobs:
       - name: Add swap and limit parallel builds on Linux
         if: runner.os == 'Linux'
         # One rustc of focusforge-gui peaks near 11 GB on the 16 GB hosted runner, and the runner is
-        # shut down when memory runs out. Swap absorbs the peak; two jobs keep a second one away.
+        # lost when memory runs out. Swap absorbs the peak; one job at a time keeps a second one away.
         run: |
           free -m
           sudo fallocate -l 16G /mnt/gate-swap
           sudo chmod 600 /mnt/gate-swap
           sudo mkswap /mnt/gate-swap
           sudo swapon /mnt/gate-swap
-          echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
+          echo "CARGO_BUILD_JOBS=1" >> "$GITHUB_ENV"
           free -m
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
