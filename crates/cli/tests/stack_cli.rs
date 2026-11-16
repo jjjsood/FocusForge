@@ -2245,7 +2245,6 @@ fn stack_repairs_defects_and_reports_count() {
         largest_deviation(&on, &checked),
         largest_deviation(&off, &checked),
     );
-    eprintln!("deviation on={on_worst} off={off_worst}");
     assert!(
         off_worst > 20_000,
         "the unrepaired output has outliers: {off_worst}"
