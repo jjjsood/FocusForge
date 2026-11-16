@@ -7294,7 +7294,7 @@ impl AppController {
     // section per family, one field per `ParamDesc`" true by construction
     // rather than by an incremental patch that could drift from it. --
 
-    /// Builds the whole panel: Prepare, Fuse, Align, Finish, in that order, each
+    /// Builds the whole panel: Prepare, Align, Fuse, Finish, in that order, each
     /// section's rows flattened from `AlgorithmRef::params()`'s own
     /// declaration order. With no tab active ("+" selected) the panel still
     /// renders -- the default algorithm of each family, with no explicit
@@ -9498,6 +9498,7 @@ impl AppController {
             align_lax: true,
             crop: settings_panel::project_flag(&tab.project_values, "auto-crop"),
             equalize: settings_panel::equalization_settings(&tab.fuse_id, &tab.project_values),
+            defects: settings_panel::defect_settings(&tab.fuse_id, &tab.project_values),
             gpu: self.performance.gpu,
             max_host_memory: self.performance.max_host_memory_bytes(),
             max_vram: self.performance.max_vram_bytes(),

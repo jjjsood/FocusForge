@@ -547,6 +547,90 @@ fn raw_develop_counts_are_one_per_frame() {
     }
 }
 
+/// Repair acts on the developed frame: each masked pixel of the result is the
+/// lower median of its eight neighbours in the unrepaired run, and the
+/// develops per frame do not change.
+#[test]
+fn raw_stack_repairs_after_develop() {
+    let cwd = common::tmp_dir("stack_raw_repair");
+    let input = cwd.join("input");
+    std::fs::create_dir(&input).expect("input directory");
+    let mut spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], Vec::new());
+    spec.width = 256;
+    spec.height = 256;
+    spec.samples = (0..256u32 * 256)
+        .map(|i| {
+            ((i % 256) * 9 + (i / 256) * 5 + i.wrapping_mul(2_654_435_761) % 300) as u16 % 4000
+        })
+        .collect();
+    let source = write_dng(&spec, false);
+    for index in 0..2 {
+        std::fs::copy(source.path(), input.join(format!("{index:02}.dng")))
+            .expect("copy RAW frame");
+    }
+    let masked = [(40u32, 30u32), (100, 128), (200, 220), (130, 60)];
+    let mask = cwd.join("mask.png");
+    common::write_defect_mask(&mask, (256, 256), &masked);
+
+    let stack = |label: &str, extra: &[&str]| {
+        let output = cwd.join(label);
+        std::fs::create_dir(&output).expect("output directory");
+        let stacked = run(&cwd, &stack_json_args(&input, &output, extra));
+        let counts = develop_counts_of(&stacked);
+        let project = common::only_project(&output);
+        (
+            counts,
+            common::read_whole(&common::export_composite(&cwd, &project)),
+        )
+    };
+    let (off_counts, (off, width, _, spp)) = stack("off", &[]);
+    let (on_counts, (on, ..)) = stack(
+        "on",
+        &[
+            "--set",
+            "defect-removal=true",
+            "--set",
+            "hot-pixels=false",
+            "--defect-mask",
+            mask.to_str().expect("UTF-8 mask"),
+        ],
+    );
+    assert_eq!(on_counts, off_counts, "repair develops nothing extra");
+
+    let mut changed = 0;
+    for &(x, y) in &masked {
+        for c in 0..spp {
+            let at = |x: u32, y: u32| off[((y * width + x) * spp + c) as usize];
+            let mut around: Vec<u16> = (y - 1..=y + 1)
+                .flat_map(|ny| (x - 1..=x + 1).map(move |nx| (nx, ny)))
+                .filter(|&p| p != (x, y))
+                .map(|(nx, ny)| at(nx, ny))
+                .collect();
+            around.sort_unstable();
+            assert_eq!(
+                on[((y * width + x) * spp + c) as usize],
+                around[3],
+                "pixel ({x}, {y}) channel {c}"
+            );
+            changed += usize::from(around[3] != at(x, y));
+        }
+    }
+    assert!(changed > 0, "the repair changed some masked sample");
+    let on_elsewhere = on
+        .iter()
+        .zip(&off)
+        .enumerate()
+        .filter(|&(i, (a, b))| {
+            a != b
+                && !masked.contains(&(
+                    ((i / spp as usize) % width as usize) as u32,
+                    ((i / spp as usize) / width as usize) as u32,
+                ))
+        })
+        .count();
+    assert_eq!(on_elsewhere, 0, "only the masked pixels change");
+}
+
 #[test]
 fn raw_develop_counts_absent_for_tiff() {
     let cwd = common::tmp_dir("stack_raw_develop_counts_tiff");
@@ -1088,5 +1172,151 @@ fn raw_stack_output_is_identical_in_ram_and_on_disk() {
     assert!(
         composites[0] == composites[1],
         "the stores gave different composites"
+    );
+}
+
+/// Hot sites rising 1 DN at a time across the detection threshold of a flat
+/// 14-bit RAW stack: rounding of the stored developed frames puts some of them
+/// on the other side of it than the on-demand develop does. The `stack` report
+/// counts the detected positions grown by the demosaic reach.
+#[test]
+fn hot_pixels_and_stack_agree_on_a_raw_stack() {
+    use std::sync::atomic::AtomicUsize;
+
+    use focusforge_core::defect_mask::DefectMask;
+    use focusforge_core::defect_repair::DEMOSAIC_REACH;
+    use focusforge_core::io::{DevelopStore, open_frame_set};
+    use focusforge_core::tile::HostBudget;
+
+    const SIZE: u32 = 128;
+    const BACKGROUND: u16 = 7_500;
+    const FIRST_RISE: u16 = 100;
+    let cwd = common::tmp_dir("stack_raw_hot_pixels_agree");
+    let input = cwd.join("input");
+    std::fs::create_dir(&input).expect("input directory");
+    let mut samples = vec![BACKGROUND; (SIZE * SIZE) as usize];
+    for (rise, at) in (0..SIZE / 4 - 1)
+        .flat_map(|c| (0..4).map(move |r| (c, r)))
+        .enumerate()
+    {
+        let (x, y) = (4 + 4 * at.0, 4 + 4 * at.1);
+        samples[(y * SIZE + x) as usize] = BACKGROUND + FIRST_RISE + rise as u16;
+    }
+    let mut spec = DngSpec::new(14, 0, 16_383, [0, 1, 1, 2], samples);
+    spec.width = SIZE;
+    spec.height = SIZE;
+    let source = write_dng(&spec, false);
+    let paths: Vec<std::path::PathBuf> = (0..3)
+        .map(|index| {
+            let path = input.join(format!("{index:02}.dng"));
+            std::fs::copy(source.path(), &path).expect("copy RAW frame");
+            path
+        })
+        .collect();
+
+    let budget = HostBudget::explicit(1 << 30);
+    let detected_in_process = |develop_first: bool| {
+        let set = open_frame_set(&paths, budget).expect("the frames open");
+        let reader = set.reader.as_ref();
+        if develop_first {
+            reader
+                .develop_once(
+                    &cwd,
+                    DevelopStore::Memory,
+                    budget,
+                    1,
+                    &|| false,
+                    &AtomicUsize::new(0),
+                )
+                .expect("the frames develop");
+        }
+        let mask = focusforge_core::hot_pixels::detect(
+            reader,
+            paths.len(),
+            reader.dimensions(),
+            reader.frame(0).samples_per_pixel,
+            7.0,
+            1,
+            &AtomicUsize::new(0),
+            &|| false,
+        )
+        .expect("detection runs");
+        let mut positions = mask.positions();
+        positions.sort_unstable();
+        positions
+    };
+    let on_demand = detected_in_process(false);
+    let stored = detected_in_process(true);
+    eprintln!(
+        "detected {} on demand, {} after develop_once",
+        on_demand.len(),
+        stored.len()
+    );
+    assert_ne!(
+        on_demand, stored,
+        "the ramp straddles the threshold for one develop and not the other"
+    );
+
+    let listed = run(
+        &cwd,
+        &[
+            "hot-pixels".to_string(),
+            input.display().to_string(),
+            "--json".to_string(),
+        ],
+    );
+    assert!(
+        listed.status.success(),
+        "hot-pixels stderr: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("JSON listing");
+    let mut listed_positions: Vec<(u32, u32)> = listed["pixels"]
+        .as_array()
+        .expect("a pixel list")
+        .iter()
+        .map(|p| {
+            (
+                p["x"].as_u64().expect("x") as u32,
+                p["y"].as_u64().expect("y") as u32,
+            )
+        })
+        .collect();
+    listed_positions.sort_unstable();
+    let only_listed: Vec<_> = listed_positions
+        .iter()
+        .filter(|at| !stored.contains(at))
+        .collect();
+    let only_stored: Vec<_> = stored
+        .iter()
+        .filter(|at| !listed_positions.contains(at))
+        .collect();
+    assert!(
+        only_listed.is_empty() && only_stored.is_empty(),
+        "the command lists what a stack run detects; only listed: {only_listed:?}, \
+         only detected after develop_once: {only_stored:?}"
+    );
+
+    let output = cwd.join("output");
+    std::fs::create_dir(&output).expect("output directory");
+    let stacked = run(
+        &cwd,
+        &stack_json_args(&input, &output, &["--set", "defect-removal=true"]),
+    );
+    assert!(
+        stacked.status.success(),
+        "stack stderr: {}",
+        String::from_utf8_lossy(&stacked.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&stacked.stdout).expect("JSON report");
+    assert_eq!(listed["count"], stored.len(), "{listed}");
+    let mut found = DefectMask::new(SIZE, SIZE);
+    for &(x, y) in &listed_positions {
+        found.insert(x, y);
+    }
+    assert_eq!(
+        report["defects"]["detected"],
+        found.grow(DEMOSAIC_REACH).count(),
+        "{report}"
     );
 }

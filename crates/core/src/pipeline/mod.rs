@@ -26,12 +26,15 @@ use crate::align::{
     AlignDriverOptions, FailurePolicy, FrameAlignment, ReferencePolicy, Registration,
     StackAlignment, Transform, WarpingReader, align_stack_with, auto_crop,
 };
+use crate::defect_mask::{self, DefectMask, DefectMaskError};
+use crate::defect_repair::{self, DEMOSAIC_REACH, DefectReport, DefectSettings, RepairReader};
 use crate::display::{PreviewCost, PreviewFeed, PreviewKinds, StagePreview};
 use crate::equalize::{self, EqualizationReport, EqualizeSettings, GainReader};
 use crate::fuse::consumer::written_rect;
 use crate::fuse::description::format_composite_description;
 use crate::fuse::{BackendFusionConsumer, FusionConsumer, FusionGeometry};
 use crate::gpu::{AlignBackend, TileBackend};
+use crate::hot_pixels;
 use crate::io::raw::document_clip;
 use crate::io::tiff::writer::file_len;
 use crate::io::{
@@ -85,6 +88,10 @@ pub struct FuseRequest {
     /// The brightness equalization to run before alignment; `None` leaves the
     /// frames as delivered.
     pub equalize: Option<EqualizeSettings>,
+    /// The sensor defects to repair after a RAW stack is developed and before
+    /// equalization, alignment and fusion; `None` leaves every pixel as
+    /// delivered.
+    pub defects: Option<DefectSettings>,
     pub tile_size: Option<u32>,
     pub max_host_memory: Option<u64>,
     pub backend: Option<&'static dyn TileBackend>,
@@ -225,6 +232,8 @@ pub struct FuseReport {
     /// The brightness estimate came from the stage cache; `false` when it was
     /// computed or equalization was off.
     pub equalization_cached: bool,
+    /// The repaired pixels; `None` when defect removal was off.
+    pub defects: Option<DefectReport>,
     pub align_cached: bool,
     pub align_source: String,
     pub align_workers: Option<usize>,
@@ -387,6 +396,8 @@ pub enum AlignSource {
 pub enum PrepareSource {
     Computed,
     Cached,
+    /// Hot-pixel detection over the frames.
+    HotPixels,
 }
 
 /// A front end's presentational hooks into [`run`]. Every method has a
@@ -445,6 +456,8 @@ pub enum PipelineError {
     Params(String),
     #[error(transparent)]
     Algorithm(#[from] AlgorithmError),
+    #[error(transparent)]
+    DefectMask(#[from] DefectMaskError),
     #[error("{0}")]
     Align(String),
     #[error(transparent)]
@@ -727,6 +740,19 @@ pub fn run(
     let stack_ctx = frame_reader.stack_context();
     let (width, height) = (stack_ctx.width, stack_ctx.height);
     let spp = stack_ctx.samples_per_pixel;
+    let file_mask = match &request.defects {
+        Some(DefectSettings {
+            mask: Some(path),
+            grow_radius,
+            ..
+        }) => {
+            let mask = defect_mask::load(path, (width, height), *grow_radius, develop_budget)?;
+            defect_repair::reach(&mask)
+                .map_err(|err| PipelineError::Input(format!("{}: {err}", path.display())))?;
+            Some(mask)
+        }
+        _ => None,
+    };
     let resolved = params::resolve(request.algorithm.params(), &request.explicit, &stack_ctx)
         .map_err(|err| PipelineError::Params(err.to_string()))?;
     let values = params::resolved_values(&resolved);
@@ -868,6 +894,77 @@ pub fn run(
             .ok()
             .map(|(_, hash)| hash)
     };
+    let detected = match request.defects.as_ref().and_then(|d| d.hot_pixel_threshold) {
+        Some(threshold) => {
+            let units = hot_pixels::hot_pixel_units(frame_reader.len(), (width, height), spp);
+            let strips_done = control.begin_prepare(units);
+            control.set_stage(JobStage::Prepare);
+            observer.stage(RunStage::Prepare {
+                frames: frame_reader.len(),
+                units,
+                source: PrepareSource::HotPixels,
+            });
+            let found = with_progress_ticks(observer, &control, request.poll, || {
+                hot_pixels::detect(
+                    frame_reader,
+                    frame_reader.len(),
+                    (width, height),
+                    spp,
+                    threshold,
+                    workers,
+                    &strips_done,
+                    &cancel_requested,
+                )
+            });
+            match found {
+                Err(AlgorithmError::Cancelled) => {
+                    return Ok(FuseOutcome::Cancelled {
+                        units_done: 0,
+                        unit_total: 0,
+                    });
+                }
+                other => Some(other?),
+            }
+        }
+        None => None,
+    };
+    // Demosaicing has tinted the neighbours of a hot photosite.
+    let detected = detected.map(|mask| {
+        if frame_reader.demosaics() {
+            mask.grow(DEMOSAIC_REACH)
+        } else {
+            mask
+        }
+    });
+    let defect_report = request.defects.as_ref().map(|_| {
+        let mut union = DefectMask::new(width, height);
+        for mask in detected.iter().chain(&file_mask) {
+            union.union_with(mask);
+        }
+        (
+            DefectReport {
+                repaired: union.count(),
+                detected: detected.as_ref().map(DefectMask::count),
+                file: file_mask.as_ref().map(DefectMask::count),
+            },
+            union,
+        )
+    });
+    let (defect_report, union) = match defect_report {
+        Some((report, union)) => (Some(report), Some(union).filter(|_| report.repaired > 0)),
+        None => (None, None),
+    };
+    let defect_digest = union.as_ref().map(DefectMask::digest);
+    let repair_reader = union
+        .as_ref()
+        .map(|mask| RepairReader::new(frame_reader, mask, spp))
+        .transpose()
+        .map_err(|err| PipelineError::Input(err.to_string()))?;
+    // Everything from the brightness estimate on reads repaired samples.
+    let prepared_reader: &dyn TileReader = match &repair_reader {
+        Some(repair) => repair,
+        None => frame_reader,
+    };
     let mut equalization_cached = false;
     // A fresh estimate, written to the stage cache once every hash is memoised.
     let mut pending_estimate: Option<(EqualizeKey, EqualizationReport)> = None;
@@ -876,7 +973,7 @@ pub fn run(
             // A RAW stack's estimate reads no frame, so there is nothing to reuse.
             let estimate_key =
                 (request.cache && stage_cache.is_some() && frame_reader.linear_means(0)?.is_none())
-                    .then(|| EqualizeKey::new(&fingerprint, settings));
+                    .then(|| EqualizeKey::new(&fingerprint, settings, defect_digest.clone()));
             let cached = estimate_key
                 .as_ref()
                 .zip(stage_cache)
@@ -892,7 +989,7 @@ pub fn run(
                 report
             } else {
                 let units = equalize::prepare_units(
-                    frame_reader,
+                    prepared_reader,
                     frame_reader.len(),
                     (width, height),
                     spp,
@@ -907,7 +1004,7 @@ pub fn run(
                 let estimated = with_progress_ticks(observer, &control, request.poll, || {
                     let _prepare = equalize_scope();
                     equalize::estimate(
-                        frame_reader,
+                        prepared_reader,
                         frame_reader.len(),
                         (width, height),
                         spp,
@@ -940,7 +1037,7 @@ pub fn run(
     let prepared_gains: &[u32] = recorded.as_ref().map_or(&[], |e| e.gains.as_slice());
     // Every reader of a frame beneath this point -- alignment, host fuse,
     // device upload and the device-loss fallback -- sees the gained samples.
-    let gain_reader = GainReader::new(frame_reader, prepared_gains);
+    let gain_reader = GainReader::new(prepared_reader, prepared_gains);
 
     timer.mark(Stage::Setup);
 
@@ -979,12 +1076,13 @@ pub fn run(
         } else {
             FailurePolicy::Strict
         };
-        let identity = AlignIdentity::new(
+        let mut identity = AlignIdentity::new(
             align_req.algorithm.id(),
             align_values.clone(),
             policy,
             prepared_gains.to_vec(),
         );
+        identity.defects = defect_digest.clone();
 
         let peeked = if request.resume {
             peek_resumable_alignment(
@@ -1264,15 +1362,18 @@ pub fn run(
         align: alignment_result
             .as_ref()
             .map(|(align_algo, align_resolved, policy, _)| {
-                AlignIdentity::new(
+                let mut identity = AlignIdentity::new(
                     align_algo.id(),
                     params::resolved_values(align_resolved),
                     *policy,
                     prepared_gains.to_vec(),
-                )
+                );
+                identity.defects = defect_digest.clone();
+                identity
             }),
         crop: applied_crop,
         equalization: recorded.clone(),
+        defects: defect_digest.clone(),
         composite_output: staged_composite.clone(),
         zmap_output: Some(staged_zmap.clone()),
     };
@@ -1598,6 +1699,7 @@ pub fn run(
         align: align_report,
         equalization,
         equalization_cached,
+        defects: defect_report,
         align_cached,
         align_source,
         align_workers,
@@ -2170,6 +2272,7 @@ mod tests {
             align: None,
             crop: None,
             equalization: None,
+            defects: None,
             composite_output: composite,
             zmap_output: None,
         };

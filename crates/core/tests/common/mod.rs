@@ -11,7 +11,7 @@ pub mod align;
 #[path = "reference_stack.rs"]
 mod reference_stack;
 #[allow(unused_imports)]
-pub use reference_stack::reference_stack_dir;
+pub use reference_stack::{raw_sample_stack_dir, reference_stack_dir};
 
 /// `crates/core/../..` -- the workspace root.
 pub fn workspace_root() -> PathBuf {
@@ -51,6 +51,28 @@ pub fn read_tiff(path: &Path) -> (u32, u32, u32, Vec<u16>) {
     };
     stack.read_tile_into(0, full, &mut samples).unwrap();
     (width, height, spp, samples)
+}
+
+/// `path`'s first image as `f32` samples, interleaved; panics unless the
+/// file stores `f32`.
+#[allow(dead_code)]
+pub fn read_f32(path: &Path) -> Vec<f32> {
+    use focusforge_core::io::{Rect, TiffStack};
+    use focusforge_core::tile::SampleFormat;
+
+    let stack = TiffStack::open_staged(path).unwrap();
+    assert_eq!(stack.sample_format(), SampleFormat::F32, "{path:?}");
+    let (width, height) = stack.dimensions();
+    let spp = stack.header(0).samples_per_pixel;
+    let mut samples = vec![0f32; (width * height * spp) as usize];
+    let full = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    stack.read_tile_f32_into(0, full, &mut samples).unwrap();
+    samples
 }
 
 /// Every field of `report`, each `f64` as `f64::to_bits()`, flattened to
@@ -141,6 +163,7 @@ pub fn fuse_held_observed(
             &project::params_for(algorithm),
             &ParamValues::new(),
         ),
+        defects: None,
         tile_size: None,
         max_host_memory: None,
         backend: None,

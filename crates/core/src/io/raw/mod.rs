@@ -221,6 +221,9 @@ pub enum RawError {
 struct RawFrame {
     metadata: RawMetadata,
     desc: FrameDesc,
+    /// The frame holds one colour filter array sample per photosite that
+    /// development interpolates; a linear or monochrome DNG does not.
+    mosaic: bool,
 }
 
 #[derive(Debug)]
@@ -653,6 +656,10 @@ impl FrameReader for RawStack {
 
     fn frame(&self, index: usize) -> &FrameDesc {
         &self.frames[index].desc
+    }
+
+    fn demosaics(&self) -> bool {
+        self.frames.iter().all(|frame| frame.mosaic)
     }
 
     fn develop_scratch_bytes(&self) -> Result<u64, AlgorithmError> {
@@ -1539,7 +1546,15 @@ fn open_dng_inner(path: &Path) -> Result<RawFrame, RawError> {
         exif: general.exif,
     };
     let desc = raw_desc(&metadata);
-    Ok(RawFrame { metadata, desc })
+    // DNG PhotometricInterpretation 32803 is a colour filter array.
+    let mosaic = raw
+        .get_entry(262_u16)
+        .is_some_and(|entry| entry.value.force_u16(0) == 32803);
+    Ok(RawFrame {
+        metadata,
+        desc,
+        mosaic,
+    })
 }
 
 fn open_dummy(path: &Path) -> Result<RawFrame, RawError> {
@@ -1565,6 +1580,10 @@ fn open_dummy_inner(path: &Path) -> Result<RawFrame, RawError> {
             detail: "dummy decoder retained pixel samples".to_string(),
         });
     }
+    let mosaic = matches!(
+        image.photometric,
+        rawler::rawimage::RawPhotometricInterpretation::Cfa(_)
+    );
     let (cfa, cfa_width, cfa_height) = match &image.photometric {
         rawler::rawimage::RawPhotometricInterpretation::Cfa(config) => (
             Some(config.cfa.flat_pattern()),
@@ -1619,7 +1638,11 @@ fn open_dummy_inner(path: &Path) -> Result<RawFrame, RawError> {
         exif: general.exif,
     };
     let desc = raw_desc(&metadata);
-    Ok(RawFrame { metadata, desc })
+    Ok(RawFrame {
+        metadata,
+        desc,
+        mosaic,
+    })
 }
 
 fn raw_desc(metadata: &RawMetadata) -> FrameDesc {

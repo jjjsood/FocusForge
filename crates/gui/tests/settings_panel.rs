@@ -300,6 +300,54 @@ fn the_align_rows_are_disabled_exactly_while_the_switch_is_off() {
 }
 
 #[test]
+fn the_defect_rows_are_disabled_exactly_while_the_switch_is_off() {
+    let mut controller = AppController::new();
+    open_mantis_512(&mut controller);
+    controller.toggle_section_more("prepare");
+    let disabled = |controller: &AppController, id: &str| {
+        controller
+            .settings_panel()
+            .rows
+            .iter()
+            .find(|r| r.section == "prepare" && r.id == id)
+            .unwrap_or_else(|| panic!("no {id} row"))
+            .disabled
+    };
+    let defect_rows = ["hot-pixels", "hot-pixel-threshold", "defect-grow-radius"];
+
+    for id in defect_rows {
+        assert!(disabled(&controller, id), "{id}: off with the switch");
+    }
+    assert!(
+        !disabled(&controller, "defect-removal"),
+        "the switch is live"
+    );
+    assert!(!disabled(&controller, "equalize"));
+    assert!(disabled(&controller, "equalize-max-gain"));
+
+    controller.set_param_value("prepare", "defect-removal", ParamValue::Bool(true));
+    for id in defect_rows {
+        assert!(!disabled(&controller, id), "{id}: live with both switches");
+    }
+    assert!(!disabled(&controller, "defect-removal"));
+    assert!(
+        disabled(&controller, "equalize-max-gain"),
+        "the equalize rows follow `equalize` only"
+    );
+
+    controller.set_param_value("prepare", "hot-pixels", ParamValue::Bool(false));
+    assert!(!disabled(&controller, "hot-pixels"));
+    assert!(
+        disabled(&controller, "hot-pixel-threshold"),
+        "the threshold needs detection"
+    );
+    assert!(!disabled(&controller, "defect-grow-radius"));
+
+    controller.set_param_value("prepare", "defect-removal", ParamValue::Bool(false));
+    assert!(!disabled(&controller, "defect-removal"));
+}
+
+#[test]
 fn provenance_is_shown_per_section() {
     let mut controller = AppController::new();
     open_mantis_512(&mut controller);
@@ -615,6 +663,65 @@ fn a_reopened_project_without_an_align_record_opens_with_align_explicit() {
     assert_eq!(
         heading(&controller.settings_panel().rows, "align").heading_state,
         HeadingState::Explicit
+    );
+}
+
+fn section_order(rows: &[SettingsRow]) -> Vec<&str> {
+    rows.iter()
+        .filter(|r| r.kind == RowKind::SectionHeading)
+        .map(|r| r.section.as_str())
+        .collect()
+}
+
+#[test]
+fn align_precedes_fuse() {
+    let order = ["prepare", "align", "fuse", "finish"];
+
+    let rows = AppController::new().settings_panel().rows;
+    assert_eq!(section_order(&rows), order, "no tab active");
+    let after_heading = rows
+        .iter()
+        .skip_while(|r| !(r.kind == RowKind::SectionHeading && r.section == "align"))
+        .nth(1)
+        .expect("a row follows the ALIGN heading");
+    assert_eq!(
+        (
+            after_heading.section.as_str(),
+            after_heading.id.as_str(),
+            after_heading.kind
+        ),
+        ("align-switch", "align", RowKind::Bool),
+        "the switch row heads the ALIGN section"
+    );
+
+    let mut controller = AppController::new();
+    let project = seal_without_align("align_precedes_fuse", "depth-map");
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[project]),
+        OpenOutcome::Opened(_)
+    ));
+    let rows = controller.settings_panel().rows;
+    assert_eq!(
+        section_order(&rows),
+        order,
+        "reopened without an align record"
+    );
+    let switch = rows
+        .iter()
+        .find(|r| r.section == "align-switch" && r.id == "align")
+        .expect("the ALIGN switch row");
+    assert_eq!(switch.selected, "false");
+    let align_below: Vec<&SettingsRow> = rows
+        .iter()
+        .filter(|r| r.section == "align" && r.kind != RowKind::SectionHeading)
+        .collect();
+    assert!(!align_below.is_empty());
+    assert!(align_below.iter().all(|r| r.disabled), "ALIGN rows grey");
+    assert!(
+        rows.iter()
+            .filter(|r| r.section == "fuse")
+            .all(|r| !r.disabled),
+        "FUSE rows stay enabled"
     );
 }
 
@@ -1783,6 +1890,17 @@ fn more_rows<'a>(rows: &'a [SettingsRow], section: &str) -> Vec<&'a SettingsRow>
         .collect()
 }
 
+/// The prepare section's parameter ids, in schema order.
+const PREPARE_IDS: [&str; 7] = [
+    "equalize",
+    "equalize-max-gain",
+    "equalize-target",
+    "defect-removal",
+    "hot-pixels",
+    "hot-pixel-threshold",
+    "defect-grow-radius",
+];
+
 fn field_ids(rows: &[SettingsRow], section: &str) -> Vec<String> {
     field_rows(rows, section)
         .iter()
@@ -1897,10 +2015,7 @@ fn more_reveals_that_sections_advanced_rows() {
     controller.set_fuse_algorithm("depth-map");
     controller.toggle_section_more("prepare");
     let rows = controller.settings_panel().rows;
-    assert_eq!(
-        field_ids(&rows, "prepare"),
-        ["equalize", "equalize-max-gain", "equalize-target"]
-    );
+    assert_eq!(field_ids(&rows, "prepare"), PREPARE_IDS);
     assert_eq!(field_ids(&rows, "finish"), ["auto-crop"]);
     assert_eq!(
         rows[row_index(&rows, "prepare", "equalize")].selected,
@@ -2209,8 +2324,8 @@ fn prepare_and_finish_sections_hold_the_project_settings() {
             headings,
             [
                 ("prepare", "PREPARE"),
-                ("fuse", "FUSE"),
                 ("align", "ALIGN"),
+                ("fuse", "FUSE"),
                 ("finish", "FINISH"),
             ],
             "{method}"
@@ -2230,11 +2345,7 @@ fn prepare_and_finish_sections_hold_the_project_settings() {
 
         controller.toggle_section_more("prepare");
         let rows = controller.settings_panel().rows;
-        assert_eq!(
-            field_ids(&rows, "prepare"),
-            ["equalize", "equalize-max-gain", "equalize-target"],
-            "{method}"
-        );
+        assert_eq!(field_ids(&rows, "prepare"), PREPARE_IDS, "{method}");
         assert_eq!(
             rows[row_index(&rows, "prepare", "equalize")].selected,
             "false",
@@ -2505,7 +2616,13 @@ fn more_strip_closes_after_opening_in_every_section() {
     assert_toggles("fresh panel");
 
     // Open Fuse's picker and pick a method from its list, as a user does.
-    panel.click(element_center(&panel.elements("FFMenu::area")[0]));
+    let rows = panel.rows();
+    let fuse_menu = rows
+        .iter()
+        .filter(|r| r.kind == RowKind::Picker)
+        .position(|r| r.section == "fuse")
+        .expect("Fuse has a picker");
+    panel.click(element_center(&panel.elements("FFMenu::area")[fuse_menu]));
     let rows = panel.rows();
     let wanted = rows
         .iter()
@@ -2710,28 +2827,28 @@ fn equalize_off_disables_target_and_max_gain_and_keeps_their_values() {
     controller.toggle_section_more("prepare");
     controller.set_param_value("prepare", "equalize-target", ParamValue::Float(0.3));
     controller.set_param_value("prepare", "equalize-max-gain", ParamValue::Float(1.5));
-    let disabled_prepare_rows = |controller: &AppController| -> Vec<String> {
+    let disabled_equalize_rows = |controller: &AppController| -> Vec<String> {
         controller
             .settings_panel()
             .rows
             .iter()
-            .filter(|r| r.section == "prepare" && r.disabled)
+            .filter(|r| r.section == "prepare" && r.id.starts_with("equalize") && r.disabled)
             .map(|r| r.id.clone())
             .collect()
     };
 
     assert_eq!(
-        disabled_prepare_rows(&controller),
+        disabled_equalize_rows(&controller),
         ["equalize-max-gain", "equalize-target"],
         "off by default: the two dependent rows are grey"
     );
 
     controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
-    assert!(disabled_prepare_rows(&controller).is_empty());
+    assert!(disabled_equalize_rows(&controller).is_empty());
 
     controller.set_param_value("prepare", "equalize", ParamValue::Bool(false));
     assert_eq!(
-        disabled_prepare_rows(&controller),
+        disabled_equalize_rows(&controller),
         ["equalize-max-gain", "equalize-target"],
         "exactly the two dependent rows grey; the switch stays enabled"
     );
@@ -2746,7 +2863,7 @@ fn equalize_off_disables_target_and_max_gain_and_keeps_their_values() {
     );
 
     controller.set_param_value("prepare", "equalize", ParamValue::Bool(true));
-    assert!(disabled_prepare_rows(&controller).is_empty());
+    assert!(disabled_equalize_rows(&controller).is_empty());
     assert_eq!(
         prepare_row(&controller, "equalize-target").value_text,
         "+0.3"

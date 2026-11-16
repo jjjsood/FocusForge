@@ -99,6 +99,12 @@ pub trait FrameReader: TileReader + Send + Sync {
     /// Frame `index`'s description.
     fn frame(&self, index: usize) -> &FrameDesc;
 
+    /// `true` when development interpolates a colour filter array, so one
+    /// photosite reaches the pixels around it.
+    fn demosaics(&self) -> bool {
+        false
+    }
+
     /// Full-frame develops per frame since this reader opened, in frame
     /// order; `None` for readers that keep no count.
     fn develop_counts(&self) -> Option<Vec<u64>> {

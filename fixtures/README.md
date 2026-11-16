@@ -2,7 +2,7 @@
 
 Small crops of the reference focus stack, checked in so `cargo test` has real sensor data to work on without the 16 GB stack being anywhere near the repository.
 
-Generated: 2026-10-30
+Generated: 2026-11-16
 
 ## Sets
 
@@ -40,6 +40,7 @@ Generated: 2026-10-30
 | `mantis8-64-old-deflate-p1-strip-mm` | 3 | `4064,2700,64,64` | 64x64 |
 | `mantis8-64-lzw-p2-tile-ii` | 3 | `4064,2700,64,64` | 64x64 |
 | `blackmagic-micro-dng` | 1 | single DNG | 1952x1104 |
+| `mantis-512-hot-pixels` | 8 | `mantis-512` with injected defects | 512x512 |
 | `open-two-stacks` | 6 | `4064,2700,64,64` | 64x64 |
 | `open-root-and-subfolder` | 3 | `4064,2700,64,64` | 64x64 |
 | `open-rejected` | 3 | `4064,2700,64,64` | 64x64 |
@@ -48,6 +49,8 @@ Generated: 2026-10-30
 Each set holds `frames/NN.tif` in focus order, `reference.tif`, and a `README.md` naming the source frame behind every `NN`. Outputs are little-endian, uncompressed, chunky, one strip per row. The `mantis-64-` sets add LZW and deflate encodings in both byte orders, with strips or zero-padded tiles and Predictor 1 or 2. The `mantis8-64` sets hold the same crop as 8-bit RGB: the high byte of each `mantis-64` sample, uncompressed or in one of four encodings.
 
 `blackmagic-micro-dng` is one lossless-JPEG DNG camera frame with its own README; it has no `frames/` directory or `reference.tif`.
+
+`mantis-512-hot-pixels` is the eight frames of `mantis-512` with stuck pixels written in at the positions `hot-pixels.json` lists, deflate-compressed; it has its own README and no `reference.tif`.
 
 `open-two-stacks`, `open-root-and-subfolder` and `open-rejected` are folder shapes for the open paths, copied byte for byte from `mantis-64/frames` (`open-rejected/frames/02.tif` is then cut in half inside its strip data). They have their own READMEs and no `reference.tif`.
 

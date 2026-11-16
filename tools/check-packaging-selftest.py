@@ -245,7 +245,7 @@ def cli_asset_helper_cases() -> None:
         shutil.copytree(ROOT / "assets/man", source / "assets/man")
         shutil.copytree(ROOT / "assets/completions", source / "assets/completions")
         expected = helper.sources(source)
-        assert len(expected) == 23
+        assert len(expected) == 24
         staged = []
         for destination in (
             directory / "appimage/usr",
@@ -617,8 +617,8 @@ def native_boundaries() -> None:
         and any(file.attrib.get("Source", "").startswith("$(var.CliAssets)") for file in component if file.tag.endswith("File"))
     ]
     assert wix.tag.endswith("Wix") and "UpgradeCode" in package.attrib and root_files == {("focusforge-cli.exe", "$(var.Cli)", "yes"), ("focusforge-gui.exe", "$(var.Gui)", "yes"), ("LICENSE", "$(var.License)", "yes"), ("NOTICE", "$(var.Notice)", "yes"), ("focusforge.ico", "$(var.Icon)", "yes")}
-    assert len(asset_sources) == 23 and "$(var.CliAssets)\\powershell\\completions\\_focusforge-cli.ps1" in asset_sources
-    assert len(asset_components) == 23 and all(
+    assert len(asset_sources) == 24 and "$(var.CliAssets)\\powershell\\completions\\_focusforge-cli.ps1" in asset_sources
+    assert len(asset_components) == 24 and all(
         len([file for file in component if file.tag.endswith("File")]) == 1
         and next(file for file in component if file.tag.endswith("File")).attrib.get("KeyPath") == "yes"
         for component in asset_components

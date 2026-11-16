@@ -48,6 +48,11 @@ pub struct JobRecord {
     /// The bound and per-frame gains the fused tiles were read through;
     /// `None` when equalization was off.
     pub equalization: Option<Equalization>,
+    /// The digest of the defect mask the sources were repaired with
+    /// ([`crate::defect_mask::DefectMask::digest`]); `None` when no pixel was
+    /// repaired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defects: Option<String>,
     pub composite_output: PathBuf,
     pub zmap_output: Option<PathBuf>,
 }
@@ -59,7 +64,7 @@ pub struct JobRecord {
 ///
 /// This is also the align stage cache key's algorithm half:
 /// **`AlignAlgorithm::params()` plus the named driver fields, and nothing
-/// else** -- `failure_policy`, `solver_version` and `gains`, named in
+/// else** -- `failure_policy`, `solver_version`, `gains` and `defects`, named in
 /// [`DRIVER_POLICY_FIELDS`]. A field added here without a matching addition
 /// to `DRIVER_POLICY_FIELDS` widens the cache key silently;
 /// `crates/core/tests/stage_cache.rs`'s
@@ -77,6 +82,10 @@ pub struct AlignIdentity {
     /// The Q16 brightness gains the alignment read its sources through,
     /// index == frame index; empty when the sources were read as delivered.
     pub gains: Vec<u32>,
+    /// The digest of the defect mask the sources were repaired with; `None`
+    /// when no pixel was repaired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defects: Option<String>,
 }
 
 impl AlignIdentity {
@@ -94,6 +103,7 @@ impl AlignIdentity {
             failure_policy,
             solver_version: ALIGN_SOLVER_VERSION,
             gains,
+            defects: None,
         }
     }
 }
@@ -106,7 +116,7 @@ pub const ALIGN_SOLVER_VERSION: u32 = 8;
 /// The field names on [`AlignIdentity`] that are **not** one of
 /// `AlignAlgorithm::params()`'s declared parameters -- the named exceptions
 /// the stage cache key's completeness test checks against.
-pub const DRIVER_POLICY_FIELDS: &[&str] = &["failure_policy", "solver_version", "gains"];
+pub const DRIVER_POLICY_FIELDS: &[&str] = &["failure_policy", "solver_version", "gains", "defects"];
 
 #[cfg(test)]
 mod tests {
@@ -127,6 +137,7 @@ mod tests {
             align: None,
             crop: None,
             equalization: None,
+            defects: None,
             composite_output: PathBuf::from("out.tif"),
             zmap_output: None,
         }

@@ -252,6 +252,7 @@ fn job_record(
         align: None,
         crop: None,
         equalization: None,
+        defects: None,
         composite_output: composite_path.to_path_buf(),
         zmap_output: zmap_path.map(|p| p.to_path_buf()),
     }

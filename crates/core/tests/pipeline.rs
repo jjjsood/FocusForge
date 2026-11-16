@@ -22,11 +22,13 @@ use focusforge_core::algorithm::{
 };
 use focusforge_core::align::warp::WarpedTile;
 use focusforge_core::align::{AlignError, FailurePolicy, Transform};
+use focusforge_core::defect_mask::DefectMask;
+use focusforge_core::defect_repair::{DEMOSAIC_REACH, DefectReport, DefectSettings};
 use focusforge_core::display::{PreviewCost, PreviewKind, PreviewKinds, StagePreview};
 use focusforge_core::equalize::{EqualizeSettings, UNIT_GAIN};
 use focusforge_core::fuse::laplacian::Laplacian;
 use focusforge_core::gpu::{BackendInfo, TileBackend};
-use focusforge_core::io::{FrameDesc, TiffHeader, TiffSpec, TiffWriter};
+use focusforge_core::io::{FrameDesc, FrameReader, TiffHeader, TiffSpec, TiffWriter};
 use focusforge_core::job::{
     AlignIdentity, ControlState, FrameFingerprint, JobControl, JobProgress, JobStage,
     StackFingerprint, StageCache, StageKey,
@@ -98,6 +100,7 @@ fn base_request(label: &str, frames: Vec<PathBuf>, explicit: ParamValues) -> Fus
         align: None,
         crop: false,
         equalize: None,
+        defects: None,
         tile_size: Some(448),
         max_host_memory: None,
         backend: None,
@@ -4088,4 +4091,905 @@ fn raw_equalization_bypasses_the_estimate_cache() {
             "run {run_index}: no entry directory for a RAW stack"
         );
     }
+}
+
+/// A grey 8-bit PNG of `size` pixels, white except the `black` positions.
+fn write_defect_png(path: &Path, size: (u32, u32), black: &[(u32, u32)]) {
+    let mut pixels = vec![255u8; size.0 as usize * size.1 as usize];
+    for &(x, y) in black {
+        pixels[y as usize * size.0 as usize + x as usize] = 0;
+    }
+    let mut encoder = png::Encoder::new(
+        std::io::BufWriter::new(std::fs::File::create(path).expect("the mask file is creatable")),
+        size.0,
+        size.1,
+    );
+    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .and_then(|mut writer| writer.write_image_data(&pixels))
+        .expect("the mask file is writable");
+}
+
+fn defect_request(
+    label: &str,
+    frames: &[PathBuf],
+    root: &Path,
+    defects: Option<DefectSettings>,
+) -> FuseRequest {
+    let mut request = base_request(label, frames.to_vec(), ParamValues::new());
+    request.scratch_root = root.join("scratch");
+    request.align = Some(dummy_align_request());
+    request.output = FuseOutput::Hold(root.join(label));
+    request.defects = defects;
+    request
+}
+
+fn defect_run(
+    label: &str,
+    frames: &[PathBuf],
+    root: &Path,
+    defects: Option<DefectSettings>,
+    observer: &dyn StageObserver,
+    cache: Option<&StageCache>,
+) -> Result<Box<FuseReport>, PipelineError> {
+    let request = defect_request(label, frames, root, defects);
+    match focusforge_core::pipeline::run(&request, observer, JobControl::new(), cache)? {
+        FuseOutcome::Completed(report) => Ok(report),
+        FuseOutcome::Cancelled { .. } => panic!("the run was not cancelled"),
+    }
+}
+
+fn composite_bytes(report: &FuseReport) -> Vec<u8> {
+    let FuseProduct::Held(held) = &report.product else {
+        panic!("a held run");
+    };
+    std::fs::read(&held.composite).expect("the composite is readable")
+}
+
+/// Records the sources of every Prepare stage announced.
+#[derive(Default)]
+struct PrepareSources(Mutex<Vec<PrepareSource>>);
+
+impl StageObserver for PrepareSources {
+    fn stage(&self, stage: RunStage) {
+        if let RunStage::Prepare { source, .. } = stage {
+            self.0.lock().expect("no panic while logging").push(source);
+        }
+    }
+}
+
+#[test]
+fn defect_repair_counts_the_union_of_both_sources() {
+    let dir = common::fixtures_dir().join("mantis-512-hot-pixels");
+    let mut frames: Vec<PathBuf> = std::fs::read_dir(dir.join("frames"))
+        .expect("the frames directory exists")
+        .map(|entry| entry.expect("a directory entry").path())
+        .collect();
+    frames.sort();
+    let mask_file = dir.join("defect-mask.tif");
+    let budget = focusforge_core::tile::HostBudget::explicit(1 << 30);
+    let size = (512, 512);
+
+    let set = focusforge_core::io::open_frame_set(&frames, budget).expect("the frames open");
+    let mut union = focusforge_core::hot_pixels::detect(
+        set.reader.as_ref(),
+        frames.len(),
+        size,
+        3,
+        7.0,
+        2,
+        &AtomicUsize::new(0),
+        &|| false,
+    )
+    .expect("detection runs");
+    let detected = union.count();
+    let file = focusforge_core::defect_mask::load(&mask_file, size, 2, budget)
+        .expect("the mask file loads");
+    union.union_with(&file);
+    assert!(detected > 0 && file.count() > 0 && union.count() > detected);
+
+    let root = scratch("defect_union");
+    let sources = PrepareSources::default();
+    let settings = DefectSettings {
+        hot_pixel_threshold: Some(7.0),
+        mask: Some(mask_file),
+        grow_radius: 2,
+    };
+    let report = defect_run("on", &frames, &root, Some(settings), &sources, None)
+        .expect("the run completes");
+    assert_eq!(
+        report.defects,
+        Some(DefectReport {
+            repaired: union.count(),
+            detected: Some(detected),
+            file: Some(file.count()),
+        })
+    );
+    assert_eq!(
+        *sources.0.lock().unwrap(),
+        [PrepareSource::HotPixels],
+        "detection is its own Prepare stage"
+    );
+
+    let off =
+        defect_run("off", &frames, &root, None, &NoopObserver, None).expect("the run completes");
+    assert_eq!(off.defects, None);
+    assert_ne!(composite_bytes(&report), composite_bytes(&off));
+}
+
+/// Side of the square synthetic Bayer frames the demosaic-spread tests use.
+const SPREAD_SIZE: u32 = 96;
+/// One red, one green and one blue photosite, at least 24 px from each other
+/// and from the frame edges.
+const HOT_SITES: [(u32, u32); 3] = [(24, 24), (72, 25), (47, 71)];
+/// Reach, in pixels, of the window around a hot site that the spread tests
+/// compare against the clean develop.
+const SPREAD_WINDOW: i64 = 8;
+
+/// Three identical 12-bit Bayer DNG frames of a gentle gradient; the hot set
+/// lifts every `HOT_SITES` photosite well above the scene and below white.
+fn spread_frames(hot: bool, monochrome: bool) -> Vec<tempfile::NamedTempFile> {
+    let mut samples: Vec<u16> = (0..SPREAD_SIZE * SPREAD_SIZE)
+        .map(|i| 1_500 + (i % SPREAD_SIZE) as u16 * 3 + (i / SPREAD_SIZE) as u16 * 2)
+        .collect();
+    if hot {
+        for (x, y) in HOT_SITES {
+            samples[(y * SPREAD_SIZE + x) as usize] = 4_080;
+        }
+    }
+    (0..3)
+        .map(|_| {
+            let mut spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], samples.clone());
+            spec.width = SPREAD_SIZE;
+            spec.height = SPREAD_SIZE;
+            spec.monochrome = monochrome;
+            write_dng(&spec, false)
+        })
+        .collect()
+}
+
+fn spread_paths(frames: &[tempfile::NamedTempFile]) -> Vec<PathBuf> {
+    frames.iter().map(|f| f.path().to_path_buf()).collect()
+}
+
+fn held_samples(report: &FuseReport) -> Vec<f32> {
+    let FuseProduct::Held(held) = &report.product else {
+        panic!("a held run");
+    };
+    common::read_f32(&held.composite)
+}
+
+/// Offsets from a hot site, within `SPREAD_WINDOW`, where `run` differs from
+/// `clean` by more than `tolerance` in any channel; sorted, without repeats.
+fn deviating_offsets(clean: &[f32], run: &[f32], spp: usize, tolerance: f32) -> Vec<(i64, i64)> {
+    let mut offsets = std::collections::BTreeSet::new();
+    for (sx, sy) in HOT_SITES {
+        for dy in -SPREAD_WINDOW..=SPREAD_WINDOW {
+            for dx in -SPREAD_WINDOW..=SPREAD_WINDOW {
+                let at = ((sy as i64 + dy) * SPREAD_SIZE as i64 + sx as i64 + dx) as usize * spp;
+                if (0..spp).any(|c| (run[at + c] - clean[at + c]).abs() > tolerance) {
+                    offsets.insert((dx, dy));
+                }
+            }
+        }
+    }
+    offsets.into_iter().collect()
+}
+
+/// Frame 0 of `paths` developed, as `f32` samples.
+fn developed_frame(paths: &[PathBuf]) -> Vec<f32> {
+    let budget = focusforge_core::tile::HostBudget::explicit(1 << 30);
+    let set = focusforge_core::io::open_frame_set(paths, budget).expect("the frames open");
+    let mut samples = vec![0f32; (SPREAD_SIZE * SPREAD_SIZE * 3) as usize];
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: SPREAD_SIZE,
+        height: SPREAD_SIZE,
+    };
+    set.reader
+        .read_tile_f32_into(0, rect, &mut samples)
+        .expect("the frame develops");
+    samples
+}
+
+/// The ungrown hot-pixel detection over `paths`, as the `hot-pixels` command
+/// runs it.
+fn detected_in(paths: &[PathBuf]) -> DefectMask {
+    let budget = focusforge_core::tile::HostBudget::explicit(1 << 30);
+    let set = focusforge_core::io::open_frame_set(paths, budget).expect("the frames open");
+    set.reader
+        .develop_once(
+            Path::new("."),
+            focusforge_core::io::DevelopStore::Memory,
+            budget,
+            2,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
+        .expect("the frames develop");
+    focusforge_core::hot_pixels::detect(
+        set.reader.as_ref(),
+        paths.len(),
+        (SPREAD_SIZE, SPREAD_SIZE),
+        3,
+        7.0,
+        2,
+        &AtomicUsize::new(0),
+        &|| false,
+    )
+    .expect("detection runs")
+}
+
+#[test]
+fn raw_stack_repairs_the_demosaic_spread_of_hot_photosites() {
+    let root = scratch("raw_demosaic_spread");
+    let clean_frames = spread_frames(false, false);
+    let hot_frames = spread_frames(true, false);
+    let (clean_paths, hot_paths) = (spread_paths(&clean_frames), spread_paths(&hot_frames));
+    let on = Some(DefectSettings {
+        hot_pixel_threshold: Some(7.0),
+        mask: None,
+        grow_radius: 0,
+    });
+
+    // What demosaicing makes of a hot photosite, measured on the developed
+    // frame itself: the fusion of identical frames smears it further.
+    let (clean_frame, hot_frame) = (developed_frame(&clean_paths), developed_frame(&hot_paths));
+    let level = clean_frame.iter().sum::<f32>() / clean_frame.len() as f32;
+    let tolerance = 0.005 * level;
+    let footprint = deviating_offsets(&clean_frame, &hot_frame, 3, tolerance);
+    assert!(
+        footprint.iter().any(|&offset| offset != (0, 0)),
+        "a hot photosite spreads past itself: {footprint:?}"
+    );
+    let reach_squared = footprint
+        .iter()
+        .map(|&(dx, dy)| dx * dx + dy * dy)
+        .max()
+        .expect("the footprint is not empty");
+    let reach = (0..).find(|r: &i64| r * r >= reach_squared).unwrap();
+    assert_eq!(reach, i64::from(DEMOSAIC_REACH), "{footprint:?}");
+
+    let hot_on = defect_run("hot-on", &hot_paths, &root, on, &NoopObserver, None)
+        .expect("the repaired run completes");
+    let found = detected_in(&hot_paths);
+    for (x, y) in HOT_SITES {
+        assert!(found.contains(x, y), "the hot site ({x}, {y}) is detected");
+    }
+    let grown = found.grow(DEMOSAIC_REACH).count();
+    assert!(grown > found.count());
+    assert_eq!(
+        hot_on.defects,
+        Some(DefectReport {
+            repaired: grown,
+            detected: Some(grown),
+            file: None,
+        })
+    );
+}
+
+/// Per `HOT_SITES` site, the offset within `SPREAD_WINDOW` at which `run`
+/// deviates most from `clean` in any channel; the first such offset in row
+/// order on a tie.
+fn peak_offsets(clean: &[f32], run: &[f32]) -> Vec<(i64, i64)> {
+    HOT_SITES
+        .iter()
+        .map(|&(sx, sy)| {
+            let mut peak = (-1.0f32, (0, 0));
+            for dy in -SPREAD_WINDOW..=SPREAD_WINDOW {
+                for dx in -SPREAD_WINDOW..=SPREAD_WINDOW {
+                    let at = ((sy as i64 + dy) * SPREAD_SIZE as i64 + sx as i64 + dx) as usize * 3;
+                    let deviation = (0..3)
+                        .map(|c| (run[at + c] - clean[at + c]).abs())
+                        .fold(0.0, f32::max);
+                    if deviation > peak.0 {
+                        peak = (deviation, (dx, dy));
+                    }
+                }
+            }
+            peak.1
+        })
+        .collect()
+}
+
+/// The Chebyshev radius around a hot site that covers every pixel (within
+/// `SPREAD_WINDOW`) where `run` differs from `clean` by more than `tolerance`
+/// in any channel, and how many such pixels there are over all sites.
+fn smear(clean: &[f32], run: &[f32], tolerance: f32) -> (i64, usize) {
+    let (mut radius, mut pixels) = (0, 0);
+    for (sx, sy) in HOT_SITES {
+        for dy in -SPREAD_WINDOW..=SPREAD_WINDOW {
+            for dx in -SPREAD_WINDOW..=SPREAD_WINDOW {
+                let at = ((sy as i64 + dy) * SPREAD_SIZE as i64 + sx as i64 + dx) as usize * 3;
+                if (0..3).any(|c| (run[at + c] - clean[at + c]).abs() > tolerance) {
+                    radius = radius.max(dx.abs().max(dy.abs()));
+                    pixels += 1;
+                }
+            }
+        }
+    }
+    (radius, pixels)
+}
+
+#[test]
+fn a_hot_photosite_keeps_its_position_through_develop_detection_and_fusion() {
+    let root = scratch("raw_hot_photosite_position");
+    let clean_frames = spread_frames(false, false);
+    let hot_frames = spread_frames(true, false);
+    let (clean_paths, hot_paths) = (spread_paths(&clean_frames), spread_paths(&hot_frames));
+    let at_site = vec![(0, 0); HOT_SITES.len()];
+
+    let (clean_frame, hot_frame) = (developed_frame(&clean_paths), developed_frame(&hot_paths));
+    let level = clean_frame.iter().sum::<f32>() / clean_frame.len() as f32;
+    assert_eq!(
+        peak_offsets(&clean_frame, &hot_frame),
+        at_site,
+        "the developed frame peaks at each hot photosite"
+    );
+
+    let found = detected_in(&hot_paths);
+    for (x, y) in HOT_SITES {
+        assert!(found.contains(x, y), "the hot site ({x}, {y}) is detected");
+    }
+    for (x, y) in found.positions() {
+        let reach = HOT_SITES
+            .iter()
+            .map(|&(sx, sy)| x.abs_diff(sx).max(y.abs_diff(sy)))
+            .min()
+            .expect("there are hot sites");
+        assert!(
+            reach <= DEMOSAIC_REACH,
+            "({x}, {y}) is detected {reach} px from the nearest hot site"
+        );
+    }
+
+    for name in ["weighted-average", "depth-map", "laplacian"] {
+        let run = |label: &str, frames: &[PathBuf], repair: bool| {
+            let mut request = defect_request(
+                &format!("{name}-{label}"),
+                frames,
+                &root,
+                repair.then_some(DefectSettings {
+                    hot_pixel_threshold: Some(7.0),
+                    mask: None,
+                    grow_radius: 0,
+                }),
+            );
+            request.algorithm = registry::find_stack(name).expect("the algorithm is registered");
+            // The test aligner translates every frame but the first.
+            request.align = None;
+            match focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+                .expect("the run completes")
+            {
+                FuseOutcome::Completed(report) => report,
+                FuseOutcome::Cancelled { .. } => panic!("the run was not cancelled"),
+            }
+        };
+        let clean = run("clean", &clean_paths, false);
+        let hot_off = run("hot-off", &hot_paths, false);
+        let hot_on = run("hot-on", &hot_paths, true);
+        assert_eq!(hot_off.defects, None, "{name}: off reports no repair");
+        let (clean, hot_off, hot_on) = (
+            held_samples(&clean),
+            held_samples(&hot_off),
+            held_samples(&hot_on),
+        );
+
+        let peaks = peak_offsets(&clean, &hot_off);
+        eprintln!("{name}: unrepaired composite peaks at offsets {peaks:?}");
+        if name == "weighted-average" {
+            assert_eq!(peaks, at_site, "identical frames fuse to the frame");
+        }
+        for (label, run_samples) in [("unrepaired", &hot_off), ("repaired", &hot_on)] {
+            for fraction in [0.02, 0.005] {
+                let (radius, pixels) = smear(&clean, run_samples, fraction * level);
+                eprintln!(
+                    "{name}: {label} composite deviates over radius {radius}, {pixels} pixels at {}% of the level",
+                    fraction * 100.0
+                );
+            }
+        }
+        assert!(
+            !deviating_offsets(&clean, &hot_off, 3, 0.005 * level).is_empty(),
+            "{name}: without repair the hot photosites show in the result"
+        );
+        assert_eq!(
+            deviating_offsets(&clean, &hot_on, 3, 0.005 * level),
+            [],
+            "{name}: the repair leaves no spread of a hot photosite"
+        );
+    }
+}
+
+#[test]
+fn only_a_colour_filter_array_stack_reports_that_it_demosaics() {
+    let budget = focusforge_core::tile::HostBudget::explicit(1 << 30);
+    let demosaics = |monochrome: bool| {
+        let frames = spread_frames(false, monochrome);
+        let set = focusforge_core::io::open_frame_set(&spread_paths(&frames), budget)
+            .expect("the frames open");
+        let cfa = set
+            .reader
+            .frame(0)
+            .raw_identity
+            .as_ref()
+            .unwrap()
+            .cfa
+            .clone();
+        (set.reader.demosaics(), cfa.is_some())
+    };
+    assert_eq!(demosaics(false), (true, true));
+    assert_eq!(
+        demosaics(true),
+        (false, true),
+        "a monochrome DNG carries the colour filter array tag and still does not demosaic"
+    );
+    let mantis =
+        focusforge_core::io::open_frame_set(&mantis_64_frames(3), budget).expect("the frames open");
+    assert!(!mantis.reader.demosaics(), "a TIFF stack does not demosaic");
+}
+
+#[test]
+fn the_grown_detected_mask_keys_the_cached_alignment() {
+    let root = scratch("raw_grown_cache");
+    let frames = spread_frames(true, false);
+    let paths = spread_paths(&frames);
+    let cache = StageCache::open(&root.join("scratch")).expect("the stage cache opens");
+    let found = detected_in(&paths);
+    let size = (SPREAD_SIZE, SPREAD_SIZE);
+    let grown_file = root.join("grown.png");
+    let ungrown_file = root.join("ungrown.png");
+    write_defect_png(&grown_file, size, &found.grow(DEMOSAIC_REACH).positions());
+    write_defect_png(&ungrown_file, size, &found.positions());
+    let detect = || DefectSettings {
+        hot_pixel_threshold: Some(7.0),
+        mask: None,
+        grow_radius: 0,
+    };
+    let from_file = |path: &Path| DefectSettings {
+        hot_pixel_threshold: None,
+        mask: Some(path.to_path_buf()),
+        grow_radius: 0,
+    };
+    let run = |label: &str, settings: DefectSettings| {
+        defect_run(
+            label,
+            &paths,
+            &root,
+            Some(settings),
+            &NoopObserver,
+            Some(&cache),
+        )
+        .expect("the run completes")
+    };
+    assert!(!run("detected", detect()).align_cached);
+    assert!(
+        run("grown-file", from_file(&grown_file)).align_cached,
+        "a mask file holding the grown positions is the same union"
+    );
+    assert!(
+        !run("ungrown-file", from_file(&ungrown_file)).align_cached,
+        "the ungrown positions are another union"
+    );
+}
+
+/// Samples `(channel, x, y)` that stand out from their 7×7 window, in the same
+/// direction, in at least `frames / 2 + 1` of `frames` frames, over a window
+/// around each of `centres`. A window's median and MAD (floored at 1) come
+/// from the pixels outside `excluded`; an outlier lies more than 7 MADs from
+/// the median, and only frame 0's outliers are candidates.
+fn persistent_outliers(
+    reader: &dyn TileReader,
+    excluded: &DefectMask,
+    centres: &[(u32, u32)],
+    frames: usize,
+) -> std::collections::BTreeSet<(usize, u32, u32)> {
+    let (width, height) = (excluded.width(), excluded.height());
+    let mut found = std::collections::BTreeSet::new();
+    for &(cx, cy) in centres {
+        let (x0, y0) = (cx.saturating_sub(3), cy.saturating_sub(3));
+        let rect = Rect {
+            x: x0,
+            y: y0,
+            width: (cx + 4).min(width) - x0,
+            height: (cy + 4).min(height) - y0,
+        };
+        let mut seen = vec![std::collections::HashSet::new(); frames];
+        for (frame, outliers) in seen.iter_mut().enumerate() {
+            let mut samples = vec![0u16; rect.width as usize * rect.height as usize * 3];
+            reader
+                .read_tile_into(frame, rect, &mut samples)
+                .expect("the window reads");
+            for channel in 0..3 {
+                let at = |i: usize| (i % rect.width as usize, i / rect.width as usize);
+                let kept: Vec<(usize, i32)> = (0..samples.len() / 3)
+                    .filter(|&i| {
+                        let (dx, dy) = at(i);
+                        !excluded.contains(rect.x + dx as u32, rect.y + dy as u32)
+                    })
+                    .map(|i| (i, i32::from(samples[i * 3 + channel])))
+                    .collect();
+                if kept.is_empty() {
+                    continue;
+                }
+                let median_of = |mut values: Vec<i32>| {
+                    values.sort_unstable();
+                    values[values.len() / 2]
+                };
+                let median = median_of(kept.iter().map(|&(_, v)| v).collect());
+                let mad = f64::from(median_of(
+                    kept.iter().map(|&(_, v)| (v - median).abs()).collect(),
+                ))
+                .max(1.0);
+                for &(i, value) in &kept {
+                    let deviation = f64::from(value - median);
+                    if deviation.abs() > 7.0 * mad {
+                        let (dx, dy) = at(i);
+                        outliers.insert((
+                            channel,
+                            rect.x + dx as u32,
+                            rect.y + dy as u32,
+                            deviation > 0.0,
+                        ));
+                    }
+                }
+            }
+        }
+        for &(channel, x, y, positive) in &seen[0] {
+            let shown = seen
+                .iter()
+                .filter(|outliers| outliers.contains(&(channel, x, y, positive)))
+                .count();
+            if shown > frames / 2 {
+                found.insert((channel, x, y));
+            }
+        }
+    }
+    found
+}
+
+/// The first eight CR3 frames of the RAW sample stack by name, or `None` (with
+/// a `skip:` line) when `FOCUSFORGE_RAW_SAMPLE_STACK` is unset or not a
+/// directory.
+fn raw_sample_frames() -> Option<Vec<PathBuf>> {
+    let dir = common::raw_sample_stack_dir()?;
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("the stack directory lists")
+        .map(|entry| entry.expect("a directory entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("cr3"))
+        })
+        .collect();
+    paths.sort();
+    paths.truncate(8);
+    assert_eq!(paths.len(), 8, "eight CR3 frames in {}", dir.display());
+    Some(paths)
+}
+
+/// The detection score of the centre of the 3x3 window of `frame` around
+/// `(x, y)`, the largest over channels of `|centre - median| / max(MAD,
+/// MIN_SPREAD)` (the rule of the hot-pixel outlier test), and the window's
+/// samples (centre included) for comparing two develops.
+fn window_score(reader: &dyn FrameReader, frame: usize, (x, y): (u32, u32)) -> (f64, Vec<u16>) {
+    let (width, height) = reader.dimensions();
+    let (x0, y0) = (x.saturating_sub(1), y.saturating_sub(1));
+    let rect = Rect {
+        x: x0,
+        y: y0,
+        width: (x + 2).min(width) - x0,
+        height: (y + 2).min(height) - y0,
+    };
+    let mut samples = vec![0u16; rect.width as usize * rect.height as usize * 3];
+    reader
+        .read_tile_into(frame, rect, &mut samples)
+        .expect("the window reads");
+    let centre = ((y - y0) * rect.width + (x - x0)) as usize;
+    let median_of = |mut values: Vec<f64>| {
+        values.sort_by(f64::total_cmp);
+        let n = values.len();
+        if n % 2 == 1 {
+            values[n / 2]
+        } else {
+            (values[n / 2 - 1] + values[n / 2]) / 2.0
+        }
+    };
+    let score = (0..3)
+        .map(|channel| {
+            let neighbours: Vec<f64> = (0..samples.len() / 3)
+                .filter(|&i| i != centre)
+                .map(|i| f64::from(samples[i * 3 + channel]))
+                .collect();
+            let m = median_of(neighbours.clone());
+            let mad = median_of(neighbours.iter().map(|n| (n - m).abs()).collect());
+            (f64::from(samples[centre * 3 + channel]) - m).abs()
+                / mad.max(focusforge_core::hot_pixels::MIN_SPREAD)
+        })
+        .fold(0.0, f64::max);
+    (score, samples)
+}
+
+#[test]
+#[ignore = "reads the RAW sample stack"]
+fn raw_sample_stack_hot_pixel_counts_agree() {
+    const THRESHOLD: f64 = 7.0;
+    // Rounding of the developed samples: 0.1 % of full scale.
+    const ROUNDING_LSB: u16 = 66;
+    let Some(paths) = raw_sample_frames() else {
+        return;
+    };
+    let budget = focusforge_core::tile::HostBudget::explicit(u64::MAX);
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let on_demand = focusforge_core::io::open_frame_set(&paths, budget).expect("the frames open");
+    let stored = focusforge_core::io::open_frame_set(&paths, budget).expect("the frames open");
+    let (on_demand, stored) = (on_demand.reader.as_ref(), stored.reader.as_ref());
+    let store = tempfile::tempdir().expect("a scratch directory");
+    stored
+        .develop_once(
+            store.path(),
+            focusforge_core::io::DevelopStore::ScratchFile,
+            budget,
+            workers,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
+        .expect("the frames develop");
+    assert_eq!(on_demand.dimensions(), stored.dimensions());
+    assert_eq!(on_demand.len(), stored.len());
+
+    let detect = |reader: &dyn FrameReader| {
+        focusforge_core::hot_pixels::detect(
+            reader,
+            paths.len(),
+            reader.dimensions(),
+            3,
+            THRESHOLD,
+            workers,
+            &AtomicUsize::new(0),
+            &|| false,
+        )
+        .expect("detection runs")
+    };
+    let (direct, after_store) = (detect(on_demand), detect(stored));
+    eprintln!(
+        "detected {} on the on-demand develop, {} after develop_once",
+        direct.count(),
+        after_store.count()
+    );
+    let in_one: Vec<(u32, u32)> = direct
+        .positions()
+        .into_iter()
+        .filter(|&(x, y)| !after_store.contains(x, y))
+        .chain(
+            after_store
+                .positions()
+                .into_iter()
+                .filter(|&(x, y)| !direct.contains(x, y)),
+        )
+        .collect();
+    assert!(
+        !in_one.is_empty(),
+        "the two develops disagree on some position"
+    );
+    for &at in &in_one {
+        let mut rounding_only = false;
+        for frame in 0..paths.len() {
+            let (score_direct, window_direct) = window_score(on_demand, frame, at);
+            let (score_stored, window_stored) = window_score(stored, frame, at);
+            let largest_difference = window_direct
+                .iter()
+                .zip(&window_stored)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .expect("the window is not empty");
+            eprintln!(
+                "{at:?} frame {frame}: score {score_direct:.3} on demand, {score_stored:.3} stored, \
+                 largest window difference {largest_difference} LSB"
+            );
+            rounding_only |= (score_direct > THRESHOLD) != (score_stored > THRESHOLD)
+                && largest_difference <= ROUNDING_LSB;
+        }
+        assert!(
+            rounding_only,
+            "{at:?}: no frame's verdict differs with windows within {ROUNDING_LSB} LSB"
+        );
+    }
+}
+
+#[test]
+#[ignore = "reads the RAW sample stack"]
+fn raw_sample_stack_growth_clears_persistent_outliers_around_hot_pixels() {
+    let Some(paths) = raw_sample_frames() else {
+        return;
+    };
+
+    let budget = focusforge_core::tile::HostBudget::explicit(u64::MAX);
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let set = focusforge_core::io::open_frame_set(&paths, budget).expect("the frames open");
+    let reader = set.reader.as_ref();
+    assert!(reader.demosaics(), "CR3 frames are a colour filter array");
+    let store = tempfile::tempdir().expect("a scratch directory");
+    reader
+        .develop_once(
+            store.path(),
+            focusforge_core::io::DevelopStore::ScratchFile,
+            budget,
+            workers,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
+        .expect("the frames develop");
+
+    let start = Instant::now();
+    let ungrown = focusforge_core::hot_pixels::detect(
+        reader,
+        paths.len(),
+        reader.dimensions(),
+        3,
+        7.0,
+        workers,
+        &AtomicUsize::new(0),
+        &|| false,
+    )
+    .expect("detection runs");
+    let detection = start.elapsed();
+    let grown = ungrown.grow(DEMOSAIC_REACH);
+    eprintln!(
+        "detected {} ungrown, {} grown, detection took {detection:?}",
+        ungrown.count(),
+        grown.count()
+    );
+    assert!(ungrown.count() > 0, "detection finds hot pixels");
+
+    let centres = ungrown.positions();
+    let repaired = focusforge_core::defect_repair::RepairReader::new(reader, &grown, 3)
+        .expect("the grown mask is repairable");
+    let without = persistent_outliers(reader, &ungrown, &centres, paths.len());
+    let with = persistent_outliers(&repaired, &grown, &centres, paths.len());
+    eprintln!(
+        "persistent outliers without growth: {} {without:?}",
+        without.len()
+    );
+    eprintln!("persistent outliers with growth: {} {with:?}", with.len());
+    assert!(!without.is_empty(), "the ungrown repair leaves outliers");
+    assert!(with.is_empty(), "the grown repair leaves none: {with:?}");
+}
+
+#[test]
+fn cancelling_during_hot_pixel_detection_stops_the_run() {
+    let control = JobControl::new();
+    let probe = StageProbe {
+        control: Arc::clone(&control),
+        cancel_on_prepare: true,
+        seen: Mutex::default(),
+    };
+    let mut request = base_request(
+        "defect_detect_cancel",
+        mantis_64_frames(3),
+        ParamValues::new(),
+    );
+    request.align = Some(dummy_align_request());
+    request.defects = Some(DefectSettings {
+        hot_pixel_threshold: Some(7.0),
+        mask: None,
+        grow_radius: 0,
+    });
+    let outcome = focusforge_core::pipeline::run(&request, &probe, control, None)
+        .expect("a cancel is not an error");
+    assert!(matches!(
+        outcome,
+        FuseOutcome::Cancelled {
+            units_done: 0,
+            unit_total: 0
+        }
+    ));
+    let seen = probe.seen.lock().unwrap();
+    assert_eq!(
+        *seen,
+        [("prepare", JobStage::Prepare)],
+        "no stage past detection"
+    );
+    assert_eq!(
+        files_under(&request.scratch_root),
+        Vec::<PathBuf>::new(),
+        "nothing staged, cached or recorded"
+    );
+}
+
+#[test]
+fn a_refused_defect_mask_stops_the_run_before_develop_or_fusion() {
+    let root = scratch("defect_bad_mask");
+    let mask_file = root.join("mask.png");
+    let frames = mantis_64_frames(3);
+    let settings = || DefectSettings {
+        hot_pixel_threshold: None,
+        mask: Some(mask_file.clone()),
+        grow_radius: 0,
+    };
+
+    // A run with a usable mask announces stages, so an empty log below means
+    // the run stopped before the first one.
+    write_defect_png(&mask_file, (64, 64), &[(3, 3)]);
+    let control = StageLog::default();
+    defect_run("good", &frames, &root, Some(settings()), &control, None)
+        .expect("a mask of the frame size is accepted");
+    assert!(
+        control.stages.lock().unwrap().contains(&"fuse"),
+        "the observer sees the stages of a completed run"
+    );
+
+    write_defect_png(&mask_file, (64, 63), &[(3, 3)]);
+    let log = StageLog::default();
+    let error = defect_run("bad", &frames, &root, Some(settings()), &log, None)
+        .err()
+        .expect("a mask of another size is refused");
+    assert!(matches!(error, PipelineError::DefectMask(_)), "{error:?}");
+    let text = error.to_string();
+    assert!(
+        text.contains(&mask_file.display().to_string()) && text.contains("64×63"),
+        "{text}"
+    );
+    assert!(!root.join("bad").exists(), "no result was written");
+    assert_eq!(
+        *log.stages.lock().unwrap(),
+        Vec::<&str>::new(),
+        "no stage was announced"
+    );
+
+    // An all-black mask leaves no pixel to repair from.
+    let everything: Vec<(u32, u32)> = (0..64 * 64).map(|at| (at % 64, at / 64)).collect();
+    write_defect_png(&mask_file, (64, 64), &everything);
+    let log = StageLog::default();
+    let error = defect_run("black", &frames, &root, Some(settings()), &log, None)
+        .err()
+        .expect("a mask covering the frame is refused");
+    let text = error.to_string();
+    assert!(
+        text.contains(&mask_file.display().to_string()) && text.contains("(0, 0)"),
+        "{text}"
+    );
+    assert!(!root.join("black").exists(), "no result was written");
+    assert_eq!(
+        *log.stages.lock().unwrap(),
+        Vec::<&str>::new(),
+        "no stage was announced"
+    );
+}
+
+#[test]
+fn defect_repair_is_part_of_the_cached_alignment_identity() {
+    let frames = mantis_64_frames(3);
+    let root = scratch("defect_cache");
+    let cache = StageCache::open(&root.join("scratch")).expect("the stage cache opens");
+    let spots = root.join("spots.png");
+    let clean = root.join("clean.png");
+    write_defect_png(&spots, (64, 64), &[(10, 10), (11, 10), (40, 33)]);
+    write_defect_png(&clean, (64, 64), &[]);
+    let run = |label: &str, mask: Option<&Path>| {
+        let settings = mask.map(|path| DefectSettings {
+            hot_pixel_threshold: None,
+            mask: Some(path.to_path_buf()),
+            grow_radius: 0,
+        });
+        defect_run(label, &frames, &root, settings, &NoopObserver, Some(&cache))
+            .expect("the run completes")
+    };
+    assert!(!run("off", None).align_cached);
+    let on = run("spots", Some(&spots));
+    assert!(!on.align_cached, "a repaired source is another input");
+    assert_eq!(on.defects.map(|d| d.repaired), Some(3));
+    assert!(run("spots-again", Some(&spots)).align_cached);
+    assert!(
+        run("off-again", None).align_cached,
+        "the unrepaired entry is intact"
+    );
+    let empty = run("clean", Some(&clean));
+    assert_eq!(empty.defects.map(|d| d.repaired), Some(0));
+    assert!(
+        empty.align_cached,
+        "an empty union keeps the unrepaired identity"
+    );
 }

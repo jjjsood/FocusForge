@@ -86,6 +86,7 @@ mod export;
 mod gpu;
 mod groups;
 mod history;
+mod hot_pixels;
 mod job;
 mod preset;
 mod progress;
@@ -245,6 +246,18 @@ enum Command {
         #[arg(long, value_enum, default_value_t = sharp_areas::Priority::Normal)]
         priority: sharp_areas::Priority,
     },
+    /// Find hot pixels: pixels that differ from their neighbours at the same sensor position in more than half the frames.
+    /// Frames are read as they are, without alignment.
+    #[command(after_help = set::parameter_help(&hot_pixels::params()))]
+    HotPixels {
+        /// Directory of frames to search (non-recursive, descending into a `frames` subdirectory).
+        dir: PathBuf,
+        #[command(flatten)]
+        set: set::SetArgs,
+        /// Print the count and the sensor coordinates as one JSON object.
+        #[arg(long)]
+        json: bool,
+    },
     /// Write the focus score of every frame of a stack, and of a composite, as maps on one scale.
     ///
     /// The scale is the 99th percentile of each pixel's peak focus score over the frames, so
@@ -298,6 +311,12 @@ enum Command {
         /// when alignment is on.
         #[arg(long = "no-crop", action = clap::ArgAction::SetFalse)]
         crop: bool,
+        /// A painted defect mask to repair in every frame: a grey image the
+        /// size of the frames in which black pixels mark defects. Needs
+        /// `--set defect-removal=true`; `defect-grow-radius` widens the
+        /// painted spots.
+        #[arg(long = "defect-mask", value_name = "PATH")]
+        defect_mask: Option<PathBuf>,
         /// Refuse the run when an alignment fails. Meaningless with
         /// `--no-align`.
         #[arg(long)]
@@ -603,6 +622,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Algorithms { .. } => "algorithms",
         Command::StepPlan { .. } => "step-plan",
         Command::SharpAreas { .. } => "sharp-areas",
+        Command::HotPixels { .. } => "hot-pixels",
         Command::SharpnessMap { .. } => "sharpness-map",
         Command::Stack { .. } => "stack",
         Command::Export { .. } => "export",
@@ -626,6 +646,7 @@ const ROOT_CATEGORIES: [(&str, &[&str]); 3] = [
             "algorithms",
             "step-plan",
             "sharp-areas",
+            "hot-pixels",
             "sharpness-map",
         ],
     ),
@@ -719,6 +740,7 @@ fn main() -> ExitCode {
             json,
             priority,
         } => sharp_areas::run(&dir, &set, json, priority),
+        Command::HotPixels { dir, set, json } => hot_pixels::run(&dir, &set, json),
         Command::SharpnessMap {
             dir,
             out,
@@ -735,6 +757,7 @@ fn main() -> ExitCode {
             group_args,
             align,
             crop,
+            defect_mask,
             strict,
             align_algo,
             align_set,
@@ -768,6 +791,7 @@ fn main() -> ExitCode {
                 algo.as_deref(),
                 json,
                 &set,
+                defect_mask.as_deref(),
                 &align::AlignOptions {
                     align,
                     crop,
@@ -2537,7 +2561,7 @@ mod tests {
         assert_eq!(first, generated_cli_assets());
         assert_eq!(
             first.keys().filter(|path| path.starts_with("man")).count(),
-            19
+            20
         );
         let manuals = first
             .keys()
@@ -2552,6 +2576,7 @@ mod tests {
                 std::path::Path::new("man/focusforge-cli-algorithms.1"),
                 std::path::Path::new("man/focusforge-cli-step-plan.1"),
                 std::path::Path::new("man/focusforge-cli-sharp-areas.1"),
+                std::path::Path::new("man/focusforge-cli-hot-pixels.1"),
                 std::path::Path::new("man/focusforge-cli-sharpness-map.1"),
                 std::path::Path::new("man/focusforge-cli-stack.1"),
                 std::path::Path::new("man/focusforge-cli-export.1"),
@@ -2652,7 +2677,7 @@ mod tests {
             .keys()
             .filter(|path| path.starts_with("man"))
             .collect::<Vec<_>>();
-        assert_eq!(manuals.len(), 20);
+        assert_eq!(manuals.len(), 21);
         assert!(assets.contains_key(std::path::Path::new("man/focusforge-cli-visible-test.1")));
         assert!(!assets.contains_key(std::path::Path::new("man/focusforge-cli-hidden-test.1")));
         assert!(manuals.iter().all(|path| {
@@ -2699,7 +2724,7 @@ mod tests {
         assert_eq!(first, generated_cli_assets());
         assert_eq!(
             first.keys().filter(|path| path.starts_with("man")).count(),
-            19
+            20
         );
         assert!(first.contains_key(std::path::Path::new("completions/_focusforge-cli.ps1")));
         #[cfg(not(feature = "gpu"))]

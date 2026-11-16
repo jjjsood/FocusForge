@@ -32,6 +32,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('algorithms', 'algorithms', [CompletionResultType]::ParameterValue, 'List every registered algorithm, or print one named algorithm''s full parameter schema')
             [CompletionResult]::new('step-plan', 'step-plan', [CompletionResultType]::ParameterValue, 'Compute the focus step, frame count, duration and disk need of a focus stack')
             [CompletionResult]::new('sharp-areas', 'sharp-areas', [CompletionResultType]::ParameterValue, 'Count the areas of the image that are sharpest in each frame of a stack')
+            [CompletionResult]::new('hot-pixels', 'hot-pixels', [CompletionResultType]::ParameterValue, 'Find hot pixels: pixels that differ from their neighbours at the same sensor position in more than half the frames. Frames are read as they are, without alignment')
             [CompletionResult]::new('sharpness-map', 'sharpness-map', [CompletionResultType]::ParameterValue, 'Write the focus score of every frame of a stack, and of a composite, as maps on one scale')
             [CompletionResult]::new('stack', 'stack', [CompletionResultType]::ParameterValue, 'Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run `focusforge-cli export` for that')
             [CompletionResult]::new('export', 'export', [CompletionResultType]::ParameterValue, 'Turn a project into an image file: the image with `-o`, the Z-Map with `--zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image')
@@ -85,6 +86,16 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
             break
         }
+        'focusforge-cli;hot-pixels' {
+            [CompletionResult]::new('--set', '--set', [CompletionResultType]::ParameterName, 'Set a parameter: `--set key=value`, repeatable. A repeated key is last-wins')
+            [CompletionResult]::new('--json', '--json', [CompletionResultType]::ParameterName, 'Print the count and the sensor coordinates as one JSON object')
+            [CompletionResult]::new('-v', '-v', [CompletionResultType]::ParameterName, 'Increase log detail (repeatable)')
+            [CompletionResult]::new('-q', '-q', [CompletionResultType]::ParameterName, 'Log errors only')
+            [CompletionResult]::new('--quiet', '--quiet', [CompletionResultType]::ParameterName, 'Log errors only')
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
+            break
+        }
         'focusforge-cli;sharpness-map' {
             [CompletionResult]::new('--out', '--out', [CompletionResultType]::ParameterName, 'Directory the maps are written to; created if missing')
             [CompletionResult]::new('--composite', '--composite', [CompletionResultType]::ParameterName, 'A composite image of the frames'' size to map on the frames'' scale')
@@ -105,6 +116,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('--groups', '--groups', [CompletionResultType]::ParameterName, 'Group the frames as this TOML file says instead of proposing a grouping: one `[[group]]` block per stack, each with a `name` and a `frames` array of paths relative to `<dir>`. Every frame found under `<dir>` must appear in exactly one group')
             [CompletionResult]::new('--write-groups', '--write-groups', [CompletionResultType]::ParameterName, 'Write the proposed grouping to this path, in exactly the format `--groups` reads, then carry on with the run. Edit it and feed it back with `--groups` to override the proposal')
             [CompletionResult]::new('--only', '--only', [CompletionResultType]::ParameterName, 'Run only the named result(s), repeatable: matches a group''s identity (what `review --json`''s `identity` field prints, and what this run''s own `--status` stream uses) or its plain name. Every unselected group is skipped -- named on stderr, not re-run -- and its project on disk is left untouched. Combine with `--set`/`--align-set` to cheaply re-run a subset after changing a fusion or alignment parameter')
+            [CompletionResult]::new('--defect-mask', '--defect-mask', [CompletionResultType]::ParameterName, 'A painted defect mask to repair in every frame: a grey image the size of the frames in which black pixels mark defects. Needs `--set defect-removal=true`; `defect-grow-radius` widens the painted spots')
             [CompletionResult]::new('--align-algorithm', '--align-algorithm', [CompletionResultType]::ParameterName, 'Alignment algorithm id. Optional: defaults to the sole registered alignment algorithm, refusing (and listing the choices) when more than one is registered')
             [CompletionResult]::new('--align-set', '--align-set', [CompletionResultType]::ParameterName, 'Set an alignment parameter: `--align-set key=value`, repeatable. A repeated key is last-wins')
             [CompletionResult]::new('--tile-size', '--tile-size', [CompletionResultType]::ParameterName, 'Override the scheduler''s outer tile size, in pixels. Omit to use the scheduler''s own default')
@@ -315,6 +327,7 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             [CompletionResult]::new('algorithms', 'algorithms', [CompletionResultType]::ParameterValue, 'List every registered algorithm, or print one named algorithm''s full parameter schema')
             [CompletionResult]::new('step-plan', 'step-plan', [CompletionResultType]::ParameterValue, 'Compute the focus step, frame count, duration and disk need of a focus stack')
             [CompletionResult]::new('sharp-areas', 'sharp-areas', [CompletionResultType]::ParameterValue, 'Count the areas of the image that are sharpest in each frame of a stack')
+            [CompletionResult]::new('hot-pixels', 'hot-pixels', [CompletionResultType]::ParameterValue, 'Find hot pixels: pixels that differ from their neighbours at the same sensor position in more than half the frames. Frames are read as they are, without alignment')
             [CompletionResult]::new('sharpness-map', 'sharpness-map', [CompletionResultType]::ParameterValue, 'Write the focus score of every frame of a stack, and of a composite, as maps on one scale')
             [CompletionResult]::new('stack', 'stack', [CompletionResultType]::ParameterValue, 'Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images -- run `focusforge-cli export` for that')
             [CompletionResult]::new('export', 'export', [CompletionResultType]::ParameterValue, 'Turn a project into an image file: the image with `-o`, the Z-Map with `--zmap`, either or both in one invocation. At least one of the two is required. This is the only command that writes an image')
@@ -338,6 +351,9 @@ Register-ArgumentCompleter -Native -CommandName 'focusforge-cli' -ScriptBlock {
             break
         }
         'focusforge-cli;help;sharp-areas' {
+            break
+        }
+        'focusforge-cli;help;hot-pixels' {
             break
         }
         'focusforge-cli;help;sharpness-map' {

@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 // stores on a project tab and passes to a mutator -- `ParamDesc`'s own
 // fields and `resolve_in`/`registry`/`Family` stay private to this module,
 // the only place that resolves a schema.
+use focusforge_core::defect_repair::DefectSettings;
 use focusforge_core::equalize::EqualizeSettings;
 use focusforge_core::params::{ParamDesc, ParamKind, ResolvedParams, check_for, resolve_in};
 pub(crate) use focusforge_core::params::{
@@ -135,6 +136,19 @@ pub(crate) fn equalization_settings(
     focusforge_core::project::equalization_settings(
         &project_schema(&focusforge_core::project::PREPARE_PARAMS, fuse_id),
         project_values,
+    )
+}
+
+/// The settings a run fused by `fuse_id` repairs defects with, `None` while
+/// the `defect-removal` switch is off. The window has no mask file picker.
+pub(crate) fn defect_settings(
+    fuse_id: &str,
+    project_values: &ParamValues,
+) -> Option<DefectSettings> {
+    focusforge_core::project::defect_settings(
+        &project_schema(&focusforge_core::project::PREPARE_PARAMS, fuse_id),
+        project_values,
+        None,
     )
 }
 
@@ -595,8 +609,8 @@ struct PickerOption {
     label: String,
 }
 
-/// Builds the whole panel's flat row list, Prepare, Fuse, Align, then Finish: each
-/// section's heading, its algorithm picker (Fuse/Align only), one row per
+/// Builds the whole panel's flat row list, Prepare, Align, Fuse, then Finish: each
+/// section's heading, its algorithm picker (Align/Fuse only), one row per
 /// plain [`ParamDesc`] in declaration order with a [`RowKind::Error`] row
 /// trailing any field in violation, then a `More...` header over the advanced
 /// ones. With no tab active the panel still renders, collapsed, seeded like a
@@ -666,31 +680,23 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
         .iter_mut()
         .skip_while(|r| r.id != "equalize")
         .skip(1)
-        .take_while(|r| r.kind != RowKind::MoreEnd)
+        .take_while(|r| r.kind != RowKind::MoreEnd && r.id != "defect-removal")
     {
         row.disabled = !equalize_on;
     }
-
-    if let Ok(fuse) = registry::find_stack(fuse_id) {
-        let mut methods = registry::stack_algorithms();
-        methods.sort_by_key(|a| (!a.is_default(), a.advanced()));
-        let picker = methods
-            .iter()
-            .filter(|a| !a.test_only())
-            .map(|a| PickerOption {
-                id: a.id().to_string(),
-                label: a.display_name().to_string(),
-            })
-            .collect();
-        rows.extend(section_rows(
-            "fuse",
-            "FUSE",
-            fuse.params(),
-            fuse_values,
-            &section_ctx,
-            Some((fuse_id, fuse.display_name(), picker)),
-        ));
+    // The rows after `defect-removal` grey the same way, and the threshold
+    // also greys while `hot-pixels` is off.
+    let defects_on = project_flag(project_values, "defect-removal");
+    let hot_pixels_on = project_flag(project_values, "hot-pixels");
+    for row in rows
+        .iter_mut()
+        .skip_while(|r| r.id != "defect-removal")
+        .skip(1)
+        .take_while(|r| r.kind != RowKind::MoreEnd)
+    {
+        row.disabled = !defects_on || (row.id == "hot-pixel-threshold" && !hot_pixels_on);
     }
+
     if let Ok(align) = registry::find_align(align_id) {
         let picker = registry::align_algorithms()
             .iter()
@@ -726,6 +732,26 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
             align_rows[0].heading_state = HeadingState::Explicit;
         }
         rows.extend(align_rows);
+    }
+    if let Ok(fuse) = registry::find_stack(fuse_id) {
+        let mut methods = registry::stack_algorithms();
+        methods.sort_by_key(|a| (!a.is_default(), a.advanced()));
+        let picker = methods
+            .iter()
+            .filter(|a| !a.test_only())
+            .map(|a| PickerOption {
+                id: a.id().to_string(),
+                label: a.display_name().to_string(),
+            })
+            .collect();
+        rows.extend(section_rows(
+            "fuse",
+            "FUSE",
+            fuse.params(),
+            fuse_values,
+            &section_ctx,
+            Some((fuse_id, fuse.display_name(), picker)),
+        ));
     }
     rows.extend(section_rows(
         "finish",

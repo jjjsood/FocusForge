@@ -265,6 +265,30 @@ pub fn run_in(cmd: &mut Command, dir: &Path, args: &[&str]) -> CliOutput {
         .into()
 }
 
+/// A grey 8-bit PNG defect mask of `size` pixels at `path`: white except the
+/// `black` positions, which mark defects.
+///
+/// `#[allow(dead_code)]`: not every test binary in this crate calls this
+/// helper.
+#[allow(dead_code)]
+pub fn write_defect_mask(path: &Path, size: (u32, u32), black: &[(u32, u32)]) {
+    let mut pixels = vec![255u8; size.0 as usize * size.1 as usize];
+    for &(x, y) in black {
+        pixels[y as usize * size.0 as usize + x as usize] = 0;
+    }
+    let mut encoder = png::Encoder::new(
+        std::io::BufWriter::new(std::fs::File::create(path).expect("the mask file is creatable")),
+        size.0,
+        size.1,
+    );
+    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .and_then(|mut writer| writer.write_image_data(&pixels))
+        .expect("the mask file is writable");
+}
+
 /// The rectangle covering a `width` x `height` image.
 ///
 /// `#[allow(dead_code)]`: not every test binary in this crate calls this

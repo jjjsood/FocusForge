@@ -14,6 +14,7 @@ use std::time::Instant;
 
 use focusforge_core::algorithm::StackAlgorithm;
 use focusforge_core::align::ReferencePolicy;
+use focusforge_core::defect_repair::{DefectReport, DefectSettings};
 use focusforge_core::equalize::{EqualizationReport, EqualizeSettings};
 use focusforge_core::gpu::{AlignBackend, TileBackend};
 use focusforge_core::io::{
@@ -129,6 +130,10 @@ pub struct StackReport {
     /// `true` only when the brightness estimate came out of the stage cache;
     /// `false` for a computed one, or when equalization was off.
     pub equalization_cached: bool,
+    /// How many sensor positions the defect repair replaced in every frame,
+    /// with the shares found by hot-pixel detection and read from the mask
+    /// file; `null` when defect removal was off.
+    pub defects: Option<DefectReport>,
     /// `true` only when the alignment came out of the stage cache;
     /// `false` for a computed one, a `--resume` ledger-peeked one, or a
     /// `--no-align` run.
@@ -338,6 +343,7 @@ pub fn run(
     algo_id: Option<&str>,
     json: bool,
     set: &SetArgs,
+    defect_mask: Option<&Path>,
     align_opts: &AlignOptions<'_>,
     job_opts: &JobOptions,
     preset_opts: &PresetOptions<'_>,
@@ -436,6 +442,13 @@ pub fn run(
             );
         }
     };
+
+    // A mask file is a source of the repair step; without the switch it
+    // would be ignored, so it is refused before any frame is read.
+    let defects = project::defect_settings(&project_schema, &project_values, defect_mask);
+    if defect_mask.is_some() && defects.is_none() {
+        return refuse("--defect-mask needs --set defect-removal=true".to_string());
+    }
 
     // The `align` project value (`--set align=false`, a preset's `[stack]`
     // table) switches alignment off like `--no-align`.
@@ -549,6 +562,7 @@ pub fn run(
         align_choice,
         explicit,
         equalize: project::equalization_settings(&project_schema, &project_values),
+        defects,
         project_values,
         file,
         align_opts,
@@ -670,6 +684,8 @@ struct RunSetup<'a> {
     /// What brightness equalization runs with, `None` when off: resolved
     /// against the fusion method's own project defaults.
     equalize: Option<EqualizeSettings>,
+    /// What sensor defect repair runs with, `None` when off.
+    defects: Option<DefectSettings>,
     file: preset::Preset,
     align_opts: &'a AlignOptions<'a>,
     job_opts: &'a JobOptions,
@@ -982,6 +998,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         explicit,
         project_values,
         equalize,
+        defects,
         file,
         align_opts,
         job_opts,
@@ -1274,6 +1291,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                 .and_then(ParamValue::as_bool)
                 .unwrap_or(true),
         equalize: *equalize,
+        defects: defects.clone(),
         tile_size: job_opts.tile_size,
         max_host_memory,
         backend,
@@ -1390,6 +1408,14 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
             } => renderer.stage(&format!(
                 "prepare {frames} frames (reused from the stage cache)"
             )),
+            RunStage::Prepare {
+                frames,
+                source: PrepareSource::HotPixels,
+                ..
+            } => {
+                renderer.stage(&format!("prepare {frames} frames (hot pixels)"));
+                renderer.start(&self.control.progress());
+            }
             // A peeked (resumed) alignment prints nothing -- it cost no
             // wall time and is not a stage a viewer is waiting through.
             RunStage::Align {
@@ -1582,6 +1608,7 @@ fn build_stack_report(
         device_peak_in_flight: device_peak.map(|p| p.peak_in_flight()),
         gpu_fallback: report.gpu_fallback,
         equalization_cached: report.equalization_cached,
+        defects: report.defects,
         align_cached: report.align_cached,
         stages: report.stages,
         develop_counts: report.develop_counts,
@@ -1692,6 +1719,18 @@ fn render(report: &StackReport) -> String {
                 "scales encoded code values, not a linear-light correction"
             },
         ),
+    });
+    lines.push(match &report.defects {
+        None => "defects=off".to_string(),
+        Some(defects) => {
+            let share = |count: Option<usize>| count.map_or("-".to_string(), |n| n.to_string());
+            format!(
+                "defects=on repaired={} detected={} file={}",
+                defects.repaired,
+                share(defects.detected),
+                share(defects.file),
+            )
+        }
     });
     lines.push(format!("backend: {}", report.backend));
     if let Some(counts) = report.develop_counts.as_deref().filter(|c| !c.is_empty()) {
@@ -1856,6 +1895,7 @@ mod tests {
             device_peak_in_flight: None,
             gpu_fallback: None,
             equalization_cached: false,
+            defects: None,
             align_cached: false,
             stages: focusforge_core::timing::StageTimings {
                 setup: Some(0.012),

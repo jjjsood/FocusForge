@@ -33,6 +33,7 @@
 - Long brackets of high-resolution frames run on an ordinary computer: the whole stack never has to fit in memory, only one frame's working memory does (see [What your computer needs](#what-your-computer-needs))
 - Shot handheld, or your lens breathes while focusing? Frames are lined up first and the edges trimmed to what every shot covers
 - Flickering light or exposure drift between shots is evened out
+- Defective sensor pixels are replaced from their neighbours before stacking: hot pixels are found automatically, any other pixel through a mask file; `focusforge-cli hot-pixels` lists the hot ones
 - Three methods to choose from: Details as the all-rounder, Soft transitions for gentler blends between frames, Focus map for the most coherent source map to pick from
 - Plan a bracket before shooting: the step calculator turns lens or objective, magnification, overlap and depth range into a focus step, frame count, duration and disk need, in the window or with `focusforge-cli step-plan`
 - See which frames hold the sharpest areas: the Analytics overlay and `focusforge-cli sharp-areas` count them per image; the command also reports how far neighbouring frames overlap, so a gap between focus steps shows; the Analytics overlay draws the same overlap as a bar

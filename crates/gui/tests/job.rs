@@ -160,6 +160,7 @@ fn no_align_request(label: &str, frame_count: usize) -> FuseRequest {
         align: None,
         crop: false,
         equalize: None,
+        defects: None,
         tile_size: None,
         max_host_memory: None,
         backend: None,

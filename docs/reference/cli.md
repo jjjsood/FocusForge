@@ -23,6 +23,7 @@ focusforge-cli [OPTIONS] <COMMAND>
 | [`algorithms`](#algorithms) | lists the stacking and alignment methods and their settings |
 | [`step-plan`](#step-plan) | plans a focus bracket: step, frame count, duration, disk need |
 | [`sharp-areas`](#sharp-areas) | counts the sharpest areas per frame |
+| [`hot-pixels`](#hot-pixels) | finds pixels that stay out of line with their neighbours across the frames |
 | [`sharpness-map`](#sharpness-map) | writes the focus score of each frame, and of a composite, as maps on one scale |
 | [`cache`](#cache) | clears the saved alignment and brightness results |
 | [`diagnostics`](#diagnostics) | packs logs and crash reports into one ZIP |
@@ -97,6 +98,7 @@ before it starts.
 | `--set <KEY=VALUE>` | set a method setting or a [project setting](#project-settings); repeatable, the last value of a key wins |
 | `--no-align` | do not align; frames are fused as they are |
 | `--no-crop` | keep the full frame instead of trimming to the area all frames cover |
+| `--defect-mask <PATH>` | repair the pixels this mask marks in every frame: a grey image the size of the frames in which black pixels mark defects. Needs `--set defect-removal=true` |
 | `--strict` | refuse the run when a frame cannot be aligned. Without it such a frame is left where it is and reported |
 | `--align-algorithm <ALGO>` | alignment method; the only one available is the default |
 | `--align-set <KEY=VALUE>` | set an [alignment setting](#algorithms); repeatable |
@@ -117,8 +119,11 @@ before it starts.
 | `--tile-size <PX>` | work on the image in blocks of this many pixels; the default suits almost every stack |
 | `--trace-accounting` | add extra counters to the `--json` report; costs a little time |
 
-An unknown method, a setting outside its range and a missing `-o` folder are
-refused before any frame is read. With alignment and trimming on and no area
+An unknown method, a setting outside its range, a missing `-o` folder and
+`--defect-mask` without `defect-removal` are refused before any frame is read.
+A mask file that is missing, has another size than the frames or leaves no
+pixel to repair from also stops the run, before any frame is developed or
+fused. With alignment and trimming on and no area
 common to all frames, `stack` stops and names `--no-crop`.
 
 ### Project settings
@@ -133,6 +138,16 @@ run:
 | `equalize` | `true` / `false` | `false` | give each frame one brightness gain so that all frames reach the same average |
 | `equalize-max-gain` | 1.01 to 2.0 | `1.25` | the largest gain a frame may get |
 | `equalize-target` | -0.5 to 0.5 | `0.0` | the shared brightness target in stops from the frames' average |
+| `defect-removal` | `true` / `false` | `false` | replace stuck, hot and dead sensor pixels in every frame from their neighbours before alignment; the source files are not changed. The report counts the replaced pixels (`defects=` in the text report, `defects` in `--json`) |
+| `hot-pixels` | `true` / `false` | `true` | with `defect-removal` on, find the hot pixels of the frames automatically (see [`hot-pixels`](#hot-pixels)); on a colour RAW stack every pixel found is replaced together with its four direct neighbours, which developing the colour filter array may have tinted, and `detected=` counts them all |
+| `hot-pixel-threshold` | 2.0 to 50.0 | `7.0` | how many times its neighbourhood's spread a pixel must differ from the neighbourhood's median to count as a hot pixel; higher finds fewer |
+| `defect-grow-radius` | 0 to 16 | `0` | widen every pixel painted in the `--defect-mask` file by this many pixels |
+
+The text report has one defect line: `defects=off` while `defect-removal` is off
+(the result is then identical to a run without the feature), otherwise
+`defects=on repaired=N detected=D file=F`, with the pixels replaced, the ones
+found automatically and the ones the mask file marks (`-` where that source is
+not in use).
 
 ### Cancel, pause, resume
 
@@ -518,6 +533,42 @@ frames of different sizes all exit `1`.
 
 ```bash
 focusforge-cli sharp-areas frames/ --set cell-size=128
+```
+
+## `hot-pixels`
+
+```
+focusforge-cli hot-pixels [OPTIONS] <DIR>
+```
+
+Finds the hot pixels of a folder's frames: pixels that differ from their
+neighbours at the same sensor position in more than half the frames. Frames
+are read as they are, without alignment. The text output is the number of hot
+pixels found. A pixel counts when it differs from the median of its
+neighbourhood by more than `hot-pixel-threshold` times that neighbourhood's
+spread.
+
+On a RAW folder the frames are developed the way `stack` develops them, so
+the pixels listed are the ones a `stack` run with hot-pixel removal on
+detects; on a colour RAW stack the `detected=` count of that run also holds
+the four direct neighbours of each, which demosaicing reaches. Developing a
+large RAW folder may keep temporary frames under `.scratch/` while the command
+runs.
+
+| option | meaning |
+|---|---|
+| `--set <KEY=VALUE>` | set one of the values below; repeatable |
+| `--json` | print the count and the sensor coordinates as one JSON object |
+
+| id | meaning | default | allowed |
+|---|---|---|---|
+| `hot-pixel-threshold` | how many times its neighbourhood's spread a pixel must differ from the neighbourhood's median to count | `7` | 2 to 50 |
+
+A value out of range, a folder without frames, a frame that cannot be read and
+frames of different sizes all exit `1`.
+
+```bash
+focusforge-cli hot-pixels frames/ --set hot-pixel-threshold=10 --json
 ```
 
 ## `sharpness-map`
