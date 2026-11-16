@@ -4652,7 +4652,8 @@ fn persistent_outliers(
 }
 
 /// The first eight CR3 frames of the RAW sample stack by name, or `None` (with
-/// a `skip:` line) when `FOCUSFORGE_RAW_SAMPLE_STACK` is unset.
+/// a `skip:` line) when `FOCUSFORGE_RAW_SAMPLE_STACK` is unset or not a
+/// directory.
 fn raw_sample_frames() -> Option<Vec<PathBuf>> {
     let dir = common::raw_sample_stack_dir()?;
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
