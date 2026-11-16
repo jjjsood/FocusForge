@@ -33,7 +33,8 @@ use focusforge_core::registry;
 use focusforge_core::tile::{NoopPreprocess, TileScheduler, TileSchedulerOptions};
 
 use common::{
-    CliOutput, TmpDir, bin, export_both, mantis_512_dir, partial_of, read_whole, tmp_dir,
+    CliOutput, TmpDir, bin, export_both, export_composite, mantis_512_dir, partial_of, read_whole,
+    tmp_dir,
 };
 
 fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
@@ -1921,6 +1922,7 @@ fn stack_json_trace_accounting_is_null_by_default() {
         "device_peak_in_flight",
         "gpu_fallback",
         "equalization_cached",
+        "defects",
         "align_cached",
         "stages",
         "develop_counts",
@@ -2089,5 +2091,298 @@ fn fuse_tiles_cover_the_plan_when_accounting_is_on() {
         assert_eq!(output_total, extent, "tile size {tile_size}");
         let has_interior = entries.iter().any(|e| e["touches_edge"] == false);
         assert_eq!(has_interior, expect_interior, "tile size {tile_size}");
+    }
+}
+
+// ---------------------------------------------------------------------
+// Sensor defect repair (`--defect-mask`, `defect-removal`).
+// ---------------------------------------------------------------------
+
+/// A `weighted-average` stack of `frames`, unaligned and uncropped, into
+/// `<cwd>/out-<label>`; the run's output and its directory.
+fn defect_stack(
+    cwd: &Path,
+    label: &str,
+    frames: &Path,
+    json: bool,
+    extra: &[&str],
+) -> (CliOutput, PathBuf) {
+    let out_dir = cwd.join(format!("out-{label}"));
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let mut args = vec![
+        "stack",
+        frames.to_str().unwrap(),
+        "-o",
+        out_dir.to_str().unwrap(),
+        "--algorithm",
+        "weighted-average",
+        "--no-align",
+        "--no-crop",
+    ];
+    if json {
+        args.push("--json");
+    }
+    args.extend_from_slice(extra);
+    let out = run_cli_in(cwd, &common::push_no_gpu(args));
+    assert!(out.success, "{label} stderr: {}", out.stderr);
+    (out, out_dir)
+}
+
+/// The largest per-channel distance of any of `positions` from the median of
+/// its 17x17 neighbourhood outside `positions`.
+fn largest_deviation(
+    (samples, width, height, spp): &(Vec<u16>, u32, u32, u32),
+    positions: &std::collections::HashSet<(u32, u32)>,
+) -> i64 {
+    let at = |x: u32, y: u32, c: u32| i64::from(samples[((y * width + x) * spp + c) as usize]);
+    let mut worst = 0;
+    for &(x, y) in positions {
+        for c in 0..*spp {
+            let mut around = Vec::new();
+            for ny in y.saturating_sub(8)..=(y + 8).min(height - 1) {
+                for nx in x.saturating_sub(8)..=(x + 8).min(width - 1) {
+                    if !positions.contains(&(nx, ny)) {
+                        around.push(at(nx, ny, c));
+                    }
+                }
+            }
+            around.sort_unstable();
+            worst = worst.max((at(x, y, c) - around[(around.len() - 1) / 2]).abs());
+        }
+    }
+    worst
+}
+
+#[test]
+fn stack_repairs_defects_and_reports_count() {
+    let set_dir = common::fixtures_dir().join("mantis-512-hot-pixels");
+    let frames = set_dir.join("frames");
+    let mask_file = set_dir.join("defect-mask.tif");
+    let cwd = tmp_dir("stack_cli_defect_repair");
+    let on_args = [
+        "--set",
+        "defect-removal=true",
+        "--set",
+        "defect-grow-radius=2",
+        "--defect-mask",
+        mask_file.to_str().unwrap(),
+    ];
+
+    let detected = run_cli_in(&cwd, &["hot-pixels", frames.to_str().unwrap(), "--json"]);
+    assert!(detected.success, "stderr: {}", detected.stderr);
+    let detected: serde_json::Value = serde_json::from_str(&detected.stdout).unwrap();
+    let detected: std::collections::HashSet<(u32, u32)> = detected["pixels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["x"].as_u64().unwrap() as u32,
+                p["y"].as_u64().unwrap() as u32,
+            )
+        })
+        .collect();
+    let grown = focusforge_core::defect_mask::load(
+        &mask_file,
+        (512, 512),
+        2,
+        focusforge_core::tile::HostBudget::explicit(1 << 30),
+    )
+    .expect("the mask file loads")
+    .positions()
+    .into_iter()
+    .collect::<std::collections::HashSet<_>>();
+    assert_eq!(grown.len(), 200, "the grown file mask");
+    let union: std::collections::HashSet<_> = detected.union(&grown).copied().collect();
+
+    // JSON and text carry the count and both shares.
+    let (json_run, on_dir) = defect_stack(&cwd, "on-json", &frames, true, &on_args);
+    let report: serde_json::Value = serde_json::from_str(&json_run.stdout).expect("--json");
+    assert_eq!(report["defects"]["repaired"], union.len(), "{report}");
+    assert_eq!(report["defects"]["detected"], detected.len(), "{report}");
+    assert_eq!(report["defects"]["file"], 200, "{report}");
+    assert!(
+        json_run
+            .stderr
+            .lines()
+            .any(|l| l.starts_with("prepare 8 frames (hot pixels)")),
+        "stderr: {}",
+        json_run.stderr
+    );
+    let (text_run, _) = defect_stack(&cwd, "on-text", &frames, false, &on_args);
+    let line = format!(
+        "defects=on repaired={} detected={} file=200",
+        union.len(),
+        detected.len()
+    );
+    assert!(
+        text_run.stdout.lines().any(|l| l == line),
+        "{line} in: {}",
+        text_run.stdout
+    );
+
+    // The listed pixels in more than half the frames, and the mask, are
+    // outliers without repair and not with it.
+    let listed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(set_dir.join("hot-pixels.json")).unwrap()).unwrap();
+    let mut checked: std::collections::HashSet<(u32, u32)> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["frames"].as_array().unwrap().len() > 4)
+        .map(|p| {
+            (
+                p["x"].as_u64().unwrap() as u32,
+                p["y"].as_u64().unwrap() as u32,
+            )
+        })
+        .collect();
+    checked.extend(grown.iter().copied());
+    let (_, off_dir) = defect_stack(&cwd, "off", &frames, true, &[]);
+    let composite_of = |dir: &Path| read_whole(&export_composite(&cwd, &common::only_project(dir)));
+    let (on, off) = (composite_of(&on_dir), composite_of(&off_dir));
+    let (on_worst, off_worst) = (
+        largest_deviation(&on, &checked),
+        largest_deviation(&off, &checked),
+    );
+    eprintln!("deviation on={on_worst} off={off_worst}");
+    assert!(
+        off_worst > 20_000,
+        "the unrepaired output has outliers: {off_worst}"
+    );
+    assert!(on_worst <= 6_000, "repaired outlier of {on_worst}");
+}
+
+#[test]
+fn stack_defects_off_is_bit_identical() {
+    let frames = common::fixtures_dir().join("mantis-64").join("frames");
+    let cwd = tmp_dir("stack_cli_defects_off");
+    let white = cwd.join("white.png");
+    common::write_defect_mask(&white, (64, 64), &[]);
+
+    let (default_json, default_dir) = defect_stack(&cwd, "default", &frames, true, &[]);
+    let report: serde_json::Value = serde_json::from_str(&default_json.stdout).unwrap();
+    assert!(report["defects"].is_null(), "{report}");
+    let (default_text, _) = defect_stack(&cwd, "default-text", &frames, false, &[]);
+    assert!(
+        default_text.stdout.lines().any(|l| l == "defects=off"),
+        "{}",
+        default_text.stdout
+    );
+    let (_, off_dir) = defect_stack(
+        &cwd,
+        "off",
+        &frames,
+        true,
+        &["--set", "defect-removal=false"],
+    );
+
+    // Step on, no pixel in either source: the output stays the same and the
+    // report counts nothing.
+    let empty = [
+        "--set",
+        "defect-removal=true",
+        "--set",
+        "hot-pixels=false",
+        "--defect-mask",
+        white.to_str().unwrap(),
+    ];
+    let (empty_json, empty_dir) = defect_stack(&cwd, "empty", &frames, true, &empty);
+    let report: serde_json::Value = serde_json::from_str(&empty_json.stdout).unwrap();
+    assert_eq!(report["defects"]["repaired"], 0, "{report}");
+    assert!(report["defects"]["detected"].is_null(), "{report}");
+    assert_eq!(report["defects"]["file"], 0, "{report}");
+    let (empty_text, _) = defect_stack(&cwd, "empty-text", &frames, false, &empty);
+    assert!(
+        empty_text
+            .stdout
+            .lines()
+            .any(|l| l == "defects=on repaired=0 detected=- file=0"),
+        "{}",
+        empty_text.stdout
+    );
+
+    let composite_of = |dir: &Path| read_whole(&export_composite(&cwd, &common::only_project(dir)));
+    let default = composite_of(&default_dir);
+    assert_eq!(default, composite_of(&off_dir), "off against the default");
+    assert_eq!(default, composite_of(&empty_dir), "empty union against off");
+}
+
+#[test]
+fn stack_rejects_bad_defect_mask() {
+    let frames = common::fixtures_dir().join("mantis-64").join("frames");
+    let cwd = tmp_dir("stack_cli_bad_defect_mask");
+    let short = cwd.join("short.png");
+    common::write_defect_mask(&short, (64, 63), &[(3, 3)]);
+    let all_black = cwd.join("all-black.png");
+    let everything: Vec<(u32, u32)> = (0..64).flat_map(|y| (0..64).map(move |x| (x, y))).collect();
+    common::write_defect_mask(&all_black, (64, 64), &everything);
+    let missing = cwd.join("missing.png");
+    let fine = cwd.join("fine.png");
+    common::write_defect_mask(&fine, (64, 64), &[(3, 3)]);
+    let on = ["--set", "defect-removal=true"];
+    let no_dir = "/definitely/does/not/exist/xyz-stack-cli-defects";
+
+    for (label, input, mask, switch, fragments) in [
+        (
+            "wrong size",
+            frames.to_str().unwrap(),
+            &short,
+            &on[..],
+            vec!["short.png", "64×63", "64×64"],
+        ),
+        (
+            "missing",
+            frames.to_str().unwrap(),
+            &missing,
+            &on[..],
+            vec!["missing.png"],
+        ),
+        (
+            "all black",
+            frames.to_str().unwrap(),
+            &all_black,
+            &on[..],
+            vec!["all-black.png", "more than 64 pixels"],
+        ),
+        (
+            "switch off",
+            no_dir,
+            &fine,
+            &[][..],
+            vec!["--defect-mask needs --set defect-removal=true"],
+        ),
+    ] {
+        let out_dir = cwd.join(format!("out-{}", label.replace(' ', "-")));
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let mut args = vec![
+            "stack",
+            input,
+            "-o",
+            out_dir.to_str().unwrap(),
+            "--algorithm",
+            "weighted-average",
+            "--no-align",
+            "--defect-mask",
+            mask.to_str().unwrap(),
+        ];
+        args.extend_from_slice(switch);
+        let out = run_cli_in(&cwd, &common::push_no_gpu(args));
+        assert!(!out.success, "{label}: stdout {}", out.stdout);
+        for fragment in fragments {
+            assert!(
+                out.stderr.contains(fragment),
+                "{label}: {fragment} in {}",
+                out.stderr
+            );
+        }
+        assert!(
+            std::fs::read_dir(&out_dir)
+                .unwrap()
+                .flatten()
+                .all(|entry| entry.path().extension().is_none_or(|ext| ext != "ffp")),
+            "{label}: no project is written"
+        );
+        assert!(!out.stderr.contains(no_dir), "{label}: {}", out.stderr);
     }
 }

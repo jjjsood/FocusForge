@@ -4209,6 +4209,47 @@ fn defect_repair_counts_the_union_of_both_sources() {
 }
 
 #[test]
+fn cancelling_during_hot_pixel_detection_stops_the_run() {
+    let control = JobControl::new();
+    let probe = StageProbe {
+        control: Arc::clone(&control),
+        cancel_on_prepare: true,
+        seen: Mutex::default(),
+    };
+    let mut request = base_request(
+        "defect_detect_cancel",
+        mantis_64_frames(3),
+        ParamValues::new(),
+    );
+    request.align = Some(dummy_align_request());
+    request.defects = Some(DefectSettings {
+        hot_pixel_threshold: Some(7.0),
+        mask: None,
+        grow_radius: 0,
+    });
+    let outcome = focusforge_core::pipeline::run(&request, &probe, control, None)
+        .expect("a cancel is not an error");
+    assert!(matches!(
+        outcome,
+        FuseOutcome::Cancelled {
+            units_done: 0,
+            unit_total: 0
+        }
+    ));
+    let seen = probe.seen.lock().unwrap();
+    assert_eq!(
+        *seen,
+        [("prepare", JobStage::Prepare)],
+        "no stage past detection"
+    );
+    assert_eq!(
+        files_under(&request.scratch_root),
+        Vec::<PathBuf>::new(),
+        "nothing staged, cached or recorded"
+    );
+}
+
+#[test]
 fn a_refused_defect_mask_stops_the_run_before_develop_or_fusion() {
     let root = scratch("defect_bad_mask");
     let mask_file = root.join("mask.png");

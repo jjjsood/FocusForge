@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 // stores on a project tab and passes to a mutator -- `ParamDesc`'s own
 // fields and `resolve_in`/`registry`/`Family` stay private to this module,
 // the only place that resolves a schema.
+use focusforge_core::defect_repair::DefectSettings;
 use focusforge_core::equalize::EqualizeSettings;
 use focusforge_core::params::{ParamDesc, ParamKind, ResolvedParams, check_for, resolve_in};
 pub(crate) use focusforge_core::params::{
@@ -135,6 +136,19 @@ pub(crate) fn equalization_settings(
     focusforge_core::project::equalization_settings(
         &project_schema(&focusforge_core::project::PREPARE_PARAMS, fuse_id),
         project_values,
+    )
+}
+
+/// The settings a run fused by `fuse_id` repairs defects with, `None` while
+/// the `defect-removal` switch is off. The window has no mask file picker.
+pub(crate) fn defect_settings(
+    fuse_id: &str,
+    project_values: &ParamValues,
+) -> Option<DefectSettings> {
+    focusforge_core::project::defect_settings(
+        &project_schema(&focusforge_core::project::PREPARE_PARAMS, fuse_id),
+        project_values,
+        None,
     )
 }
 
@@ -669,6 +683,18 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
         .take_while(|r| r.kind != RowKind::MoreEnd && r.id != "defect-removal")
     {
         row.disabled = !equalize_on;
+    }
+    // The rows after `defect-removal` grey the same way, and the threshold
+    // also greys while `hot-pixels` is off.
+    let defects_on = project_flag(project_values, "defect-removal");
+    let hot_pixels_on = project_flag(project_values, "hot-pixels");
+    for row in rows
+        .iter_mut()
+        .skip_while(|r| r.id != "defect-removal")
+        .skip(1)
+        .take_while(|r| r.kind != RowKind::MoreEnd)
+    {
+        row.disabled = !defects_on || (row.id == "hot-pixel-threshold" && !hot_pixels_on);
     }
 
     if let Ok(align) = registry::find_align(align_id) {

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::source_previews::PreviewPixels;
 use focusforge_core::algorithm::{AlignAlgorithm, AlignStatus, StackAlgorithm, TileReader};
 use focusforge_core::align::WarpingReader;
+use focusforge_core::defect_repair::DefectSettings;
 pub use focusforge_core::display::PreviewKinds;
 use focusforge_core::display::{PreviewKind, StagePreview};
 use focusforge_core::equalize::{EqualizeSettings, GainReader};
@@ -185,6 +186,9 @@ pub struct JobRequest {
     pub crop: bool,
     /// What brightness equalization runs with, `None` when off.
     pub equalize: Option<EqualizeSettings>,
+    /// What defect repair runs with, `None` when off. The window has no mask
+    /// file, so only hot-pixel detection feeds it.
+    pub defects: Option<DefectSettings>,
     /// Whether this run may use the headless GPU backend at all -- resolved
     /// against the real device only inside [`spawn`], on the worker thread,
     /// never here.
@@ -579,6 +583,7 @@ mod spawn_tests {
             align_lax: false,
             crop: false,
             equalize: None,
+            defects: None,
             gpu: false,
             max_host_memory: Some(1024 * 1024),
             max_vram: None,
@@ -642,7 +647,7 @@ pub fn fuse_request(
         align,
         crop: request.crop,
         equalize: request.equalize,
-        defects: None,
+        defects: request.defects,
         tile_size: None,
         max_host_memory: request.max_host_memory,
         backend,

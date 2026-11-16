@@ -263,6 +263,55 @@ fn an_alignment_input_change_misses_the_cache() {
     assert!(!cached("fewer", &frames, &[]), "a changed frame set misses");
 }
 
+/// An alignment computed with defect repair on is not reused by a run
+/// without it, and the other way round; the same setting hits.
+#[test]
+fn align_cache_distinguishes_defect_repair() {
+    let cwd = tmp_dir("cache_cli_defect_repair");
+    let frames = common::fixtures_dir().join("mantis-64").join("frames");
+    let mask = cwd.join("spots.png");
+    common::write_defect_mask(&mask, (64, 64), &[(10, 10), (11, 10), (40, 33)]);
+
+    let cached = |label: &str, extra: &[&str]| -> bool {
+        let out = cwd.join(format!("out_{label}"));
+        std::fs::create_dir_all(&out).unwrap();
+        let mut args = vec![
+            "stack",
+            frames.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--algorithm",
+            "dummy-stack",
+            "--align-algorithm",
+            "dummy-align",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let run = run_cli_in(&cwd, &common::push_no_gpu(args));
+        assert!(run.success, "{label} stderr: {}", run.stderr);
+        let report: serde_json::Value = serde_json::from_str(&run.stdout).expect("--json");
+        report["align_cached"]
+            .as_bool()
+            .expect("align_cached is a bool")
+    };
+    let on = [
+        "--set",
+        "defect-removal=true",
+        "--set",
+        "hot-pixels=false",
+        "--defect-mask",
+        mask.to_str().unwrap(),
+    ];
+
+    assert!(!cached("on-first", &on), "the first run computes");
+    assert!(
+        !cached("off-first", &[]),
+        "off does not reuse the repaired alignment"
+    );
+    assert!(cached("on-again", &on), "the same repair hits");
+    assert!(cached("off-again", &[]), "off still hits its own entry");
+}
+
 /// `--no-cache` recomputes even when a valid entry exists, and leaves no
 /// entry behind.
 #[test]

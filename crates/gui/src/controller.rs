@@ -9498,6 +9498,7 @@ impl AppController {
             align_lax: true,
             crop: settings_panel::project_flag(&tab.project_values, "auto-crop"),
             equalize: settings_panel::equalization_settings(&tab.fuse_id, &tab.project_values),
+            defects: settings_panel::defect_settings(&tab.fuse_id, &tab.project_values),
             gpu: self.performance.gpu,
             max_host_memory: self.performance.max_host_memory_bytes(),
             max_vram: self.performance.max_vram_bytes(),

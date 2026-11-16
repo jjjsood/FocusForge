@@ -98,6 +98,7 @@ before it starts.
 | `--set <KEY=VALUE>` | set a method setting or a [project setting](#project-settings); repeatable, the last value of a key wins |
 | `--no-align` | do not align; frames are fused as they are |
 | `--no-crop` | keep the full frame instead of trimming to the area all frames cover |
+| `--defect-mask <PATH>` | repair the pixels this mask marks in every frame: a grey image the size of the frames in which black pixels mark defects. Needs `--set defect-removal=true` |
 | `--strict` | refuse the run when a frame cannot be aligned. Without it such a frame is left where it is and reported |
 | `--align-algorithm <ALGO>` | alignment method; the only one available is the default |
 | `--align-set <KEY=VALUE>` | set an [alignment setting](#algorithms); repeatable |
@@ -118,8 +119,11 @@ before it starts.
 | `--tile-size <PX>` | work on the image in blocks of this many pixels; the default suits almost every stack |
 | `--trace-accounting` | add extra counters to the `--json` report; costs a little time |
 
-An unknown method, a setting outside its range and a missing `-o` folder are
-refused before any frame is read. With alignment and trimming on and no area
+An unknown method, a setting outside its range, a missing `-o` folder and
+`--defect-mask` without `defect-removal` are refused before any frame is read.
+A mask file that is missing, has another size than the frames or leaves no
+pixel to repair from also stops the run, before any frame is developed or
+fused. With alignment and trimming on and no area
 common to all frames, `stack` stops and names `--no-crop`.
 
 ### Project settings
@@ -134,6 +138,10 @@ run:
 | `equalize` | `true` / `false` | `false` | give each frame one brightness gain so that all frames reach the same average |
 | `equalize-max-gain` | 1.01 to 2.0 | `1.25` | the largest gain a frame may get |
 | `equalize-target` | -0.5 to 0.5 | `0.0` | the shared brightness target in stops from the frames' average |
+| `defect-removal` | `true` / `false` | `false` | replace stuck, hot and dead sensor pixels in every frame from their neighbours before alignment; the source files are not changed. The report counts the replaced pixels (`defects=` in the text report, `defects` in `--json`) |
+| `hot-pixels` | `true` / `false` | `true` | with `defect-removal` on, find the hot pixels of the frames automatically (see [`hot-pixels`](#hot-pixels)) |
+| `hot-pixel-threshold` | 2.0 to 50.0 | `7.0` | how many times its neighbourhood's spread a pixel must differ from the neighbourhood's median to count as a hot pixel; higher finds fewer |
+| `defect-grow-radius` | 0 to 16 | `0` | widen every pixel painted in the `--defect-mask` file by this many pixels |
 
 ### Cancel, pause, resume
 

@@ -4,7 +4,7 @@
 .SH NAME
 focusforge\-cli\-stack \- Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images \-\- run `focusforge\-cli export` for that
 .SH SYNOPSIS
-\fBfocusforge\-cli stack\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-algorithm\fR] [\fB\-\-json\fR] [\fB\-\-set\fR] [\fB\-\-groups\fR] [\fB\-\-write\-groups\fR] [\fB\-\-only\fR] [\fB\-\-no\-align\fR] [\fB\-\-no\-crop\fR] [\fB\-\-strict\fR] [\fB\-\-align\-algorithm\fR] [\fB\-\-align\-set\fR] [\fB\-\-resume\fR] [\fB\-\-no\-progress\fR] [\fB\-\-tile\-size\fR] [\fB\-\-max\-host\-memory\fR] [\fB\-v \fR]... [\fB\-\-max\-vram\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-preset\fR] [\fB\-\-write\-preset\fR] [\fB\-\-status\fR] [\fB\-\-dry\-run\fR] [\fB\-\-cpu\fR] [\fB\-\-no\-cache\fR] [\fB\-\-trace\-accounting\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDIR\fR> 
+\fBfocusforge\-cli stack\fR [\fB\-o\fR|\fB\-\-output\fR] [\fB\-\-algorithm\fR] [\fB\-\-json\fR] [\fB\-\-set\fR] [\fB\-\-groups\fR] [\fB\-\-write\-groups\fR] [\fB\-\-only\fR] [\fB\-\-no\-align\fR] [\fB\-\-no\-crop\fR] [\fB\-\-defect\-mask\fR] [\fB\-\-strict\fR] [\fB\-\-align\-algorithm\fR] [\fB\-\-align\-set\fR] [\fB\-\-resume\fR] [\fB\-\-no\-progress\fR] [\fB\-\-tile\-size\fR] [\fB\-v \fR]... [\fB\-\-max\-host\-memory\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-max\-vram\fR] [\fB\-\-preset\fR] [\fB\-\-write\-preset\fR] [\fB\-\-status\fR] [\fB\-\-dry\-run\fR] [\fB\-\-cpu\fR] [\fB\-\-no\-cache\fR] [\fB\-\-trace\-accounting\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIDIR\fR> 
 .SH DESCRIPTION
 Fuse supported TIFF, JPEG or RAW frames of a directory into one **project** per detected stack, through a registered stacking algorithm. A run prepares projects for review; it does not export images \-\- run `focusforge\-cli export` for that
 .SH OPTIONS
@@ -36,6 +36,9 @@ Skip alignment: frames are fused as read and the output keeps the full frame
 \fB\-\-no\-crop\fR
 Skip the auto\-crop: the output keeps the full frame extent even when alignment is on
 .TP
+\fB\-\-defect\-mask\fR \fI<PATH>\fR
+A painted defect mask to repair in every frame: a grey image the size of the frames in which black pixels mark defects. Needs `\-\-set defect\-removal=true`; `defect\-grow\-radius` widens the painted spots
+.TP
 \fB\-\-strict\fR
 Refuse the run when an alignment fails. Meaningless with `\-\-no\-align`
 .TP
@@ -54,17 +57,17 @@ Print no stage progress
 \fB\-\-tile\-size\fR \fI<PX>\fR
 Override the scheduler\*(Aqs outer tile size, in pixels. Omit to use the scheduler\*(Aqs own default
 .TP
-\fB\-\-max\-host\-memory\fR \fI<SIZE>\fR
-A **ceiling only** on the adaptive host\-memory budget: it can lower the budget the host\-derived estimate resolved to, and can never raise it. Nobody has to pass this to get the machine\*(Aqs own concurrency \-\- omit it entirely and the budget is derived from the host. Accepts suffixed sizes (`8GiB`, `512MiB`, `4096`)
-.TP
 \fB\-v\fR
 Increase log detail (repeatable)
 .TP
-\fB\-\-max\-vram\fR \fI<SIZE>\fR
-A **ceiling only** on the adaptive device (VRAM) budget: it can lower the budget the startup probe settled on, and can never raise it. Omit it entirely to get the probed value. Accepts the same suffixed sizes as `\-\-max\-host\-memory`. Only present when the `gpu` feature is compiled in
+\fB\-\-max\-host\-memory\fR \fI<SIZE>\fR
+A **ceiling only** on the adaptive host\-memory budget: it can lower the budget the host\-derived estimate resolved to, and can never raise it. Nobody has to pass this to get the machine\*(Aqs own concurrency \-\- omit it entirely and the budget is derived from the host. Accepts suffixed sizes (`8GiB`, `512MiB`, `4096`)
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
 Log errors only
+.TP
+\fB\-\-max\-vram\fR \fI<SIZE>\fR
+A **ceiling only** on the adaptive device (VRAM) budget: it can lower the budget the startup probe settled on, and can never raise it. Omit it entirely to get the probed value. Accepts the same suffixed sizes as `\-\-max\-host\-memory`. Only present when the `gpu` feature is compiled in
 .TP
 \fB\-\-preset\fR \fI<PATH>\fR
 Read parameter values from a TOML preset: the `algo` and `align\-algo` keys plus the `[stack]` and `[align]` value tables. A flag always beats the file \-\- `\-\-set`/`\-\-align\-set` override the tables, `\-\-algorithm`/`\-\-align\-algorithm` override the keys

@@ -7382,6 +7382,33 @@ fn equalize_rows_reach_the_run() {
     assert_eq!(recorded.gains.len(), 3, "one gain per frame");
 }
 
+/// The job request carries defect settings only while `defect-removal` is on,
+/// with the panel's threshold and grow radius and no mask file.
+#[test]
+fn job_request_carries_defect_removal() {
+    use focusforge_core::defect_repair::DefectSettings;
+    use focusforge_core::params::ParamValue;
+
+    let mut controller = common::controller_with_frames("defect_removal_request", 3);
+    let defects = |controller: &AppController| controller.job_request_for(0).unwrap().defects;
+    assert_eq!(defects(&controller), None, "off by default");
+
+    controller.set_param_value("prepare", "defect-removal", ParamValue::Bool(true));
+    controller.set_param_value("prepare", "hot-pixel-threshold", ParamValue::Float(9.5));
+    controller.set_param_value("prepare", "defect-grow-radius", ParamValue::Int(3));
+    assert_eq!(
+        defects(&controller),
+        Some(DefectSettings {
+            hot_pixel_threshold: Some(9.5),
+            mask: None,
+            grow_radius: 3,
+        })
+    );
+
+    controller.set_param_value("prepare", "defect-removal", ParamValue::Bool(false));
+    assert_eq!(defects(&controller), None, "off again");
+}
+
 /// A frame the equalization bound clamps is reported as a record naming its
 /// file in plain words; a bound wide enough for the stack raises nothing.
 #[test]

@@ -547,6 +547,90 @@ fn raw_develop_counts_are_one_per_frame() {
     }
 }
 
+/// Repair acts on the developed frame: each masked pixel of the result is the
+/// lower median of its eight neighbours in the unrepaired run, and the
+/// develops per frame do not change.
+#[test]
+fn raw_stack_repairs_after_develop() {
+    let cwd = common::tmp_dir("stack_raw_repair");
+    let input = cwd.join("input");
+    std::fs::create_dir(&input).expect("input directory");
+    let mut spec = DngSpec::new(12, 64, 4095, [0, 1, 1, 2], Vec::new());
+    spec.width = 256;
+    spec.height = 256;
+    spec.samples = (0..256u32 * 256)
+        .map(|i| {
+            ((i % 256) * 9 + (i / 256) * 5 + i.wrapping_mul(2_654_435_761) % 300) as u16 % 4000
+        })
+        .collect();
+    let source = write_dng(&spec, false);
+    for index in 0..2 {
+        std::fs::copy(source.path(), input.join(format!("{index:02}.dng")))
+            .expect("copy RAW frame");
+    }
+    let masked = [(40u32, 30u32), (100, 128), (200, 220), (130, 60)];
+    let mask = cwd.join("mask.png");
+    common::write_defect_mask(&mask, (256, 256), &masked);
+
+    let stack = |label: &str, extra: &[&str]| {
+        let output = cwd.join(label);
+        std::fs::create_dir(&output).expect("output directory");
+        let stacked = run(&cwd, &stack_json_args(&input, &output, extra));
+        let counts = develop_counts_of(&stacked);
+        let project = common::only_project(&output);
+        (
+            counts,
+            common::read_whole(&common::export_composite(&cwd, &project)),
+        )
+    };
+    let (off_counts, (off, width, _, spp)) = stack("off", &[]);
+    let (on_counts, (on, ..)) = stack(
+        "on",
+        &[
+            "--set",
+            "defect-removal=true",
+            "--set",
+            "hot-pixels=false",
+            "--defect-mask",
+            mask.to_str().expect("UTF-8 mask"),
+        ],
+    );
+    assert_eq!(on_counts, off_counts, "repair develops nothing extra");
+
+    let mut changed = 0;
+    for &(x, y) in &masked {
+        for c in 0..spp {
+            let at = |x: u32, y: u32| off[((y * width + x) * spp + c) as usize];
+            let mut around: Vec<u16> = (y - 1..=y + 1)
+                .flat_map(|ny| (x - 1..=x + 1).map(move |nx| (nx, ny)))
+                .filter(|&p| p != (x, y))
+                .map(|(nx, ny)| at(nx, ny))
+                .collect();
+            around.sort_unstable();
+            assert_eq!(
+                on[((y * width + x) * spp + c) as usize],
+                around[3],
+                "pixel ({x}, {y}) channel {c}"
+            );
+            changed += usize::from(around[3] != at(x, y));
+        }
+    }
+    assert!(changed > 0, "the repair changed some masked sample");
+    let on_elsewhere = on
+        .iter()
+        .zip(&off)
+        .enumerate()
+        .filter(|&(i, (a, b))| {
+            a != b
+                && !masked.contains(&(
+                    ((i / spp as usize) % width as usize) as u32,
+                    ((i / spp as usize) / width as usize) as u32,
+                ))
+        })
+        .count();
+    assert_eq!(on_elsewhere, 0, "only the masked pixels change");
+}
+
 #[test]
 fn raw_develop_counts_absent_for_tiff() {
     let cwd = common::tmp_dir("stack_raw_develop_counts_tiff");

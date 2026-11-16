@@ -977,7 +977,7 @@ _focusforge__cli() {
             return 0
             ;;
         focusforge__cli__subcmd__stack)
-            opts="-o -v -q -h --output --algorithm --json --set --groups --write-groups --only --no-align --no-crop --strict --align-algorithm --align-set --resume --no-progress --tile-size --max-host-memory --max-vram --preset --write-preset --status --dry-run --cpu --no-cache --trace-accounting --quiet --help"
+            opts="-o -v -q -h --output --algorithm --json --set --groups --write-groups --only --no-align --no-crop --defect-mask --strict --align-algorithm --align-set --resume --no-progress --tile-size --max-host-memory --max-vram --preset --write-preset --status --dry-run --cpu --no-cache --trace-accounting --quiet --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -1008,6 +1008,10 @@ _focusforge__cli() {
                     return 0
                     ;;
                 --only)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --defect-mask)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

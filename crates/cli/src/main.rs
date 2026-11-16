@@ -311,6 +311,12 @@ enum Command {
         /// when alignment is on.
         #[arg(long = "no-crop", action = clap::ArgAction::SetFalse)]
         crop: bool,
+        /// A painted defect mask to repair in every frame: a grey image the
+        /// size of the frames in which black pixels mark defects. Needs
+        /// `--set defect-removal=true`; `defect-grow-radius` widens the
+        /// painted spots.
+        #[arg(long = "defect-mask", value_name = "PATH")]
+        defect_mask: Option<PathBuf>,
         /// Refuse the run when an alignment fails. Meaningless with
         /// `--no-align`.
         #[arg(long)]
@@ -751,6 +757,7 @@ fn main() -> ExitCode {
             group_args,
             align,
             crop,
+            defect_mask,
             strict,
             align_algo,
             align_set,
@@ -784,6 +791,7 @@ fn main() -> ExitCode {
                 algo.as_deref(),
                 json,
                 &set,
+                defect_mask.as_deref(),
                 &align::AlignOptions {
                     align,
                     crop,
