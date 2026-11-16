@@ -255,6 +255,7 @@ pub(super) fn full_blob<'a>(
 }
 
 use crate::algorithm::StackAlgorithm;
+use crate::defect_repair::DefectSettings;
 use crate::equalize::EqualizeSettings;
 use crate::io::raw::{HighlightClip, document_clip, narrow_document_band};
 use crate::params::{ParamDesc, ParamKind, ParamValue, ParamValues, validate};
@@ -489,6 +490,38 @@ pub fn equalization_settings(
             max_gain: read("equalize-max-gain").as_f64()?,
             target_stops: read("equalize-target").as_f64()?,
         })
+    })
+}
+
+/// The settings sensor defect repair runs with, `None` when the
+/// `defect-removal` switch is off or neither source is active: the hot-pixel
+/// detection (`hot-pixels`) and the painted mask file `mask`. An absent key
+/// reads as its default in `schema`.
+pub fn defect_settings(
+    schema: &[ParamDesc],
+    values: &ParamValues,
+    mask: Option<&Path>,
+) -> Option<DefectSettings> {
+    let read = |id: &str| {
+        let desc = schema
+            .iter()
+            .find(|d| d.id == id)
+            .expect("the project schema declares the defect parameters");
+        values.get(id).unwrap_or(&desc.default).clone()
+    };
+    read("defect-removal").as_bool().filter(|&on| on)?;
+    let hot_pixels = read("hot-pixels").as_bool()?;
+    if !hot_pixels && mask.is_none() {
+        return None;
+    }
+    Some(DefectSettings {
+        hot_pixel_threshold: if hot_pixels {
+            Some(read("hot-pixel-threshold").as_f64()?)
+        } else {
+            None
+        },
+        mask: mask.map(Path::to_path_buf),
+        grow_radius: u32::try_from(read("defect-grow-radius").as_i64()?).ok()?,
     })
 }
 
@@ -1460,5 +1493,44 @@ mod tests {
                 target_stops: -0.3
             })
         );
+    }
+
+    #[test]
+    fn defect_settings_need_the_switch_and_a_source() {
+        use crate::defect_repair::DefectSettings;
+        let schema = schema_for("laplacian");
+        let mask = Path::new("spots.tif");
+        let mut values = ParamValues::new();
+        assert_eq!(defect_settings(&schema, &values, Some(mask)), None);
+
+        values.insert("defect-removal".into(), ParamValue::Bool(true));
+        assert_eq!(
+            defect_settings(&schema, &values, None),
+            Some(DefectSettings {
+                hot_pixel_threshold: Some(HOT_PIXEL_THRESHOLD_DEFAULT),
+                mask: None,
+                grow_radius: 0,
+            })
+        );
+        values.insert("hot-pixel-threshold".into(), ParamValue::Float(9.5));
+        values.insert("defect-grow-radius".into(), ParamValue::Int(3));
+        assert_eq!(
+            defect_settings(&schema, &values, Some(mask)),
+            Some(DefectSettings {
+                hot_pixel_threshold: Some(9.5),
+                mask: Some(mask.to_path_buf()),
+                grow_radius: 3,
+            })
+        );
+        values.insert("hot-pixels".into(), ParamValue::Bool(false));
+        assert_eq!(
+            defect_settings(&schema, &values, Some(mask)),
+            Some(DefectSettings {
+                hot_pixel_threshold: None,
+                mask: Some(mask.to_path_buf()),
+                grow_radius: 3,
+            })
+        );
+        assert_eq!(defect_settings(&schema, &values, None), None);
     }
 }

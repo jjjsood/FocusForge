@@ -141,6 +141,7 @@ pub fn fuse_held_observed(
             &project::params_for(algorithm),
             &ParamValues::new(),
         ),
+        defects: None,
         tile_size: None,
         max_host_memory: None,
         backend: None,

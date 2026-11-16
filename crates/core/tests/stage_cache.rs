@@ -246,7 +246,7 @@ fn every_parameter_the_align_stage_reads_is_in_its_key() {
 fn the_align_key_is_params_plus_the_named_driver_fields() {
     assert_eq!(
         DRIVER_POLICY_FIELDS,
-        ["failure_policy", "solver_version", "gains"]
+        ["failure_policy", "solver_version", "gains", "defects"]
     );
 
     let src = include_str!("../src/job/record.rs");
@@ -264,9 +264,9 @@ fn the_align_key_is_params_plus_the_named_driver_fields() {
         .filter(|line| line.trim_start().starts_with("pub "))
         .count();
     assert_eq!(
-        pub_fields, 5,
-        "AlignIdentity must carry exactly 5 `pub` fields (algorithm, params, \
-         failure_policy, solver_version, gains) -- a field added without updating this \
+        pub_fields, 6,
+        "AlignIdentity must carry exactly 6 `pub` fields (algorithm, params, \
+         failure_policy, solver_version, gains, defects) -- a field added without updating this \
          test or DRIVER_POLICY_FIELDS silently widens the cache key:\n{block}"
     );
 }
@@ -789,7 +789,7 @@ fn next_up(x: f64) -> f64 {
 }
 
 fn eq_key(fingerprint: &StackFingerprint) -> EqualizeKey {
-    EqualizeKey::new(fingerprint, EQ_SETTINGS)
+    EqualizeKey::new(fingerprint, EQ_SETTINGS, None)
 }
 
 /// Three frames: one ordinary with a thirds-valued mean and a `-0.0`
@@ -860,6 +860,7 @@ fn equalization_key_digest_moves_with_each_input() {
                 max_gain: next_up(EQ_SETTINGS.max_gain),
                 ..EQ_SETTINGS
             },
+            None,
         )
         .digest(),
     ));
@@ -871,6 +872,7 @@ fn equalization_key_digest_moves_with_each_input() {
                 target_stops: next_up(EQ_SETTINGS.target_stops),
                 ..EQ_SETTINGS
             },
+            None,
         )
         .digest(),
     ));
@@ -1018,6 +1020,7 @@ fn equalization_entry_of_other_settings_or_frames_is_a_miss() {
             max_gain: next_up(EQ_SETTINGS.max_gain),
             ..EQ_SETTINGS
         },
+        None,
     );
     let other_stops = EqualizeKey::new(
         &fingerprint,
@@ -1025,6 +1028,7 @@ fn equalization_entry_of_other_settings_or_frames_is_a_miss() {
             target_stops: next_up(EQ_SETTINGS.target_stops),
             ..EQ_SETTINGS
         },
+        None,
     );
     let mut other_version = eq_key(&fingerprint);
     other_version.version += 1;
@@ -1044,4 +1048,70 @@ fn equalization_entry_of_other_settings_or_frames_is_a_miss() {
             "{what} differs"
         );
     }
+}
+
+#[test]
+fn equalization_cache_distinguishes_defect_repair() {
+    let fingerprint = sample_fingerprint(3);
+    let keyed = |defects: Option<&str>| {
+        EqualizeKey::new(&fingerprint, EQ_SETTINGS, defects.map(str::to_string))
+    };
+    assert_eq!(
+        keyed(None).digest(),
+        "ba8f3ba11bec1b1b6c27764883d84a1b2ee2c24604cf9d277f3373b956eecf3b",
+        "a key without a defect digest keeps the bytes it had before repair existed"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&keyed(None).canonical_bytes()).unwrap();
+    assert!(json.get("defects").is_none(), "{json}");
+    let json: serde_json::Value =
+        serde_json::from_slice(&keyed(Some("aa")).canonical_bytes()).unwrap();
+    assert_eq!(json["defects"], "aa");
+
+    let digests = [keyed(None), keyed(Some("aa")), keyed(Some("bb"))].map(|key| key.digest());
+    assert!(digests[0] != digests[1] && digests[1] != digests[2] && digests[0] != digests[2]);
+
+    for stored in [None, Some("aa")] {
+        let scratch = tmp_dir("eq-defects");
+        let cache = StageCache::open(scratch.path()).unwrap();
+        let hit = |key: &EqualizeKey| cache.get_equalization(key, sample_hash).is_some();
+        let stored = keyed(stored);
+        cache
+            .put_equalization(&stored, &[], &sample_content(3), &eq_report())
+            .unwrap();
+        assert!(hit(&stored), "{stored:?} hits itself");
+        for other in [None, Some("aa"), Some("bb")] {
+            let other = keyed(other);
+            assert_eq!(hit(&other), other == stored, "{stored:?} read as {other:?}");
+        }
+    }
+}
+
+#[test]
+fn changed_defects_change_the_align_digest() {
+    let fingerprint = sample_fingerprint(2);
+    let key = |defects: Option<&str>| {
+        let mut identity = sample_identity("ecc", FailurePolicy::Strict);
+        identity.defects = defects.map(str::to_string);
+        StageKey::align(&fingerprint, &identity)
+    };
+    let json = |defects: Option<&str>| {
+        serde_json::from_slice::<serde_json::Value>(&key(defects).canonical_bytes()).unwrap()
+    };
+    assert!(json(None).get("defects").is_none(), "off adds no key field");
+    assert_eq!(json(Some("aa"))["defects"], "aa");
+    assert_ne!(
+        key(None).digest(),
+        key(Some("aa")).digest(),
+        "repair on or off"
+    );
+    assert_ne!(
+        key(Some("aa")).digest(),
+        key(Some("bb")).digest(),
+        "another mask"
+    );
+    assert_eq!(
+        key(Some("aa")).digest(),
+        key(Some("aa")).digest(),
+        "the same mask hits"
+    );
 }

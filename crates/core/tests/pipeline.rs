@@ -22,6 +22,7 @@ use focusforge_core::algorithm::{
 };
 use focusforge_core::align::warp::WarpedTile;
 use focusforge_core::align::{AlignError, FailurePolicy, Transform};
+use focusforge_core::defect_repair::{DefectReport, DefectSettings};
 use focusforge_core::display::{PreviewCost, PreviewKind, PreviewKinds, StagePreview};
 use focusforge_core::equalize::{EqualizeSettings, UNIT_GAIN};
 use focusforge_core::fuse::laplacian::Laplacian;
@@ -98,6 +99,7 @@ fn base_request(label: &str, frames: Vec<PathBuf>, explicit: ParamValues) -> Fus
         align: None,
         crop: false,
         equalize: None,
+        defects: None,
         tile_size: Some(448),
         max_host_memory: None,
         backend: None,
@@ -4088,4 +4090,215 @@ fn raw_equalization_bypasses_the_estimate_cache() {
             "run {run_index}: no entry directory for a RAW stack"
         );
     }
+}
+
+/// A grey 8-bit PNG of `size` pixels, white except the `black` positions.
+fn write_defect_png(path: &Path, size: (u32, u32), black: &[(u32, u32)]) {
+    let mut pixels = vec![255u8; size.0 as usize * size.1 as usize];
+    for &(x, y) in black {
+        pixels[y as usize * size.0 as usize + x as usize] = 0;
+    }
+    let mut encoder = png::Encoder::new(
+        std::io::BufWriter::new(std::fs::File::create(path).expect("the mask file is creatable")),
+        size.0,
+        size.1,
+    );
+    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .and_then(|mut writer| writer.write_image_data(&pixels))
+        .expect("the mask file is writable");
+}
+
+fn defect_run(
+    label: &str,
+    frames: &[PathBuf],
+    root: &Path,
+    defects: Option<DefectSettings>,
+    observer: &dyn StageObserver,
+    cache: Option<&StageCache>,
+) -> Result<Box<FuseReport>, PipelineError> {
+    let mut request = base_request(label, frames.to_vec(), ParamValues::new());
+    request.scratch_root = root.join("scratch");
+    request.align = Some(dummy_align_request());
+    request.output = FuseOutput::Hold(root.join(label));
+    request.defects = defects;
+    match focusforge_core::pipeline::run(&request, observer, JobControl::new(), cache)? {
+        FuseOutcome::Completed(report) => Ok(report),
+        FuseOutcome::Cancelled { .. } => panic!("the run was not cancelled"),
+    }
+}
+
+fn composite_bytes(report: &FuseReport) -> Vec<u8> {
+    let FuseProduct::Held(held) = &report.product else {
+        panic!("a held run");
+    };
+    std::fs::read(&held.composite).expect("the composite is readable")
+}
+
+/// Records the sources of every Prepare stage announced.
+#[derive(Default)]
+struct PrepareSources(Mutex<Vec<PrepareSource>>);
+
+impl StageObserver for PrepareSources {
+    fn stage(&self, stage: RunStage) {
+        if let RunStage::Prepare { source, .. } = stage {
+            self.0.lock().expect("no panic while logging").push(source);
+        }
+    }
+}
+
+#[test]
+fn defect_repair_counts_the_union_of_both_sources() {
+    let dir = common::fixtures_dir().join("mantis-512-hot-pixels");
+    let mut frames: Vec<PathBuf> = std::fs::read_dir(dir.join("frames"))
+        .expect("the frames directory exists")
+        .map(|entry| entry.expect("a directory entry").path())
+        .collect();
+    frames.sort();
+    let mask_file = dir.join("defect-mask.tif");
+    let budget = focusforge_core::tile::HostBudget::explicit(1 << 30);
+    let size = (512, 512);
+
+    let set = focusforge_core::io::open_frame_set(&frames, budget).expect("the frames open");
+    let mut union = focusforge_core::hot_pixels::detect(
+        set.reader.as_ref(),
+        frames.len(),
+        size,
+        3,
+        7.0,
+        2,
+        &AtomicUsize::new(0),
+        &|| false,
+    )
+    .expect("detection runs");
+    let detected = union.count();
+    let file = focusforge_core::defect_mask::load(&mask_file, size, 2, budget)
+        .expect("the mask file loads");
+    union.union_with(&file);
+    assert!(detected > 0 && file.count() > 0 && union.count() > detected);
+
+    let root = scratch("defect_union");
+    let sources = PrepareSources::default();
+    let settings = DefectSettings {
+        hot_pixel_threshold: Some(7.0),
+        mask: Some(mask_file),
+        grow_radius: 2,
+    };
+    let report = defect_run("on", &frames, &root, Some(settings), &sources, None)
+        .expect("the run completes");
+    assert_eq!(
+        report.defects,
+        Some(DefectReport {
+            repaired: union.count(),
+            detected: Some(detected),
+            file: Some(file.count()),
+        })
+    );
+    assert_eq!(
+        *sources.0.lock().unwrap(),
+        [PrepareSource::HotPixels],
+        "detection is its own Prepare stage"
+    );
+
+    let off =
+        defect_run("off", &frames, &root, None, &NoopObserver, None).expect("the run completes");
+    assert_eq!(off.defects, None);
+    assert_ne!(composite_bytes(&report), composite_bytes(&off));
+}
+
+#[test]
+fn a_refused_defect_mask_stops_the_run_before_develop_or_fusion() {
+    let root = scratch("defect_bad_mask");
+    let mask_file = root.join("mask.png");
+    let frames = mantis_64_frames(3);
+    let settings = || DefectSettings {
+        hot_pixel_threshold: None,
+        mask: Some(mask_file.clone()),
+        grow_radius: 0,
+    };
+
+    // A run with a usable mask announces stages, so an empty log below means
+    // the run stopped before the first one.
+    write_defect_png(&mask_file, (64, 64), &[(3, 3)]);
+    let control = StageLog::default();
+    defect_run("good", &frames, &root, Some(settings()), &control, None)
+        .expect("a mask of the frame size is accepted");
+    assert!(
+        control.stages.lock().unwrap().contains(&"fuse"),
+        "the observer sees the stages of a completed run"
+    );
+
+    write_defect_png(&mask_file, (64, 63), &[(3, 3)]);
+    let log = StageLog::default();
+    let error = defect_run("bad", &frames, &root, Some(settings()), &log, None)
+        .err()
+        .expect("a mask of another size is refused");
+    assert!(matches!(error, PipelineError::DefectMask(_)), "{error:?}");
+    let text = error.to_string();
+    assert!(
+        text.contains(&mask_file.display().to_string()) && text.contains("64×63"),
+        "{text}"
+    );
+    assert!(!root.join("bad").exists(), "no result was written");
+    assert_eq!(
+        *log.stages.lock().unwrap(),
+        Vec::<&str>::new(),
+        "no stage was announced"
+    );
+
+    // An all-black mask leaves no pixel to repair from.
+    let everything: Vec<(u32, u32)> = (0..64 * 64).map(|at| (at % 64, at / 64)).collect();
+    write_defect_png(&mask_file, (64, 64), &everything);
+    let log = StageLog::default();
+    let error = defect_run("black", &frames, &root, Some(settings()), &log, None)
+        .err()
+        .expect("a mask covering the frame is refused");
+    let text = error.to_string();
+    assert!(
+        text.contains(&mask_file.display().to_string()) && text.contains("(0, 0)"),
+        "{text}"
+    );
+    assert!(!root.join("black").exists(), "no result was written");
+    assert_eq!(
+        *log.stages.lock().unwrap(),
+        Vec::<&str>::new(),
+        "no stage was announced"
+    );
+}
+
+#[test]
+fn defect_repair_is_part_of_the_cached_alignment_identity() {
+    let frames = mantis_64_frames(3);
+    let root = scratch("defect_cache");
+    let cache = StageCache::open(&root.join("scratch")).expect("the stage cache opens");
+    let spots = root.join("spots.png");
+    let clean = root.join("clean.png");
+    write_defect_png(&spots, (64, 64), &[(10, 10), (11, 10), (40, 33)]);
+    write_defect_png(&clean, (64, 64), &[]);
+    let run = |label: &str, mask: Option<&Path>| {
+        let settings = mask.map(|path| DefectSettings {
+            hot_pixel_threshold: None,
+            mask: Some(path.to_path_buf()),
+            grow_radius: 0,
+        });
+        defect_run(label, &frames, &root, settings, &NoopObserver, Some(&cache))
+            .expect("the run completes")
+    };
+    assert!(!run("off", None).align_cached);
+    let on = run("spots", Some(&spots));
+    assert!(!on.align_cached, "a repaired source is another input");
+    assert_eq!(on.defects.map(|d| d.repaired), Some(3));
+    assert!(run("spots-again", Some(&spots)).align_cached);
+    assert!(
+        run("off-again", None).align_cached,
+        "the unrepaired entry is intact"
+    );
+    let empty = run("clean", Some(&clean));
+    assert_eq!(empty.defects.map(|d| d.repaired), Some(0));
+    assert!(
+        empty.align_cached,
+        "an empty union keeps the unrepaired identity"
+    );
 }

@@ -115,6 +115,7 @@ fn leave_a_cancelled_run_ledger(cwd: &Path) -> PathBuf {
         align: None,
         crop: None,
         equalization: None,
+        defects: None,
         composite_output: PathBuf::from("leftover.ffp"),
         zmap_output: None,
     };

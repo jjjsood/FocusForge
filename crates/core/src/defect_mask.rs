@@ -70,6 +70,33 @@ impl DefectMask {
         self.bits[at / 64] |= 1 << (at % 64);
     }
 
+    /// Sets every position set in `other`.
+    ///
+    /// # Panics
+    /// When the masks are not the same size.
+    pub fn union_with(&mut self, other: &DefectMask) {
+        assert_eq!(
+            (self.width, self.height),
+            (other.width, other.height),
+            "a union needs masks of the same size"
+        );
+        for (word, other) in self.bits.iter_mut().zip(&other.bits) {
+            *word |= other;
+        }
+    }
+
+    /// A blake3 digest, 64 hex characters, of the frame size and the set
+    /// positions: equal for equal masks and different for any other.
+    pub fn digest(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.width.to_le_bytes());
+        hasher.update(&self.height.to_le_bytes());
+        for word in &self.bits {
+            hasher.update(&word.to_le_bytes());
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+
     /// The set positions as `(x, y)`, row by row.
     pub fn positions(&self) -> Vec<(u32, u32)> {
         let width = self.width as usize;
@@ -171,10 +198,12 @@ pub enum DefectMaskError {
     /// The mask is not exactly the frames' size; it is never cropped, scaled
     /// or rotated to fit.
     #[error(
-        "the defect mask is {}×{} pixels but the frames are {}×{}; the mask must be the frames' size",
-        mask.0, mask.1, frames.0, frames.1
+        "{}: the defect mask is {}×{} pixels but the frames are {}×{}; the mask must be the frames' size",
+        path.display(), mask.0, mask.1, frames.0, frames.1
     )]
     SizeMismatch {
+        /// The file.
+        path: PathBuf,
         /// The mask's width and height.
         mask: (u32, u32),
         /// The frames' width and height.
@@ -258,6 +287,7 @@ fn decode_frames(
     let size = reader.dimensions();
     if size != frame {
         return Err(DefectMaskError::SizeMismatch {
+            path: path.to_path_buf(),
             mask: size,
             frames: frame,
         });
@@ -301,6 +331,7 @@ fn decode_png(path: &Path, frame: (u32, u32)) -> Result<DefectMask, DefectMaskEr
     let size = (reader.info().width, reader.info().height);
     if size != frame {
         return Err(DefectMaskError::SizeMismatch {
+            path: path.to_path_buf(),
             mask: size,
             frames: frame,
         });
@@ -383,6 +414,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn union_sets_every_position_of_either_mask() {
+        let a = random_mask(131, 47, 5, 1);
+        let b = random_mask(131, 47, 5, 2);
+        let mut union = a.clone();
+        union.union_with(&b);
+        let mut want = a.positions();
+        want.extend(b.positions());
+        want.sort_unstable_by_key(|&(x, y)| (y, x));
+        want.dedup();
+        assert_eq!(union.positions(), want);
+    }
+
+    #[test]
+    #[should_panic(expected = "same size")]
+    fn union_refuses_a_mask_of_another_size() {
+        DefectMask::new(8, 8).union_with(&DefectMask::new(8, 9));
+    }
+
+    #[test]
+    fn digest_tells_masks_and_sizes_apart() {
+        let mut one = DefectMask::new(10, 6);
+        one.insert(3, 2);
+        let mut other = DefectMask::new(10, 6);
+        other.insert(4, 2);
+        // The same 60 bits read as another frame shape.
+        let mut reshaped = DefectMask::new(6, 10);
+        reshaped.insert(3, 2);
+        let digests = [
+            one.digest(),
+            other.digest(),
+            reshaped.digest(),
+            DefectMask::new(10, 6).digest(),
+        ];
+        for (at, digest) in digests.iter().enumerate() {
+            assert_eq!(digest.len(), 64);
+            assert!(
+                digests[..at].iter().all(|earlier| earlier != digest),
+                "{at}"
+            );
+        }
+        assert_eq!(one.digest(), one.clone().digest());
     }
 
     #[test]
@@ -729,7 +804,9 @@ mod tests {
         for path in &files {
             for frames in [(23, 37), (38, 23), (37, 22), (37, 24), (512, 512)] {
                 match rejected(path, frames) {
-                    DefectMaskError::SizeMismatch { mask, frames: got } => {
+                    DefectMaskError::SizeMismatch {
+                        mask, frames: got, ..
+                    } => {
                         assert_eq!((mask, got), (SIZE, frames), "{}", path.display());
                     }
                     other => panic!("{}: expected a size mismatch, got {other}", path.display()),
@@ -738,7 +815,10 @@ mod tests {
         }
         assert_eq!(
             rejected(&files[0], (512, 512)).to_string(),
-            "the defect mask is 37×23 pixels but the frames are 512×512; the mask must be the frames' size"
+            format!(
+                "{}: the defect mask is 37×23 pixels but the frames are 512×512; the mask must be the frames' size",
+                files[0].display()
+            )
         );
     }
 

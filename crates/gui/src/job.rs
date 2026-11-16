@@ -642,6 +642,7 @@ pub fn fuse_request(
         align,
         crop: request.crop,
         equalize: request.equalize,
+        defects: None,
         tile_size: None,
         max_host_memory: request.max_host_memory,
         backend,

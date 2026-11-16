@@ -1274,6 +1274,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                 .and_then(ParamValue::as_bool)
                 .unwrap_or(true),
         equalize: *equalize,
+        defects: None,
         tile_size: job_opts.tile_size,
         max_host_memory,
         backend,
@@ -1390,6 +1391,14 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
             } => renderer.stage(&format!(
                 "prepare {frames} frames (reused from the stage cache)"
             )),
+            RunStage::Prepare {
+                frames,
+                source: PrepareSource::HotPixels,
+                ..
+            } => {
+                renderer.stage(&format!("prepare {frames} frames (hot pixels)"));
+                renderer.start(&self.control.progress());
+            }
             // A peeked (resumed) alignment prints nothing -- it cost no
             // wall time and is not a stage a viewer is waiting through.
             RunStage::Align {

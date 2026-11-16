@@ -2005,6 +2005,7 @@ fn raw_request(
         align: None,
         crop: false,
         equalize,
+        defects: None,
         tile_size: Some(160),
         max_host_memory,
         backend: None,

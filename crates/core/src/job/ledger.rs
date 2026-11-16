@@ -489,6 +489,12 @@ impl ResumeStore {
             );
             check_identity!(
                 candidate.composite_output,
+                "defects",
+                candidate.defects,
+                record.defects
+            );
+            check_identity!(
+                candidate.composite_output,
                 "align",
                 candidate.align,
                 record.align
@@ -575,6 +581,7 @@ impl TileConsumer for TimingConsumer<'_> {
 mod tests {
     use super::*;
     use crate::job::fingerprint::StackFingerprint;
+    use crate::job::record::AlignIdentity;
     use std::path::PathBuf as StdPathBuf;
     use std::process;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -600,6 +607,7 @@ mod tests {
             align: None,
             crop: None,
             equalization: None,
+            defects: None,
             composite_output: output,
             zmap_output: None,
         }
@@ -687,6 +695,54 @@ mod tests {
             other => panic!("expected a backend mismatch, got {other:?}"),
         }
         let _ = fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn resume_refuses_another_defect_digest() {
+        let identity = |defects: Option<&str>| {
+            let mut identity = AlignIdentity::new(
+                "ecc",
+                crate::params::ParamValues::new(),
+                crate::align::FailurePolicy::Strict,
+                Vec::new(),
+            );
+            identity.defects = defects.map(str::to_string);
+            identity
+        };
+        for with_align in [false, true] {
+            for (begun, found) in [
+                (None, Some("aa")),
+                (Some("aa"), None),
+                (Some("aa"), Some("bb")),
+            ] {
+                // `find` reports the first stored record that disagrees, so
+                // each pair gets a store of its own.
+                let scratch = tmp_dir("changed-defects");
+                let store = ResumeStore::open(&scratch).unwrap();
+                let mut record = sample_record(&scratch, "out.tif");
+                record.defects = begun.map(str::to_string);
+                record.align = with_align.then(|| identity(begun));
+                let ledger = store.begin(&record).unwrap();
+                ledger.record_unit(0).unwrap();
+                drop(ledger);
+
+                let mut moved = record.clone();
+                moved.defects = found.map(str::to_string);
+                moved.align = with_align.then(|| identity(found));
+                match store.find(&moved).unwrap() {
+                    Resumable::Mismatch(mismatch) => {
+                        let text = mismatch.to_string();
+                        assert!(
+                            text.contains("defects changed"),
+                            "{begun:?} to {found:?}, align {with_align}: {text}"
+                        );
+                    }
+                    other => panic!("expected a defects mismatch, got {other:?}"),
+                }
+                assert!(matches!(store.find(&record).unwrap(), Resumable::Ledger(_)));
+                let _ = fs::remove_dir_all(&scratch);
+            }
+        }
     }
 
     #[test]

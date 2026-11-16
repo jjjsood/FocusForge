@@ -182,6 +182,8 @@ struct KeyMirror<'a> {
     failure_policy: crate::align::FailurePolicy,
     solver_version: u32,
     gains: &'a [u32],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    defects: Option<&'a str>,
 }
 
 /// A stage's cache key: the path-free projection of a [`StackFingerprint`]
@@ -192,11 +194,12 @@ struct KeyMirror<'a> {
 /// [`FrameKey`]), [`AlignIdentity::algorithm`], `AlignIdentity::params`
 /// (`AlignAlgorithm::params()`'s resolved values, nothing else), and the
 /// named driver fields, `AlignIdentity::failure_policy`,
-/// `AlignIdentity::solver_version` and `AlignIdentity::gains`
+/// `AlignIdentity::solver_version`, `AlignIdentity::gains` and
+/// `AlignIdentity::defects`
 /// ([`DRIVER_POLICY_FIELDS`](super::record::DRIVER_POLICY_FIELDS)). An entry
 /// stores only the key's digest, so the solver revision lets an alignment
-/// computed by another revision miss, and other brightness gains let an
-/// alignment of differently prepared sources miss.
+/// computed by another revision miss, and other brightness gains or another
+/// defect mask let an alignment of differently prepared sources miss.
 ///
 /// **Deliberately not in the key**, by name: `path` and `mtime` (a moved, renamed or touched
 /// input frame still hits); the frames' content hashes (the entry holds them and
@@ -247,6 +250,7 @@ impl StageKey {
             failure_policy: self.align.failure_policy,
             solver_version: self.align.solver_version,
             gains: &self.align.gains,
+            defects: self.align.defects.as_deref(),
         };
         serde_json::to_vec(&mirror).expect("KeyMirror serialization cannot fail")
     }
@@ -266,6 +270,8 @@ struct EqualizeKeyMirror<'a> {
     max_gain_bits: u64,
     target_stops_bits: u64,
     version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    defects: Option<&'a str>,
 }
 
 /// The equalization estimate's cache key: the path-free projection of a
@@ -279,17 +285,26 @@ pub struct EqualizeKey {
     pub max_gain: f64,
     pub target_stops: f64,
     pub version: u32,
+    /// The digest of the defect mask the sources are read repaired with;
+    /// `None` when they are read as delivered.
+    pub defects: Option<String>,
 }
 
 impl EqualizeKey {
-    /// `fingerprint`'s projection with `settings` and the current
-    /// [`EQUALIZE_ESTIMATE_VERSION`].
-    pub fn new(fingerprint: &StackFingerprint, settings: EqualizeSettings) -> Self {
+    /// `fingerprint`'s projection with `settings`, the current
+    /// [`EQUALIZE_ESTIMATE_VERSION`] and the digest of the defect mask the
+    /// estimate reads through, if any.
+    pub fn new(
+        fingerprint: &StackFingerprint,
+        settings: EqualizeSettings,
+        defects: Option<String>,
+    ) -> Self {
         EqualizeKey {
             frames: fingerprint.frames.iter().map(FrameKey::from).collect(),
             max_gain: settings.max_gain,
             target_stops: settings.target_stops,
             version: EQUALIZE_ESTIMATE_VERSION,
+            defects,
         }
     }
 
@@ -301,6 +316,7 @@ impl EqualizeKey {
             max_gain_bits: self.max_gain.to_bits(),
             target_stops_bits: self.target_stops.to_bits(),
             version: self.version,
+            defects: self.defects.as_deref(),
         };
         serde_json::to_vec(&mirror).expect("EqualizeKeyMirror serialization cannot fail")
     }
