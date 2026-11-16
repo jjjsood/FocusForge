@@ -55,7 +55,7 @@ Start: --open fixtures/mantis-64/frames
     Expect: the field shows a non-empty path text (the field is narrower than the path, so its end is cut off); the result line (`FFDiagnosticsPanel::message`) is empty and **Create bundle** is listed enabled (read with `buttons AppWindow::settings-modal`).
 ## About
 25. Click **About** (`FFNavRailEntry::area` 5).
-    Expect: the heading "FOCUSFORGE" shows "Version" with a version number of the form "0.1.0", with or without a pre-release suffix such as "-rc.1" and "License" with "GPL-3.0"; the heading "NOTICE" shows the line "Copyright © 2026 Johannes Sood" and a paragraph starting "FocusForge is free software"; the row "Source" shows the accent-coloured text "github.com/jjjsood/FocusForge" (within 1 s).
+    Expect: the heading "FOCUSFORGE" shows "Version" with a version number of the form MAJOR.MINOR.PATCH (for example "0.2.1"), with or without a pre-release suffix such as "-rc.1" and "License" with "GPL-3.0"; the heading "NOTICE" shows the line "Copyright © 2026 Johannes Sood" and a paragraph starting "FocusForge is free software"; the row "Source" shows the accent-coloured text "github.com/jjjsood/FocusForge" (within 1 s).
 ## The backend line after a fuse with the GPU switch off
 26. Press Escape (step 24 focused the "Save to" field and step 25 switched to About).
     Expect: the "Settings" window and its rail are gone; the canvas panes are visible again (within 1 s).
