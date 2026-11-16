@@ -901,4 +901,20 @@ mod tests {
         assert_eq!(grown.count(), 200);
         assert_eq!(grown, brute_grow(&painted, 2));
     }
+
+    #[test]
+    #[ignore = "measurement: prints the wall time of grow(16) on a full 44.8 MP mask"]
+    fn grow_of_a_black_full_frame_mask_at_radius_16() {
+        let (width, height) = (8192, 5464);
+        let mut mask = DefectMask::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                mask.insert(x, y);
+            }
+        }
+        let start = std::time::Instant::now();
+        let grown = mask.grow(16);
+        eprintln!("grow(16) on {width}x{height}: {:?}", start.elapsed());
+        assert_eq!(grown.count(), width as usize * height as usize);
+    }
 }

@@ -139,7 +139,7 @@ run:
 | `equalize-max-gain` | 1.01 to 2.0 | `1.25` | the largest gain a frame may get |
 | `equalize-target` | -0.5 to 0.5 | `0.0` | the shared brightness target in stops from the frames' average |
 | `defect-removal` | `true` / `false` | `false` | replace stuck, hot and dead sensor pixels in every frame from their neighbours before alignment; the source files are not changed. The report counts the replaced pixels (`defects=` in the text report, `defects` in `--json`) |
-| `hot-pixels` | `true` / `false` | `true` | with `defect-removal` on, find the hot pixels of the frames automatically (see [`hot-pixels`](#hot-pixels)) |
+| `hot-pixels` | `true` / `false` | `true` | with `defect-removal` on, find the hot pixels of the frames automatically (see [`hot-pixels`](#hot-pixels)); on a colour RAW stack every pixel found is replaced together with its four direct neighbours, which developing the colour filter array may have tinted, and `detected=` counts them all |
 | `hot-pixel-threshold` | 2.0 to 50.0 | `7.0` | how many times its neighbourhood's spread a pixel must differ from the neighbourhood's median to count as a hot pixel; higher finds fewer |
 | `defect-grow-radius` | 0 to 16 | `0` | widen every pixel painted in the `--defect-mask` file by this many pixels |
 

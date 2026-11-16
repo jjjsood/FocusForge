@@ -27,7 +27,7 @@ use crate::align::{
     StackAlignment, Transform, WarpingReader, align_stack_with, auto_crop,
 };
 use crate::defect_mask::{self, DefectMask, DefectMaskError};
-use crate::defect_repair::{self, DefectReport, DefectSettings, RepairReader};
+use crate::defect_repair::{self, DEMOSAIC_REACH, DefectReport, DefectSettings, RepairReader};
 use crate::display::{PreviewCost, PreviewFeed, PreviewKinds, StagePreview};
 use crate::equalize::{self, EqualizationReport, EqualizeSettings, GainReader};
 use crate::fuse::consumer::written_rect;
@@ -928,6 +928,14 @@ pub fn run(
         }
         None => None,
     };
+    // Demosaicing has tinted the neighbours of a hot photosite.
+    let detected = detected.map(|mask| {
+        if frame_reader.demosaics() {
+            mask.grow(DEMOSAIC_REACH)
+        } else {
+            mask
+        }
+    });
     let defect_report = request.defects.as_ref().map(|_| {
         let mut union = DefectMask::new(width, height);
         for mask in detected.iter().chain(&file_mask) {

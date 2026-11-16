@@ -20,6 +20,11 @@ use crate::tile::{Rect, SampleFormat};
 /// mask that covers most of a frame is refused instead of read whole.
 pub const MAX_REPAIR_REACH: u32 = 64;
 
+/// The radius of the disc around a detected pixel that demosaicing a colour
+/// filter array leaves tinted: its direct neighbours, measured on real Bayer
+/// frames.
+pub const DEMOSAIC_REACH: u32 = 1;
+
 /// What a run repairs and where the defects come from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DefectSettings {

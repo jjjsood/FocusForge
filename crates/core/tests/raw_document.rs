@@ -26,7 +26,7 @@ use focusforge_core::project::{
     self, BlobKind, CheckpointImage, HeldCheckpoint, InMemoryCheckpoint, InMemoryKind, Metrics, Op,
     PendingState, Point, Project, ProjectError, SealRequest,
 };
-use focusforge_core::tile::{Sample, SampleFormat};
+use focusforge_core::tile::Sample;
 use focusforge_core::zmap::{ZMapInfo, ZMapWriter};
 use raw_dng::{DngSpec, write_dng};
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
@@ -93,18 +93,6 @@ fn dng_frames_with(
 
 fn paths(frames: &[tempfile::NamedTempFile]) -> Vec<PathBuf> {
     frames.iter().map(|f| f.path().to_path_buf()).collect()
-}
-
-fn read_f32(path: &Path) -> Vec<f32> {
-    let stack = TiffStack::open_staged(path).unwrap();
-    assert_eq!(stack.sample_format(), SampleFormat::F32, "{path:?}");
-    let (width, height) = stack.dimensions();
-    let spp = stack.header(0).samples_per_pixel;
-    let mut samples = vec![0f32; (width * height * spp) as usize];
-    stack
-        .read_tile_f32_into(0, full(width, height), &mut samples)
-        .unwrap();
-    samples
 }
 
 fn bits(samples: &[f32]) -> Vec<u32> {
@@ -200,7 +188,7 @@ fn stroked_raw(name: &str) -> StrokedRaw {
     let frames = dng_frames(3, width, height);
     let dir = tmp_dir(name);
     let held = common::fuse_held(&paths(&frames), "weighted-average", false, &dir);
-    let staged = read_f32(&held.composite);
+    let staged = common::read_f32(&held.composite);
     assert!(
         staged.iter().any(|&s| s > 65_535.0),
         "headroom precondition"
@@ -368,7 +356,7 @@ fn raw_exports_clip_once() {
     let clip = highlight_clip(&paths(&raw.frames)[0], &[])
         .unwrap()
         .expect("a colour RAW source has a clip");
-    let staged = read_f32(&raw.held.composite);
+    let staged = common::read_f32(&raw.held.composite);
     let held = raw.held.clone();
     check_exports(&dir, "held", &clip, &staged, size, &mut |path, options| {
         project::export_held(&held, path, options, &meta).unwrap();
@@ -399,7 +387,7 @@ fn raw_view_render_keeps_headroom() {
     let view = dir.join("view.tif");
     project::render_checkpoint(&mut raw.project, &raw.edited, &view, None).unwrap();
     assert_eq!(
-        bits(&read_f32(&view)),
+        bits(&common::read_f32(&view)),
         bits(&raw.edited_f32),
         "the view render is the f32 render"
     );
@@ -429,7 +417,7 @@ fn raw_document_keeps_headroom() {
         let dir = tmp_dir(&format!("raw_document_headroom_{method}_{count}_{width}"));
         let held = common::fuse_held(&paths(&frames), method, false, &dir);
 
-        let staged = read_f32(&held.composite);
+        let staged = common::read_f32(&held.composite);
         assert!(
             staged.iter().any(|&s| s > 65_535.0),
             "{label}: a staged sample above white"
@@ -477,7 +465,7 @@ fn one_render_for_held_saved_and_pending() {
     let sources = paths(&frames);
     let dir = tmp_dir("raw_document_one_render");
     let held = common::fuse_held(&sources, "weighted-average", false, &dir);
-    let staged = read_f32(&held.composite);
+    let staged = common::read_f32(&held.composite);
     assert!(
         staged.iter().any(|&s| s > 65_535.0),
         "headroom precondition"
@@ -1047,7 +1035,7 @@ fn dng_same_document_as_render() {
     let held_path = dir.join("held.dng");
     project::export_held(&raw.held, &held_path, &ExportOptions::Dng, &meta).unwrap();
     let held = read_dng(&held_path).samples();
-    let staged = read_f32(&raw.held.composite);
+    let staged = common::read_f32(&raw.held.composite);
     assert_within(&held, &camera_16bit(&look, &staged), 1, "held");
 
     let pending_path = dir.join("pending.dng");
@@ -1098,7 +1086,7 @@ fn dng_keeps_highlights() {
     let path = dir.join("held.dng");
     project::export_held(&raw.held, &path, &ExportOptions::Dng, &dng_meta(true)).unwrap();
     let dng = read_dng(&path).samples();
-    let tiff = narrowed(&read_f32(&raw.held.composite));
+    let tiff = narrowed(&common::read_f32(&raw.held.composite));
 
     let kept = (0..tiff.len()).any(|i| {
         let pixel = &dng[i / 3 * 3..i / 3 * 3 + 3];
@@ -1297,7 +1285,7 @@ fn raw_highlight_clip_document() {
     let frames = patch_frames(3);
     let dir = tmp_dir("raw_highlight_clip_document");
     let held = common::fuse_held(&paths(&frames), "weighted-average", false, &dir);
-    let samples = read_f32(&held.composite);
+    let samples = common::read_f32(&held.composite);
     let clip = highlight_clip(&paths(&frames)[0], &[])
         .unwrap()
         .expect("a colour RAW source has a clip");
@@ -1348,7 +1336,7 @@ fn raw_highlight_clip_below_white_level() {
     });
     let dir = tmp_dir("raw_highlight_clip_below_white_level");
     let held = common::fuse_held(&paths(&frames), "weighted-average", false, &dir);
-    let samples = read_f32(&held.composite);
+    let samples = common::read_f32(&held.composite);
     let clip = highlight_clip(&paths(&frames)[0], &[])
         .unwrap()
         .expect("a colour RAW source has a clip");
@@ -1510,7 +1498,7 @@ fn raw_exports_clip_highlight() {
     let frames = patch_frames(3);
     let dir = tmp_dir("raw_exports_clip_highlight");
     let held = common::fuse_held(&paths(&frames), "weighted-average", false, &dir);
-    let staged = read_f32(&held.composite);
+    let staged = common::read_f32(&held.composite);
     let plain = narrowed(&staged);
     let out = dir.join("held.tif");
     project::export_held(&held, &out, &tiff16(), &NO_METADATA).unwrap();
@@ -1614,7 +1602,7 @@ fn raw_reopened_project_clips_like_held() {
     let frames = patch_frames(3);
     let dir = tmp_dir("raw_reopened_project_clips_like_held");
     let held = common::fuse_held(&paths(&frames), "weighted-average", false, &dir);
-    let plain = narrowed(&read_f32(&held.composite));
+    let plain = narrowed(&common::read_f32(&held.composite));
     let out = dir.join("held.tif");
     project::export_held(&held, &out, &tiff16(), &NO_METADATA).unwrap();
     let clipped = read_u16(&out);
