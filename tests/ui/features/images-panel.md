@@ -15,4 +15,4 @@ Gotchas:
 - Human only: dragging a row in List, the native file dialog behind the add icon, wheel scrolling the list, judging the frame thumbnails.
 Guides: 10-images-panel.md, 13-source-image-views.md, 19-editor-source-list.md
 Book: guide/images-panel.md#the-frame-list, guide/images-panel.md#choose-how-the-list-looks
-Sources: crates/ui/ui/shell/dock/images_panel.slint, crates/gui/src/images.rs, crates/gui/src/source_previews.rs
+Sources: crates/ui/ui/shell/dock/images_panel.slint, crates/gui/src/images.rs, crates/gui/src/source_previews.rs, crates/ui/ui/shell/dock.slint

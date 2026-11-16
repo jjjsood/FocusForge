@@ -977,12 +977,12 @@ fn a_one_group_run_writes_a_manifest_too() {
     assert_eq!(groups[0]["outcome"], "completed");
 }
 
-/// Every group document in the `groups` wrapper carries its own `run_plan` and
-/// the process-wide counters as they stand at the end of that group; a failed
-/// run prints no document.
+/// Every group document in the `groups` wrapper carries its own frame count
+/// and the process-wide counters as they stand at the end of that group; a
+/// failed run prints no document.
 #[test]
-fn groups_json_carries_run_plan_and_trace_accounting() {
-    let dump = common::tmp_dir("groups_cli_run_plan");
+fn groups_json_carries_trace_accounting_per_group() {
+    let dump = common::tmp_dir("groups_cli_trace_accounting");
     for (file, when) in [
         ("IMG_9801.tif", "2026:08:29 18:42:41"),
         ("IMG_9802.tif", "2026:08:29 18:42:42"),
@@ -992,8 +992,8 @@ fn groups_json_carries_run_plan_and_trace_accounting() {
     ] {
         frame(&dump, file, Some(when));
     }
-    let out_dir = common::tmp_dir("groups_cli_run_plan_out");
-    let cwd = common::tmp_dir("groups_cli_run_plan_cwd");
+    let out_dir = common::tmp_dir("groups_cli_trace_accounting_out");
+    let cwd = common::tmp_dir("groups_cli_trace_accounting_cwd");
     let out = run_cli_in(
         &cwd,
         &[
@@ -1014,9 +1014,9 @@ fn groups_json_carries_run_plan_and_trace_accounting() {
     let groups = wrapped["groups"].as_array().expect("a groups array");
     let counts: Vec<u64> = groups
         .iter()
-        .map(|g| g["run_plan"]["frame_count"].as_u64().expect("frame_count"))
+        .map(|g| g["frame_count"].as_u64().expect("frame_count"))
         .collect();
-    assert_eq!(counts, [2, 3], "each group's run_plan is its own");
+    assert_eq!(counts, [2, 3], "each group reports its own frame count");
     let decoded: Vec<u64> = groups
         .iter()
         .map(|g| {

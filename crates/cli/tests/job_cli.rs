@@ -25,12 +25,11 @@ use std::process::{Child, Command, Stdio};
 use common::{CliOutput, bin, export_composite, mantis_512_dir, read_pixels, tmp_dir};
 
 fn run_cli_in(dir: &Path, args: &[&str]) -> CliOutput {
-    common::run_in(bin().env("FOCUSFORGE_SHOW_ETA", "1"), dir, args)
+    common::run_in(&mut bin(), dir, args)
 }
 
 fn spawn_piped(dir: &Path, args: &[&str]) -> Child {
     bin()
-        .env("FOCUSFORGE_SHOW_ETA", "1")
         .args(args)
         .current_dir(dir)
         .stdout(Stdio::piped())
@@ -173,9 +172,9 @@ fn count_lines(stderr: &str) -> Vec<&str> {
 }
 
 #[test]
-fn stage_lines_carry_no_eta_unless_the_eta_display_is_on() {
-    let dir = tmp_dir("job_cli_eta_display");
+fn stage_lines_never_carry_an_eta() {
     let frames = common::fixtures_dir().join("mantis-64");
+    let dir = tmp_dir("job_cli_stage_lines");
     let args = common::push_no_gpu(vec![
         "stack",
         frames.to_str().unwrap(),
@@ -188,52 +187,25 @@ fn stage_lines_carry_no_eta_unless_the_eta_display_is_on() {
         "--set",
         "equalize=true",
     ]);
-
-    let off = common::run_in(bin().env_remove("FOCUSFORGE_SHOW_ETA"), &dir, &args);
-    assert!(off.success, "stderr: {}", off.stderr);
-    assert!(!off.stderr.contains(" eta "), "display off: {}", off.stderr);
-    let counts = count_lines(&off.stderr);
+    let run = common::run_in(&mut bin(), &dir, &args);
+    assert!(run.success, "stderr: {}", run.stderr);
+    assert!(!run.stderr.contains(" eta "), "{}", run.stderr);
+    let counts = count_lines(&run.stderr);
     assert!(
         counts.iter().any(|line| line.starts_with("prepare 0/")),
         "no `prepare 0/N strips` line: {}",
-        off.stderr
+        run.stderr
     );
     assert!(
         counts.iter().any(|line| line.starts_with("fuse ")),
         "no fuse count line: {}",
-        off.stderr
+        run.stderr
     );
     for line in &counts {
         let ends_at_count =
             line.ends_with(" frames") || line.ends_with(" strips") || line.ends_with('%');
         assert!(ends_at_count, "line does not end at its count: {line:?}");
     }
-
-    let on = common::run_in(bin().env("FOCUSFORGE_SHOW_ETA", "1"), &dir, &args);
-    assert!(on.success, "stderr: {}", on.stderr);
-    let counts = count_lines(&on.stderr);
-    assert!(!counts.is_empty(), "no count lines: {}", on.stderr);
-    let mut numeric = 0;
-    for line in &counts {
-        let (_, token) = line
-            .rsplit_once(" eta ")
-            .unwrap_or_else(|| panic!("count line without an eta token: {line:?}"));
-        let is_clock = token.split_once(':').is_some_and(|(minutes, seconds)| {
-            !minutes.is_empty()
-                && minutes.bytes().all(|b| b.is_ascii_digit())
-                && seconds.len() == 2
-                && seconds.bytes().all(|b| b.is_ascii_digit())
-        });
-        let is_seconds = token
-            .strip_suffix('s')
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
-        assert!(
-            matches!(token, "--" | "<1s") || is_seconds || is_clock,
-            "unknown eta token in {line:?}"
-        );
-        numeric += usize::from(token != "--");
-    }
-    assert!(numeric > 0, "every token read `--`: {}", on.stderr);
 }
 
 #[test]
@@ -262,13 +234,13 @@ fn prepare_progress_reaches_a_redirected_log() {
     let prepare: Vec<usize> = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| line.starts_with("prepare ") && line.contains(" strips eta "))
+        .filter(|(_, line)| line.starts_with("prepare ") && line.ends_with(" strips"))
         .filter(|(_, line)| line.contains('/'))
         .map(|(at, _)| at)
         .collect();
     let first = prepare
         .first()
-        .unwrap_or_else(|| panic!("no `prepare <k>/<N> strips eta` line: {}", out.stderr));
+        .unwrap_or_else(|| panic!("no `prepare <k>/<N> strips` line: {}", out.stderr));
     assert!(
         lines[*first].starts_with("prepare 0/8 strips"),
         "the first count line: {}",
@@ -285,7 +257,7 @@ fn prepare_progress_reaches_a_redirected_log() {
     );
 }
 
-/// `fuse <done>/<total> tiles <pct>% eta <...>` -> `(done, total)`, for
+/// `fuse <done>/<total> tiles <pct>%` -> `(done, total)`, for
 /// every progress line on a captured stderr.
 fn fuse_counts(stderr: &str) -> Vec<(usize, usize)> {
     stderr
@@ -298,7 +270,7 @@ fn fuse_counts(stderr: &str) -> Vec<(usize, usize)> {
 }
 
 /// One single-worker run read three ways: the scheduler tuning
-/// flags reach the plan, the progress lines carry units, stage and an ETA and
+/// flags reach the plan, the progress lines carry units and stage and
 /// climb mid-run, and the redirected stderr holds no escape sequences within
 /// the renderer's line budget. Each block names the claim it checks.
 ///
@@ -349,7 +321,7 @@ fn interruptible_stack_honours_tuning_flags_and_reports_live_progress() {
         default_plan["tiles"]
     );
 
-    // Every fuse line carries units, stage and an ETA field.
+    // Every fuse line carries units and a percentage.
     let fuse_lines: Vec<&str> = out
         .stderr
         .lines()
@@ -358,14 +330,12 @@ fn interruptible_stack_honours_tuning_flags_and_reports_live_progress() {
     assert!(!fuse_lines.is_empty(), "stderr: {}", out.stderr);
     for line in &fuse_lines {
         assert!(
-            line.contains('/') && line.contains("tiles") && line.contains("eta "),
-            "a fuse line must read `fuse <done>/<total> tiles <pct>% eta <eta>`: {line}"
+            line.contains('/') && line.contains("tiles") && line.ends_with('%'),
+            "a fuse line must read `fuse <done>/<total> tiles <pct>%`: {line}"
         );
     }
-    assert!(!out.stderr.contains("eta 0s"), "stderr: {}", out.stderr);
 
-    // Progress is live: units done climb mid-run, never `0/<total>` until the end,
-    // and `eta --` is honest only before the first unit finishes.
+    // Progress is live: units done climb mid-run, never `0/<total>` until the end.
     let counts = fuse_counts(&out.stderr);
     assert!(
         counts.len() >= 2,
@@ -380,14 +350,6 @@ fn interruptible_stack_honours_tuning_flags_and_reports_live_progress() {
          not a counter frozen at 0 until the run ends: {}",
         out.stderr
     );
-    for (line, &(done, _)) in fuse_lines.iter().zip(&counts) {
-        if done > 0 {
-            assert!(
-                !line.contains("eta --"),
-                "a line with {done} unit(s) done must carry an ETA: {line}"
-            );
-        }
-    }
 
     // A redirected stderr holds no escape sequences, and stays within the
     // renderer's line budget, with the grouping proposal (printed once,
@@ -1262,14 +1224,14 @@ mod unix_signals {
         }
     }
 
-    /// `run_plan` in the `--json` report records what the driver resolved: the
-    /// stage-cache hit of a second identical run, and the ledger units a
-    /// resume kept. The cancelled run prints no document.
+    /// The `--json` report records what the driver resolved: the stage-cache
+    /// hit of a second identical run, and the tiles a resume kept. The
+    /// cancelled run prints no document.
     #[test]
-    fn run_plan_counts_cache_and_resume_hits() {
+    fn json_report_counts_cache_and_resume_hits() {
         let mantis = mantis_512_dir();
 
-        let cached = tmp_dir("job_cli_run_plan_cache");
+        let cached = tmp_dir("job_cli_json_report_cache");
         let cached_out = cached.join("out");
         std::fs::create_dir_all(&cached_out).unwrap();
         let mut cache_args = vec![
@@ -1293,14 +1255,11 @@ mod unix_signals {
             serde_json::from_str(&out.stdout).expect("--json must parse")
         };
         let first = run_json(&cached, &cache_args);
-        assert_eq!(first["run_plan"]["align_cache_hit"], false, "{first}");
         assert_eq!(first["align_source"], "computed", "{first}");
-        assert_eq!(first["run_plan"]["resumed_units"], 0, "{first}");
         let second = run_json(&cached, &cache_args);
-        assert_eq!(second["run_plan"]["align_cache_hit"], true, "{second}");
         assert_eq!(second["align_source"], "cached", "{second}");
 
-        let dir = tmp_dir("job_cli_run_plan_resume");
+        let dir = tmp_dir("job_cli_json_report_resume");
         let out_dir = dir.join("out");
         std::fs::create_dir_all(&out_dir).unwrap();
         let mut args =
@@ -1330,18 +1289,12 @@ mod unix_signals {
 
         args.push("--resume");
         let resumed = run_json(&dir, &args);
-        let kept = resumed["run_plan"]["resumed_units"]
-            .as_u64()
-            .expect("count");
         let tiles = resumed["tiles"].as_u64().expect("tiles");
+        let fused = resumed["fuse_tiles"].as_array().expect("fuse_tiles").len() as u64;
+        let kept = tiles - fused;
         assert!(
             kept > 0 && kept < tiles,
             "kept {kept} of {tiles}: {resumed}"
-        );
-        assert_eq!(
-            resumed["fuse_tiles"].as_array().map(Vec::len),
-            Some((tiles - kept) as usize),
-            "a resumed run lists only the tiles it fused: {resumed}"
         );
     }
 }

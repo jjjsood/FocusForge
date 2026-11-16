@@ -797,9 +797,6 @@ fn main() -> ExitCode {
                     no_progress,
                     tile_size,
                     cache,
-                    show_eta: progress::eta_display_enabled(
-                        std::env::var_os("FOCUSFORGE_SHOW_ETA").as_deref(),
-                    ),
                 },
                 &preset::PresetOptions {
                     preset: preset.as_deref(),

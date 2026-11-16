@@ -21,8 +21,7 @@ pub trait TileControl: Send + Sync {
 
     /// Called once per unit that **finished successfully**, from the rayon
     /// worker that ran it, immediately after the same unit is recorded as
-    /// complete. `tile` is the unit: its read-rect area and its position in
-    /// the plan are what `crate::job::JobProgress` weights its ETA by.
+    /// complete. `tile` is the unit; `crate::job::JobControl` counts it.
     ///
     /// The default is a no-op, so [`NoControl`] and every test control stay
     /// one-method implementations. `crate::job::JobControl` overrides it,

@@ -10,6 +10,12 @@ Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 
 - `focusforge-cli sharpness-map` writes the focus score of every frame, and of a composite, as `f32` TIFF maps on one scale for the whole stack, so equal values mean equal sharpness in every map.
 - `focusforge-cli sharp-areas` reports, for each pair of neighbouring frames, how much their sharp zones overlap, with the `overlap-threshold` parameter that sets what counts as sharp.
+- While a stack fuses, the bottom bar shows how many tiles are done, for example `12 of 64 tiles`, next to the stage name; the open project card and the Projects overlay show the same count.
+
+### Removed
+
+- `focusforge-cli stack --dry-run` no longer prints a predicted duration, and the `stack --json` and `stack --dry-run --json` documents no longer carry the `run_plan` and `prediction` fields.
+- The `FOCUSFORGE_SHOW_ETA` environment variable no longer shows a time-remaining estimate in the window or in the progress lines of `focusforge-cli`.
 
 ### Fixed
 

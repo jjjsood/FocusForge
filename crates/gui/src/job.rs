@@ -340,21 +340,6 @@ pub fn spawn_after(
 mod stage_tests {
     use super::*;
 
-    #[test]
-    fn eta_display_enabled_only_for_exactly_one() {
-        use std::ffi::OsStr;
-        assert!(eta_display_enabled(Some(OsStr::new("1"))));
-        for value in ["", "0", "true", "yes", " 1", "1 ", "01"] {
-            assert!(!eta_display_enabled(Some(OsStr::new(value))), "{value:?}");
-        }
-        assert!(!eta_display_enabled(None));
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            assert!(!eta_display_enabled(Some(OsStr::from_bytes(b"\xff"))));
-        }
-    }
-
     const EXTENT: Rect = Rect {
         x: 0,
         y: 0,
@@ -367,17 +352,12 @@ mod stage_tests {
             stage: JobStage::Fuse,
             units_done,
             unit_total: 8,
-            pixels_done: 0,
-            pixel_total: 0,
-            running: Duration::ZERO,
-            eta: None,
             align_done: 0,
             align_total: 0,
             prepare_done: 0,
             prepare_total: 0,
             develop_done: 0,
             develop_total: 0,
-            total_eta: None,
         }
     }
 
@@ -1186,17 +1166,12 @@ impl StageObserver for GuiObserver {
             stage,
             units_done: 0,
             unit_total: 0,
-            pixels_done: 0,
-            pixel_total: 0,
-            running: Duration::ZERO,
-            eta: None,
             align_done: 0,
             align_total: 0,
             prepare_done: 0,
             prepare_total,
             develop_done: 0,
             develop_total,
-            total_eta: self.last_progress().and_then(|p| p.total_eta),
         };
         match stage {
             RunStage::Develop { frames } => self.tick(&snapshot(JobStage::Develop, 0, frames)),
@@ -1288,7 +1263,8 @@ impl StageObserver for GuiObserver {
 
 /// The run's own phases, in order. A phase declares its name and whether it
 /// counts frames ([`Phase::frames`]) -- the one place either is decided, so a
-/// phase added later needs only an arm here.
+/// phase added later needs only an arm here. The fuse phase counts tiles,
+/// which [`progress_text`] renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Developing,
@@ -1312,9 +1288,10 @@ impl Phase {
     /// `Some((done, total))` while `self` counts work and `progress`
     /// carries a non-zero total for it, `None` otherwise -- a cached or
     /// resumed alignment included, since its total is `0`. `Developing`,
-    /// `Preparing` and `Aligning` are the phases with a total; the Preparing
-    /// count is in strips read (frames for a RAW source), the others in
-    /// frames.
+    /// `Preparing` and `Aligning` are the phases with a frame total; the
+    /// Preparing count is in strips read (frames for a RAW source), the
+    /// others in frames. `Fusing` counts tiles, not frames, so it is `None`
+    /// here.
     pub fn frames(self, progress: &JobProgress) -> Option<(usize, usize)> {
         match self {
             Phase::Developing if progress.develop_total > 0 => {
@@ -1423,11 +1400,12 @@ pub fn current_phase(state: &RunState, progress: Option<&JobProgress>) -> Option
 }
 
 /// The bottom bar's step-text slot: `"<done> of <total>"` while the current
-/// phase counts work and `progress` carries a total for it
-/// ([`Phase::frames`]), `"from cache"` while the align stage has no total
-/// (the alignment is served from the stage cache), empty for any other
-/// name-only phase, outside a running state, or with no progress to derive a
-/// phase from.
+/// phase counts frames and `progress` carries a total for it
+/// ([`Phase::frames`]), `"<done> of <total> tiles"` (`tile` for a total of 1)
+/// while the fuse stage reports a tile total, `"from cache"` while the align
+/// stage has no total (the alignment is served from the stage cache), empty
+/// for any other name-only phase (`Writing`, a fuse stage with no total yet),
+/// outside a running state, or with no progress to derive a phase from.
 pub fn progress_text(state: &RunState, progress: Option<&JobProgress>) -> String {
     let (Some(phase), Some(p)) = (current_phase(state, progress), progress) else {
         return String::new();
@@ -1435,14 +1413,19 @@ pub fn progress_text(state: &RunState, progress: Option<&JobProgress>) -> String
     match (phase, phase.frames(p)) {
         (_, Some((done, total))) => format!("{done} of {total}"),
         (Phase::Aligning, None) => "from cache".to_string(),
+        (Phase::Fusing, None) if p.unit_total > 0 => {
+            let tiles = if p.unit_total == 1 { "tile" } else { "tiles" };
+            format!("{} of {} {tiles}", p.units_done, p.unit_total)
+        }
         _ => String::new(),
     }
 }
 
 /// The run's phase line for a card or overlay meta text: the lower-cased
-/// phase name, plus `, <k> of <N>` or `, from cache` when [`progress_text`]
-/// has a step text to show. `None` outside `Running` -- a name-only phase
-/// still returns `Some`, so it never falls back to some other line.
+/// phase name, plus `, <k> of <N>`, `, <k> of <N> tiles` or `, from cache`
+/// when [`progress_text`] has a step text to show. `None` outside `Running`
+/// -- a name-only phase still returns `Some`, so it never falls back to some
+/// other line.
 pub fn phase_line(state: &RunState, progress: Option<&JobProgress>) -> Option<String> {
     if !matches!(state, RunState::Running) {
         return None;
@@ -1454,37 +1437,6 @@ pub fn phase_line(state: &RunState, progress: Option<&JobProgress>) -> Option<St
     } else {
         format!("{name}, {text}")
     })
-}
-
-/// Whether the remaining-time estimate is shown: only for the exact
-/// environment value `1`. Unset, empty, `0` or anything else leaves it hidden.
-pub fn eta_display_enabled(value: Option<&std::ffi::OsStr>) -> bool {
-    value == Some(std::ffi::OsStr::new("1"))
-}
-
-/// The time left in the whole run, not just the current stage: `estimating`
-/// while no total estimate exists, `ETA M:SS` while running with one (`ETA
-/// H:MM:SS` from an hour up), `ETA —` once paused, cancelling or failed --
-/// never a rendered zero. Empty when `shown` is false.
-pub fn eta_text(state: &RunState, progress: Option<&JobProgress>, shown: bool) -> String {
-    if !shown {
-        return String::new();
-    }
-    match state {
-        RunState::Paused | RunState::Cancelling | RunState::Failed(_) => "ETA —".to_string(),
-        RunState::Idle | RunState::Fused { .. } | RunState::Queued { .. } => String::new(),
-        RunState::Running => match progress.and_then(|p| p.total_eta) {
-            Some(eta) => {
-                let secs = eta.as_secs();
-                if secs >= 3600 {
-                    format!("ETA {}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
-                } else {
-                    format!("ETA {}:{:02}", secs / 60, secs % 60)
-                }
-            }
-            None => "estimating".to_string(),
-        },
-    }
 }
 
 /// The bar's fill fraction: during the develop pass,

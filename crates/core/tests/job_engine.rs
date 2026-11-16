@@ -346,19 +346,6 @@ fn progress_advances_while_one_segment_is_still_running() {
          strictly between 0 and {plan_len} across {} snapshots",
         history.len()
     );
-    assert!(
-        intermediate
-            .iter()
-            .all(|snap| snap.pixels_done > 0 && snap.eta.is_some()),
-        "every snapshot with a completed unit must carry a completed pixel count and an ETA"
-    );
-    assert!(
-        intermediate
-            .iter()
-            .any(|snap| snap.running > Duration::ZERO && snap.eta > Some(Duration::ZERO)),
-        "the running clock must advance mid-segment too -- otherwise the ETA it feeds is \
-         rendered as `0s` for the whole run"
-    );
 }
 
 #[test]
@@ -877,9 +864,9 @@ fn abort_fires_on_error_only() {
 }
 
 #[test]
-fn eta_ignores_time_spent_paused() {
+fn units_done_holds_through_a_pause_and_resumes_from_it() {
     let stack = open_stack();
-    let opts = options("eta-ignores-pause", 1);
+    let opts = options("units-done-holds-through-pause", 1);
     let scheduler = build_scheduler(&stack, &opts);
 
     let gate = Gate::new();
@@ -901,21 +888,16 @@ fn eta_ignores_time_spent_paused() {
     assert_eq!(first_outcome, JobOutcome::Paused);
 
     let at_pause = control.progress();
-    let running_at_pause = at_pause.running;
-    assert!(at_pause.eta.is_some(), "a unit is done: {at_pause:?}");
-    assert_eq!(at_pause.total_eta, None, "no prediction is seeded");
+    assert!(at_pause.units_done > 0, "a unit is done: {at_pause:?}");
+    assert!(at_pause.units_done < at_pause.unit_total);
 
-    // Simulate a long real-world pause: nothing below touches `job` or
-    // `control` in any way that would grow the running clock.
     std::thread::sleep(Duration::from_millis(50));
-
     let paused = control.progress();
     assert_eq!(
-        paused.running, running_at_pause,
-        "running time -- and therefore the ETA it feeds -- must not grow while the job sits \
-         paused"
+        paused.units_done, at_pause.units_done,
+        "a pause does not move the count"
     );
-    assert_eq!(paused.eta, at_pause.eta, "the ETA is frozen while paused");
+    assert_eq!(paused.unit_total, at_pause.unit_total);
 
     control.clear();
     let second_outcome = job
@@ -923,28 +905,9 @@ fn eta_ignores_time_spent_paused() {
         .expect("resumed segment must succeed");
     assert_eq!(second_outcome, JobOutcome::Completed);
 
-    assert!(
-        control.progress().running >= running_at_pause,
-        "running time only grows while a segment actually executes"
-    );
-}
-
-#[test]
-fn eta_of_an_unseeded_job_is_the_observed_rate_with_no_total() {
-    let stack = open_stack();
-    let opts = options("eta-unseeded", 1);
-    let scheduler = build_scheduler(&stack, &opts);
-    let mut job = Job::new(&scheduler);
-    let before = job.control().progress();
-    assert_eq!((before.eta, before.total_eta), (None, None));
-
-    let outcome = job
-        .run(&NoopPreprocess, &Noop)
-        .expect("the run must succeed");
-    assert_eq!(outcome, JobOutcome::Completed);
-    let after = job.control().progress();
-    assert_eq!(after.eta, Some(Duration::ZERO));
-    assert_eq!(after.total_eta, None);
+    let finished = control.progress();
+    assert_eq!(finished.unit_total, at_pause.unit_total);
+    assert_eq!(finished.units_done, finished.unit_total);
 }
 
 #[test]

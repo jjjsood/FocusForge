@@ -170,7 +170,7 @@ pub fn run(
     // One monotonic timer shares `start` with `wall_seconds` below.
     let mut timer = StageTimer::from_start(start);
     timer.enter(Stage::Setup);
-    let mut renderer = ProgressRenderer::new(ProgressMode::choose(no_progress), false);
+    let mut renderer = ProgressRenderer::new(ProgressMode::choose(no_progress));
     let sink = StatusSink::new(preset_opts.status, dir.display().to_string(), "align");
 
     // One preset file serves both subcommands: `align` reads `align-algo`
