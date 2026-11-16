@@ -55,7 +55,6 @@
 pub mod control;
 pub mod fingerprint;
 pub mod ledger;
-pub mod prediction;
 pub mod progress;
 pub mod record;
 pub mod stage_cache;
@@ -167,8 +166,8 @@ impl<'a> Job<'a> {
     /// driving an alignment stage can call [`JobControl::set_stage`] on it
     /// before this job exists. Same totals as [`Self::new`] with an empty
     /// `completed` set, except `remaining` excludes the completed tiles and
-    /// `control` is pre-credited with their units and pixels, so
-    /// `units_done`/`eta` stay honest across a restart.
+    /// `control` is pre-credited with their units, so `units_done` stays
+    /// honest across a restart.
     pub fn with_control(
         scheduler: &'a TileScheduler<'a>,
         completed: &[usize],
@@ -176,10 +175,8 @@ impl<'a> Job<'a> {
     ) -> Self {
         let tiles = scheduler.plan().tiles();
         let unit_total = tiles.len();
-        let pixel_total: u64 = tiles.iter().map(tile_area).sum();
 
         control.set_unit_total(unit_total);
-        control.set_pixel_total(pixel_total);
 
         let completed_set: HashSet<usize> = completed.iter().copied().collect();
         let remaining: Vec<PlannedTile> = tiles
@@ -217,11 +214,8 @@ impl<'a> Job<'a> {
         consumer: &dyn TileConsumer,
     ) -> Result<JobOutcome, TileError> {
         // The running clock is bracketed rather than measured afterwards, so
-        // `JobControl::progress` can add this segment's elapsed time to the
-        // accumulated total while the segment is still executing -- an ETA
-        // that only appeared after the run finished would be useless, and a
-        // `running` of zero against a non-zero `pixels_done` renders as
-        // `eta 0s`.
+        // the running-time floor sees this segment's elapsed time while the
+        // segment is still executing.
         self.control.begin_segment();
         let result = self.scheduler.run_tiles_controlled(
             &self.remaining,
@@ -261,9 +255,4 @@ impl<'a> Job<'a> {
             ControlState::PauseRequested | ControlState::Running => JobOutcome::Paused,
         })
     }
-}
-
-fn tile_area(tile: &PlannedTile) -> u64 {
-    let rect = tile.read();
-    rect.width as u64 * rect.height as u64
 }

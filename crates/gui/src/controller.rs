@@ -2501,8 +2501,6 @@ pub struct AppController {
     /// A literal toolbar/bottom-bar view that [`AppController::job_view`]
     /// returns in place of the active run's, until the next run starts.
     toolbar_preview: Option<JobView>,
-    /// Whether the bottom bar shows the remaining-time estimate.
-    eta_display: bool,
     /// How long every folder or project load waits before it reads anything.
     open_hold: Duration,
     /// How long every Analytics count waits before it reads anything.
@@ -2676,7 +2674,6 @@ pub struct JobView {
     pub toolbar_run_state: String,
     pub stage_word: String,
     pub step_text: String,
-    pub eta_text: String,
     pub bar_tone: String,
     pub fraction: f32,
     pub fuse_enabled: bool,
@@ -10431,7 +10428,6 @@ impl AppController {
             toolbar_run_state: job::toolbar_run_state(&run).to_string(),
             stage_word: job::stage_word(&run, progress.as_ref()),
             step_text: job::progress_text(&run, progress.as_ref()),
-            eta_text: job::eta_text(&run, progress.as_ref(), self.eta_display),
             bar_tone: job::bar_tone(&run).to_string(),
             fraction: job::bar_fraction(progress.as_ref()),
             fuse_enabled: self.fuse_enabled(),
@@ -10527,56 +10523,36 @@ impl AppController {
         Some(view)
     }
 
-    /// Shows or hides the remaining-time estimate in [`Self::job_view`] and
-    /// in any toolbar preview set afterwards. Hidden by default.
-    pub fn set_eta_display(&mut self, shown: bool) {
-        self.eta_display = shown;
-    }
-
     /// Holds a literal transport view -- `state` is one of `idle`, `running`,
     /// `paused`, `cancelling` or `failed` -- that [`Self::job_view`] returns
     /// until the next run starts; `fuse_enabled` still follows the active
     /// tab. An unknown `state` gets the idle numbers and labels but keeps
     /// its own string as `toolbar_run_state`, so callers validate first.
     pub fn set_toolbar_preview(&mut self, state: &str) {
-        let (run, stage_word, step_text, fraction, tone, eta) = match state {
+        let (run, stage_word, step_text, fraction, tone) = match state {
             "running" => (
                 job::RunState::Running,
                 "Aligning",
                 "42 of 61",
                 0.62,
                 "running",
-                "ETA 1:12",
             ),
-            "paused" => (job::RunState::Paused, "Paused", "", 0.62, "held", "ETA —"),
-            "cancelling" => (
-                job::RunState::Cancelling,
-                "Cancelling",
-                "",
-                0.0,
-                "held",
-                "ETA —",
-            ),
+            "paused" => (job::RunState::Paused, "Paused", "", 0.62, "held"),
+            "cancelling" => (job::RunState::Cancelling, "Cancelling", "", 0.0, "held"),
             "failed" => (
                 job::RunState::Failed(String::new()),
                 "Failed",
                 "",
                 0.28,
                 "failed",
-                "ETA —",
             ),
-            _ => (job::RunState::Idle, "", "", 0.0, "held", ""),
+            _ => (job::RunState::Idle, "", "", 0.0, "held"),
         };
         self.toolbar_preview = Some(JobView {
             state: run,
             toolbar_run_state: state.to_string(),
             stage_word: stage_word.to_string(),
             step_text: step_text.to_string(),
-            eta_text: if self.eta_display {
-                eta.to_string()
-            } else {
-                String::new()
-            },
             bar_tone: tone.to_string(),
             fraction,
             fuse_enabled: self.fuse_enabled(),
@@ -12776,8 +12752,9 @@ fn unsaved_ops<'a>(ops: impl IntoIterator<Item = &'a job::Op>) -> String {
 }
 
 /// An open card's second meta line: `phase_line` (already rendered, e.g.
-/// `"aligning, 3 of 8"` or `"fusing"`) while a run is live against this tab,
-/// otherwise the checkpoint count -- `"no checkpoint yet"` at zero.
+/// `"aligning, 3 of 8"` or `"fusing, 12 of 64 tiles"`) while a run is live
+/// against this tab, otherwise the checkpoint count -- `"no checkpoint yet"`
+/// at zero.
 fn open_card_meta(frame_count: u32, checkpoints: usize, phase_line: Option<&str>) -> String {
     let frames = frame_word(frame_count as usize);
     if let Some(phase) = phase_line {

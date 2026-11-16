@@ -5,15 +5,15 @@ Start: --open fixtures/mantis-512/frames --open fixtures/mantis-64/frames --slow
    Expect: the dock header reads "8 frames · 0 excluded", the right pane shows the card "Not fused yet" with the line "Fuse stack builds the composite here.", the CHECKPOINTS list shows "None yet — fuse a stack" and the bottom bar status reads "No job running".
 ## A held fuse
 2. Click **Fuse stack** (`FFToolbar::fuse-button`); this is the first run of the launch, which `--slow-run 1` holds in its fuse stage for up to 600 s of running time.
-   Expect: (within 60 s) the bottom bar status reads "Fusing" and the right pane shows the card "Fusing" with the line "The result builds here tile by tile."; the card "Not fused yet" is gone.
+   Expect: (within 60 s) the bottom bar status reads "Fusing", the step text (`get_element_properties` of `FFBottomBar::step-text`) reads "0 of 1 tile", and the right pane shows the card "Fusing" with the line "The result builds here tile by tile."; the card "Not fused yet" is gone.
 3. (human only) Watch the right pane in the first seconds after the click of step 2 (only the first run of a launch aligns its frames). It reads "Preparing frames" with the line "Images appear here once alignment starts.", then the pane label reads "Aligned · " followed by a file name ending ".tif" over a frame lined up with the left pane, then the card "Fusing" stays. These seconds pass faster than a step can read them.
    Expect: the card "Preparing frames" shows first, the label "Aligned · <name>.tif" with a picture shows next and the card "Fusing" shows last.
 4. Hover the progress bar (`FFBottomBar::progress-bar`).
-   Expect: Must not: a separate bar or row of stage names (Preparing, Aligning, Fusing, Writing) shows above, between or below the panes; the bottom bar still shows the status "Fusing" and its progress bar track.
+   Expect: Must not: a separate bar or row of stage names (Preparing, Aligning, Fusing, Writing) shows above, between or below the panes; the bottom bar still shows the status "Fusing", the step text "0 of 1 tile" to the right of it (`FFBottomBar::step-text` absolutePosition.x is at least `FFBottomBar::status-text` absolutePosition.x + width) and its empty progress bar track starting right of the step text; the track ends before the overlay caption (`get_element_properties` of `FFBottomBar::progress-bar` and of `FFBottomBar::overlay-caption`: the bar's absolutePosition.x + width is smaller than the caption's absolutePosition.x).
 5. Click **Pause** (`FFToolbar::pause-button`).
-   Expect: the bottom bar status reads "Paused", the toolbar shows **Resume** and the right pane still shows the card "Fusing".
+   Expect: the bottom bar status reads "Paused" with no step text (`find_elements_by_id` of `FFBottomBar::step-text` finds nothing), the toolbar shows **Resume** and the right pane still shows the card "Fusing".
 6. Click **Resume** (`FFToolbar::resume-button`).
-   Expect: the bottom bar status reads "Fusing", the toolbar shows **Pause** and the right pane still shows the card "Fusing".
+   Expect: the bottom bar status reads "Fusing" with the step text "0 of 1 tile", the toolbar shows **Pause** and the right pane still shows the card "Fusing".
 7. Click the second tab (`FFTab::area` 1) while the first tab's run is held.
    Expect: Must not: the card "Fusing" shows in the right pane; it shows the card "Not fused yet", the dock header reads "3 frames · 0 excluded" and the toolbar shows a single button reading "Queued".
 8. Click the first tab (`FFTab::area` 0).

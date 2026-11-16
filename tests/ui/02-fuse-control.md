@@ -38,7 +38,7 @@ Start: --open fixtures/mantis-512/frames --open fixtures/mantis-64/frames --fuse
     Expect: the overlay is gone and the toolbar shows a **Fuse stack** button (read with `buttons AppWindow::toolbar`).
 ## Pause, queue and cancel a running fuse
 17. Click **Fuse stack** (`FFToolbar::fuse-button`) on the first tab; this is the fourth run of the launch, which `--slow-run 4` holds in its fuse stage for at least 150 s.
-    Expect: (within 60 s) the bottom bar status reads "Fusing" and the toolbar shows **Pause** and **Cancel** and no **Fuse stack** button (the grey text at the right end of the toolbar is not a button).
+    Expect: (within 60 s) the bottom bar status reads "Fusing" with the step text "0 of 1 tile" to its right (`get_element_properties` of `FFBottomBar::step-text`) and the toolbar shows **Pause** and **Cancel** and no **Fuse stack** button (the grey text at the right end of the toolbar is not a button).
 18. Click **Pause** (`FFToolbar::pause-button`) on the running first tab.
     Expect: the toolbar shows **Resume** (`FFToolbar::resume-button`) instead of **Pause**, and the bottom bar status reads "Paused".
 19. Click the second tab (`FFTab::area` 1) while the first tab's run is paused.

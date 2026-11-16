@@ -2045,7 +2045,6 @@ pub fn push_job(app: &AppWindow, view: &JobView) {
     app.set_step_text(view.step_text.as_str().into());
     app.set_bar_fraction(view.fraction);
     app.set_bar_tone(view.bar_tone.as_str().into());
-    app.set_eta_text(view.eta_text.as_str().into());
     app.set_fuse_enabled(view.fuse_enabled);
 }
 

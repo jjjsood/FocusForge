@@ -144,22 +144,18 @@ there is nothing to resume or the inputs differ.
 
 ### Dry run
 
-`--dry-run` prints the resolved method and settings, the alignment settings,
-the projects it would write and a predicted duration, then exits `0`:
+`--dry-run` prints the resolved method and settings, the alignment settings and
+the projects it would write, then exits `0`:
 
 ```
 dry run -- resolved only, nothing computed and nothing written
 ...
 would write: .scratch/out/mantis-64.ffp
-predicted duration: 12.3 s (estimate for the reference machine, cold run)
 crop: not computed -- --dry-run stops before alignment
 output size: not computed -- it follows from the crop
 ```
 
-The prediction is for a reference machine and a first run. For an input
-FocusForge cannot predict well it reads `predicted duration: ~N s (not
-calibrated for this input)`, and `predicted duration: unknown` when there is
-nothing to estimate. `--dry-run` cannot be combined with `--resume`.
+`--dry-run` cannot be combined with `--resume`.
 
 ### Examples
 

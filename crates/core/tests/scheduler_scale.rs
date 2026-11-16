@@ -941,7 +941,6 @@ fn scale_progress_reaches_the_total() {
 
         let final_progress = control.progress();
         assert_eq!(final_progress.units_done, final_progress.unit_total);
-        assert_eq!(final_progress.eta, Some(Duration::ZERO));
 
         let samples = samples.into_inner().unwrap();
         assert!(

@@ -378,7 +378,7 @@ fn mixed_compression_set_is_handled() {
     assert_eq!(samples(&zmap), samples(&reference_zmap));
 }
 
-fn dry_run_plan(cwd: &Path, input: &Path) -> serde_json::Value {
+fn dry_run_report(cwd: &Path, input: &Path) -> serde_json::Value {
     let output = cwd.join("dry-run-output");
     std::fs::create_dir_all(&output).unwrap();
     let mut command = common::cli_bin("compressed_cli_dry_run");
@@ -416,8 +416,8 @@ fn dry_run_plan(cwd: &Path, input: &Path) -> serde_json::Value {
 fn dry_run_uses_decoded_scheduler_share() {
     let cwd = common::tmp_dir("compressed_cli_dry_run");
     let fixtures = common::fixtures_dir();
-    let mmap = dry_run_plan(&cwd, &fixtures.join("mantis-64"));
-    let decoded = dry_run_plan(&cwd, &fixtures.join("mantis-64-deflate-p1-strip-ii"));
+    let mmap = dry_run_report(&cwd, &fixtures.join("mantis-64"));
+    let decoded = dry_run_report(&cwd, &fixtures.join("mantis-64-deflate-p1-strip-ii"));
     assert_eq!(mmap["max_bytes_in_flight"], 65_536);
     assert_eq!(decoded["max_bytes_in_flight"], 49_152);
     for plan in [&mmap, &decoded] {

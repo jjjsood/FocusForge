@@ -122,36 +122,6 @@ fn fuse_runs_to_completion_off_the_ui_thread() {
 }
 
 // ---------------------------------------------------------------------
-// `eta` renders `estimating`/`ETA —`, never a rendered zero, while
-// there is no number to show.
-// ---------------------------------------------------------------------
-
-#[test]
-fn eta_none_never_renders_as_zero() {
-    use focusforge_gui::job::{RunState, eta_text};
-    assert_eq!(eta_text(&RunState::Idle, None, true), "");
-    assert_eq!(eta_text(&RunState::Running, None, true), "estimating");
-    assert_eq!(eta_text(&RunState::Paused, None, true), "ETA —");
-    assert_eq!(eta_text(&RunState::Cancelling, None, true), "ETA —");
-    assert_eq!(
-        eta_text(&RunState::Failed("x".to_string()), None, true),
-        "ETA —"
-    );
-    for state in [
-        RunState::Idle,
-        RunState::Running,
-        RunState::Paused,
-        RunState::Cancelling,
-        RunState::Failed("x".to_string()),
-    ] {
-        assert!(
-            !eta_text(&state, None, true).contains("0:00"),
-            "{state:?} must never render a rendered zero with no number to show"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------
 // Pause holds the run and releases its workers; resume continues rather
 // than restarting, with the unit total unchanged. `control.pause()` is
 // requested before the call starts, so the first segment observes it
@@ -1161,17 +1131,12 @@ fn phases_map_onto_engine_stages() {
         stage: JobStage::Align,
         units_done: 0,
         unit_total: 0,
-        pixels_done: 0,
-        pixel_total: 0,
-        running: Duration::ZERO,
-        eta: None,
         align_done: 0,
         align_total: 0,
         prepare_done: 0,
         prepare_total: 0,
         develop_done: 0,
         develop_total: 0,
-        total_eta: None,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&aligning)),
@@ -1183,17 +1148,12 @@ fn phases_map_onto_engine_stages() {
         stage: JobStage::Fuse,
         units_done: 2,
         unit_total: 10,
-        pixels_done: 0,
-        pixel_total: 0,
-        running: Duration::ZERO,
-        eta: None,
         align_done: 0,
         align_total: 0,
         prepare_done: 0,
         prepare_total: 0,
         develop_done: 0,
         develop_total: 0,
-        total_eta: None,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&fusing)),
@@ -1204,17 +1164,12 @@ fn phases_map_onto_engine_stages() {
         stage: JobStage::Fuse,
         units_done: 10,
         unit_total: 10,
-        pixels_done: 0,
-        pixel_total: 0,
-        running: Duration::ZERO,
-        eta: None,
         align_done: 0,
         align_total: 0,
         prepare_done: 0,
         prepare_total: 0,
         develop_done: 0,
         develop_total: 0,
-        total_eta: None,
     };
     assert_eq!(
         current_phase(&RunState::Running, Some(&sealing)),
@@ -1239,17 +1194,12 @@ fn align_progress(align_done: usize, align_total: usize) -> focusforge_core::job
         stage: JobStage::Align,
         units_done: 0,
         unit_total: 0,
-        pixels_done: 0,
-        pixel_total: 0,
-        running: Duration::ZERO,
-        eta: None,
         align_done,
         align_total,
         prepare_done: 0,
         prepare_total: 0,
         develop_done: 0,
         develop_total: 0,
-        total_eta: None,
     }
 }
 
@@ -1259,17 +1209,12 @@ fn fuse_progress(units_done: usize, unit_total: usize) -> focusforge_core::job::
         stage: JobStage::Fuse,
         units_done,
         unit_total,
-        pixels_done: 0,
-        pixel_total: 0,
-        running: Duration::ZERO,
-        eta: None,
         align_done: 0,
         align_total: 0,
         prepare_done: 0,
         prepare_total: 0,
         develop_done: 0,
         develop_total: 0,
-        total_eta: None,
     }
 }
 
@@ -1291,14 +1236,41 @@ fn align_progress_text_counts_frames() {
 }
 
 #[test]
-fn fuse_progress_text_is_the_name_only() {
+fn fuse_progress_text_counts_tiles() {
     use focusforge_gui::job::{RunState, progress_text};
 
-    for (done, total) in [(0, 0), (4, 10), (10, 10)] {
+    for (done, total, expected) in [
+        (0, 10, "0 of 10 tiles"),
+        (4, 10, "4 of 10 tiles"),
+        (9, 10, "9 of 10 tiles"),
+        (175, 176, "175 of 176 tiles"),
+        (0, 1, "0 of 1 tile"),
+        (0, 0, ""),
+        (10, 10, ""),
+        (11, 10, ""),
+    ] {
         assert_eq!(
             progress_text(&RunState::Running, Some(&fuse_progress(done, total))),
+            expected,
+            "a running fuse snapshot at {done}/{total}"
+        );
+    }
+
+    for state in [
+        RunState::Idle,
+        RunState::Queued { position: 1 },
+        RunState::Paused,
+        RunState::Cancelling,
+        RunState::Failed("stopped".into()),
+        RunState::Fused {
+            at: "now".into(),
+            unaligned: 0,
+        },
+    ] {
+        assert_eq!(
+            progress_text(&state, Some(&fuse_progress(4, 10))),
             "",
-            "a fuse snapshot at {done}/{total} must render no count"
+            "a mid-fuse snapshot must render no count in {state:?}"
         );
     }
 }
@@ -1372,7 +1344,6 @@ fn develop_progress(
         stage: focusforge_core::job::JobStage::Develop,
         develop_done,
         develop_total,
-        total_eta: None,
         ..fuse_progress(0, 0)
     }
 }
@@ -1380,8 +1351,7 @@ fn develop_progress(
 #[test]
 fn develop_progress_names_the_frame_count_and_fills_the_bar() {
     use focusforge_gui::job::{
-        Phase, RunState, bar_fraction, eta_text, phase_line, progress_phase, progress_text,
-        stage_word,
+        Phase, RunState, bar_fraction, phase_line, progress_phase, progress_text, stage_word,
     };
 
     for (done, total) in [(3, 8), (20, 20), (0, 5)] {
@@ -1402,18 +1372,6 @@ fn develop_progress_names_the_frame_count_and_fills_the_bar() {
         assert_eq!(bar_fraction(Some(&snapshot)), done as f32 / total as f32);
         assert_eq!(Phase::Developing.frames(&snapshot), Some((done, total)));
     }
-
-    let mut snapshot = develop_progress(0, 8);
-    assert_eq!(
-        eta_text(&RunState::Running, Some(&snapshot), true),
-        "estimating"
-    );
-    snapshot.develop_done = 2;
-    snapshot.total_eta = Some(Duration::from_secs(95));
-    assert_eq!(
-        eta_text(&RunState::Running, Some(&snapshot), true),
-        "ETA 1:35"
-    );
 }
 
 #[test]
@@ -1426,7 +1384,6 @@ fn developing_hands_over_to_the_next_phase_from_zero() {
     let preparing = focusforge_core::job::JobProgress {
         develop_done: 8,
         develop_total: 8,
-        total_eta: None,
         ..prepare_progress(0, 8)
     };
     assert_eq!(progress_phase(Some(&preparing)), Phase::Preparing);
@@ -1434,7 +1391,6 @@ fn developing_hands_over_to_the_next_phase_from_zero() {
     let fusing = focusforge_core::job::JobProgress {
         develop_done: 8,
         develop_total: 8,
-        total_eta: None,
         ..fuse_progress(0, 10)
     };
     assert_eq!(progress_phase(Some(&fusing)), Phase::Fusing);
@@ -1453,182 +1409,6 @@ fn develop_stage_announcement_records_the_frame_total() {
     assert_eq!(recorded.stage, JobStage::Develop);
     assert_eq!((recorded.develop_done, recorded.develop_total), (0, 9));
     assert_eq!(job::progress_phase(Some(&recorded)), job::Phase::Developing);
-}
-
-#[test]
-fn prepare_eta_text_follows_the_engine_estimate() {
-    use focusforge_gui::job::{RunState, eta_text};
-
-    let mut snapshot = prepare_progress(0, 8);
-    assert_eq!(
-        eta_text(&RunState::Running, Some(&snapshot), true),
-        "estimating"
-    );
-    snapshot.prepare_done = 2;
-    snapshot.total_eta = Some(Duration::from_secs(95));
-    assert_eq!(
-        eta_text(&RunState::Running, Some(&snapshot), true),
-        "ETA 1:35"
-    );
-}
-
-#[test]
-fn align_eta_text_follows_the_engine_estimate() {
-    use focusforge_gui::job::{RunState, bar_fraction, eta_text, progress_text};
-
-    let mut snapshot = align_progress(3, 61);
-    assert_eq!(
-        eta_text(&RunState::Running, Some(&snapshot), true),
-        "estimating"
-    );
-    snapshot.total_eta = Some(Duration::from_secs(125));
-    assert_eq!(
-        eta_text(&RunState::Running, Some(&snapshot), true),
-        "ETA 2:05"
-    );
-    assert_eq!(
-        progress_text(&RunState::Running, Some(&snapshot)),
-        "3 of 61"
-    );
-    assert_eq!(bar_fraction(Some(&snapshot)), 3.0 / 61.0);
-    assert_eq!(eta_text(&RunState::Paused, Some(&snapshot), true), "ETA —");
-
-    // Every frame done with fuse still ahead: the total-run estimate keeps
-    // counting down.
-    let mut finished = align_progress(61, 61);
-    finished.total_eta = Some(Duration::from_secs(40));
-    assert_eq!(
-        eta_text(&RunState::Running, Some(&finished), true),
-        "ETA 0:40"
-    );
-}
-
-/// `snapshot` with its per-stage `eta` and `total_eta` replaced, in seconds.
-fn two_etas(
-    snapshot: focusforge_core::job::JobProgress,
-    eta: Option<u64>,
-    total_eta: Option<u64>,
-) -> focusforge_core::job::JobProgress {
-    focusforge_core::job::JobProgress {
-        eta: eta.map(Duration::from_secs),
-        total_eta: total_eta.map(Duration::from_secs),
-        ..snapshot
-    }
-}
-
-#[test]
-fn eta_text_renders_the_total_run_for_every_stage() {
-    use focusforge_gui::job::{RunState, eta_text};
-
-    for (stage, snapshot) in [
-        ("develop", develop_progress(2, 9)),
-        ("prepare", prepare_progress(2, 9)),
-        ("align", align_progress(3, 8)),
-        ("fuse", fuse_progress(4, 30)),
-    ] {
-        // The per-stage value would read `ETA 0:07`, the total reads `ETA 2:05`.
-        let snapshot = two_etas(snapshot, Some(7), Some(125));
-        assert_eq!(
-            eta_text(&RunState::Running, Some(&snapshot), true),
-            "ETA 2:05",
-            "{stage}"
-        );
-    }
-}
-
-#[test]
-fn eta_text_without_a_total_estimates_even_when_the_stage_has_one() {
-    use focusforge_gui::job::{RunState, eta_text};
-
-    for snapshot in [
-        develop_progress(2, 9),
-        prepare_progress(2, 9),
-        align_progress(3, 8),
-        fuse_progress(4, 30),
-    ] {
-        let unseeded = two_etas(snapshot, Some(42), None);
-        let text = eta_text(&RunState::Running, Some(&unseeded), true);
-        assert_eq!(text, "estimating", "{:?}", unseeded.stage);
-        assert!(!text.contains("0:00"), "{text}");
-    }
-}
-
-#[test]
-fn eta_text_switches_to_hours_at_3600_seconds() {
-    use focusforge_gui::job::{RunState, eta_text};
-
-    for (secs, expected) in [
-        (59, "ETA 0:59"),
-        (60, "ETA 1:00"),
-        (3599, "ETA 59:59"),
-        (3600, "ETA 1:00:00"),
-        (3725, "ETA 1:02:05"),
-        (45296, "ETA 12:34:56"),
-    ] {
-        let snapshot = two_etas(fuse_progress(4, 30), Some(9), Some(secs));
-        assert_eq!(
-            eta_text(&RunState::Running, Some(&snapshot), true),
-            expected,
-            "{secs} s"
-        );
-    }
-}
-
-#[test]
-fn eta_text_is_empty_in_every_state_with_the_eta_display_off() {
-    use focusforge_gui::job::{RunState, eta_text};
-
-    let totals = [None, Some(95), Some(3_725)];
-    for total in totals {
-        let snapshot = two_etas(align_progress(3, 8), Some(7), total);
-        for state in [
-            RunState::Idle,
-            RunState::Queued { position: 2 },
-            RunState::Running,
-            RunState::Paused,
-            RunState::Cancelling,
-            RunState::Failed("x".to_string()),
-            RunState::Fused {
-                at: "12:00".to_string(),
-                unaligned: 0,
-            },
-        ] {
-            assert_eq!(
-                eta_text(&state, Some(&snapshot), false),
-                "",
-                "{state:?} {total:?}"
-            );
-            assert_eq!(
-                eta_text(&state, None, false),
-                "",
-                "{state:?} without progress"
-            );
-        }
-    }
-}
-
-#[test]
-fn eta_text_holds_a_dash_outside_a_running_state_whatever_the_total() {
-    use focusforge_gui::job::{RunState, eta_text};
-
-    let snapshot = two_etas(align_progress(3, 8), Some(7), Some(125));
-    for held in [
-        RunState::Paused,
-        RunState::Cancelling,
-        RunState::Failed("x".to_string()),
-    ] {
-        assert_eq!(eta_text(&held, Some(&snapshot), true), "ETA —", "{held:?}");
-    }
-    for quiet in [
-        RunState::Idle,
-        RunState::Queued { position: 2 },
-        RunState::Fused {
-            at: "12:00".to_string(),
-            unaligned: 0,
-        },
-    ] {
-        assert_eq!(eta_text(&quiet, Some(&snapshot), true), "", "{quiet:?}");
-    }
 }
 
 #[test]
@@ -1652,59 +1432,10 @@ fn prepare_stage_announcement_records_the_unit_total() {
 }
 
 #[test]
-fn stage_announcement_carries_the_last_total_run_estimate_forward() {
-    use focusforge_core::job::JobStage;
-    use focusforge_core::pipeline::{AlignSource, RunStage, StageObserver};
-
-    let announcements = || {
-        [
-            (RunStage::Fuse, JobStage::Fuse),
-            (
-                RunStage::Prepare {
-                    frames: 7,
-                    units: 7,
-                    source: focusforge_core::pipeline::PrepareSource::Computed,
-                },
-                JobStage::Prepare,
-            ),
-            (
-                RunStage::Align {
-                    frames: 9,
-                    source: AlignSource::Cached,
-                },
-                JobStage::Align,
-            ),
-        ]
-    };
-    for (announced, stage) in announcements() {
-        let observer = job::GuiObserver::new();
-        observer.stage(announced);
-        let fresh = observer.last_progress().expect("an entry snapshot");
-        assert_eq!(fresh.stage, stage);
-        assert_eq!(fresh.total_eta, None, "{stage:?} with no prior tick");
-    }
-    for (announced, stage) in announcements() {
-        let observer = job::GuiObserver::new();
-        observer.tick(&two_etas(align_progress(3, 8), Some(7), Some(75)));
-        observer.stage(announced);
-        let carried = observer.last_progress().expect("an entry snapshot");
-        assert_eq!(carried.stage, stage);
-        assert_eq!(
-            carried.total_eta,
-            Some(Duration::from_secs(75)),
-            "{stage:?} after a tick"
-        );
-        assert_eq!(carried.eta, None, "the per-stage value is not carried");
-    }
-}
-
-#[test]
 fn a_cached_alignment_reads_as_reused() {
     use focusforge_core::job::JobStage;
     use focusforge_core::pipeline::{AlignSource, RunStage, StageObserver};
-    use focusforge_gui::job::{
-        RunState, bar_fraction, eta_text, phase_line, progress_text, stage_word,
-    };
+    use focusforge_gui::job::{RunState, bar_fraction, phase_line, progress_text, stage_word};
 
     let cached = || RunStage::Align {
         frames: 9,
@@ -1728,7 +1459,6 @@ fn a_cached_alignment_reads_as_reused() {
         assert_eq!(stage_word(&running, Some(&snapshot)), "Aligning");
         assert_eq!(progress_text(&running, Some(&snapshot)), "from cache");
         assert_eq!(bar_fraction(Some(&snapshot)), 0.0);
-        assert_eq!(eta_text(&running, Some(&snapshot), true), "estimating");
         assert_eq!(
             phase_line(&running, Some(&snapshot)).as_deref(),
             Some("aligning, from cache")
@@ -1766,7 +1496,7 @@ fn a_computed_alignment_shows_no_reuse_text() {
     );
     assert_eq!(
         progress_text(&RunState::Running, Some(&fuse_progress(2, 10))),
-        ""
+        "2 of 10 tiles"
     );
     assert_eq!(progress_text(&RunState::Running, None), "");
 }
@@ -1804,13 +1534,14 @@ fn progress_text_without_a_total_is_the_name_only() {
     assert_eq!(progress_text(&RunState::Running, Some(&no_total)), "");
 
     // A fuse snapshot that still carries a finished align stage's `8/8`
-    // shows no count -- only Aligning counts frames.
+    // counts tiles, never the align stage's frames -- only Aligning counts
+    // frames.
     let mut finished_align_then_fusing = fuse_progress(0, 10);
     finished_align_then_fusing.align_done = 8;
     finished_align_then_fusing.align_total = 8;
     assert_eq!(
         progress_text(&RunState::Running, Some(&finished_align_then_fusing)),
-        ""
+        "0 of 10 tiles"
     );
 }
 
@@ -2081,7 +1812,7 @@ fn fuse_is_enabled_from_two_frames_and_disabled_below() {
 }
 
 #[test]
-fn toolbar_preview_shows_no_eta_with_the_eta_display_off() {
+fn toolbar_preview_holds_until_a_run_starts() {
     for (state, stage_word) in [
         ("idle", ""),
         ("running", "Aligning"),
@@ -2089,30 +1820,11 @@ fn toolbar_preview_shows_no_eta_with_the_eta_display_off() {
         ("cancelling", "Cancelling"),
         ("failed", "Failed"),
     ] {
-        let mut controller = controller_with_frames(&format!("preview_no_eta_{state}"), 3);
-        controller.set_toolbar_preview(state);
-        let preview = controller.job_view();
-        assert_eq!(preview.stage_word, stage_word, "{state}");
-        assert_eq!(preview.eta_text, "", "{state}");
-    }
-}
-
-#[test]
-fn toolbar_preview_holds_until_a_run_starts() {
-    for (state, stage_word, eta) in [
-        ("idle", "", ""),
-        ("running", "Aligning", "ETA 1:12"),
-        ("paused", "Paused", "ETA —"),
-        ("cancelling", "Cancelling", "ETA —"),
-        ("failed", "Failed", "ETA —"),
-    ] {
         let mut controller = controller_with_frames(&format!("preview_{state}"), 3);
-        controller.set_eta_display(true);
         controller.set_toolbar_preview(state);
         let preview = controller.job_view();
         assert_eq!(preview.toolbar_run_state, state);
         assert_eq!(preview.stage_word, stage_word, "{state}");
-        assert_eq!(preview.eta_text, eta, "{state}");
         assert!(preview.fuse_enabled, "{state}: a 3-frame tab can fuse");
 
         // A completed open adds a 1-frame tab: the preview stays, only
@@ -2169,7 +1881,6 @@ impl PartialEq for JobViewHeld<'_> {
             && a.toolbar_run_state == b.toolbar_run_state
             && a.stage_word == b.stage_word
             && a.step_text == b.step_text
-            && a.eta_text == b.eta_text
             && a.bar_tone == b.bar_tone
             && a.fraction == b.fraction
     }
@@ -2339,7 +2050,6 @@ fn switching_to_an_idle_tab_clears_the_running_tabs_words() {
     let view = controller.job_view();
     assert_eq!(view.stage_word, "");
     assert_eq!(view.step_text, "");
-    assert_eq!(view.eta_text, "");
     assert_eq!(view.fraction, 0.0);
 
     controller.select_project(0);
@@ -2350,7 +2060,6 @@ fn switching_to_an_idle_tab_clears_the_running_tabs_words() {
 #[test]
 fn returning_to_the_running_tab_restores_its_live_progress() {
     let mut controller = controller_with_two_tabs("returns_restores");
-    controller.set_eta_display(true);
     start_and_hold_at_pause(&mut controller, Duration::from_secs(120));
     let held_fraction = controller.job_view().fraction;
     assert!(held_fraction > 0.0);
@@ -2365,7 +2074,6 @@ fn returning_to_the_running_tab_restores_its_live_progress() {
         view.fraction, held_fraction,
         "the same non-zero fraction the bar read before the switch"
     );
-    assert_eq!(view.eta_text, "ETA —");
 
     controller.cancel_fuse();
     common::wait_for_settle(&mut controller, Duration::from_secs(120));
@@ -2609,7 +2317,6 @@ fn a_tab_switch_updates_the_bar_without_a_job_event() {
 
     assert_eq!(app.get_stage_word(), "");
     assert_eq!(app.get_step_text(), "");
-    assert_eq!(app.get_eta_text(), "");
 
     let mut guard = controller.lock().unwrap();
     guard.select_project(0);
@@ -8112,7 +7819,6 @@ fn stage_view_leaves_the_bottom_bar_unchanged() {
             job::stage_word(&running, progress.as_ref()),
             job::progress_text(&running, progress.as_ref()),
             job::phase_line(&running, progress.as_ref()),
-            job::eta_text(&running, progress.as_ref(), true),
             job::bar_fraction(progress.as_ref()),
         )
     };

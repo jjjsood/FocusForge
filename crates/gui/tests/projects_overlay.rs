@@ -232,17 +232,12 @@ fn align_progress(align_done: usize, align_total: usize) -> focusforge_core::job
         stage: JobStage::Align,
         units_done: 0,
         unit_total: 0,
-        pixels_done: 0,
-        pixel_total: 0,
-        running: Duration::ZERO,
-        eta: None,
         align_done,
         align_total,
         prepare_done: 0,
         prepare_total: 0,
         develop_done: 0,
         develop_total: 0,
-        total_eta: None,
     }
 }
 
@@ -252,17 +247,12 @@ fn fuse_progress(units_done: usize, unit_total: usize) -> focusforge_core::job::
         stage: JobStage::Fuse,
         units_done,
         unit_total,
-        pixels_done: 0,
-        pixel_total: 0,
-        running: Duration::ZERO,
-        eta: None,
         align_done: 0,
         align_total: 0,
         prepare_done: 0,
         prepare_total: 0,
         develop_done: 0,
         develop_total: 0,
-        total_eta: None,
     }
 }
 
@@ -280,7 +270,15 @@ fn live_card_meta_names_the_phase() {
     );
     assert_eq!(
         job::phase_line(&RunState::Running, Some(&fuse_progress(4, 10))).as_deref(),
+        Some("fusing, 4 of 10 tiles")
+    );
+    assert_eq!(
+        job::phase_line(&RunState::Running, Some(&fuse_progress(0, 0))).as_deref(),
         Some("fusing")
+    );
+    assert_eq!(
+        job::phase_line(&RunState::Paused, Some(&fuse_progress(4, 10))),
+        None
     );
     assert_eq!(
         job::phase_line(&RunState::Running, Some(&fuse_progress(10, 10))).as_deref(),

@@ -18,14 +18,10 @@ use focusforge_core::equalize::{EqualizationReport, EqualizeSettings};
 use focusforge_core::gpu::{AlignBackend, TileBackend};
 use focusforge_core::io::{
     DevelopStore, FrameReader, Group, Proposal, Rect, open_frame_set, propose,
-    source_bits_per_sample,
 };
-use focusforge_core::job::prediction::{RawSource, RunPrediction, predict_run};
 use focusforge_core::job::{JobControl, StageCache};
 use focusforge_core::params::{self, ParamValue, ParamValues, Provenance};
-use focusforge_core::pipeline::{
-    FuseTileTiming, RunPlanFeatures, develop_tile_share, host_workers,
-};
+use focusforge_core::pipeline::{FuseTileTiming, develop_tile_share, host_workers};
 use focusforge_core::project::{self, PROJECT_EXTENSION};
 use focusforge_core::registry;
 use focusforge_core::tile::{InFlightBound, TileScheduler, TileSchedulerOptions};
@@ -149,11 +145,6 @@ pub struct StackReport {
     /// Full-frame RAW develops per frame, in frame order, across every stage
     /// of this group; `null` for TIFF and JPEG stacks.
     pub develop_counts: Option<Vec<u64>>,
-    /// The run-plan inputs, known before the first stage: frame count and
-    /// pixels, source bit depth, reader (the input format), planned backend,
-    /// worker count, blend method. `align_cache_hit` and `resumed_units`
-    /// carry what the run resolved, not the cold values a dry run reports.
-    pub run_plan: RunPlanFeatures,
     /// The bounded trace-accounting counters, `null` unless accounting was on
     /// (`--trace-accounting`). They are process-wide and cumulative: in a
     /// multi-group run each group's document holds the totals at the end of
@@ -317,13 +308,6 @@ pub struct DryRunPlan {
     /// Where the RAW frames would be developed to: `memory` or `scratch_file`;
     /// `null` for input that is not developed.
     pub developed_store: Option<DevelopStore>,
-    /// The run-plan inputs as a cold run would start: no alignment cache hit,
-    /// nothing resumed.
-    pub run_plan: RunPlanFeatures,
-    /// Seconds on the reference machine for a cold run; a stage the plan does
-    /// not enter is `null`, and `calibrated` says whether the input matches
-    /// a measured class. `null` when the stack has no frames or pixels.
-    pub prediction: Option<RunPrediction>,
     pub backend: String,
     /// The paths this invocation *would* write. None of them exists.
     pub would_write: Vec<String>,
@@ -1031,10 +1015,7 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
     let _stack = tracing::debug_span!("stack", identity = %identity).entered();
     // Inside the span, so a forced crash carries this run's own context.
     focusforge_diagnostics::force_crash("stack");
-    let renderer = ProgressRenderer::new(
-        ProgressMode::choose(job_opts.no_progress),
-        job_opts.show_eta,
-    );
+    let renderer = ProgressRenderer::new(ProgressMode::choose(job_opts.no_progress));
     let status = StatusSink::new(preset_opts.status, identity, "stack");
     status.set_algorithm(algo.id());
 
@@ -1087,20 +1068,6 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         Ok(resolved) => resolved,
         Err(err) => return failed(&status, start, err),
     };
-    let source_bits = match source_bits_per_sample(opened.kind, &paths[0]) {
-        Ok(bits) => bits,
-        Err(err) => return failed(&status, start, err),
-    };
-    // The CLI sets no worker cap on its jobs.
-    let run_plan = RunPlanFeatures::new(
-        &stack_ctx,
-        opened.kind,
-        source_bits,
-        backend.is_some(),
-        align_choice.backend.is_some(),
-        algo.id(),
-        usize::MAX,
-    );
 
     // Resolving the alignment algorithm and its parameters is pure --
     // registry lookup, `--align-set`/`[align]` validation, `auto`
@@ -1217,12 +1184,6 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
         let geometry = scheduler.plan();
         // One project, and nothing else: a run writes no image at all.
         let would_write = vec![output.display().to_string()];
-        let raw = developed_store.zip(paths[0].extension().and_then(|ext| ext.to_str()));
-        let prediction = predict_run(
-            &run_plan,
-            align_prepared.is_some(),
-            raw.map(|(store, extension)| RawSource { extension, store }),
-        );
         let plan = DryRunPlan {
             dry_run: true,
             input: dir.display().to_string(),
@@ -1259,8 +1220,6 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
             },
             max_bytes_in_flight: scheduler_budget.bytes(),
             developed_store,
-            run_plan,
-            prediction,
             backend: backend
                 .map(|b| b.info().to_string())
                 .unwrap_or_else(|| "cpu".to_string()),
@@ -1385,7 +1344,6 @@ fn run_group(setup: &RunSetup<'_>, group: &Group, output: &Path, identity: Strin
                 device_peak,
                 align_opts,
                 align_choice,
-                run_plan,
                 *report,
             );
             GroupResult::Completed(Box::new(stack_report))
@@ -1448,9 +1406,9 @@ impl focusforge_core::pipeline::StageObserver for CliObserver<'_> {
                 frames,
                 source: AlignSource::Computed,
             } => renderer.stage(&format!("align {frames} frames")),
-            // A fuse-stage entry line, unconditional and immediate, carrying
-            // the whole run's remaining time: it gives a script or a human
-            // watching a redirected log a fact the instant the job starts.
+            // A fuse-stage entry line, unconditional and immediate: it gives
+            // a script or a human watching a redirected log a fact the
+            // instant the job starts.
             RunStage::Fuse => renderer.start(&self.control.progress()),
             RunStage::Seal => renderer.stage("seal project"),
             // The completion line's exact wording is what `job_cli.rs`
@@ -1534,7 +1492,6 @@ fn build_stack_report(
     device_peak: Option<&'static dyn DevicePeak>,
     align_opts: &AlignOptions<'_>,
     align_choice: &AlignBackendChoice,
-    run_plan: RunPlanFeatures,
     report: focusforge_core::pipeline::FuseReport,
 ) -> StackReport {
     let outputs = vec![sealed_path(&report)];
@@ -1628,11 +1585,6 @@ fn build_stack_report(
         align_cached: report.align_cached,
         stages: report.stages,
         develop_counts: report.develop_counts,
-        run_plan: RunPlanFeatures {
-            align_cache_hit: report.align_cached,
-            resumed_units: report.resumed_units,
-            ..run_plan
-        },
         trace_accounting: timing_snapshot(),
         fuse_tiles: report.fuse_tiles,
         align_source: report.align_source,
@@ -1848,17 +1800,6 @@ fn render_plan(plan: &DryRunPlan) -> String {
     for output in &plan.would_write {
         lines.push(format!("would write: {output}"));
     }
-    lines.push(match &plan.prediction {
-        Some(p) if p.calibrated => format!(
-            "predicted duration: {:.1} s (estimate for the reference machine, cold run)",
-            p.total_seconds
-        ),
-        Some(p) => format!(
-            "predicted duration: ~{:.1} s (not calibrated for this input)",
-            p.total_seconds
-        ),
-        None => "predicted duration: unknown".to_string(),
-    });
     lines.push("crop: not computed -- --dry-run stops before alignment".to_string());
     lines.push("output size: not computed -- it follows from the crop".to_string());
     lines.join("\n")
@@ -1925,15 +1866,6 @@ mod tests {
                 finalize: Some(0.038),
             },
             develop_counts: None,
-            run_plan: RunPlanFeatures::new(
-                &focusforge_core::params::StackContext::new(8, 512, 512, 3),
-                focusforge_core::io::ReaderKind::Mmap,
-                16,
-                false,
-                false,
-                "example-stack",
-                usize::MAX,
-            ),
             trace_accounting: None,
             fuse_tiles: None,
             align_source: "computed".to_string(),
