@@ -595,8 +595,8 @@ struct PickerOption {
     label: String,
 }
 
-/// Builds the whole panel's flat row list, Prepare, Fuse, Align, then Finish: each
-/// section's heading, its algorithm picker (Fuse/Align only), one row per
+/// Builds the whole panel's flat row list, Prepare, Align, Fuse, then Finish: each
+/// section's heading, its algorithm picker (Align/Fuse only), one row per
 /// plain [`ParamDesc`] in declaration order with a [`RowKind::Error`] row
 /// trailing any field in violation, then a `More...` header over the advanced
 /// ones. With no tab active the panel still renders, collapsed, seeded like a
@@ -671,26 +671,6 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
         row.disabled = !equalize_on;
     }
 
-    if let Ok(fuse) = registry::find_stack(fuse_id) {
-        let mut methods = registry::stack_algorithms();
-        methods.sort_by_key(|a| (!a.is_default(), a.advanced()));
-        let picker = methods
-            .iter()
-            .filter(|a| !a.test_only())
-            .map(|a| PickerOption {
-                id: a.id().to_string(),
-                label: a.display_name().to_string(),
-            })
-            .collect();
-        rows.extend(section_rows(
-            "fuse",
-            "FUSE",
-            fuse.params(),
-            fuse_values,
-            &section_ctx,
-            Some((fuse_id, fuse.display_name(), picker)),
-        ));
-    }
     if let Ok(align) = registry::find_align(align_id) {
         let picker = registry::align_algorithms()
             .iter()
@@ -726,6 +706,26 @@ pub(crate) fn build_rows(active: Option<ActiveTabParams<'_>>) -> Vec<SettingsRow
             align_rows[0].heading_state = HeadingState::Explicit;
         }
         rows.extend(align_rows);
+    }
+    if let Ok(fuse) = registry::find_stack(fuse_id) {
+        let mut methods = registry::stack_algorithms();
+        methods.sort_by_key(|a| (!a.is_default(), a.advanced()));
+        let picker = methods
+            .iter()
+            .filter(|a| !a.test_only())
+            .map(|a| PickerOption {
+                id: a.id().to_string(),
+                label: a.display_name().to_string(),
+            })
+            .collect();
+        rows.extend(section_rows(
+            "fuse",
+            "FUSE",
+            fuse.params(),
+            fuse_values,
+            &section_ctx,
+            Some((fuse_id, fuse.display_name(), picker)),
+        ));
     }
     rows.extend(section_rows(
         "finish",

@@ -7297,7 +7297,7 @@ impl AppController {
     // section per family, one field per `ParamDesc`" true by construction
     // rather than by an incremental patch that could drift from it. --
 
-    /// Builds the whole panel: Prepare, Fuse, Align, Finish, in that order, each
+    /// Builds the whole panel: Prepare, Align, Fuse, Finish, in that order, each
     /// section's rows flattened from `AlgorithmRef::params()`'s own
     /// declaration order. With no tab active ("+" selected) the panel still
     /// renders -- the default algorithm of each family, with no explicit

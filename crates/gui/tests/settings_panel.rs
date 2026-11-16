@@ -618,6 +618,65 @@ fn a_reopened_project_without_an_align_record_opens_with_align_explicit() {
     );
 }
 
+fn section_order(rows: &[SettingsRow]) -> Vec<&str> {
+    rows.iter()
+        .filter(|r| r.kind == RowKind::SectionHeading)
+        .map(|r| r.section.as_str())
+        .collect()
+}
+
+#[test]
+fn align_precedes_fuse() {
+    let order = ["prepare", "align", "fuse", "finish"];
+
+    let rows = AppController::new().settings_panel().rows;
+    assert_eq!(section_order(&rows), order, "no tab active");
+    let after_heading = rows
+        .iter()
+        .skip_while(|r| !(r.kind == RowKind::SectionHeading && r.section == "align"))
+        .nth(1)
+        .expect("a row follows the ALIGN heading");
+    assert_eq!(
+        (
+            after_heading.section.as_str(),
+            after_heading.id.as_str(),
+            after_heading.kind
+        ),
+        ("align-switch", "align", RowKind::Bool),
+        "the switch row heads the ALIGN section"
+    );
+
+    let mut controller = AppController::new();
+    let project = seal_without_align("align_precedes_fuse", "depth-map");
+    assert!(matches!(
+        common::open_and_settle(&mut controller, &[project]),
+        OpenOutcome::Opened(_)
+    ));
+    let rows = controller.settings_panel().rows;
+    assert_eq!(
+        section_order(&rows),
+        order,
+        "reopened without an align record"
+    );
+    let switch = rows
+        .iter()
+        .find(|r| r.section == "align-switch" && r.id == "align")
+        .expect("the ALIGN switch row");
+    assert_eq!(switch.selected, "false");
+    let align_below: Vec<&SettingsRow> = rows
+        .iter()
+        .filter(|r| r.section == "align" && r.kind != RowKind::SectionHeading)
+        .collect();
+    assert!(!align_below.is_empty());
+    assert!(align_below.iter().all(|r| r.disabled), "ALIGN rows grey");
+    assert!(
+        rows.iter()
+            .filter(|r| r.section == "fuse")
+            .all(|r| !r.disabled),
+        "FUSE rows stay enabled"
+    );
+}
+
 #[test]
 fn reopened_cropped_project_shows_auto_crop_on() {
     use focusforge_core::align::Registration;
@@ -2217,8 +2276,8 @@ fn prepare_and_finish_sections_hold_the_project_settings() {
             headings,
             [
                 ("prepare", "PREPARE"),
-                ("fuse", "FUSE"),
                 ("align", "ALIGN"),
+                ("fuse", "FUSE"),
                 ("finish", "FINISH"),
             ],
             "{method}"
@@ -2509,7 +2568,13 @@ fn more_strip_closes_after_opening_in_every_section() {
     assert_toggles("fresh panel");
 
     // Open Fuse's picker and pick a method from its list, as a user does.
-    panel.click(element_center(&panel.elements("FFMenu::area")[0]));
+    let rows = panel.rows();
+    let fuse_menu = rows
+        .iter()
+        .filter(|r| r.kind == RowKind::Picker)
+        .position(|r| r.section == "fuse")
+        .expect("Fuse has a picker");
+    panel.click(element_center(&panel.elements("FFMenu::area")[fuse_menu]));
     let rows = panel.rows();
     let wanted = rows
         .iter()
