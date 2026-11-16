@@ -28,7 +28,7 @@ use focusforge_core::display::{PreviewCost, PreviewKind, PreviewKinds, StagePrev
 use focusforge_core::equalize::{EqualizeSettings, UNIT_GAIN};
 use focusforge_core::fuse::laplacian::Laplacian;
 use focusforge_core::gpu::{BackendInfo, TileBackend};
-use focusforge_core::io::{FrameDesc, TiffHeader, TiffSpec, TiffWriter};
+use focusforge_core::io::{FrameDesc, FrameReader, TiffHeader, TiffSpec, TiffWriter};
 use focusforge_core::job::{
     AlignIdentity, ControlState, FrameFingerprint, JobControl, JobProgress, JobStage,
     StackFingerprint, StageCache, StageKey,
@@ -4112,6 +4112,20 @@ fn write_defect_png(path: &Path, size: (u32, u32), black: &[(u32, u32)]) {
         .expect("the mask file is writable");
 }
 
+fn defect_request(
+    label: &str,
+    frames: &[PathBuf],
+    root: &Path,
+    defects: Option<DefectSettings>,
+) -> FuseRequest {
+    let mut request = base_request(label, frames.to_vec(), ParamValues::new());
+    request.scratch_root = root.join("scratch");
+    request.align = Some(dummy_align_request());
+    request.output = FuseOutput::Hold(root.join(label));
+    request.defects = defects;
+    request
+}
+
 fn defect_run(
     label: &str,
     frames: &[PathBuf],
@@ -4120,11 +4134,7 @@ fn defect_run(
     observer: &dyn StageObserver,
     cache: Option<&StageCache>,
 ) -> Result<Box<FuseReport>, PipelineError> {
-    let mut request = base_request(label, frames.to_vec(), ParamValues::new());
-    request.scratch_root = root.join("scratch");
-    request.align = Some(dummy_align_request());
-    request.output = FuseOutput::Hold(root.join(label));
-    request.defects = defects;
+    let request = defect_request(label, frames, root, defects);
     match focusforge_core::pipeline::run(&request, observer, JobControl::new(), cache)? {
         FuseOutcome::Completed(report) => Ok(report),
         FuseOutcome::Cancelled { .. } => panic!("the run was not cancelled"),
@@ -4290,6 +4300,16 @@ fn developed_frame(paths: &[PathBuf]) -> Vec<f32> {
 fn detected_in(paths: &[PathBuf]) -> DefectMask {
     let budget = focusforge_core::tile::HostBudget::explicit(1 << 30);
     let set = focusforge_core::io::open_frame_set(paths, budget).expect("the frames open");
+    set.reader
+        .develop_once(
+            Path::new("."),
+            focusforge_core::io::DevelopStore::Memory,
+            budget,
+            2,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
+        .expect("the frames develop");
     focusforge_core::hot_pixels::detect(
         set.reader.as_ref(),
         paths.len(),
@@ -4333,13 +4353,8 @@ fn raw_stack_repairs_the_demosaic_spread_of_hot_photosites() {
     let reach = (0..).find(|r: &i64| r * r >= reach_squared).unwrap();
     assert_eq!(reach, i64::from(DEMOSAIC_REACH), "{footprint:?}");
 
-    let clean = defect_run("clean", &clean_paths, &root, None, &NoopObserver, None)
-        .expect("the clean run completes");
-    let hot_off = defect_run("hot-off", &hot_paths, &root, None, &NoopObserver, None)
-        .expect("the unrepaired run completes");
     let hot_on = defect_run("hot-on", &hot_paths, &root, on, &NoopObserver, None)
         .expect("the repaired run completes");
-    assert_eq!(hot_off.defects, None, "off reports no repair");
     let found = detected_in(&hot_paths);
     for (x, y) in HOT_SITES {
         assert!(found.contains(x, y), "the hot site ({x}, {y}) is detected");
@@ -4354,21 +4369,139 @@ fn raw_stack_repairs_the_demosaic_spread_of_hot_photosites() {
             file: None,
         })
     );
+}
 
-    let (clean, hot_off, hot_on) = (
-        held_samples(&clean),
-        held_samples(&hot_off),
-        held_samples(&hot_on),
-    );
-    assert!(
-        !deviating_offsets(&clean, &hot_off, 3, tolerance).is_empty(),
-        "without repair the hot photosites show in the result"
-    );
+/// Per `HOT_SITES` site, the offset within `SPREAD_WINDOW` at which `run`
+/// deviates most from `clean` in any channel; the first such offset in row
+/// order on a tie.
+fn peak_offsets(clean: &[f32], run: &[f32]) -> Vec<(i64, i64)> {
+    HOT_SITES
+        .iter()
+        .map(|&(sx, sy)| {
+            let mut peak = (-1.0f32, (0, 0));
+            for dy in -SPREAD_WINDOW..=SPREAD_WINDOW {
+                for dx in -SPREAD_WINDOW..=SPREAD_WINDOW {
+                    let at = ((sy as i64 + dy) * SPREAD_SIZE as i64 + sx as i64 + dx) as usize * 3;
+                    let deviation = (0..3)
+                        .map(|c| (run[at + c] - clean[at + c]).abs())
+                        .fold(0.0, f32::max);
+                    if deviation > peak.0 {
+                        peak = (deviation, (dx, dy));
+                    }
+                }
+            }
+            peak.1
+        })
+        .collect()
+}
+
+/// The Chebyshev radius around a hot site that covers every pixel (within
+/// `SPREAD_WINDOW`) where `run` differs from `clean` by more than `tolerance`
+/// in any channel, and how many such pixels there are over all sites.
+fn smear(clean: &[f32], run: &[f32], tolerance: f32) -> (i64, usize) {
+    let (mut radius, mut pixels) = (0, 0);
+    for (sx, sy) in HOT_SITES {
+        for dy in -SPREAD_WINDOW..=SPREAD_WINDOW {
+            for dx in -SPREAD_WINDOW..=SPREAD_WINDOW {
+                let at = ((sy as i64 + dy) * SPREAD_SIZE as i64 + sx as i64 + dx) as usize * 3;
+                if (0..3).any(|c| (run[at + c] - clean[at + c]).abs() > tolerance) {
+                    radius = radius.max(dx.abs().max(dy.abs()));
+                    pixels += 1;
+                }
+            }
+        }
+    }
+    (radius, pixels)
+}
+
+#[test]
+fn a_hot_photosite_keeps_its_position_through_develop_detection_and_fusion() {
+    let root = scratch("raw_hot_photosite_position");
+    let clean_frames = spread_frames(false, false);
+    let hot_frames = spread_frames(true, false);
+    let (clean_paths, hot_paths) = (spread_paths(&clean_frames), spread_paths(&hot_frames));
+    let at_site = vec![(0, 0); HOT_SITES.len()];
+
+    let (clean_frame, hot_frame) = (developed_frame(&clean_paths), developed_frame(&hot_paths));
+    let level = clean_frame.iter().sum::<f32>() / clean_frame.len() as f32;
     assert_eq!(
-        deviating_offsets(&clean, &hot_on, 3, tolerance),
-        [],
-        "the repair leaves no spread of a hot photosite"
+        peak_offsets(&clean_frame, &hot_frame),
+        at_site,
+        "the developed frame peaks at each hot photosite"
     );
+
+    let found = detected_in(&hot_paths);
+    for (x, y) in HOT_SITES {
+        assert!(found.contains(x, y), "the hot site ({x}, {y}) is detected");
+    }
+    for (x, y) in found.positions() {
+        let reach = HOT_SITES
+            .iter()
+            .map(|&(sx, sy)| x.abs_diff(sx).max(y.abs_diff(sy)))
+            .min()
+            .expect("there are hot sites");
+        assert!(
+            reach <= DEMOSAIC_REACH,
+            "({x}, {y}) is detected {reach} px from the nearest hot site"
+        );
+    }
+
+    for name in ["weighted-average", "depth-map", "laplacian"] {
+        let run = |label: &str, frames: &[PathBuf], repair: bool| {
+            let mut request = defect_request(
+                &format!("{name}-{label}"),
+                frames,
+                &root,
+                repair.then_some(DefectSettings {
+                    hot_pixel_threshold: Some(7.0),
+                    mask: None,
+                    grow_radius: 0,
+                }),
+            );
+            request.algorithm = registry::find_stack(name).expect("the algorithm is registered");
+            // The test aligner translates every frame but the first.
+            request.align = None;
+            match focusforge_core::pipeline::run(&request, &NoopObserver, JobControl::new(), None)
+                .expect("the run completes")
+            {
+                FuseOutcome::Completed(report) => report,
+                FuseOutcome::Cancelled { .. } => panic!("the run was not cancelled"),
+            }
+        };
+        let clean = run("clean", &clean_paths, false);
+        let hot_off = run("hot-off", &hot_paths, false);
+        let hot_on = run("hot-on", &hot_paths, true);
+        assert_eq!(hot_off.defects, None, "{name}: off reports no repair");
+        let (clean, hot_off, hot_on) = (
+            held_samples(&clean),
+            held_samples(&hot_off),
+            held_samples(&hot_on),
+        );
+
+        let peaks = peak_offsets(&clean, &hot_off);
+        eprintln!("{name}: unrepaired composite peaks at offsets {peaks:?}");
+        if name == "weighted-average" {
+            assert_eq!(peaks, at_site, "identical frames fuse to the frame");
+        }
+        for (label, run_samples) in [("unrepaired", &hot_off), ("repaired", &hot_on)] {
+            for fraction in [0.02, 0.005] {
+                let (radius, pixels) = smear(&clean, run_samples, fraction * level);
+                eprintln!(
+                    "{name}: {label} composite deviates over radius {radius}, {pixels} pixels at {}% of the level",
+                    fraction * 100.0
+                );
+            }
+        }
+        assert!(
+            !deviating_offsets(&clean, &hot_off, 3, 0.005 * level).is_empty(),
+            "{name}: without repair the hot photosites show in the result"
+        );
+        assert_eq!(
+            deviating_offsets(&clean, &hot_on, 3, 0.005 * level),
+            [],
+            "{name}: the repair leaves no spread of a hot photosite"
+        );
+    }
 }
 
 #[test]
@@ -4518,12 +4651,10 @@ fn persistent_outliers(
     found
 }
 
-#[test]
-#[ignore = "reads the RAW sample stack"]
-fn raw_sample_stack_growth_clears_persistent_outliers_around_hot_pixels() {
-    let Some(dir) = common::raw_sample_stack_dir() else {
-        return;
-    };
+/// The first eight CR3 frames of the RAW sample stack by name, or `None` (with
+/// a `skip:` line) when `FOCUSFORGE_RAW_SAMPLE_STACK` is unset.
+fn raw_sample_frames() -> Option<Vec<PathBuf>> {
+    let dir = common::raw_sample_stack_dir()?;
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
         .expect("the stack directory lists")
         .map(|entry| entry.expect("a directory entry").path())
@@ -4535,6 +4666,144 @@ fn raw_sample_stack_growth_clears_persistent_outliers_around_hot_pixels() {
     paths.sort();
     paths.truncate(8);
     assert_eq!(paths.len(), 8, "eight CR3 frames in {}", dir.display());
+    Some(paths)
+}
+
+/// The detection score of the centre of the 3x3 window of `frame` around
+/// `(x, y)`, the largest over channels of `|centre - median| / max(MAD,
+/// MIN_SPREAD)` (the rule of the hot-pixel outlier test), and the window's
+/// samples (centre included) for comparing two develops.
+fn window_score(reader: &dyn FrameReader, frame: usize, (x, y): (u32, u32)) -> (f64, Vec<u16>) {
+    let (width, height) = reader.dimensions();
+    let (x0, y0) = (x.saturating_sub(1), y.saturating_sub(1));
+    let rect = Rect {
+        x: x0,
+        y: y0,
+        width: (x + 2).min(width) - x0,
+        height: (y + 2).min(height) - y0,
+    };
+    let mut samples = vec![0u16; rect.width as usize * rect.height as usize * 3];
+    reader
+        .read_tile_into(frame, rect, &mut samples)
+        .expect("the window reads");
+    let centre = ((y - y0) * rect.width + (x - x0)) as usize;
+    let median_of = |mut values: Vec<f64>| {
+        values.sort_by(f64::total_cmp);
+        let n = values.len();
+        if n % 2 == 1 {
+            values[n / 2]
+        } else {
+            (values[n / 2 - 1] + values[n / 2]) / 2.0
+        }
+    };
+    let score = (0..3)
+        .map(|channel| {
+            let neighbours: Vec<f64> = (0..samples.len() / 3)
+                .filter(|&i| i != centre)
+                .map(|i| f64::from(samples[i * 3 + channel]))
+                .collect();
+            let m = median_of(neighbours.clone());
+            let mad = median_of(neighbours.iter().map(|n| (n - m).abs()).collect());
+            (f64::from(samples[centre * 3 + channel]) - m).abs()
+                / mad.max(focusforge_core::hot_pixels::MIN_SPREAD)
+        })
+        .fold(0.0, f64::max);
+    (score, samples)
+}
+
+#[test]
+#[ignore = "reads the RAW sample stack"]
+fn raw_sample_stack_hot_pixel_counts_agree() {
+    const THRESHOLD: f64 = 7.0;
+    // Rounding of the developed samples: 0.1 % of full scale.
+    const ROUNDING_LSB: u16 = 66;
+    let Some(paths) = raw_sample_frames() else {
+        return;
+    };
+    let budget = focusforge_core::tile::HostBudget::explicit(u64::MAX);
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let on_demand = focusforge_core::io::open_frame_set(&paths, budget).expect("the frames open");
+    let stored = focusforge_core::io::open_frame_set(&paths, budget).expect("the frames open");
+    let (on_demand, stored) = (on_demand.reader.as_ref(), stored.reader.as_ref());
+    let store = tempfile::tempdir().expect("a scratch directory");
+    stored
+        .develop_once(
+            store.path(),
+            focusforge_core::io::DevelopStore::ScratchFile,
+            budget,
+            workers,
+            &|| false,
+            &AtomicUsize::new(0),
+        )
+        .expect("the frames develop");
+    assert_eq!(on_demand.dimensions(), stored.dimensions());
+    assert_eq!(on_demand.len(), stored.len());
+
+    let detect = |reader: &dyn FrameReader| {
+        focusforge_core::hot_pixels::detect(
+            reader,
+            paths.len(),
+            reader.dimensions(),
+            3,
+            THRESHOLD,
+            workers,
+            &AtomicUsize::new(0),
+            &|| false,
+        )
+        .expect("detection runs")
+    };
+    let (direct, after_store) = (detect(on_demand), detect(stored));
+    eprintln!(
+        "detected {} on the on-demand develop, {} after develop_once",
+        direct.count(),
+        after_store.count()
+    );
+    let in_one: Vec<(u32, u32)> = direct
+        .positions()
+        .into_iter()
+        .filter(|&(x, y)| !after_store.contains(x, y))
+        .chain(
+            after_store
+                .positions()
+                .into_iter()
+                .filter(|&(x, y)| !direct.contains(x, y)),
+        )
+        .collect();
+    assert!(
+        !in_one.is_empty(),
+        "the two develops disagree on some position"
+    );
+    for &at in &in_one {
+        let mut rounding_only = false;
+        for frame in 0..paths.len() {
+            let (score_direct, window_direct) = window_score(on_demand, frame, at);
+            let (score_stored, window_stored) = window_score(stored, frame, at);
+            let largest_difference = window_direct
+                .iter()
+                .zip(&window_stored)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .expect("the window is not empty");
+            eprintln!(
+                "{at:?} frame {frame}: score {score_direct:.3} on demand, {score_stored:.3} stored, \
+                 largest window difference {largest_difference} LSB"
+            );
+            rounding_only |= (score_direct > THRESHOLD) != (score_stored > THRESHOLD)
+                && largest_difference <= ROUNDING_LSB;
+        }
+        assert!(
+            rounding_only,
+            "{at:?}: no frame's verdict differs with windows within {ROUNDING_LSB} LSB"
+        );
+    }
+}
+
+#[test]
+#[ignore = "reads the RAW sample stack"]
+fn raw_sample_stack_growth_clears_persistent_outliers_around_hot_pixels() {
+    let Some(paths) = raw_sample_frames() else {
+        return;
+    };
 
     let budget = focusforge_core::tile::HostBudget::explicit(u64::MAX);
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get());

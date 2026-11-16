@@ -39,15 +39,30 @@ pub(crate) fn run(dir: &Path, set: &SetArgs, json: bool) -> ExitCode {
         Ok(paths) => paths,
         Err(err) => return crate::fail(err),
     };
-    let frames = match open_frame_set(
-        &paths,
-        HostBudget::host_derived(&focusforge_core::host::snapshot()),
-    ) {
+    let budget = HostBudget::host_derived(&focusforge_core::host::snapshot());
+    let frames = match open_frame_set(&paths, budget) {
         Ok(frames) => frames,
         Err(err) => return crate::fail(err),
     };
     let reader = frames.reader.as_ref();
     let workers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    // A RAW stack is detected on the frames as `stack` stores them.
+    let developed = reader
+        .develop_store(budget, workers, 0)
+        .and_then(|store| match store {
+            Some(store) => reader.develop_once(
+                Path::new(".scratch"),
+                store,
+                budget,
+                workers,
+                &|| false,
+                &AtomicUsize::new(0),
+            ),
+            None => Ok(0),
+        });
+    if let Err(err) = developed {
+        return crate::fail(err);
+    }
     let mask = match detect(
         reader,
         reader.len(),

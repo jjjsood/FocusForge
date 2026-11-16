@@ -542,6 +542,13 @@ pixels found. A pixel counts when it differs from the median of its
 neighbourhood by more than `hot-pixel-threshold` times that neighbourhood's
 spread.
 
+On a RAW folder the frames are developed the way `stack` develops them, so
+the pixels listed are the ones a `stack` run with hot-pixel removal on
+detects; on a colour RAW stack the `detected=` count of that run also holds
+the four direct neighbours of each, which demosaicing reaches. Developing a
+large RAW folder may keep temporary frames under `.scratch/` while the command
+runs.
+
 | option | meaning |
 |---|---|
 | `--set <KEY=VALUE>` | set one of the values below; repeatable |
