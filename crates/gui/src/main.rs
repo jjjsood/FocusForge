@@ -1002,6 +1002,7 @@ fn run_window<T: ComponentHandle + 'static>(
                 // Slint reports no scale-factor change on its own, and one
                 // without a resize leaves the pane geometry stale.
                 slint::RenderingState::BeforeRendering => {
+                    bridge::record_frame_begin();
                     if let Some(app) = app_handle.as_ref().and_then(|app| app.upgrade())
                         && last_scale.replace(app.window().scale_factor())
                             != app.window().scale_factor()

@@ -18,6 +18,7 @@ figure under both machine profiles and every refusal.
 """
 
 import argparse
+import bisect
 import json
 import math
 import os
@@ -332,6 +333,34 @@ def switch_times(by_kind):
     return times
 
 
+def frame_pacing(by_kind):
+    """Render, wait and interval of the frames drawn within half a second of
+    an input, in ms; None for a trace without frame-begin stamps."""
+    begins = [s.start for s in by_kind.get("gui_frame_begin", [])]
+    frames = [s.start for s in by_kind.get("gui_frame_rendered", [])]
+    inputs = [s.start for s in by_kind.get("gui_input", [])]
+    if not begins or len(frames) < 2:
+        return None
+    renders, waits, intervals = [], [], []
+    for previous, frame in zip(frames, frames[1:]):
+        at = bisect.bisect_right(begins, previous)
+        before = bisect.bisect_right(inputs, frame)
+        near = before > 0 and frame - inputs[before - 1] <= GESTURE_GAP_MS
+        if at < len(begins) and begins[at] <= frame and near:
+            renders.append(frame - begins[at])
+            waits.append(begins[at] - previous)
+            intervals.append(frame - previous)
+    if not renders:
+        return None
+    return {
+        "frames": len(renders),
+        **{
+            key: {"median_ms": statistics.median(v), "p95_ms": percentile(v, 0.95)}
+            for key, v in (("render", renders), ("wait", waits), ("interval", intervals))
+        },
+    }
+
+
 def analyze(raw, machine):
     """The report dict for the trace text `raw`; raises TraceError."""
     spans, partial = read_trace(raw)
@@ -406,6 +435,7 @@ def analyze(raw, machine):
         "frame_rate_gesture": {"kind": lowest[0], "p95_interval_ms": lowest[2]},
         "switch_median_ms": statistics.median(switches),
         "exact_detail_ms": exact_detail_times(by_kind),
+        "frame_pacing": frame_pacing(by_kind),
         "stages": {
             key: {"median_ms": None, "p95_ms": None}
             if partial and key == "readback_wait"
@@ -451,6 +481,11 @@ def render(report):
         "zoom to exact detail: %s (no limit)"
         % ("n/a" if exact is None else "%.1f ms" % exact)
     )
+    pacing = report.get("frame_pacing")
+    if pacing:
+        lines.append("frame pacing near input, %d frames (median / p95, ms):" % pacing["frames"])
+        for key, label in (("render", "render"), ("wait", "wait before render"), ("interval", "interval")):
+            lines.append("  %-18s %8.2f %8.2f" % (label, pacing[key]["median_ms"], pacing[key]["p95_ms"]))
     lines.append("brush stages (median / p95, ms):")
     for key, label in STAGES:
         stage = report["stages"][key]
@@ -657,6 +692,23 @@ def selftest():
     }, results(station)
     assert fig(station, "brush_p95_ms")["limit"] == 16.0
     assert fig(laptop, "brush_p95_ms")["limit"] == 33.0
+    assert laptop["frame_pacing"] is None, laptop["frame_pacing"]
+    paced = {
+        kind: [Span(kind, 1, at, {}) for at in times]
+        for kind, times in (
+            ("gui_input", (0.0,)),
+            ("gui_frame_begin", (10.0, 40.0, 5000.0)),
+            ("gui_frame_rendered", (0.0, 30.0, 45.0, 5010.0)),
+        )
+    }
+    pacing = frame_pacing(paced)
+    # Two frames follow the input within half a second: begin 10 ms after the
+    # previous frame and 20 ms to render, then begin 10 ms after, 5 ms to render.
+    assert pacing["frames"] == 2, pacing
+    assert close(pacing["render"]["median_ms"], 12.5), pacing
+    assert close(pacing["wait"]["median_ms"], 10.0), pacing
+    assert close(pacing["interval"]["median_ms"], 22.5), pacing
+    assert frame_pacing({**paced, "gui_frame_begin": []}) is None
     stages = laptop["stages"]
     for key, median in (
         ("queueing", 8.0), ("worker_wait", 3.0), ("read_warp", 6.0), ("blend", 4.0),

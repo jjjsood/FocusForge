@@ -908,6 +908,13 @@ pub fn finish_input_trace() {
     }
 }
 
+/// Stamps the start of one frame's render in the trace; free without trace
+/// accounting. With [`record_frame_rendered`] it splits a frame interval into
+/// the render and the wait before the next one.
+pub fn record_frame_begin() {
+    let _scope = measurement_scope("gui_frame_begin");
+}
+
 /// Stamps one rendered frame in the trace; free without trace accounting.
 pub fn record_frame_rendered() {
     let _scope = measurement_scope("gui_frame_rendered");
