@@ -82,6 +82,9 @@ ignore = [
     # pin-utils v0.1.0, via pin-utils -> spin_on -> i-slint-renderer-skia ->
     # slint -> focusforge-gui
     { id = "RUSTSEC-2026-0441", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint version bump" },
+    # chrono v0.4.45, via chrono -> i-slint-core -> slint -> focusforge-gui
+    # and chrono -> rawler -> focusforge-core
+    { id = "RUSTSEC-2026-0543", reason = "no safe upgrade available -- tracked upstream, revisit on any Slint or rawler version bump" },
 ]
 
 # `akaze` is taken from the one git revision that carries the detector fixes

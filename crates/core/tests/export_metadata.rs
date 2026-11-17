@@ -130,7 +130,7 @@ fn rewrites_dimensions_software_and_drops_layout_tags() {
     let (project_path, checkpoint, dir) = seal_project_with_rich_source("export_metadata_rewrite");
     let mut project = Project::open(&project_path).unwrap();
 
-    let before = chrono::Local::now();
+    let before = jiff::ZonedDateTime::now();
     let out_path = dir.join("out.tif");
     let outcome = project::export_checkpoint(
         &mut project,
@@ -140,7 +140,7 @@ fn rewrites_dimensions_software_and_drops_layout_tags() {
         &MetadataOptions::default(),
     )
     .expect("export must succeed");
-    let after = chrono::Local::now();
+    let after = jiff::ZonedDateTime::now();
 
     // The sentinel MakerNote bytes must not appear anywhere in the output
     // file -- checked over the raw bytes, since the reader would already
@@ -183,11 +183,11 @@ fn rewrites_dimensions_software_and_drops_layout_tags() {
     let datetime_text = String::from_utf8_lossy(&datetime.value)
         .trim_end_matches('\0')
         .to_string();
-    let parsed = chrono::NaiveDateTime::parse_from_str(&datetime_text, "%Y:%m:%d %H:%M:%S")
+    let parsed = jiff::civil::DateTime::strptime("%Y:%m:%d %H:%M:%S", &datetime_text)
         .expect("DateTime must parse");
+    let slack = jiff::SignedDuration::from_secs(2);
     assert!(
-        parsed >= before.naive_local() - chrono::Duration::seconds(2)
-            && parsed <= after.naive_local() + chrono::Duration::seconds(2),
+        parsed >= before.datetime() - slack && parsed <= after.datetime() + slack,
         "DateTime {datetime_text} must fall within the export's before/after window"
     );
 

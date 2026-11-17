@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::{Datelike, Days, Local, NaiveDate};
 use common::{enter_editor, fused_tab, paint, record_events, scratch_controller, settle_all};
 use focusforge_core::align::Registration;
 use focusforge_core::io::{Rect, TiffSpec, TiffStack, TiffWriter};
@@ -27,6 +26,9 @@ use focusforge_gui::{
     AppController, AppWindow, OpenOutcome, ShellEvent, ShellMode, checkpoints, job,
 };
 use i_slint_backend_testing::ElementQuery;
+use jiff::ToSpan;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 use slint::{ComponentHandle, Model};
 
 /// Writes a 47-checkpoint project spanning several local days to the repo's
@@ -1266,17 +1268,14 @@ fn a_failed_frame_is_named_and_not_reopened_per_repaint() {
 
 /// Local noon `days_ago` days before today, so no time zone moves a row
 /// across midnight.
-fn local_noon(days_ago: u64) -> (NaiveDate, i64) {
-    let date = checkpoints::today()
-        .checked_sub_days(Days::new(days_ago))
-        .unwrap();
+fn local_noon(days_ago: i64) -> (Date, i64) {
+    let date = checkpoints::today().checked_sub(days_ago.days()).unwrap();
     let at = date
-        .and_hms_opt(12, 0, 0)
+        .at(12, 0, 0, 0)
+        .to_zoned_datetime(TimeZone::system())
         .unwrap()
-        .and_local_timezone(Local)
-        .earliest()
-        .unwrap()
-        .timestamp();
+        .timestamp()
+        .as_second();
     (date, at)
 }
 
@@ -1311,7 +1310,7 @@ fn day_separator_appears_only_across_days() {
     let absolute = format!(
         "{:02} {} {}",
         older_date.day(),
-        MONTHS[older_date.month0() as usize],
+        MONTHS[older_date.month() as usize - 1],
         older_date.year()
     );
     assert_eq!(

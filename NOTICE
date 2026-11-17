@@ -759,6 +759,22 @@ Third-party Rust components
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT OR Apache-2.0
   Targets: Linux x86_64, Windows x86_64, macOS arm64
+- Package: jiff 1.0.0
+  Source: registry+https://github.com/rust-lang/crates.io-index
+  Declared license: Unlicense OR MIT
+  Targets: Linux x86_64, Windows x86_64, macOS arm64
+- Package: jiff-core 1.0.0
+  Source: registry+https://github.com/rust-lang/crates.io-index
+  Declared license: Unlicense OR MIT
+  Targets: Linux x86_64, Windows x86_64, macOS arm64
+- Package: jiff-tzdb 1.0.0
+  Source: registry+https://github.com/rust-lang/crates.io-index
+  Declared license: Unlicense OR MIT
+  Targets: Windows x86_64
+- Package: jiff-tzdb-platform 1.0.0
+  Source: registry+https://github.com/rust-lang/crates.io-index
+  Declared license: Unlicense OR MIT
+  Targets: Windows x86_64
 - Package: jpeg-encoder 0.7.1
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: (MIT OR Apache-2.0) AND IJG
@@ -2011,7 +2027,7 @@ Third-party Rust components
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: Unicode-3.0
   Targets: Linux x86_64, Windows x86_64, macOS arm64
-- Package: zip 9.0.4
+- Package: zip 9.0.5
   Source: registry+https://github.com/rust-lang/crates.io-index
   Declared license: MIT
   Targets: Linux x86_64, Windows x86_64, macOS arm64

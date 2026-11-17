@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::mpsc;
 
-use chrono::Local;
+use jiff::ZonedDateTime;
 use jpeg_encoder::{Encoder, ImageBuffer, JpegColorType, SamplingFactor, rgb_to_ycbcr};
 use serde::{Deserialize, Serialize};
 
@@ -793,12 +793,12 @@ fn encode(
     check_supported_samples(options, image.samples_per_pixel, path)?;
 
     let source = io::read_source_metadata(frame_path);
-    let now = Local::now().fixed_offset();
+    let now = ZonedDateTime::now();
     let plan = io::resolve_plan(
         &source,
         image.width,
         image.height,
-        now,
+        &now,
         metadata_options.exif,
         metadata_options.icc,
         metadata_options.xmp,

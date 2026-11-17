@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use chrono::{DateTime, FixedOffset};
+use jiff::ZonedDateTime;
 use rawler::exif::{Exif, ExifGPS};
 use rawler::formats::tiff::{Rational, SRational};
 use rawler::tags::{ExifGpsTag, ExifTag};
@@ -77,8 +77,8 @@ pub struct MetadataTags {
 
 /// The export moment as EXIF `DateTime`/`DateTimeOriginal` text
 /// (`YYYY:MM:DD HH:MM:SS`), in `now`'s own zone.
-fn exif_datetime(now: DateTime<FixedOffset>) -> String {
-    now.format("%Y:%m:%d %H:%M:%S").to_string()
+fn exif_datetime(now: &ZonedDateTime) -> String {
+    now.strftime("%Y:%m:%d %H:%M:%S").to_string()
 }
 
 /// Puts `entry` in `entries`, replacing the entry of the same tag if there is one.
@@ -94,14 +94,13 @@ pub(crate) fn set_entry(entries: &mut Vec<TagEntry>, entry: TagEntry) {
 /// become the export's own identity and moment, `OffsetTime` (36880)
 /// becomes that moment's UTC offset, and the EXIF image-dimension tags
 /// (40962/40963) become `width`/`height`, and a TIFF source's Orientation
-/// (274) becomes 1. `now` is read once by the caller,
-/// not here: `chrono`'s local-time lookup is not safe to call concurrently
-/// with anything that mutates `TZ`.
+/// (274) becomes 1. `now` is the caller's own reading of the clock, so a
+/// test can pin it.
 pub(crate) fn rewrite(
     source: &SourceMetadata,
     width: u32,
     height: u32,
-    now: DateTime<FixedOffset>,
+    now: &ZonedDateTime,
 ) -> MetadataTags {
     let mut ifd0 = source.ifd0.clone();
     set_entry(
@@ -124,7 +123,7 @@ pub(crate) fn rewrite(
     let mut exif = source.exif.clone();
     set_entry(
         &mut exif,
-        exif_tag_entry(ExifTag::OffsetTime, &now.format("%:z").to_string()),
+        exif_tag_entry(ExifTag::OffsetTime, &now.strftime("%:z").to_string()),
     );
     set_entry(&mut exif, exif_tag_entry(ExifTag::ExifImageWidth, &width));
     set_entry(&mut exif, exif_tag_entry(ExifTag::ExifImageHeight, &height));
@@ -559,7 +558,7 @@ pub(crate) fn resolve_plan(
     source: &SourceMetadata,
     width: u32,
     height: u32,
-    now: DateTime<FixedOffset>,
+    now: &ZonedDateTime,
     exif_on: bool,
     icc_on: bool,
     xmp_on: bool,
@@ -822,7 +821,8 @@ pub(crate) fn photoshop_iptc_segment(iptc: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeZone;
+    use jiff::civil;
+    use jiff::tz::{self, TimeZone};
 
     use super::super::grouping::parse_exif_datetime;
     use super::*;
@@ -960,18 +960,17 @@ mod tests {
     }
 
     fn fixed_offset_hms(
-        offset_hours: i32,
-        y: i32,
-        m: u32,
-        d: u32,
-        h: u32,
-        mi: u32,
-        s: u32,
-    ) -> DateTime<FixedOffset> {
-        FixedOffset::east_opt(offset_hours * 3600)
-            .unwrap()
-            .with_ymd_and_hms(y, m, d, h, mi, s)
-            .single()
+        offset_hours: i8,
+        y: i16,
+        m: i8,
+        d: i8,
+        h: i8,
+        mi: i8,
+        s: i8,
+    ) -> ZonedDateTime {
+        civil::date(y, m, d)
+            .at(h, mi, s, 0)
+            .to_zoned_datetime(TimeZone::fixed(tz::offset(offset_hours)))
             .unwrap()
     }
 
@@ -998,7 +997,7 @@ mod tests {
         };
         let now = fixed_offset_hms(2, 2026, 9, 29, 14, 30, 5);
 
-        let tags = rewrite(&source, 640, 480, now);
+        let tags = rewrite(&source, 640, 480, &now);
 
         assert!(
             tags.ifd0
@@ -1063,9 +1062,9 @@ mod tests {
             (2026, 1, 1, 0, 0, 1),
         ] {
             let now = fixed_offset_hms(0, y, m, d, h, mi, s);
-            let text = exif_datetime(now);
+            let text = exif_datetime(&now);
             let parsed = parse_exif_datetime(&text).expect("a well-formed EXIF datetime");
-            assert_eq!(parsed.epoch_seconds, now.timestamp(), "{text}");
+            assert_eq!(parsed.epoch_seconds, now.timestamp().as_second(), "{text}");
         }
     }
 
@@ -1125,7 +1124,7 @@ mod tests {
             &populated_tiff_source(),
             10,
             20,
-            now,
+            &now,
             false,
             false,
             false,
@@ -1147,7 +1146,7 @@ mod tests {
             &SourceMetadata::default(),
             10,
             20,
-            now,
+            &now,
             true,
             false,
             false,
@@ -1167,7 +1166,7 @@ mod tests {
             &populated_tiff_source(),
             10,
             20,
-            now,
+            &now,
             true,
             false,
             false,
@@ -1193,7 +1192,7 @@ mod tests {
     fn resolve_plan_icc_origin_follows_the_switch_and_the_source_kind() {
         let now = fixed_offset_hms(0, 2026, 1, 1, 0, 0, 0);
         let tiff_with_profile = populated_tiff_source();
-        let plan = resolve_plan(&tiff_with_profile, 1, 1, now, false, true, false, false);
+        let plan = resolve_plan(&tiff_with_profile, 1, 1, &now, false, true, false, false);
         assert_eq!(plan.icc, IccOrigin::Source);
         assert_eq!(plan.icc_bytes, Some(vec![1, 2, 3]));
 
@@ -1201,7 +1200,7 @@ mod tests {
             icc: None,
             ..populated_tiff_source()
         };
-        let plan = resolve_plan(&tiff_without_profile, 1, 1, now, false, true, false, false);
+        let plan = resolve_plan(&tiff_without_profile, 1, 1, &now, false, true, false, false);
         assert_eq!(plan.icc, IccOrigin::None);
         assert!(plan.icc_bytes.is_none());
 
@@ -1210,10 +1209,10 @@ mod tests {
             icc: Some(vec![9]),
             ..populated_tiff_source()
         };
-        let plan = resolve_plan(&raw, 1, 1, now, false, true, false, false);
+        let plan = resolve_plan(&raw, 1, 1, &now, false, true, false, false);
         assert_eq!(plan.icc, IccOrigin::BuiltinSrgb);
 
-        let plan = resolve_plan(&tiff_with_profile, 1, 1, now, false, false, false, false);
+        let plan = resolve_plan(&tiff_with_profile, 1, 1, &now, false, false, false, false);
         assert_eq!(plan.icc, IccOrigin::Off);
         assert!(plan.icc_bytes.is_none(), "off carries no bytes either");
     }
@@ -1227,7 +1226,7 @@ mod tests {
             iptc: None,
             ..populated_tiff_source()
         };
-        let plan = resolve_plan(&raw, 1, 1, now, false, false, true, true);
+        let plan = resolve_plan(&raw, 1, 1, &now, false, false, true, true);
         assert!(!plan.has_xmp);
         assert!(plan.xmp_bytes.is_none());
         assert!(!plan.has_iptc);
@@ -1237,7 +1236,7 @@ mod tests {
             &populated_tiff_source(),
             1,
             1,
-            now,
+            &now,
             false,
             false,
             true,
@@ -1265,7 +1264,7 @@ mod tests {
         assert_eq!(source.kind, SourceKind::Tiff);
 
         let now = fixed_offset_hms(0, 2026, 1, 1, 0, 0, 0);
-        let rewritten = rewrite(&source, 4, 3, now);
+        let rewritten = rewrite(&source, 4, 3, &now);
         let orientation = rewritten.ifd0.iter().find(|e| e.tag == 274).expect("274");
         assert_eq!(orientation.value, 1u16.to_le_bytes());
         assert_eq!(
@@ -1281,7 +1280,7 @@ mod tests {
             ..populated_tiff_source()
         };
         let now = fixed_offset_hms(0, 2026, 1, 1, 0, 0, 0);
-        resolve_plan(&source, 1, 1, now, false, false, true, false).xmp_bytes
+        resolve_plan(&source, 1, 1, &now, false, false, true, false).xmp_bytes
     }
 
     #[test]

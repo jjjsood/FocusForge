@@ -7,7 +7,9 @@
 
 use std::cmp::Ordering;
 
-use chrono::{Local, NaiveDate, TimeZone};
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, ZonedDateTime};
 
 use focusforge_core::project::Checkpoint;
 use focusforge_core::project::Op;
@@ -123,7 +125,7 @@ pub struct CheckpointsModel {
 /// `unix_secs` as local `"HH:MM:SS"`, the row's own time-text format.
 pub fn local_hhmmss(unix_secs: i64) -> String {
     local_datetime(unix_secs)
-        .map(|dt| dt.format("%H:%M:%S").to_string())
+        .map(|dt| dt.strftime("%H:%M:%S").to_string())
         .unwrap_or_default()
 }
 
@@ -131,7 +133,7 @@ pub fn local_hhmmss(unix_secs: i64) -> String {
 /// full date-and-time format, unlike the list row's relative day label.
 pub fn local_date_and_time(unix_secs: i64) -> String {
     local_datetime(unix_secs)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .map(|dt| dt.strftime("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_default()
 }
 
@@ -139,30 +141,32 @@ pub fn local_date_and_time(unix_secs: i64) -> String {
 /// machine's own zone rather than UTC.
 pub fn local_hhmm(unix_secs: i64) -> String {
     local_datetime(unix_secs)
-        .map(|dt| dt.format("%H:%M").to_string())
+        .map(|dt| dt.strftime("%H:%M").to_string())
         .unwrap_or_default()
 }
 
 /// The machine's own local date, for a caller that needs "today" to label
 /// separators against.
-pub fn today() -> NaiveDate {
-    Local::now().date_naive()
+pub fn today() -> Date {
+    ZonedDateTime::now().date()
 }
 
-fn local_datetime(unix_secs: i64) -> Option<chrono::DateTime<Local>> {
-    Local.timestamp_opt(unix_secs, 0).single()
+fn local_datetime(unix_secs: i64) -> Option<ZonedDateTime> {
+    Timestamp::from_second(unix_secs)
+        .ok()
+        .map(|at| at.to_zoned_datetime(TimeZone::system()))
 }
 
 /// `TODAY`/`YESTERDAY` for the last two local days, `"12 SEP 2026"` beyond
 /// that -- `today` is the caller's own reading of the local date, so a test
 /// can pin it instead of racing the real clock.
-fn day_label(date: NaiveDate, today: NaiveDate) -> String {
+fn day_label(date: Date, today: Date) -> String {
     if date == today {
         "TODAY".to_string()
-    } else if today.pred_opt() == Some(date) {
+    } else if today.yesterday().ok() == Some(date) {
         "YESTERDAY".to_string()
     } else {
-        date.format("%d %b %Y").to_string().to_uppercase()
+        date.strftime("%d %b %Y").to_string().to_uppercase()
     }
 }
 
@@ -257,7 +261,7 @@ pub fn build_model(
     checkpoints: &[&Checkpoint],
     held: &[InMemoryCheckpoint],
     pending: &[ParentRef],
-    today: NaiveDate,
+    today: Date,
     selected: Option<&str>,
     scroll_y: f32,
 ) -> CheckpointsModel {
@@ -290,11 +294,11 @@ pub fn build_model(
             })
     });
 
-    let dates: Vec<NaiveDate> = rows
+    let dates: Vec<Date> = rows
         .iter()
         .map(|r| {
             local_datetime(r.created_at())
-                .map(|dt| dt.date_naive())
+                .map(|dt| dt.date())
                 .unwrap_or(today)
         })
         .collect();
@@ -302,7 +306,7 @@ pub fn build_model(
 
     let mut entries = Vec::with_capacity(rows.len());
     let mut top = 0.0f32;
-    let mut last_date: Option<NaiveDate> = None;
+    let mut last_date: Option<Date> = None;
     for (row, &date) in rows.iter().zip(&dates) {
         if multi_day && last_date != Some(date) {
             entries.push(CheckpointEntry {
@@ -379,7 +383,7 @@ mod tests {
         let noon = 1_756_468_800; // an arbitrary local noon
         let a = checkpoint("a", noon);
         let b = checkpoint("b", noon + 60);
-        let today = local_datetime(noon).unwrap().date_naive();
+        let today = local_datetime(noon).unwrap().date();
         let model = build_model(&[&b, &a], &[], &[], today, None, 0.0);
         assert!(
             model.entries.iter().all(|e| e.separator_label.is_none()),
@@ -393,7 +397,7 @@ mod tests {
         let noon = 1_756_468_800;
         let today_cp = checkpoint("a", noon);
         let older_cp = checkpoint("b", noon - 3 * 86_400);
-        let today = local_datetime(noon).unwrap().date_naive();
+        let today = local_datetime(noon).unwrap().date();
         let model = build_model(&[&today_cp, &older_cp], &[], &[], today, None, 0.0);
         let labels: Vec<&str> = model
             .entries
@@ -410,7 +414,7 @@ mod tests {
     fn an_unregistered_algorithm_id_shows_verbatim() {
         let mut c = checkpoint("a", 1_756_468_800);
         c.algorithm = "not-a-real-algorithm".to_string();
-        let today = local_datetime(c.created_at).unwrap().date_naive();
+        let today = local_datetime(c.created_at).unwrap().date();
         let model = build_model(&[&c], &[], &[], today, None, 0.0);
         assert_eq!(model.entries[0].algorithm, "not-a-real-algorithm");
     }
@@ -429,7 +433,7 @@ mod tests {
             fused_entry(),
             ops_entry(vec![stroke(3)], Some(ParentRef::Entry(1))),
         ];
-        let today = local_datetime(noon).unwrap().date_naive();
+        let today = local_datetime(noon).unwrap().date();
         let model = build_model(&[&fused, &retouched], &held, &[], today, None, 0.0);
         let label = |id: &str| {
             model
@@ -465,7 +469,7 @@ mod tests {
         let today_cp = checkpoint("a", noon);
         let yesterday_cp = checkpoint("b", noon - 86_400);
         let older_cp = checkpoint("c", noon - 3 * 86_400);
-        let today = local_datetime(noon).unwrap().date_naive();
+        let today = local_datetime(noon).unwrap().date();
         let model = build_model(
             &[&today_cp, &yesterday_cp, &older_cp],
             &[],
@@ -490,7 +494,7 @@ mod tests {
     fn the_selected_id_marks_exactly_one_row() {
         let a = checkpoint("a", 1_756_468_800);
         let b = checkpoint("b", 1_756_468_860);
-        let today = local_datetime(a.created_at).unwrap().date_naive();
+        let today = local_datetime(a.created_at).unwrap().date();
         let model = build_model(&[&b, &a], &[], &[], today, Some("a"), 0.0);
         let selected: Vec<bool> = model.entries.iter().map(|e| e.selected).collect();
         assert_eq!(selected, vec![false, true]);
@@ -520,7 +524,7 @@ mod tests {
                 parent: Some(ParentRef::Entry(0)),
             },
         ];
-        let today = local_datetime(noon).unwrap().date_naive();
+        let today = local_datetime(noon).unwrap().date();
         let model = build_model(&[&saved], &held, &[], today, None, 0.0);
 
         let rows: Vec<&CheckpointEntry> = model
@@ -564,7 +568,7 @@ mod tests {
             ops(ParentRef::Saved("b".to_string()), noon),
         ];
         let pending = [ParentRef::Saved("c".to_string()), ParentRef::Entry(1)];
-        let today = local_datetime(noon).unwrap().date_naive();
+        let today = local_datetime(noon).unwrap().date();
         let model = build_model(&[&hidden, &b, &c], &held, &pending, today, None, 0.0);
 
         let rows: Vec<&CheckpointEntry> = model
@@ -592,7 +596,7 @@ mod tests {
         ];
         let (z, y, x) = (checkpoint("z", 0), checkpoint("y", 0), checkpoint("x", 1));
         let saved = [&z, &y, &x];
-        let today = local_datetime(0).unwrap().date_naive();
+        let today = local_datetime(0).unwrap().date();
         let ids = |pending: &[ParentRef], selected: Option<&str>| {
             let model = build_model(&saved, &held, pending, today, selected, 0.0);
             model
