@@ -535,6 +535,36 @@ pub fn measurement_scope_with_fields(
     ))
 }
 
+/// Correlation fields of one editor span: the stroke, its segment, the
+/// re-rendered region in pixels and the resident-tiles generation. Zero means
+/// the field does not apply.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EditSpanFields {
+    pub stroke: u64,
+    pub segment: u64,
+    pub area: u64,
+    pub generation: u64,
+}
+
+/// Opens one bounded measured boundary carrying [`EditSpanFields`].
+pub fn measurement_scope_with_edit(kind: &'static str, edit: EditSpanFields) -> MeasurementScope {
+    let Some(state) = timing() else {
+        return MeasurementScope(None);
+    };
+    if !state.admit_kind(kind) {
+        return MeasurementScope(None);
+    }
+    let EditSpanFields {
+        stroke,
+        segment,
+        area,
+        generation,
+    } = edit;
+    MeasurementScope(Some(
+        tracing::debug_span!("timing", kind, stroke, segment, area, generation).entered(),
+    ))
+}
+
 struct GpuTileClock {
     stages: Vec<TimingCounter>,
     since: Option<Instant>,

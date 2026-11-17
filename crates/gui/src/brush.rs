@@ -5,10 +5,14 @@
 //! release -- plus the brush cursor's `Path` geometry. Plain Rust, no Slint
 //! types.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use focusforge_core::project::{BrushMode, Point, StrokeSource};
 use focusforge_core::tile::Rect;
 
 pub use focusforge_core::retouch::preview::BrushPreviewSpec;
+
+static NEXT_STROKE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The preview brush of the one-point stroke a press at the source point
 /// `(sx, sy)` would record: its centre is the integer point the stroke stores.
@@ -53,6 +57,8 @@ pub struct LiveStroke {
     painted_at: Option<u64>,
     /// The newest generation the Composite has published since the press.
     published: u64,
+    id: u64,
+    segments: u64,
     /// Every tick's own re-rendered region, oldest first -- empty until a
     /// caller records one.
     pub tick_rects: Vec<Rect>,
@@ -83,8 +89,20 @@ impl LiveStroke {
             preview: None,
             painted_at: None,
             published: 0,
+            id: NEXT_STROKE_ID.fetch_add(1, Ordering::Relaxed),
+            segments: 0,
             tick_rects: Vec::new(),
         }
+    }
+
+    /// The process-wide id the stroke's trace spans carry, from 1.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// How many segments [`Self::take_segment`] has returned.
+    pub fn segments_taken(&self) -> u64 {
+        self.segments
     }
 
     /// Sets the preview the press showed, `None` for a press off the image.
@@ -152,6 +170,7 @@ impl LiveStroke {
         }
         let segment = round_and_dedup(&self.points[self.flushed..=last]);
         self.flushed = last;
+        self.segments += 1;
         Some(segment)
     }
 

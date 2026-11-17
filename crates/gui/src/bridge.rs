@@ -37,7 +37,8 @@ use crate::diagnostics::{
     take_published_input,
 };
 use crate::diagnostics::{
-    TimingCounter, measurement_scope, measurement_scope_with_fields, record_timing,
+    EditSpanFields, TimingCounter, measurement_scope, measurement_scope_with_edit,
+    measurement_scope_with_fields, record_timing,
 };
 use crate::gpu_canvas::CanvasRenderer;
 use crate::input_map::{Button, Modifiers, PointerKind};
@@ -311,19 +312,17 @@ impl Canvas {
         let mut composite = None;
         if let Some(renderer) = self.renderer.as_mut() {
             for prepared in &done {
-                let stamp = prepared.job.stamp;
-                let _scope = measurement_scope_with_fields(
-                    if prepared.job.backdrop {
-                        "gui_canvas_backdrop_publish"
-                    } else {
-                        "gui_canvas_publish"
+                let kind = match (prepared.job.pane, prepared.job.backdrop) {
+                    (_, true) => "gui_canvas_backdrop_publish",
+                    (crate::canvas::Pane::Frame, false) => "gui_frame_pane_publish",
+                    (crate::canvas::Pane::Composite, false) => "gui_canvas_publish",
+                };
+                let _scope = measurement_scope_with_edit(
+                    kind,
+                    EditSpanFields {
+                        generation: prepared.job.state.generation.unwrap_or(0),
+                        ..EditSpanFields::default()
                     },
-                    stamp,
-                    stamp,
-                    1,
-                    0,
-                    false,
-                    0,
                 );
                 let shown = renderer.publish_for_generation(
                     &prepared.job,
@@ -396,6 +395,13 @@ pub fn publish_completed(
             return;
         };
         if let Some(generation) = composite {
+            drop(measurement_scope_with_edit(
+                "gui_composite_shown",
+                EditSpanFields {
+                    generation,
+                    ..EditSpanFields::default()
+                },
+            ));
             controller.composite_published(generation);
         }
         (controller.frame_draw(), controller.plane_draw())
@@ -778,7 +784,10 @@ pub fn repaint(
             controller.zoom_readout(),
             controller.active_project().is_some(),
             controller.edited_view().map(|view| view.tiles.generation()),
-            controller.overlay_draw(),
+            {
+                let _overlay = measurement_scope("gui_overlay_draw");
+                controller.overlay_draw()
+            },
         )
     };
     canvas

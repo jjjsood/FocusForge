@@ -15,8 +15,8 @@ use focusforge_core::timing::timing_enabled;
 /// `focusforge_core` directly (`crates/gui/tests/shell.rs`'s
 /// `checkpoint_panel_touches_no_storage`).
 pub(crate) use focusforge_core::timing::{
-    MeasurementScope, TimingCounter, measurement_scope, measurement_scope_with_fields,
-    record_timing,
+    EditSpanFields, MeasurementScope, TimingCounter, measurement_scope,
+    measurement_scope_with_edit, measurement_scope_with_fields, record_timing,
 };
 #[cfg(test)]
 pub(crate) use focusforge_core::timing::{enable_trace_accounting, timing_snapshot};

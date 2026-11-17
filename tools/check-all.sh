@@ -259,6 +259,7 @@ tool_selftest "lock directory selftest" tools/with-lock-selftest.sh
 tool_selftest "cargo jobs selftest" tools/cargo-jobs-selftest.sh
 tool_selftest "tiff-diff selftest" python3 tools/tiff-diff.py --selftest
 tool_selftest "image-metrics selftest" python3 tools/image-metrics.py --selftest
+tool_selftest "editor-latency selftest" python3 tools/editor-latency.py --selftest
 tool_selftest "rawtiff selftest" python3 tools/lib/rawtiff.py --selftest
 tool_selftest "download selftest" python3 tools/lib/download.py --selftest
 tool_selftest "make-fixtures selftest" python3 tools/lib/make_fixtures.py --selftest
@@ -347,10 +348,13 @@ if [ "$STATIC_ONLY" -eq 0 ]; then
                               env FF_REQUIRE_SYNTH_ALIGN="$REQUIRE_SYNTH" cargo test --doc --workspace
   # The off-by-default `trace` feature's own suite: the stage above resolves
   # no profiling crate at all, and the clippy stage compiles the feature
-  # without running anything. ~13.5s on an already-compiled tree, most of it
-  # one real stack run over fixtures/mantis-512.
+  # without running anything. ~35s on an already-compiled tree: ~24s of
+  # `trace_cli`, whose tests run focusforge-cli over fixtures/mantis-512, and
+  # ~9s of `editor_trace`, whose two traced tests need a graphics adapter and
+  # skip without one.
   [ "$QUICK" -eq 1 ] || run_gate "trace feature"  tools/with-lock.sh build -- \
-                              cargo test -p focusforge-cli --features trace --test trace_cli
+                              sh -c 'cargo test -p focusforge-cli --features trace --test trace_cli \
+                                && cargo test -p focusforge-gui --features trace --test editor_trace'
   # The theme sheet is built out of the stages above; this one lints it and runs
   # its tests, when a UI path or workspace input changed.
   if [ "$QUICK" -eq 0 ]; then

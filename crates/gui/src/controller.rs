@@ -31,7 +31,8 @@ use crate::canvas::{FrameView, OverlayDraw, PaneSource, SharedCheckpointSources,
 use crate::checkpoints;
 use crate::diagnostics::{
     DiagnosticsEntryView, DiagnosticsScan, DiagnosticsScanEntry, DiagnosticsStatus,
-    DiagnosticsView, clamp_manifest_scroll, manifest_content_height, measurement_scope, size_text,
+    DiagnosticsView, EditSpanFields, clamp_manifest_scroll, manifest_content_height,
+    measurement_scope, measurement_scope_with_edit, size_text,
 };
 use crate::editor_settings::{self, EditorSettings};
 use crate::entry;
@@ -3482,7 +3483,7 @@ impl AppController {
             return;
         };
         if let Some(stroke) = edit.stroke.take() {
-            edit.end_drag(&stroke.tick_rects, Vec::new(), &wake);
+            edit.end_drag(&stroke.tick_rects, Vec::new(), stroke.id(), &wake);
         }
     }
 
@@ -4384,20 +4385,32 @@ impl AppController {
             ActionEvent::Fired {
                 action: Action::ZoomAtCursor,
                 steps,
-            } => self.zoom_wheel(steps),
+            } => {
+                let _scope = measurement_scope("gui_action_zoom");
+                self.zoom_wheel(steps);
+            }
             ActionEvent::Fired {
                 action: Action::PanHorizontal,
                 steps,
-            } => self.pan_viewport(steps, 0.0),
+            } => {
+                let _scope = measurement_scope("gui_action_pan");
+                self.pan_viewport(steps, 0.0);
+            }
             ActionEvent::Update {
                 action: Action::Pan,
                 dx,
                 dy,
-            } => self.pan_viewport(dx, dy),
+            } => {
+                let _scope = measurement_scope("gui_action_pan");
+                self.pan_viewport(dx, dy);
+            }
             ActionEvent::Fired {
                 action: Action::StepSourceFrame,
                 steps,
-            } => self.step_source_rows(steps),
+            } => {
+                let _scope = measurement_scope("gui_action_source_step");
+                self.step_source_rows(steps);
+            }
             ActionEvent::Fired {
                 action: Action::BrushSize,
                 steps,
@@ -4897,7 +4910,7 @@ impl AppController {
                 ops,
                 ends_drag: false,
             };
-            edit.queue_region_render(region_render, &wake);
+            edit.queue_region_render(region_render, EditSpanFields::default(), &wake);
         }
         if tab.unsaved() != was_unsaved {
             self.emit(ShellEvent::ProjectsChanged);
@@ -5116,6 +5129,7 @@ impl AppController {
         let (radius, softness) = (stroke.radius(), stroke.softness());
         let source = stroke.source().clone();
         let (mode, opacity) = (stroke.mode(), stroke.opacity());
+        let (stroke_id, segment_number) = (stroke.id(), stroke.segments_taken());
         let op = job::Op::BrushStroke {
             source: source.clone(),
             path: segment,
@@ -5143,7 +5157,14 @@ impl AppController {
             ops: vec![so_far],
             ends_drag: false,
         };
-        edit.queue_region_render(region_render, &wake);
+        let fields = EditSpanFields {
+            stroke: stroke_id,
+            segment: segment_number,
+            area: u64::from(region.width) * u64::from(region.height),
+            generation: 0,
+        };
+        let _segment = measurement_scope_with_edit("gui_stroke_segment", fields);
+        edit.queue_region_render(region_render, fields, &wake);
         edit.stroke
             .as_mut()
             .expect("the stroke that produced this tick is still live")
@@ -5168,6 +5189,15 @@ impl AppController {
         let Some(stroke) = edit.stroke.take() else {
             return;
         };
+        let stroke_id = stroke.id();
+        let _release = measurement_scope_with_edit(
+            "gui_stroke_release",
+            EditSpanFields {
+                stroke: stroke_id,
+                segment: stroke.segments_taken(),
+                ..EditSpanFields::default()
+            },
+        );
         let op = job::Op::BrushStroke {
             source: stroke.source().clone(),
             path: stroke.finish(),
@@ -5179,7 +5209,7 @@ impl AppController {
         let has_footprint = job::footprint(&op, edit.info()).ok().flatten().is_some();
         let mut touched = stroke.tick_rects;
         if !has_footprint {
-            edit.end_drag(&touched, Vec::new(), &wake);
+            edit.end_drag(&touched, Vec::new(), stroke_id, &wake);
             return;
         }
         let region = edit
@@ -5189,7 +5219,7 @@ impl AppController {
         // strip and the project card show.
         let lit = !was_unsaved;
         touched.extend(region);
-        edit.end_drag(&touched, vec![op], &wake);
+        edit.end_drag(&touched, vec![op], stroke_id, &wake);
         if lit {
             self.emit(ShellEvent::ProjectsChanged);
         }

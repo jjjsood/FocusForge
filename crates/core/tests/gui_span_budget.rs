@@ -4,8 +4,9 @@
 //! One test function: accounting is a process-wide switch.
 
 use focusforge_core::timing::{
-    TimingCounter, enable_trace_accounting, measurement_scope, measurement_scope_with_fields,
-    record_timing, timing_enabled, timing_snapshot,
+    EditSpanFields, TimingCounter, enable_trace_accounting, measurement_scope,
+    measurement_scope_with_edit, measurement_scope_with_fields, record_timing, timing_enabled,
+    timing_snapshot,
 };
 
 const PROCESSING_BUDGET: u64 = 262_144;
@@ -22,6 +23,15 @@ fn gui_spans_are_admitted_after_the_processing_budget_refuses() {
         0,
         false,
         0,
+    ));
+    drop(measurement_scope_with_edit(
+        "gui_region_job",
+        EditSpanFields {
+            stroke: 1,
+            segment: 2,
+            area: 3,
+            generation: 4,
+        },
     ));
     record_timing(TimingCounter::CopyBytes, 1);
     assert!(!timing_enabled());
@@ -41,10 +51,14 @@ fn gui_spans_are_admitted_after_the_processing_budget_refuses() {
         false,
         0,
     ));
+    drop(measurement_scope_with_edit(
+        "gui_region_job",
+        EditSpanFields::default(),
+    ));
 
     let snapshot = timing_snapshot().expect("accounting is enabled");
     assert_eq!(snapshot.admitted, PROCESSING_BUDGET);
     assert_eq!(snapshot.exhausted, OVERFLOW);
-    assert_eq!(snapshot.gui_admitted, 2);
+    assert_eq!(snapshot.gui_admitted, 3);
     assert_eq!(snapshot.gui_exhausted, 0);
 }

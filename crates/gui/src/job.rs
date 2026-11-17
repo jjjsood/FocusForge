@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::diagnostics::{EditSpanFields, measurement_scope, measurement_scope_with_edit};
 use crate::source_previews::PreviewPixels;
 use focusforge_core::algorithm::{AlignAlgorithm, AlignStatus, StackAlgorithm, TileReader};
 use focusforge_core::align::WarpingReader;
@@ -2004,8 +2005,8 @@ pub struct RegionRender {
 }
 
 /// What a region-render worker renders: each region, in dispatch order, with
-/// its samples or the reason it failed.
-type Rendered = Vec<(Rect, Result<Vec<f32>, String>)>;
+/// the fields its spans carry and its samples or the reason it failed.
+type Rendered = Vec<(Rect, EditSpanFields, Result<Vec<f32>, String>)>;
 
 /// What a worker parks: its regions, the pre-drag tiles it holds once the
 /// batch is done (`None` when it panicked), and whether the batch ended the
@@ -2023,7 +2024,7 @@ pub type RegionRenderWake = Arc<dyn Fn() + Send + Sync>;
 /// worker holds a batch, and where it parks the result.
 #[derive(Default)]
 struct RegionRenders {
-    queued: Vec<RegionRender>,
+    queued: Vec<(RegionRender, EditSpanFields)>,
     in_flight: bool,
     parked: Arc<Mutex<Option<Parked>>>,
 }
@@ -2124,6 +2125,7 @@ fn render_region(
                                 region: Rect,
                                 src: &[u16],
                                 spp: usize| {
+                let _blend = measurement_scope("gui_region_blend");
                 if let Some(blender) = &input.blender {
                     match blender.apply(op, info, out_rect, out, region, src, spp) {
                         Ok(()) => return Ok(()),
@@ -2141,7 +2143,16 @@ fn render_region(
             blend_region(input, job, local, snapshot, blend_stroke)
                 .map(|samples| samples.into_iter().map(f32::from).collect())
         }
-        SampleFormat::F32 => blend_region(input, job, local, snapshot, blend::apply::<f32>),
+        SampleFormat::F32 => blend_region(
+            input,
+            job,
+            local,
+            snapshot,
+            |op, info, out_rect, out: &mut [f32], region, src: &[f32], spp| {
+                let _blend = measurement_scope("gui_region_blend");
+                blend::apply(op, info, out_rect, out, region, src, spp)
+            },
+        ),
     };
     if job.ends_drag {
         snapshot.clear();
@@ -2500,17 +2511,25 @@ impl EditState {
         render_region(&input, job, &mut self.tiles, &mut self.snapshot).map(|_| ())
     }
 
-    fn enqueue(&mut self, job: RegionRender) {
-        self.region_renders.queued.push(job);
+    /// Queues `job`; its spans carry `edit` with the area of its region.
+    fn enqueue(&mut self, job: RegionRender, mut edit: EditSpanFields) {
+        edit.area = u64::from(job.region.width) * u64::from(job.region.height);
+        self.region_renders.queued.push((job, edit));
         self.tiles.touch();
     }
 
     /// Queues `job` for a worker and bumps the tiles' generation, so the
     /// repaint picks the region up. Jobs queued while a worker holds a batch
     /// go out together when it is installed, rendered in queue order; `wake`
-    /// runs on the worker once a batch is parked.
-    pub fn queue_region_render(&mut self, job: RegionRender, wake: &RegionRenderWake) {
-        self.enqueue(job);
+    /// runs on the worker once a batch is parked. `edit` names the stroke and
+    /// segment the job's trace spans carry.
+    pub fn queue_region_render(
+        &mut self,
+        job: RegionRender,
+        edit: EditSpanFields,
+        wake: &RegionRenderWake,
+    ) {
+        self.enqueue(job, edit);
         if !self.region_renders.in_flight {
             self.dispatch_region_renders(wake);
         }
@@ -2518,17 +2537,31 @@ impl EditState {
 
     /// Ends a drag: queues every resident tile `touched` meets, each
     /// re-rendered from its pre-drag samples with `ops` blended over them;
-    /// the last job drops the pre-drag samples.
-    pub fn end_drag(&mut self, touched: &[Rect], ops: Vec<Op>, wake: &RegionRenderWake) {
+    /// the last job drops the pre-drag samples. `stroke` is the id the jobs'
+    /// trace spans carry, `0` for none.
+    pub fn end_drag(
+        &mut self,
+        touched: &[Rect],
+        ops: Vec<Op>,
+        stroke: u64,
+        wake: &RegionRenderWake,
+    ) {
+        let edit = EditSpanFields {
+            stroke,
+            ..EditSpanFields::default()
+        };
         let tiles = self.tiles.tile_rects(touched);
         let last = tiles.len().saturating_sub(1);
         for (at, region) in tiles.into_iter().enumerate() {
-            self.enqueue(RegionRender {
-                region,
-                pre: PreImage::Snapshot,
-                ops: ops.clone(),
-                ends_drag: at == last,
-            });
+            self.enqueue(
+                RegionRender {
+                    region,
+                    pre: PreImage::Snapshot,
+                    ops: ops.clone(),
+                    ends_drag: at == last,
+                },
+                edit,
+            );
         }
         if !self.region_renders.in_flight {
             self.dispatch_region_renders(wake);
@@ -2561,10 +2594,20 @@ impl EditState {
                 None if parked.ends_drag => self.snapshot.clear(),
                 None => {}
             }
-            for (region, result) in parked.rendered {
+            for (region, edit, result) in parked.rendered {
                 match result {
                     Ok(samples) => {
-                        self.tiles.install(region, &samples);
+                        {
+                            // The install bumps the generation by one.
+                            let _install = measurement_scope_with_edit(
+                                "gui_region_install",
+                                EditSpanFields {
+                                    generation: self.tiles.generation() + 1,
+                                    ..edit
+                                },
+                            );
+                            self.tiles.install(region, &samples);
+                        }
                         if let Some(stroke) = self.stroke.as_mut()
                             && stroke.tick_rects.contains(&region)
                         {
@@ -2587,23 +2630,27 @@ impl EditState {
         if self.region_renders.queued.is_empty() {
             return;
         }
-        let jobs: Vec<RegionRender> = self.region_renders.queued.drain(..).collect();
+        let jobs: Vec<(RegionRender, EditSpanFields)> =
+            self.region_renders.queued.drain(..).collect();
         let input = self.render_input();
         let extents: Vec<Rect> = jobs
             .iter()
-            .map(|job| read_extent_of(input.info, job, &|id| input.checkpoints.contains_key(id)))
+            .map(|(job, _)| {
+                read_extent_of(input.info, job, &|id| input.checkpoints.contains_key(id))
+            })
             .collect();
         let (mut local, mut snapshot) = (self.tiles.subset(&extents), self.snapshot.clone());
-        let ends_drag = jobs.iter().any(|job| job.ends_drag);
+        let ends_drag = jobs.iter().any(|(job, _)| job.ends_drag);
         self.region_renders.in_flight = true;
         let parked = Arc::clone(&self.region_renders.parked);
         let wake = Arc::clone(wake);
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 jobs.iter()
-                    .map(|job| {
+                    .map(|(job, edit)| {
+                        let _job = measurement_scope_with_edit("gui_region_job", *edit);
                         let samples = render_region(&input, job, &mut local, &mut snapshot);
-                        (job.region, samples)
+                        (job.region, *edit, samples)
                     })
                     .collect::<Rendered>()
             }));
@@ -2616,12 +2663,19 @@ impl EditState {
                 Err(_) => Parked {
                     rendered: jobs
                         .iter()
-                        .map(|job| (job.region, Err("the region render worker panicked".into())))
+                        .map(|(job, edit)| {
+                            (
+                                job.region,
+                                *edit,
+                                Err("the region render worker panicked".into()),
+                            )
+                        })
                         .collect(),
                     snapshot: None,
                     ends_drag,
                 },
             };
+            let _park = measurement_scope("gui_region_park");
             *parked
                 .lock()
                 .expect("no worker panicked while parking its region renders") =

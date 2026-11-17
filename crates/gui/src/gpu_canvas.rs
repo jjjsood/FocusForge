@@ -2091,7 +2091,11 @@ impl CanvasRenderer {
         let merged = match job.pane {
             Pane::Composite => {
                 let merged = edited.map(|view| {
-                    let mut merged = samples.to_vec();
+                    let mut merged = {
+                        let _copy = measurement_scope("gui_publish_copy");
+                        samples.to_vec()
+                    };
+                    let _lookup = measurement_scope("gui_publish_overlay_lookup");
                     crate::canvas::overlay_edited(
                         &mut merged,
                         rect,
@@ -2103,6 +2107,7 @@ impl CanvasRenderer {
                     merged
                 });
                 let composite = merged.as_deref().unwrap_or(samples);
+                let _upload = measurement_scope("gui_publish_upload");
                 match &job.state.overlay {
                     Some(overlay) if !colors.is_empty() => {
                         texture.ensure_and_render_overlay(
@@ -2128,6 +2133,7 @@ impl CanvasRenderer {
                 merged
             }
             _ => {
+                let _upload = measurement_scope("gui_publish_upload");
                 texture.ensure_and_render(
                     renderer,
                     &device,
