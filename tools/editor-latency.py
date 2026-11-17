@@ -48,6 +48,8 @@ STAGES = (
 LONG_STROKE_MS = 5000.0
 LONG_STROKE_SEGMENTS = 10
 GESTURE_GAP_MS = 500.0
+MIN_GESTURE_ACTIONS = 3
+MIN_GESTURE_MS = 250.0
 
 
 class TraceError(Exception):
@@ -120,13 +122,14 @@ def read_trace(raw):
         raise TraceError("unbalanced B and E events: a span never closed")
     if summary is None:
         raise TraceError("the trace has no timing_summary record")
-    for field in ("gui_exhausted_admissions", "exhausted_admissions"):
-        if number(summary.get(field, 0)) > 0:
-            raise TraceError("the span budget was exhausted (%s)" % field)
+    if number(summary.get("gui_exhausted_admissions", 0)) > 0:
+        raise TraceError("the span budget was exhausted (gui_exhausted_admissions)")
     if text(summary.get("saturated", "false")).lower() == "true":
         raise TraceError("the timing counters saturated")
     spans.sort(key=lambda span: (span.start, -span.end))
-    return spans
+    # The processing budget only feeds the readback-wait stage; once it is
+    # spent that stage is a lower bound, so it is left out, not refused.
+    return spans, number(summary.get("exhausted_admissions", 0)) > 0
 
 
 def percentile(values, fraction):
@@ -282,10 +285,15 @@ def frame_rates(by_kind, kind):
     frames = by_kind.get("gui_frame_rendered", [])
     found = []
     for group in gestures(by_kind.get(kind, [])):
+        if len(group) < MIN_GESTURE_ACTIONS:
+            continue
         last = first_at_or_after(frames, group[-1].start)
         window = [f for f in frames if last is not None and group[0].start <= f.start <= last.start]
         if len(window) < 2 or window[-1].start == window[0].start:
-            found.append((kind, 0.0, 0.0))
+            # A burst that ended inside one frame has no interval to measure;
+            # a gesture that lasted and still drew one frame is a stall.
+            if group[-1].start - group[0].start >= MIN_GESTURE_MS:
+                found.append((kind, 0.0, 0.0))
             continue
         gaps = [b.start - a.start for a, b in zip(window, window[1:])]
         hertz = 1000.0 * (len(window) - 1) / (window[-1].start - window[0].start)
@@ -326,7 +334,7 @@ def switch_times(by_kind):
 
 def analyze(raw, machine):
     """The report dict for the trace text `raw`; raises TraceError."""
-    spans = read_trace(raw)
+    spans, partial = read_trace(raw)
     by_kind = {}
     for span in spans:
         by_kind.setdefault(span.kind, []).append(span)
@@ -366,6 +374,8 @@ def analyze(raw, machine):
     if ratio is None or settle is None:
         raise TraceError("no stroke cost or release settle could be derived")
     rates = frame_rates(by_kind, "gui_action_pan") + frame_rates(by_kind, "gui_action_zoom")
+    if not rates:
+        raise TraceError("no pan or zoom gesture of at least %d actions" % MIN_GESTURE_ACTIONS)
     lowest = min(rates, key=lambda r: r[1])
     switches = switch_times(by_kind)
     if not switches:
@@ -397,7 +407,9 @@ def analyze(raw, machine):
         "switch_median_ms": statistics.median(switches),
         "exact_detail_ms": exact_detail_times(by_kind),
         "stages": {
-            key: {
+            key: {"median_ms": None, "p95_ms": None}
+            if partial and key == "readback_wait"
+            else {
                 "median_ms": statistics.median(r[key] for r in rows),
                 "p95_ms": percentile([r[key] for r in rows], 0.95),
             }
@@ -442,7 +454,10 @@ def render(report):
     lines.append("brush stages (median / p95, ms):")
     for key, label in STAGES:
         stage = report["stages"][key]
-        lines.append("  %-16s %8.2f %8.2f" % (label, stage["median_ms"], stage["p95_ms"]))
+        if stage["median_ms"] is None:
+            lines.append("  %-16s %8s %8s  (processing span budget spent)" % (label, "n/a", "n/a"))
+        else:
+            lines.append("  %-16s %8.2f %8.2f" % (label, stage["median_ms"], stage["p95_ms"]))
     lines.append(
         "segments: %d, inputs: %d (excluded %d), strokes: %d (long %d)"
         % (report["segments"], report["inputs"], report["inputs_excluded"],
@@ -657,12 +672,15 @@ def selftest():
     expect_error(session.text()[:-3], "not one closed JSON array", "a cut file")
     events = session.events()
     expect_error(json.dumps(events[2:]), "timing_summary", "no summary")
-    for field, value in (
-        ("gui_exhausted_admissions", "3"), ("exhausted_admissions", 1), ("saturated", "true"),
-    ):
+    for field, value in (("gui_exhausted_admissions", "3"), ("saturated", "true")):
         summary = {"gui_exhausted_admissions": "0", "exhausted_admissions": "0",
                    "saturated": "false", field: value}
         expect_error(session.text(summary=summary), "budget" if field != "saturated" else "saturated", field)
+    spent = analyze(session.text(summary={
+        "gui_exhausted_admissions": "0", "exhausted_admissions": "5", "saturated": "false"}), "laptop")
+    assert spent["stages"]["readback_wait"]["median_ms"] is None, spent["stages"]
+    assert spent["stages"]["blend"]["median_ms"] is not None, spent["stages"]
+    assert "n/a" in render(spent)
     expect_error(session.text(unbalance=True), "unbalanced", "a missing E")
     for kind, name in (
         ("gui_stroke_segment", "stroke"), ("gui_stroke_release", "release"),
@@ -677,6 +695,21 @@ def selftest():
     short.gesture("gui_action_zoom", 6000, 3, 100, 20)
     short.switch(7000, 30)
     expect_error(short.text(), "no stroke of at least 5 s and 10 segments", "a short stroke")
+    lone = Builder()
+    lone.stroke(1, 0, 12, 300, lambda k: 10)
+    lone.release(1, 6000, 12, 60)
+    lone.gesture("gui_action_pan", 7000, 1, 20, 20)
+    lone.gesture("gui_action_zoom", 8000, 2, 100, 20)
+    lone.switch(9000, 30)
+    expect_error(lone.text(), "no pan or zoom gesture", "single-action gestures")
+    stall = Builder()
+    stall.stroke(1, 0, 12, 300, lambda k: 10)
+    stall.release(1, 6000, 12, 60)
+    stall.gesture("gui_action_pan", 7000, 10, 100, 5000)
+    stall.gesture("gui_action_zoom", 8000, 10, 100, 20)
+    stall.switch(9000, 30)
+    report = analyze(stall.text(), "laptop")
+    assert report["figures"]["frame_rate_hz"]["value"] <= 1.0, report["figures"]
 
     # The command line: exit 1 with one stderr line and no figure, exit 2 on usage.
     with tempfile.TemporaryDirectory() as folder:
